@@ -45,7 +45,7 @@ Create a `.env` file in `/var/www/kudos_phantom/backend/.env`:
 ```env
 BACKEND_PORT=8001
 DATABASE_URL=sqlite:///trading_system.db
-CORS_ORIGINS=http://your_server_ip:5173,http://your_server_ip
+CORS_ORIGINS=http://72.60.195.95:5173,http://72.60.195.95
 ```
 
 ### 3. Update `main.py` for Dynamic Port & CORS
