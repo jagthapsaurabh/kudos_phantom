@@ -91,6 +91,16 @@ def register(username: str, password: str, db=Depends(get_db)):
     db.commit()
     return {"status": "User registered"}
 
+# --- HEALTH CHECK ---
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "system": "PHANTOM v2.5",
+        "timestamp": datetime.utcnow(),
+        "message": "Trading engine is operational"
+    }
+
 # --- STRATEGY MANAGEMENT ---
 @app.get("/strategies")
 def list_strategies(user=Depends(get_current_user), db=Depends(get_db)):
