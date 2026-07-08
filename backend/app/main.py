@@ -11,6 +11,7 @@ from .services.paper_trader import PaperTradeService
 from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
 from .database.models import init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade
+import bcrypt
 from passlib.context import CryptContext
 import asyncio
 from datetime import datetime
@@ -79,13 +80,27 @@ def startup():
 @app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
     user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not pwd_context.verify(form_data.password, user.password_hash):
+    if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
-    return {"access_token": user.username, "token_type": "bearer"}
+    
+    try:
+        # Use bcrypt directly to avoid passlib version incompatibility issues
+        import bcrypt
+        password_bytes = form_data.password.encode('utf-8')
+        hashed_bytes = user.password_hash.encode('utf-8')
+        if bcrypt.checkpw(password_bytes, hashed_bytes):
+            return {"access_token": user.username, "token_type": "bearer"}
+    except Exception as e:
+        print(f"Login Verification Error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication system error")
+        
+    raise HTTPException(status_code=400, detail="Incorrect username or password")
 
 @app.post("/auth/register")
 def register(username: str, password: str, db=Depends(get_db)):
-    hashed = pwd_context.hash(password)
+    import bcrypt
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
     user = User(username=username, password_hash=hashed)
     db.add(user)
     db.commit()
