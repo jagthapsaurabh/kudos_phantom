@@ -8,7 +8,7 @@ def seed_admin():
     db = SessionLocal()
     
     admin_username = "admin"
-    admin_password = "admin_password_123" 
+    admin_password = "admin123" 
     
     existing_user = db.query(User).filter(User.username == admin_username).first()
     if existing_user:
