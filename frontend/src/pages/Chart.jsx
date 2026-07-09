@@ -33,20 +33,22 @@ const ChartPage = () => {
       
       chartRef.current = chart;
 
-      if (typeof chart.addCandlestickSeries === 'function') {
-        const candlestickSeries = chart.addCandlestickSeries({
-          upColor: '#4ade80',
-          downColor: '#f87171',
-          borderVisible: false,
-          wickUpColor: '#4ade80',
-          wickDownColor: '#f87171',
-        });
-        seriesRef.current = candlestickSeries;
-      } else {
-        console.error("Lightweight Charts Error: addCandlestickSeries not found. Available methods:", Object.getOwnPropertyNames(chart));
-      }
-
-      fetchData();
+      // Use a small timeout to ensure the chart instance is fully mounted in the DOM
+      setTimeout(() => {
+        if (chart && typeof chart.addCandlestickSeries === 'function') {
+          const candlestickSeries = chart.addCandlestickSeries({
+            upColor: '#4ade80',
+            downColor: '#f87171',
+            borderVisible: false,
+            wickUpColor: '#4ade80',
+            wickDownColor: '#f87171',
+          });
+          seriesRef.current = candlestickSeries;
+          fetchData();
+        } else {
+          console.error("Lightweight Charts Error: addCandlestickSeries not found.");
+        }
+      }, 100);
 
       const handleResize = () => {
         if (chartRef.current) {

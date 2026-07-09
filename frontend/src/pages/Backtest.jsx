@@ -49,10 +49,14 @@ const Backtest = () => {
     } catch (e) {}
   };
 
-  useEffect(() => { 
-    fetchStrategies();
-    fetchHistory(); 
-  }, []);
+  useEffect(() => {
+    if (results && results.equity_curve) {
+      const timer = setTimeout(() => {
+        initEquityChart(results.equity_curve);
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [results]);
 
   const resetParams = () => {
     setParams({
@@ -86,13 +90,37 @@ const Backtest = () => {
       }
       
       const data = await response.json();
-      setResults(data.results);
-      fetchHistory();
-      initEquityChart(data.results.equity_curve);
+      const runId = data.run_id;
+      
+      // Poll for results
+      const pollInterval = setInterval(async () => {
+        try {
+          const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+          });
+          const resultData = await res.json();
+          
+          // Check if results are fully computed (ROI should not be 0.0 if trades occurred)
+          if (resultData.run_details && resultData.run_details.total_trades !== undefined && resultData.run_details.total_trades !== 0) {
+            setResults({
+              ...resultData.run_details,
+              final_equity_inr: resultData.run_details.final_equity,
+              trades: resultData.trades
+            });
+            initEquityChart(resultData.run_details.equity_curve);
+            setLoading(false);
+            clearInterval(pollInterval);
+            fetchHistory();
+          }
+        } catch (e) {
+          console.error("Polling error:", e);
+        }
+      }, 2000);
+
     } catch (error) {
       alert(error.message);
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const initEquityChart = (equityData) => {
@@ -128,15 +156,34 @@ const Backtest = () => {
       const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
+      
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Run not found on server");
+      }
+      
       const data = await res.json();
+      
+      if (!data.run_details) {
+        throw new Error("Run details are missing from the server response");
+      }
+
       setResults({
         ...data.run_details,
         final_equity_inr: data.run_details.final_equity,
         trades: data.trades
       });
       setShowHistory(false);
-      initEquityChart(data.run_details.equity_curve);
-    } catch (e) { alert("Error loading run"); }
+      
+      if (data.run_details.equity_curve && Array.isArray(data.run_details.equity_curve)) {
+        initEquityChart(data.run_details.equity_curve);
+      } else {
+        console.warn("No equity curve data available for this run.");
+      }
+    } catch (e) { 
+      console.error("Load Run Error:", e);
+      alert(`Error loading run: ${e.message}`); 
+    }
   };
 
   const clearHistory = async () => {
