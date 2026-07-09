@@ -31,9 +31,9 @@ const PaperTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
-
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   useEffect(() => {
-    fetch('/api/strategies', { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+    fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
   }, []);
@@ -41,7 +41,7 @@ const PaperTrade = () => {
   const startTrade = async () => {
     setLoading(true);
     try {
-      await fetch('/api/paper-trade/start', {
+      await fetch(`${API_URL}/paper-trade/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ strategy_id: selectedStrategy })
@@ -52,7 +52,7 @@ const PaperTrade = () => {
 
   const stopTrade = async (instanceKey) => {
     try {
-      await fetch('/api/paper-trade/stop', {
+      await fetch(`${API_URL}/paper-trade/stop`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ instance_key: instanceKey })
@@ -62,10 +62,10 @@ const PaperTrade = () => {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch('/api/paper-trade/status', { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
+      const res = await fetch(`${API_URL}/paper-trade/status`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
       const data = await res.json();
       setStatus(data);
-    } catch (e) {}
+    } catch (e) { }
   };
 
   useEffect(() => {
@@ -75,7 +75,7 @@ const PaperTrade = () => {
 
   // Filter instances for the selected strategy
   const myInstances = status.filter(s => s.strategy_id === selectedStrategy);
-  const activeTrades = myInstances.flatMap(inst => inst.active_trades.map(t => ({...t, instance_key: inst.instance_key})));
+  const activeTrades = myInstances.flatMap(inst => inst.active_trades.map(t => ({ ...t, instance_key: inst.instance_key })));
   const virtualBalance = myInstances.length > 0 ? myInstances[0].equity_inr : 20000;
   const marginUsed = activeTrades.reduce((sum, t) => sum + t.margin, 0);
 
@@ -92,14 +92,14 @@ const PaperTrade = () => {
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Active Strategy</label>
             <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+              className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
               <option value="PhantomV2">Phantom V2.5 (Default)</option>
               <option value="FastTest">Fast Test Strategy (Quick Signals)</option>
               {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
           </div>
           <button onClick={startTrade} disabled={loading}
-                  className="px-6 py-2 rounded-lg font-bold transition bg-blue-600 hover:bg-blue-500 flex items-center gap-2">
+            className="px-6 py-2 rounded-lg font-bold transition bg-blue-600 hover:bg-blue-500 flex items-center gap-2">
             <Play size={18} /> Start Instance
           </button>
         </div>
@@ -114,11 +114,11 @@ const PaperTrade = () => {
             <div className="space-y-4">
               <div className="flex justify-between items-center">
                 <span className="text-gray-500 text-xs">Virtual Balance</span>
-                <span className="font-mono font-bold">₹{virtualBalance.toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
+                <span className="font-mono font-bold">₹{virtualBalance.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-gray-500 text-xs">Margin Used</span>
-                <span className="font-mono font-bold text-blue-400">₹{marginUsed.toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
+                <span className="font-mono font-bold text-blue-400">₹{marginUsed.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
               </div>
             </div>
           </div>

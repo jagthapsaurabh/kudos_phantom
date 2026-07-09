@@ -4,7 +4,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 const LoginPage = ({ onLogin }) => {
   const [form, setForm] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
-
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const handleSubmit = async (e) => {
     e.preventDefault();
     const formData = new FormData();
@@ -12,7 +12,7 @@ const LoginPage = ({ onLogin }) => {
     formData.append('password', form.password);
 
     try {
-      const res = await fetch('/api/token', { method: 'POST', body: formData });
+      const res = await fetch(`${API_URL}/token`, { method: 'POST', body: formData });
       if (!res.ok) throw new Error('Invalid credentials');
       const data = await res.json();
       localStorage.setItem('token', data.access_token);
@@ -29,13 +29,13 @@ const LoginPage = ({ onLogin }) => {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="text-sm text-gray-400">Username</label>
-            <input type="text" className="w-full bg-gray-700 p-3 rounded-lg border border-gray-600 text-white" 
-                   value={form.username} onChange={e => setForm({...form, username: e.target.value})} />
+            <input type="text" className="w-full bg-gray-700 p-3 rounded-lg border border-gray-600 text-white"
+              value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} />
           </div>
           <div>
             <label className="text-sm text-gray-400">Password</label>
-            <input type="password" className="w-full bg-gray-700 p-3 rounded-lg border border-gray-600 text-white" 
-                   value={form.password} onChange={e => setForm({...form, password: e.target.value})} />
+            <input type="password" className="w-full bg-gray-700 p-3 rounded-lg border border-gray-600 text-white"
+              value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} />
           </div>
           {error && <p className="text-red-400 text-sm">{error}</p>}
           <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-bold transition">Login</button>
@@ -64,16 +64,16 @@ const AdminPanel = ({ token, onLogout }) => {
 
   const fetchPaperStatus = async () => {
     try {
-      const res = await fetch('/api/paper/status', { headers: authHeader });
+      const res = await fetch(`${API_URL}/paper/status`, { headers: authHeader });
       const data = await res.json();
       setPaperStatus(data);
-    } catch (e) {}
+    } catch (e) { }
   };
 
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const response = await fetch('/api/backtest', {
+      const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
         headers: { ...authHeader, 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
@@ -87,7 +87,7 @@ const AdminPanel = ({ token, onLogout }) => {
   };
 
   const updateConfig = async () => {
-    await fetch('/api/config/update', {
+    await fetch(`${API_URL}/config/update`, {
       method: 'POST',
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -96,7 +96,7 @@ const AdminPanel = ({ token, onLogout }) => {
   };
 
   const togglePaperTrade = async () => {
-    const endpoint = paperStatus.status === 'running' ? '/api/paper/stop' : '/api/paper/start';
+    const endpoint = paperStatus.status === 'running' ? `${API_URL}/paper/stop` : `${API_URL}/paper/start`;
     await fetch(endpoint, { method: 'POST', headers: authHeader });
     fetchPaperStatus();
   };
@@ -127,9 +127,9 @@ const AdminPanel = ({ token, onLogout }) => {
             {Object.keys(params).map(key => (
               <div key={key} className="flex flex-col">
                 <label className="text-sm text-gray-400 capitalize">{key.replace('_', ' ')}</label>
-                <input type="number" step="0.01" value={params[key]} 
-                       onChange={e => setParams({...params, [key]: parseFloat(e.target.value)})}
-                       className="bg-gray-700 text-white p-2 rounded border border-gray-600 focus:border-blue-500 outline-none" />
+                <input type="number" step="0.01" value={params[key]}
+                  onChange={e => setParams({ ...params, [key]: parseFloat(e.target.value) })}
+                  className="bg-gray-700 text-white p-2 rounded border border-gray-600 focus:border-blue-500 outline-none" />
               </div>
             ))}
           </div>
@@ -167,7 +167,7 @@ const AdminPanel = ({ token, onLogout }) => {
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                     <XAxis dataKey="name" hide />
                     <YAxis stroke="#9CA3AF" domain={['auto', 'auto']} />
-                    <Tooltip contentStyle={{backgroundColor: '#1F2937', border: 'none'}} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: 'none' }} />
                     <Line type="monotone" dataKey="value" stroke="#60A5FA" strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>

@@ -8,11 +8,11 @@ const BrokerSettings = () => {
     initialCapital: 20000, 
     marginPct: 25 
   });
-
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const res = await fetch('/api/broker-settings', {
+        const res = await fetch(`${API_URL}/broker-settings`, {
           headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
         });
         const data = await res.json();
@@ -30,7 +30,7 @@ const BrokerSettings = () => {
 
   const saveSettings = async () => {
     try {
-      const res = await fetch('/api/broker-settings', {
+      const res = await fetch(`${API_URL}/broker-settings`, {
         method: 'POST',
         headers: { 
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
