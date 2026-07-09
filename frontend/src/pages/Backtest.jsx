@@ -33,6 +33,9 @@ const Backtest = () => {
       });
       const data = await res.json();
       setHistory(data);
+      if(data){
+        setShowHistory(true);
+      }
     } catch (e) {}
   };
 
@@ -166,7 +169,7 @@ const Backtest = () => {
 
           <div className="flex flex-wrap gap-4 flex-1 border-l border-gray-700 pl-6">
             {Object.keys(params).map(key => (
-              <div key={key} className="flex flex-col w-32">
+              <div key={key} className="flex  w-32">
                 <label className="text-[10px] text-gray-400 uppercase font-bold mb-1">{key.replace('_', ' ')}</label>
                 <input type="number" step="0.01" value={params[key]} 
                        onChange={e => setParams({...params, [key]: parseFloat(e.target.value)})}
