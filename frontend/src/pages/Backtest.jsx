@@ -31,25 +31,25 @@ const Backtest = () => {
 
   const fetchStrategies = async () => {
     try {
-      const res = await fetch(`${API_URL}/strategies`, { 
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+      const res = await fetch(`${API_URL}/strategies`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
       });
       const data = await res.json();
       setStrategies(data);
-    } catch (e) {}
+    } catch (e) { }
   };
 
   const fetchHistory = async () => {
     try {
-      const res = await fetch(`${API_URL}/backtest/history`, { 
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+      const res = await fetch(`${API_URL}/backtest/history`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
       });
       const data = await res.json();
       setHistory(data);
-      if(data){
+      if (data) {
         setShowHistory(true);
       }
-    } catch (e) {}
+    } catch (e) { }
   };
 
   useEffect(() => {
@@ -74,9 +74,9 @@ const Backtest = () => {
     try {
       const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json' 
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           params: params,
@@ -86,23 +86,23 @@ const Backtest = () => {
           strategy_name: selectedStrategyId === 'PhantomV2' ? "Phantom Optimization" : `Custom Run ${selectedStrategyId}`,
         }),
       });
-      
+
       if (!response.ok) {
         const err = await response.json();
         throw new Error(err.detail || "Backtest failed");
       }
-      
+
       const data = await response.json();
       const runId = data.run_id;
-      
+
       // Poll for results
       const pollInterval = setInterval(async () => {
         try {
-          const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+          const res = await fetch(`${API_URL}/backtest/results/${runId}`, {
+            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
           });
           const resultData = await res.json();
-          
+
           // Check if results are fully computed (ROI should not be 0.0 if trades occurred)
           if (resultData.run_details && resultData.run_details.total_trades !== undefined && resultData.run_details.total_trades !== 0) {
             setResults({
@@ -156,17 +156,17 @@ const Backtest = () => {
 
   const loadRun = async (runId) => {
     try {
-      const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+      const res = await fetch(`${API_URL}/backtest/results/${runId}`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
       });
-      
+
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || "Run not found on server");
       }
-      
+
       const data = await res.json();
-      
+
       if (!data.run_details) {
         throw new Error("Run details are missing from the server response");
       }
@@ -177,24 +177,24 @@ const Backtest = () => {
         trades: data.trades
       });
       setShowHistory(false);
-      
+
       // if (data.run_details.equity_curve && Array.isArray(data.run_details.equity_curve)) {
       //   initEquityChart(data.run_details.equity_curve);
       // } else {
       //   console.warn("No equity curve data available for this run.");
       // }
-    } catch (e) { 
+    } catch (e) {
       console.error("Load Run Error:", e);
-      alert(`Error loading run: ${e.message}`); 
+      alert(`Error loading run: ${e.message}`);
     }
   };
 
   const clearHistory = async () => {
     if (!window.confirm("Are you sure you want to clear all backtest history?")) return;
     try {
-      const res = await fetch(`${API_URL}/backtest/clear`, { 
+      const res = await fetch(`${API_URL}/backtest/clear`, {
         method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
       });
       if (res.ok) {
         setHistory([]);
@@ -270,19 +270,19 @@ const Backtest = () => {
             <div className="flex gap-4">
               <div className="flex flex-col">
                 <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start Date</label>
-                <input type="date" value={dates.start} onChange={e => setDates({...dates, start: e.target.value})}
-                       className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+                <input type="date" value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })}
+                  className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
               </div>
               <div className="flex flex-col">
                 <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End Date</label>
-                <input type="date" value={dates.end} onChange={e => setDates({...dates, end: e.target.value})}
-                       className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+                <input type="date" value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })}
+                  className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
               </div>
             </div>
             <div className="flex flex-col">
               <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
               <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
-                      className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+                className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
                 <option value="PhantomV2">Phantom V2.5 (Default)</option>
                 {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
@@ -298,9 +298,9 @@ const Backtest = () => {
                     {fields.map(field => (
                       <div key={field} className="flex flex-col">
                         <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace('_', ' ')}</label>
-                        <input type="number" step="0.01" value={params[field]} 
-                               onChange={e => setParams({...params, [field]: parseFloat(e.target.value)})}
-                               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
+                        <input type="number" step="0.01" value={params[field]}
+                          onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
+                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
                       </div>
                     ))}
                   </div>
@@ -339,7 +339,7 @@ const Backtest = () => {
               </div>
               <div ref={chartContainerRef} className="w-full" />
             </div> */}
-            
+
             <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
               <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
               <div className="flex-1">
@@ -416,9 +416,9 @@ const Backtest = () => {
                 <MetricRow label="Profit Factor" value={`${stats?.profitFactor?.toFixed(2)}`} />
                 <MetricRow label="Sharpe Ratio" value={`${stats?.sharpe?.toFixed(2)}`} />
                 <MetricRow label="Max Drawdown" value={`${stats?.maxDD?.toFixed(2)}%`} color="text-red-400" />
-                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${((stats?.directionDist?.Long || 0)/stats?.totalTrades * 100).toFixed(1)}%)`} />
-                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${((stats?.directionDist?.Short || 0)/stats?.totalTrades * 100).toFixed(1)}%)`} />
-                
+                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${((stats?.directionDist?.Long || 0) / stats?.totalTrades * 100).toFixed(1)}%)`} />
+                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${((stats?.directionDist?.Short || 0) / stats?.totalTrades * 100).toFixed(1)}%)`} />
+
                 <div className="border-t border-gray-700 mt-6 pt-6">
                   <div className="flex justify-between items-center mb-3">
                     <span className="text-xs font-bold text-gray-500 uppercase">Rejected Signals</span>

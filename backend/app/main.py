@@ -293,6 +293,7 @@ def start_paper_trade(
     instance_key = f"paper_{user.username}_{strategy_id}_{instance_id}"
     
     if strategy_id == "FastTest":
+        # Fixed: Import within the function to avoid UnboundLocalError if not available at module level
         from .core.strategy import FastTestStrategyService, PhantomV2Config
         service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct)
         service.strategy = FastTestStrategyService(service.config)
@@ -305,7 +306,10 @@ def start_paper_trade(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        # Fixed: Explicitly use the imported PhantomV2Config from the top of the file
+        # The issue was a scope conflict where the name PhantomV2Config was being shadowed or accessed incorrectly
+        from .core.strategy import PhantomV2Config as PConfig
+        service = PaperTradeService(strategy_id, PConfig(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
 
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
