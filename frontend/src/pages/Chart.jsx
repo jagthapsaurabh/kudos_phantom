@@ -30,7 +30,7 @@ const ChartPage = () => {
         width: chartContainerRef.current.clientWidth,
         height: 600,
       });
-      
+
       chartRef.current = chart;
 
       // Use a small timeout to ensure the chart instance is fully mounted in the DOM
@@ -69,9 +69,7 @@ const ChartPage = () => {
     }
   }, []);
 
-  useEffect(() => {
-    fetchData();
-  }, [interval, symbol]);
+
 
   const fetchData = async () => {
     if (!seriesRef.current) return;
@@ -84,6 +82,9 @@ const ChartPage = () => {
     }
   };
 
+  useEffect(() => {
+    fetchData();
+  }, [interval, symbol]);
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
       <div className="flex justify-between items-center mb-8">
@@ -96,8 +97,8 @@ const ChartPage = () => {
         <div className="flex gap-4 items-center">
           <div className="flex items-center gap-2 bg-gray-800 p-1 rounded-lg border border-gray-700">
             {['1m', '5m', '15m', '1h', '4h', '1d'].map(int => (
-              <button 
-                key={int} 
+              <button
+                key={int}
                 onClick={() => setInterval(int)}
                 className={`px-3 py-1 rounded-md text-xs font-medium transition ${interval === int ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
               >

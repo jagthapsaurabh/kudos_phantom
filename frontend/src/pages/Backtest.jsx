@@ -46,6 +46,9 @@ const Backtest = () => {
       });
       const data = await res.json();
       setHistory(data);
+      if(data){
+        setShowHistory(true);
+      }
     } catch (e) {}
   };
 
@@ -223,6 +226,11 @@ const Backtest = () => {
 
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
+
+  useEffect(() => {
+    fetchStrategies();
+    fetchHistory();
+  }, []);
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
