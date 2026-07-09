@@ -77,11 +77,11 @@ const CustomStrategyBuilder = () => {
   const [rules, setRules] = useState([{ field: 'close', op: 'gt', value: 'ema50', timeframe: '4h' }]);
   const [stratName, setStratName] = useState('My Custom Strategy');
   const [loading, setLoading] = useState(false);
-
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const saveStrategy = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/strategies/create', {
+      const res = await fetch(`${API_URL}/strategies/create`, {
         method: 'POST',
         headers: { 
           'Authorization': `Bearer ${localStorage.getItem('token')}`,

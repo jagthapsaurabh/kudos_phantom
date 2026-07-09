@@ -4,7 +4,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 const LoginPage = ({ onLogin }) => {
   const [form, setForm] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
-
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const handleSubmit = async (e) => {
     e.preventDefault();
     const formData = new FormData();
@@ -12,7 +12,7 @@ const LoginPage = ({ onLogin }) => {
     formData.append('password', form.password);
 
     try {
-      const res = await fetch('/api/token', { method: 'POST', body: formData });
+      const res = await fetch(`${API_URL}/token`, { method: 'POST', body: formData });
       if (!res.ok) throw new Error('Invalid credentials');
       const data = await res.json();
       localStorage.setItem('token', data.access_token);
@@ -64,7 +64,7 @@ const AdminPanel = ({ token, onLogout }) => {
 
   const fetchPaperStatus = async () => {
     try {
-      const res = await fetch('/api/paper/status', { headers: authHeader });
+      const res = await fetch(`${API_URL}/paper/status`, { headers: authHeader });
       const data = await res.json();
       setPaperStatus(data);
     } catch (e) {}
@@ -73,7 +73,7 @@ const AdminPanel = ({ token, onLogout }) => {
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const response = await fetch('/api/backtest', {
+      const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
         headers: { ...authHeader, 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
@@ -87,7 +87,7 @@ const AdminPanel = ({ token, onLogout }) => {
   };
 
   const updateConfig = async () => {
-    await fetch('/api/config/update', {
+    await fetch(`${API_URL}/config/update`, {
       method: 'POST',
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -96,7 +96,7 @@ const AdminPanel = ({ token, onLogout }) => {
   };
 
   const togglePaperTrade = async () => {
-    const endpoint = paperStatus.status === 'running' ? '/api/paper/stop' : '/api/paper/start';
+    const endpoint = paperStatus.status === 'running' ? `${API_URL}/paper/stop` : `${API_URL}/paper/start`;
     await fetch(endpoint, { method: 'POST', headers: authHeader });
     fetchPaperStatus();
   };

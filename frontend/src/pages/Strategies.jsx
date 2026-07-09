@@ -353,10 +353,11 @@ const Strategies = () => {
       trail_activation_atr: 1.5, trail_distance_atr: 0.5,
     }
   });
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   const fetchStrategies = async () => {
     try {
-      const res = await fetch('/api/strategies', { 
+      const res = await fetch(`${API_URL}/strategies`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
@@ -380,7 +381,7 @@ const Strategies = () => {
     }
 
     try {
-      const res = await fetch(endpoint, {
+      const res = await fetch(`${API_URL}${endpoint}`, {
         method: editingStrat ? 'PUT' : 'POST',
         headers: { 
           'Authorization': `Bearer ${localStorage.getItem('token')}`,

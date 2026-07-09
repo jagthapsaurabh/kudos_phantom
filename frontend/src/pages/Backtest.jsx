@@ -14,10 +14,11 @@ const Backtest = () => {
   const [dates, setDates] = useState({ start: '', end: '' });
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   const fetchStrategies = async () => {
     try {
-      const res = await fetch('/api/strategies', { 
+      const res = await fetch(`${API_URL}/strategies`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
@@ -27,7 +28,7 @@ const Backtest = () => {
 
   const fetchHistory = async () => {
     try {
-      const res = await fetch('/api/backtest/history', { 
+      const res = await fetch(`${API_URL}/backtest/history`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
@@ -43,7 +44,7 @@ const Backtest = () => {
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const response = await fetch('/api/backtest', {
+      const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
         headers: { 
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
@@ -74,7 +75,7 @@ const Backtest = () => {
 
   const loadRun = async (runId) => {
     try {
-      const res = await fetch(`/api/backtest/results/${runId}`, { 
+      const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();

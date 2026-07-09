@@ -2,11 +2,12 @@ import React, { useState, useEffect } from 'react';
 
 const Dashboard = () => {
   const [stats, setStats] = useState({ best_roi: 0, total_runs: 0, avg_win_rate: 0 });
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const res = await fetch('/api/dashboard/stats', { 
+        const res = await fetch(`${API_URL}/dashboard/stats`, { 
           headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
         });
         const data = await res.json();

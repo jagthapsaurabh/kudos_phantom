@@ -8,6 +8,7 @@ const ChartPage = () => {
   const seriesRef = useRef();
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -71,7 +72,7 @@ const ChartPage = () => {
   const fetchData = async () => {
     if (!seriesRef.current) return;
     try {
-      const res = await fetch(`/api/klines?symbol=${symbol}&interval=${interval}`);
+      const res = await fetch(`${API_URL}/klines?symbol=${symbol}&interval=${interval}`);
       const data = await res.json();
       seriesRef.current.setData(data);
     } catch (e) {
