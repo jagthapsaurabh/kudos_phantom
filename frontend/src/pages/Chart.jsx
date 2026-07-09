@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
 import { TrendingUp, Timer, Layers } from 'lucide-react';
+import { API_URL } from '../api';
 
 const ChartPage = () => {
   const chartContainerRef = useRef();
@@ -8,7 +9,6 @@ const ChartPage = () => {
   const seriesRef = useRef();
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -30,7 +30,7 @@ const ChartPage = () => {
         width: chartContainerRef.current.clientWidth,
         height: 600,
       });
-
+      
       chartRef.current = chart;
 
       if (typeof chart.addCandlestickSeries === 'function') {
@@ -67,7 +67,9 @@ const ChartPage = () => {
     }
   }, []);
 
-
+  useEffect(() => {
+    fetchData();
+  }, [interval, symbol]);
 
   const fetchData = async () => {
     if (!seriesRef.current) return;
@@ -79,9 +81,6 @@ const ChartPage = () => {
       console.error("Error fetching chart data", e);
     }
   };
-  useEffect(() => {
-    fetchData();
-  }, [interval, symbol]);
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
@@ -95,8 +94,8 @@ const ChartPage = () => {
         <div className="flex gap-4 items-center">
           <div className="flex items-center gap-2 bg-gray-800 p-1 rounded-lg border border-gray-700">
             {['1m', '5m', '15m', '1h', '4h', '1d'].map(int => (
-              <button
-                key={int}
+              <button 
+                key={int} 
                 onClick={() => setInterval(int)}
                 className={`px-3 py-1 rounded-md text-xs font-medium transition ${interval === int ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
               >

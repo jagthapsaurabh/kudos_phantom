@@ -30,14 +30,14 @@ const TradingPage = ({ type }) => {
   const [isRunning, setIsRunning] = useState(false);
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
   const isLive = type === 'live';
 
   const toggleTrade = async () => {
     setLoading(true);
-    const endpoint = isLive ? `${API_URL}/live-trade/start` : `${API_URL}/paper-trade/start`;
-    const stopEndpoint = isLive ? `${API_URL}/live-trade/stop` : `${API_URL}/paper-trade/stop`;
-
+    const endpoint = isLive ? '/live-trade/start' : '/paper-trade/start';
+    const stopEndpoint = isLive ? '/live-trade/stop' : '/paper-trade/stop';
+    
     try {
       if (!isRunning) {
         const res = await fetch(endpoint, {
@@ -62,7 +62,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   };
 
   const fetchStatus = async () => {
-    const endpoint = isLive ? `${API_URL}/live-trade/status` : `${API_URL}/paper-trade/status`;
+    const endpoint = isLive ? '/live-trade/status' : '/paper-trade/status';
     try {
       const res = await fetch(endpoint, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
       const data = await res.json();

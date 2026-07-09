@@ -399,12 +399,32 @@ def get_live_status(user=Depends(get_current_user)):
 
 # --- DATA ENDPOINTS ---
 @app.get("/klines")
-def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500):
+def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, db=Depends(get_db)):
     try:
+        # First, try to fetch from the database for speed and history
+        data = db.query(Klines).filter(
+            Klines.symbol == symbol, 
+            Klines.interval == interval
+        ).order_by(Klines.event_time.desc()).limit(limit).all()
+        
+        if data:
+            # Reverse to get chronological order
+            data.reverse()
+            formatted = []
+            for k in data:
+                formatted.append({
+                    "time": k.event_time.timestamp(),
+                    "open": k.open,
+                    "high": k.high,
+                    "low": k.low,
+                    "close": k.close,
+                })
+            return formatted
+
+        # Fallback to API if DB is empty
         import requests
         url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url).json()
-        # Format for Lightweight Charts: { time: unix_timestamp, open: float, high: float, low: float, close: float }
         formatted = []
         for k in res:
             formatted.append({
@@ -416,7 +436,7 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500):
             })
         return formatted
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Klines fetch error: {str(e)}")
 
 class BrokerSettingsUpdate(BaseModel):
     api_key: str

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus, FilePlus, Search, Settings, Info } from 'lucide-react';
+import { API_URL } from '../api';
 
 // --- Constants ---
 const FIELDS = [
@@ -353,7 +354,6 @@ const Strategies = () => {
       trail_activation_atr: 1.5, trail_distance_atr: 0.5,
     }
   });
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   const fetchStrategies = async () => {
     try {

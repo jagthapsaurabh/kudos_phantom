@@ -1,35 +1,32 @@
-import React, { useState, useEffect } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import React, { useState, useEffect, useRef } from 'react';
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
+import { createChart } from 'lightweight-charts';
+import { API_URL } from '../api';
+import { Activity, TrendingUp, AlertCircle, RotateCcw } from 'lucide-react';
 
 const Backtest = () => {
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
   const [params, setParams] = useState({
     trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22,
-    macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 1.2,
+    macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 10.0,
     trail_activation_atr: 1.5, trail_distance_atr: 0.5,
   });
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [dates, setDates] = useState({ start: '', end: '' });
+  const [dates, setDates] = useState({ start: '2023-04-01', end: '2026-04-01' });
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-  const clearHistory = async () => {
-    if (!window.confirm("Are you sure you want to clear all backtest history? This action cannot be undone.")) return;
-    try {
-      const res = await fetch(`${API_URL}/backtest/clear`, { 
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
-      });
-      if (res.ok) {
-        alert("History cleared successfully");
-        setHistory([]);
-        setResults(null);
-      } else {
-        throw new Error("Failed to clear history");
-      }
-    } catch (e) { alert(e.message); }
+
+  // Chart Refs
+  const chartContainerRef = useRef();
+  const chartRef = useRef();
+  const seriesRef = useRef();
+
+  const paramGroups = {
+    "Trend Alignment": ["trend_ema_period"],
+    "Momentum & Volatility": ["rsi_oversold", "rsi_overbought", "adx_min", "macd_hist_min", "atr_regime_ratio"],
+    "Risk & Exit Model": ["stop_loss_atr", "take_profit_atr", "trail_activation_atr", "trail_distance_atr"]
   };
 
   const fetchStrategies = async () => {
@@ -57,6 +54,14 @@ const Backtest = () => {
     fetchHistory(); 
   }, []);
 
+  const resetParams = () => {
+    setParams({
+      trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22,
+      macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 10.0,
+      trail_activation_atr: 1.5, trail_distance_atr: 0.5,
+    });
+  };
+
   const runBacktest = async () => {
     setLoading(true);
     try {
@@ -68,7 +73,7 @@ const Backtest = () => {
         },
         body: JSON.stringify({
           params: params,
-          strategy_id: selectedStrategyId, // Pass the selected strategy
+          strategy_id: selectedStrategyId,
           start_date: dates.start,
           end_date: dates.end,
           strategy_name: selectedStrategyId === 'PhantomV2' ? "Phantom Optimization" : `Custom Run ${selectedStrategyId}`,
@@ -83,10 +88,39 @@ const Backtest = () => {
       const data = await response.json();
       setResults(data.results);
       fetchHistory();
+      initEquityChart(data.results.equity_curve);
     } catch (error) {
       alert(error.message);
     }
     setLoading(false);
+  };
+
+  const initEquityChart = (equityData) => {
+    if (!chartContainerRef.current) return;
+    if (chartRef.current) chartRef.current.remove();
+
+    const chart = createChart(chartContainerRef.current, {
+      layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
+      grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
+      width: chartContainerRef.current.clientWidth,
+      height: 400,
+    });
+
+    const areaSeries = chart.addAreaSeries({
+      lineColor: '#3b82f6',
+      topColor: 'rgba(59, 130, 246, 0.4)',
+      bottomColor: 'rgba(59, 130, 246, 0)',
+      lineWidth: 2,
+    });
+
+    const formattedData = equityData.map((val, idx) => ({
+      time: idx,
+      value: val,
+    }));
+
+    areaSeries.setData(formattedData);
+    chart.timeScale().fitContent();
+    chartRef.current = chart;
   };
 
   const loadRun = async (runId) => {
@@ -101,7 +135,22 @@ const Backtest = () => {
         trades: data.trades
       });
       setShowHistory(false);
+      initEquityChart(data.run_details.equity_curve);
     } catch (e) { alert("Error loading run"); }
+  };
+
+  const clearHistory = async () => {
+    if (!window.confirm("Are you sure you want to clear all backtest history?")) return;
+    try {
+      const res = await fetch(`${API_URL}/backtest/clear`, { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+      });
+      if (res.ok) {
+        setHistory([]);
+        setResults(null);
+      }
+    } catch (e) { alert(e.message); }
   };
 
   const stats = results ? {
@@ -121,26 +170,25 @@ const Backtest = () => {
       const dir = t.direction === 1 ? 'Long' : 'Short';
       acc[dir] = (acc[dir] || 0) + 1;
       return acc;
-    }, {})
+    }, {}),
+    rejections: results.rejected_reasons || {}
   } : null;
 
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 
-  const chartData = results?.equity_curve?.map((val, idx) => ({
-    time: idx,
-    equity: val
-  }));
-
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
       <div className="flex justify-between items-center mb-8">
-        <h1 className="text-3xl font-bold text-blue-400">Strategy Optimizer</h1>
+        <div>
+          <h1 className="text-3xl font-extrabold text-blue-400 tracking-tight">Strategy Optimizer</h1>
+          <p className="text-gray-500 text-sm">Refine PHANTOM v2.5 parameters and validate equity growth</p>
+        </div>
         <div className="flex gap-3">
-          <button onClick={clearHistory} className="bg-red-900/30 text-red-400 px-4 py-2 rounded-lg border border-red-800 hover:bg-red-800 hover:text-white transition text-sm font-semibold">
+          <button onClick={clearHistory} className="bg-red-900/20 text-red-400 px-4 py-2 rounded-lg border border-red-900/50 hover:bg-red-900/40 transition text-sm font-semibold">
             🗑️ Clear History
           </button>
-          <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition">
+          <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition text-sm font-semibold">
             {showHistory ? 'Close History' : '📜 View History'}
           </button>
         </div>
@@ -148,163 +196,219 @@ const Backtest = () => {
 
       {showHistory && (
         <div className="mb-8 bg-gray-800 p-6 rounded-2xl border border-gray-700 animate-in slide-in-from-top-4">
-          <h2 className="text-xl font-semibold mb-4">Backtest History</h2>
+          <h2 className="text-xl font-semibold mb-4 text-gray-300">Backtest History</h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {history.map(run => (
-              <div key={run.id} onClick={() => loadRun(run.id)} className="p-4 bg-gray-700 rounded-xl border border-gray-600 cursor-pointer hover:border-blue-500 transition">
-                <div className="font-bold">{run.name}</div>
-                <div className="text-xs text-gray-400">{run.start_date?.split('T')[0]} to {run.end_date?.split('T')[0]}</div>
-                <div className="text-green-400 font-mono text-sm">ROI: {run.roi?.toFixed(2)}%</div>
+              <div key={run.id} onClick={() => loadRun(run.id)} className="p-4 bg-gray-900 rounded-xl border border-gray-700 cursor-pointer hover:border-blue-500 transition group">
+                <div className="font-bold text-gray-200 group-hover:text-blue-400 transition">{run.name}</div>
+                <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} to {run.end_date?.split('T')[0]}</div>
+                <div className="text-green-400 font-mono text-sm mt-2">ROI: {run.roi?.toFixed(2)}%</div>
               </div>
             ))}
           </div>
         </div>
       )}
 
-      <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
-        <div className="flex flex-wrap items-end gap-6">
-          <div className="flex gap-4 shrink-0">
-            <div className="flex flex-col">
-              <label className="text-xs text-gray-400 mb-1">Start Date</label>
-              <input type="date" value={dates.start} onChange={e => setDates({...dates, start: e.target.value})}
-                     className="bg-gray-700 p-2 rounded border border-gray-600 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div className="flex flex-col">
-              <label className="text-xs text-gray-400 mb-1">End Date</label>
-              <input type="date" value={dates.end} onChange={e => setDates({...dates, end: e.target.value})}
-                     className="bg-gray-700 p-2 rounded border border-gray-600 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-          </div>
-          
-          <div className="flex flex-col w-48">
-            <label className="text-xs text-gray-400 mb-1">Test Strategy</label>
-            <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
-                    className="bg-gray-700 p-2 rounded border border-gray-600 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="PhantomV2">Phantom V2.5 (Default)</option>
-              {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-          </div>
-
-          <div className="flex flex-wrap gap-4 flex-1 border-l border-gray-700 pl-6">
-            {Object.keys(params).map(key => (
-              <div key={key} className="flex flex-col w-32">
-                <label className="text-[10px] text-gray-400 uppercase font-bold mb-1">{key.replace('_', ' ')}</label>
-                <input type="number" step="0.01" value={params[key]} 
-                       onChange={e => setParams({...params, [key]: parseFloat(e.target.value)})}
-                       className="bg-gray-700 p-1.5 rounded border border-gray-600 text-white text-xs outline-none focus:ring-1 focus:ring-blue-500" />
+      <div className="bg-gray-800 p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
+        <div className="flex flex-wrap items-start gap-8">
+          <div className="flex flex-col gap-4 w-full lg:w-auto shrink-0">
+            <div className="flex gap-4">
+              <div className="flex flex-col">
+                <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start Date</label>
+                <input type="date" value={dates.start} onChange={e => setDates({...dates, start: e.target.value})}
+                       className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
               </div>
-            ))}
+              <div className="flex flex-col">
+                <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End Date</label>
+                <input type="date" value={dates.end} onChange={e => setDates({...dates, end: e.target.value})}
+                       className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+              </div>
+            </div>
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
+              <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
+                      className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+                <option value="PhantomV2">Phantom V2.5 (Default)</option>
+                {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
           </div>
 
-          <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-8 py-2 rounded-lg font-bold hover:bg-blue-500 disabled:opacity-50 transition shrink-0">
-            {loading ? 'Computing...' : '🚀 Run Backtest'}
-          </button>
+          {selectedStrategyId === 'PhantomV2' && (
+            <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-6 border-l border-gray-700 pl-8">
+              {Object.entries(paramGroups).map(([groupName, fields]) => (
+                <div key={groupName} className="space-y-3">
+                  <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
+                  <div className="grid grid-cols-1 gap-3">
+                    {fields.map(field => (
+                      <div key={field} className="flex flex-col">
+                        <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace('_', ' ')}</label>
+                        <input type="number" step="0.01" value={params[field]} 
+                               onChange={e => setParams({...params, [field]: parseFloat(e.target.value)})}
+                               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-col justify-end gap-3 shrink-0">
+            <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2">
+              <RotateCcw size={14} /> Reset to Defaults
+            </button>
+            <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-8 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
+              {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : '🚀 Run Backtest'}
+            </button>
+          </div>
         </div>
       </div>
 
       {results ? (
-        <div className="space-y-8">
-          <div className="grid grid-cols-4 gap-4">
-            <div className="bg-gray-800 p-4 rounded-xl border border-gray-700 text-center">
-              <div className="text-gray-400 text-xs">Final Equity</div>
-              <div className={`text-xl font-bold ${stats?.finalEquity >= 20000 ? 'text-green-400' : 'text-red-400'}`}>₹{stats?.finalEquity?.toLocaleString()}</div>
-            </div>
-            <div className="bg-gray-800 p-4 rounded-xl border border-gray-700 text-center">
-              <div className="text-gray-400 text-xs">Net Profit</div>
-              <div className={`text-xl font-bold ${stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>₹{stats?.netProfit?.toLocaleString()}</div>
-            </div>
-            <div className="bg-gray-800 p-4 rounded-xl border border-gray-700 text-center">
-              <div className="text-gray-400 text-xs">ROI</div>
-              <div className={`text-xl font-bold ${stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'}`}>{stats?.roi?.toFixed(2)}%</div>
-            </div>
-            <div className="bg-gray-800 p-4 rounded-xl border border-gray-700 text-center">
-              <div className="text-gray-400 text-xs">Win Rate</div>
-              <div className="text-xl font-bold text-purple-400">{stats?.winRate?.toFixed(2)}%</div>
-            </div>
+        <div className="space-y-8 animate-in fade-in duration-500">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= 20000 ? 'text-green-400' : 'text-red-400'} />
+            <StatCard label="Net Profit" value={`₹${stats?.netProfit?.toLocaleString()}`} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
+            <StatCard label="ROI" value={`${stats?.roi?.toFixed(2)}%`} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
+            <StatCard label="Win Rate" value={`${stats?.winRate?.toFixed(2)}%`} color="text-purple-400" />
           </div>
 
-          <div className="grid grid-cols-3 gap-6">
-            <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 h-80">
-              <h3 className="text-sm font-semibold text-gray-400 mb-4">Equity Curve</h3>
-              <ResponsiveContainer width="100%" height="90%">
-                <LineChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                  <XAxis dataKey="time" hide />
-                  <YAxis stroke="#9ca3af" fontSize={10} domain={['auto', 'auto']} />
-                  <Tooltip contentStyle={{ backgroundColor: '#1f2937', borderColor: '#374151' }} />
-                  <Line type="monotone" dataKey="equity" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-sm font-semibold text-gray-400 flex items-center gap-2">
+                  <TrendingUp size={16} /> Equity Growth Map
+                </h3>
+                <span className="text-[10px] text-gray-500 uppercase">Interactive TradingView-style Chart</span>
+              </div>
+              <div ref={chartContainerRef} className="w-full" />
             </div>
-            <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 h-80">
+            
+            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
               <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
-              <ResponsiveContainer width="100%" height="90%">
-                <PieChart>
-                  <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
-                    {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="bg-gray-800 p-6 rounded-xl border border-gray-700">
-              <h3 className="text-sm font-semibold text-gray-400 mb-4">Core Metrics</h3>
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between"><span className="text-gray-500">Total Trades</span> <span className="font-mono">{stats?.totalTrades}</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Profit Factor</span> <span className="font-mono">{stats?.profitFactor?.toFixed(2)}</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Sharpe Ratio</span> <span className="font-mono">{stats?.sharpe?.toFixed(2)}</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Max DD</span> <span className="font-mono text-red-400">{stats?.maxDD?.toFixed(2)}%</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Longs</span> <span className="font-mono">{stats?.directionDist?.Long || 0} ({((stats?.directionDist?.Long || 0)/stats?.totalTrades * 100).toFixed(1)}%)</span></div>
-                <div className="flex justify-between"><span className="text-gray-500">Shorts</span> <span className="font-mono">{stats?.directionDist?.Short || 0} ({((stats?.directionDist?.Short || 0)/stats?.totalTrades * 100).toFixed(1)}%)</span></div>
+              <div className="flex-1">
+                <ResponsiveContainer width="100%" height={250}>
+                  <PieChart>
+                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
+                      {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
+                    </Pie>
+                    <Tooltip contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', color: '#fff' }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="mt-4 space-y-2">
+                {Object.entries(stats?.exitDist || {}).map(([reason, count]) => (
+                  <div key={reason} className="flex justify-between text-xs">
+                    <span className="text-gray-500">{reason}</span>
+                    <span className="font-mono font-bold">{count}</span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
 
-          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-            <div className="p-4 border-b border-gray-700 bg-gray-700/50">
-              <h3 className="font-semibold">Detailed Trade Logs</h3>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-gray-900 text-gray-400 uppercase">
-                  <tr>
-                    <th className="p-3">Entry Time</th>
-                    <th className="p-3">Exit Time</th>
-                    <th className="p-3">Dir</th>
-                    <th className="p-3">Entry</th>
-                    <th className="p-3">Exit</th>
-                    <th className="p-3">Lots</th>
-                    <th className="p-3">Margin</th>
-                    <th className="p-3">Net PnL</th>
-                    <th className="p-3">Reason</th>
-                    <th className="p-3">Equity</th>
-                    <th className="p-3">Hold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.trades?.map((t, i) => (
-                    <tr key={i} className="border-b border-gray-700 hover:bg-gray-700/30 transition">
-                      <td className="p-3 font-mono">{t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A'}</td>
-                      <td className="p-3 font-mono">{t.exit_time ? new Date(t.exit_time).toLocaleString() : 'N/A'}</td>
-                      <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
-                      <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
-                      <td className="p-3">{(t.exit_price || 0).toFixed(2)}</td>
-                      <td className="p-3">{(t.lots || 0).toFixed(4)}</td>
-                      <td className="p-3">₹{(t.margin || 0).toFixed(0)}</td>
-                      <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
-                      <td className="p-3"><span className="bg-gray-900 px-2 py-1 rounded text-[10px]">{t.exit_reason || 'N/A'}</span></td>
-                      <td className="p-3">₹{(t.equity_after || 0).toFixed(0)}</td>
-                      <td className="p-3">{t.hold_bars || 0}b</td>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-xl">
+              <div className="p-4 border-b border-gray-700 bg-gray-700/30 flex justify-between items-center">
+                <h3 className="font-bold text-gray-200">Detailed Trade Logs</h3>
+                <span className="text-[10px] bg-gray-900 px-2 py-1 rounded text-gray-400">Sorted by Time</span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-gray-900 text-gray-500 uppercase">
+                    <tr>
+                      <th className="p-4 font-semibold">Entry Time</th>
+                      <th className="p-4 font-semibold">Exit Time</th>
+                      <th className="p-4 font-semibold">Dir</th>
+                      <th className="p-4 font-semibold">Entry</th>
+                      <th className="p-4 font-semibold">Exit</th>
+                      <th className="p-4 font-semibold">Lots</th>
+                      <th className="p-4 font-semibold">Margin</th>
+                      <th className="p-4 font-semibold">Net PnL</th>
+                      <th className="p-4 font-semibold">Reason</th>
+                      <th className="p-4 font-semibold">Equity</th>
+                      <th className="p-4 font-semibold">Hold</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {results.trades?.map((t, i) => (
+                      <tr key={i} className="border-b border-gray-700 hover:bg-gray-700/30 transition">
+                        <td className="p-4 font-mono text-gray-400">{t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A'}</td>
+                        <td className="p-4 font-mono text-gray-400">{t.exit_time ? new Date(t.exit_time).toLocaleString() : 'N/A'}</td>
+                        <td className={`p-4 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
+                        <td className="p-4">{(t.entry_price || 0).toFixed(2)}</td>
+                        <td className="p-4">{(t.exit_price || 0).toFixed(2)}</td>
+                        <td className="p-4">{(t.lots || 0).toFixed(4)}</td>
+                        <td className="p-4">₹{(t.margin || 0).toFixed(0)}</td>
+                        <td className={`p-4 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
+                        <td className="p-4"><span className="bg-gray-900 px-2 py-1 rounded text-[10px] text-gray-400 border border-gray-700">{t.exit_reason || 'N/A'}</span></td>
+                        <td className="p-4">₹{(t.equity_after || 0).toFixed(0)}</td>
+                        <td className="p-4">{t.hold_bars || 0}b</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+              <h3 className="text-sm font-semibold text-gray-400 mb-6 flex items-center gap-2">
+                <Activity size={16} /> Core Metrics
+              </h3>
+              <div className="space-y-4">
+                <MetricRow label="Total Trades" value={stats?.totalTrades} />
+                <MetricRow label="Profit Factor" value={`${stats?.profitFactor?.toFixed(2)}`} />
+                <MetricRow label="Sharpe Ratio" value={`${stats?.sharpe?.toFixed(2)}`} />
+                <MetricRow label="Max Drawdown" value={`${stats?.maxDD?.toFixed(2)}%`} color="text-red-400" />
+                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${((stats?.directionDist?.Long || 0)/stats?.totalTrades * 100).toFixed(1)}%)`} />
+                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${((stats?.directionDist?.Short || 0)/stats?.totalTrades * 100).toFixed(1)}%)`} />
+                
+                <div className="border-t border-gray-700 mt-6 pt-6">
+                  <div className="flex justify-between items-center mb-3">
+                    <span className="text-xs font-bold text-gray-500 uppercase">Rejected Signals</span>
+                    <span className="bg-red-900/30 text-red-400 px-2 py-0.5 rounded text-xs font-bold border border-red-900/50">
+                      {Object.values(stats?.rejections || {}).reduce((a, b) => a + b, 0)}
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(stats?.rejections || {}).map(([reason, count]) => (
+                      <div key={reason} className="flex justify-between items-center p-2 bg-gray-900 rounded-lg border border-gray-700/50">
+                        <span className="text-[10px] text-gray-500 italic">{reason}</span>
+                        <span className="text-xs font-mono font-bold text-gray-300">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
-      ) : <div className="bg-gray-800 p-12 rounded-xl border border-gray-700 text-center text-gray-500">Run backtest or select from history to see results.</div>}
+      ) : (
+        <div className="bg-gray-800 p-20 rounded-2xl border border-gray-700 text-center shadow-inner">
+          <div className="bg-gray-900 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 text-gray-600">
+            <TrendingUp size={32} />
+          </div>
+          <h3 className="text-xl font-bold text-gray-400">No Backtest Data</h3>
+          <p className="text-gray-600 text-sm mt-2 max-w-md mx-auto">Configure your strategy parameters and date range, then hit "Run Backtest" to analyze the equity curve.</p>
+        </div>
+      )}
     </div>
   );
 };
+
+const StatCard = ({ label, value, color }) => (
+  <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 text-center shadow-lg hover:border-blue-500/50 transition-all group">
+    <div className="text-gray-500 text-xs uppercase font-bold mb-2 group-hover:text-gray-400 transition">{label}</div>
+    <div className={`text-2xl font-extrabold font-mono ${color}`}>{value}</div>
+  </div>
+);
+
+const MetricRow = ({ label, value, color = "text-gray-200" }) => (
+  <div className="flex justify-between items-center py-1">
+    <span className="text-xs text-gray-500">{label}</span>
+    <span className={`text-xs font-mono font-bold ${color}`}>{value}</span>
+  </div>
+);
 
 export default Backtest;

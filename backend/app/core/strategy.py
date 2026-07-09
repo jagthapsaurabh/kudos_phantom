@@ -19,8 +19,8 @@ class PhantomV2Config(BaseModel):
     macd_slow: int = Field(default=26, ge=5)
     macd_signal: int = Field(default=9, ge=2)
     adx_period: int = Field(default=14, ge=2)
-    adx_min: float = Field(default=float(os.getenv("ADX_MIN", 22.0)), ge=0.0)
-    macd_hist_min: float = Field(default=float(os.getenv("MACD_HIST_MIN", 25.0)), ge=0.0)
+    adx_min: float = Field(default=float(os.getenv("ADX_MIN", 20.0)), ge=0.0)
+    macd_hist_min: float = Field(default=float(os.getenv("MACD_HIST_MIN", 20.0)), ge=0.0)
     atr_regime_ratio: float = Field(default=0.50, ge=0.0, le=1.0)
     atr_period: int = Field(default=14, ge=2)
     stop_loss_atr: float = Field(default=2.0, gt=0.0)
@@ -119,7 +119,8 @@ class ValidationResult:
 
 class ValidatorService:
     def validate_signal(self, signal_dir, ref_price, current_price, ind_1h_slice):
-        # Keep the basic sanity checks
+        # Increased drift tolerance from 0.005 to 0.01 (1%)
+        # This prevents the validator from killing too many trades due to minor price gaps
         drift = abs(current_price - ref_price) / ref_price
-        if drift > 0.005: return ValidationResult(False, "PRICE_DRIFT", drift)
+        if drift > 0.01: return ValidationResult(False, "PRICE_DRIFT", drift)
         return ValidationResult(True, "PASSED", drift)

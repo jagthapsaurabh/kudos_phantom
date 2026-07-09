@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet } from 'lucide-react';
+import { API_URL } from '../api';
 
 const TradeCard = ({ trade }) => (
   <div className={`p-4 rounded-xl border border-green-500/30 bg-green-500/5 transition hover:scale-[1.01]`}>
@@ -30,8 +31,6 @@ const LiveTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
-
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })

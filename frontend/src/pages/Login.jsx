@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
+import { API_URL } from '../api';
 
 const Login = () => {
   const [form, setForm] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   const handleSubmit = async (e) => {
     e.preventDefault();

@@ -44,7 +44,7 @@ class BacktestEngine:
         equity_inr = initial_capital_inr
         equity_curve = [initial_capital_inr]
         trades = []
-        rejected_count = 0
+        rejected_reasons = {}
         
         for i in range(1, len(df_1h)):
             current_time = df_1h.index[i]
@@ -84,7 +84,8 @@ class BacktestEngine:
                     margin_inr = equity_inr * 0.25
                     self.oms.create_order("BTCUSDT", sig, next_open_usd, current_atr_usd, df_1h.index[i+1], margin_inr, conversion_rate)
                 else:
-                    rejected_count += 1
+                    reason = val.reason
+                    rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
             
             equity_curve.append(equity_inr)
 
@@ -126,5 +127,5 @@ class BacktestEngine:
             "equity_curve": equity_curve,
             "trades": trades,
             "exit_dist": dist,
-            "rejected_count": rejected_count
+            "rejected_reasons": rejected_reasons
         }
