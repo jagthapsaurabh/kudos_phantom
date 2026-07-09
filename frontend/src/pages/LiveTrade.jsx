@@ -30,10 +30,9 @@ const LiveTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
-    fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+    fetch('/api/strategies', { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
   }, []);
@@ -41,7 +40,7 @@ const LiveTrade = () => {
   const startTrade = async () => {
     setLoading(true);
     try {
-      await fetch(`${API_URL}/live-trade/start` , {
+      await fetch('/api/live-trade/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ strategy_id: selectedStrategy })
@@ -52,7 +51,7 @@ const LiveTrade = () => {
 
   const stopTrade = async (instanceKey) => {
     try {
-      await fetch(`${API_URL}/live-trade/stop`, {
+      await fetch('/api/live-trade/stop', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ instance_key: instanceKey })
@@ -62,7 +61,7 @@ const LiveTrade = () => {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch(`${API_URL}/live-trade/status`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
+      const res = await fetch('/api/live-trade/status', { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
       const data = await res.json();
       setStatus(data);
     } catch (e) {}

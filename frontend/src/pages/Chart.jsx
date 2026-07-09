@@ -8,13 +8,15 @@ const ChartPage = () => {
   const seriesRef = useRef();
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
     try {
-      // Create chart
+      if (chartRef.current) {
+        chartRef.current.remove();
+      }
+
       const chart = createChart(chartContainerRef.current, {
         layout: {
           background: { color: '#111827' },
@@ -30,8 +32,7 @@ const ChartPage = () => {
       
       chartRef.current = chart;
 
-      // Defensive check for the method
-      if (chart && typeof chart.addCandlestickSeries === 'function') {
+      if (typeof chart.addCandlestickSeries === 'function') {
         const candlestickSeries = chart.addCandlestickSeries({
           upColor: '#4ade80',
           downColor: '#f87171',
@@ -41,7 +42,7 @@ const ChartPage = () => {
         });
         seriesRef.current = candlestickSeries;
       } else {
-        console.error("Lightweight Charts Error: addCandlestickSeries is not available on the chart object", chart);
+        console.error("Lightweight Charts Error: addCandlestickSeries not found. Available methods:", Object.getOwnPropertyNames(chart));
       }
 
       fetchData();
@@ -72,7 +73,7 @@ const ChartPage = () => {
   const fetchData = async () => {
     if (!seriesRef.current) return;
     try {
-      const res = await fetch(`${API_URL}/klines?symbol=${symbol}&interval=${interval}`);
+      const res = await fetch(`/api/klines?symbol=${symbol}&interval=${interval}`);
       const data = await res.json();
       seriesRef.current.setData(data);
     } catch (e) {

@@ -14,11 +14,27 @@ const Backtest = () => {
   const [dates, setDates] = useState({ start: '', end: '' });
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+  const clearHistory = async () => {
+    if (!window.confirm("Are you sure you want to clear all backtest history? This action cannot be undone.")) return;
+    try {
+      const res = await fetch('/api/backtest/clear', { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
+      });
+      if (res.ok) {
+        alert("History cleared successfully");
+        setHistory([]);
+        setResults(null);
+      } else {
+        throw new Error("Failed to clear history");
+      }
+    } catch (e) { alert(e.message); }
+  };
 
   const fetchStrategies = async () => {
     try {
-      const res = await fetch(`${API_URL}/strategies`, { 
+      const res = await fetch('/api/strategies', { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
@@ -28,14 +44,11 @@ const Backtest = () => {
 
   const fetchHistory = async () => {
     try {
-      const res = await fetch(`${API_URL}/backtest/history`, { 
+      const res = await fetch('/api/backtest/history', { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
       setHistory(data);
-      if(data){
-        setShowHistory(true);
-      }
     } catch (e) {}
   };
 
@@ -47,7 +60,7 @@ const Backtest = () => {
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_URL}/backtest`, {
+      const response = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
@@ -78,7 +91,7 @@ const Backtest = () => {
 
   const loadRun = async (runId) => {
     try {
-      const res = await fetch(`${API_URL}/backtest/results/${runId}`, { 
+      const res = await fetch(`/api/backtest/results/${runId}`, { 
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } 
       });
       const data = await res.json();
@@ -123,9 +136,14 @@ const Backtest = () => {
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
       <div className="flex justify-between items-center mb-8">
         <h1 className="text-3xl font-bold text-blue-400">Strategy Optimizer</h1>
-        <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition">
-          {showHistory ? 'Close History' : '📜 View History'}
-        </button>
+        <div className="flex gap-3">
+          <button onClick={clearHistory} className="bg-red-900/30 text-red-400 px-4 py-2 rounded-lg border border-red-800 hover:bg-red-800 hover:text-white transition text-sm font-semibold">
+            🗑️ Clear History
+          </button>
+          <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition">
+            {showHistory ? 'Close History' : '📜 View History'}
+          </button>
+        </div>
       </div>
 
       {showHistory && (
@@ -169,7 +187,7 @@ const Backtest = () => {
 
           <div className="flex flex-wrap gap-4 flex-1 border-l border-gray-700 pl-6">
             {Object.keys(params).map(key => (
-              <div key={key} className="flex  w-32">
+              <div key={key} className="flex flex-col w-32">
                 <label className="text-[10px] text-gray-400 uppercase font-bold mb-1">{key.replace('_', ' ')}</label>
                 <input type="number" step="0.01" value={params[key]} 
                        onChange={e => setParams({...params, [key]: parseFloat(e.target.value)})}

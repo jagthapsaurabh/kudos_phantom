@@ -44,6 +44,7 @@ class BacktestEngine:
         equity_inr = initial_capital_inr
         equity_curve = [initial_capital_inr]
         trades = []
+        rejected_count = 0
         
         for i in range(1, len(df_1h)):
             current_time = df_1h.index[i]
@@ -78,9 +79,12 @@ class BacktestEngine:
             if sig != 0 and i + 1 < len(df_1h):
                 next_open_usd = df_1h['open'].iloc[i+1]
                 ind_slice = df_1h.iloc[max(0, i-50):i+1]
-                if self.validator_service.validate_signal(sig, df_1h['close'].iloc[i], next_open_usd, ind_slice).passed:
+                val = self.validator_service.validate_signal(sig, df_1h['close'].iloc[i], next_open_usd, ind_slice)
+                if val.passed:
                     margin_inr = equity_inr * 0.25
                     self.oms.create_order("BTCUSDT", sig, next_open_usd, current_atr_usd, df_1h.index[i+1], margin_inr, conversion_rate)
+                else:
+                    rejected_count += 1
             
             equity_curve.append(equity_inr)
 
@@ -97,6 +101,10 @@ class BacktestEngine:
         profit_factor = sum(wins) / sum(losses) if sum(losses) > 0 else 99.0
         win_rate = (len(wins) / len(trades) * 100 if trades else 0)
         roi = ((equity_inr - initial_capital_inr) / initial_capital_inr) * 100
+        
+        # Exit Distribution
+        reasons = [t['exit_reason'] for t in trades]
+        dist = {r: reasons.count(r) for r in set(reasons)}
         
         # Sharpe Ratio (Simplified monthly)
         equity_series = pd.Series(equity_curve, index=df_1h.index)
@@ -116,5 +124,7 @@ class BacktestEngine:
             "max_drawdown": max_dd,
             "roi": roi,
             "equity_curve": equity_curve,
-            "trades": trades
+            "trades": trades,
+            "exit_dist": dist,
+            "rejected_count": rejected_count
         }

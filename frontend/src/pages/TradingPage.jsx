@@ -30,7 +30,6 @@ const TradingPage = ({ type }) => {
   const [isRunning, setIsRunning] = useState(false);
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
-  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   const isLive = type === 'live';
 
@@ -41,7 +40,7 @@ const TradingPage = ({ type }) => {
     
     try {
       if (!isRunning) {
-        const res = await fetch(`${API_URL}${endpoint}`, {
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
           body: JSON.stringify({ strategy_id: selectedStrategy })
@@ -49,7 +48,7 @@ const TradingPage = ({ type }) => {
         if (res.ok) setIsRunning(true);
       } else {
         // Note: Simplified stop. In real app, we'd use the instance_key.
-        await fetch(`${API_URL}${stopEndpoint}`, {
+        await fetch(stopEndpoint, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
           body: JSON.stringify({ strategy_id: selectedStrategy })
@@ -65,7 +64,7 @@ const TradingPage = ({ type }) => {
   const fetchStatus = async () => {
     const endpoint = isLive ? '/live-trade/status' : '/paper-trade/status';
     try {
-      const res = await fetch(`${API_URL}${endpoint}`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
+      const res = await fetch(endpoint, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
       const data = await res.json();
       // Mocking the trades for UI demo since the backend returns simple status
       setActiveTrades([

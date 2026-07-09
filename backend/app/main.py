@@ -5,6 +5,8 @@ from pydantic import BaseModel
 import pandas as pd
 import json
 from typing import Optional, List, Dict, Union
+import os
+from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
 from .services.paper_trader import PaperTradeService
@@ -16,14 +18,20 @@ from passlib.context import CryptContext
 import asyncio
 from datetime import datetime
 
+# Load environment variables
+load_dotenv()
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="PHANTOM v2.5 Trading Tool")
 
+# CORS configuration from .env
+origins = os.getenv("CORS_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -261,6 +269,20 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
         },
         "trades": trade_list
     }
+
+@app.delete("/backtest/clear")
+def clear_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        # Delete trades associated with the user's runs first
+        run_ids = [r.id for r in db.query(BacktestRun).filter(BacktestRun.user_id == user.id).all()]
+        if run_ids:
+            db.query(Trade).filter(Trade.run_id.in_(run_ids)).delete()
+            db.query(BacktestRun).filter(BacktestRun.user_id == user.id).delete()
+        db.commit()
+        return {"status": "Backtest history cleared successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error clearing history: {str(e)}")
 
 # --- PAPER TRADING ---
 @app.post("/paper-trade/start")

@@ -2,12 +2,16 @@ from pydantic import BaseModel, Field
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
+import os
+from dotenv import load_dotenv
 from .indicators import compute_indicators, sma
+
+load_dotenv()
 
 class PhantomV2Config(BaseModel):
     entry_interval: str = "1h"
     trend_interval: str = "4h"
-    trend_ema_period: int = Field(default=50, ge=5)
+    trend_ema_period: int = Field(default=int(os.getenv("TREND_EMA_PERIOD", 50)), ge=5)
     rsi_period: int = Field(default=14, ge=2)
     rsi_oversold: int = Field(default=30, ge=5, le=45)
     rsi_overbought: int = Field(default=70, ge=55, le=95)
@@ -15,12 +19,12 @@ class PhantomV2Config(BaseModel):
     macd_slow: int = Field(default=26, ge=5)
     macd_signal: int = Field(default=9, ge=2)
     adx_period: int = Field(default=14, ge=2)
-    adx_min: float = Field(default=22.0, ge=0.0)
-    macd_hist_min: float = Field(default=25.0, ge=0.0)
+    adx_min: float = Field(default=float(os.getenv("ADX_MIN", 22.0)), ge=0.0)
+    macd_hist_min: float = Field(default=float(os.getenv("MACD_HIST_MIN", 25.0)), ge=0.0)
     atr_regime_ratio: float = Field(default=0.50, ge=0.0, le=1.0)
     atr_period: int = Field(default=14, ge=2)
     stop_loss_atr: float = Field(default=2.0, gt=0.0)
-    take_profit_atr: float = Field(default=1.2, gt=0.0)
+    take_profit_atr: float = Field(default=10.0, gt=0.0)
     sl_floor_pct: float = Field(default=0.016, ge=0.0)
     trail_activation_atr: float = Field(default=1.5, ge=0.0)
     trail_distance_atr: float = Field(default=0.5, gt=0.0)
@@ -30,8 +34,8 @@ class PhantomV2Config(BaseModel):
     leverage: int = Field(default=7, ge=1, le=125)
     lot_size_btc: float = Field(default=0.001, gt=0.0)
     max_notional_mult: int = Field(default=10, ge=1)
-    taker_fee_bps: float = Field(default=5.9, ge=0.0)
-    maker_fee_bps: float = Field(default=2.36, ge=0.0)
+    taker_fee_bps: float = Field(default=float(os.getenv("TAKER_FEE_BPS", 5.9)), ge=0.0)
+    maker_fee_bps: float = Field(default=float(os.getenv("MAKER_FEE_BPS", 2.36)), ge=0.0)
     liquidation_buffer: float = Field(default=0.005, ge=0.0)
 
 class StrategyService:
@@ -117,5 +121,5 @@ class ValidatorService:
     def validate_signal(self, signal_dir, ref_price, current_price, ind_1h_slice):
         # Keep the basic sanity checks
         drift = abs(current_price - ref_price) / ref_price
-        if drift > 0.003: return ValidationResult(False, "PRICE_DRIFT", drift)
+        if drift > 0.005: return ValidationResult(False, "PRICE_DRIFT", drift)
         return ValidationResult(True, "PASSED", drift)

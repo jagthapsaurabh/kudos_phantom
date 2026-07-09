@@ -38,7 +38,7 @@ def seed_to_db(symbol="BTCUSDT", interval="1h", years=6):
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=years*365)
     
-    print(f"Fetching {interval} data for {symbol}...")
+    print(f"Fetching {interval} data for {symbol} from API...")
     klines = fetch_binance_klines(symbol, interval, start_date, end_date)
     
     if not klines:
@@ -66,6 +66,44 @@ def seed_to_db(symbol="BTCUSDT", interval="1h", years=6):
     
     db.close()
     print(f"Successfully seeded {len(klines)} candles for {interval} into DB.")
+
+def seed_from_csv(csv_path, interval, symbol="BTCUSDT"):
+    """Seeds data from a local CSV file."""
+    if not os.path.exists(csv_path):
+        print(f"CSV file {csv_path} not found at {os.path.abspath(csv_path)}.")
+        return False
+
+    print(f"Loading data from {csv_path} for {interval}...")
+    df = pd.read_csv(csv_path)
+    df['event_time'] = pd.to_datetime(df['event_time'])
+    
+    init_db()
+    db = SessionLocal()
+    
+    # Clear existing data for this interval to avoid duplicates
+    db.query(Klines).filter_by(symbol=symbol, interval=interval).delete()
+    
+    batch_size = 1000
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i+batch_size]
+        records = [
+            Klines(
+                symbol=symbol,
+                interval=interval,
+                event_time=row.event_time,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume
+            ) for _, row in batch.iterrows()
+        ]
+        db.bulk_save_objects(records)
+        db.commit()
+    
+    db.close()
+    print(f"Successfully seeded {len(df)} candles for {interval} from CSV.")
+    return True
 
 def update_daily_data(symbol="BTCUSDT", intervals=["1h", "4h"]):
     """Updates the DB with the most recent candles."""
@@ -96,5 +134,16 @@ def update_daily_data(symbol="BTCUSDT", intervals=["1h", "4h"]):
     db.close()
 
 if __name__ == "__main__":
-    seed_to_db()
+    # Default behavior: Try CSV first, then API
+    # Assuming files are in backend/data/ relative to where the script is run (or modified for the app structure)
+    csv_1h = "data/btc_1h.csv"
+    csv_4h = "data/btc_4h.csv"
+    
+    if seed_from_csv(csv_1h, "1h") and seed_from_csv(csv_4h, "4h"):
+        print("✅ Initial seed completed using CSV files.")
+    else:
+        print("⚠️ CSV files not found or failed. Falling back to API seeding...")
+        seed_to_db(interval="1h")
+        seed_to_db(interval="4h")
+        
     update_daily_data()
