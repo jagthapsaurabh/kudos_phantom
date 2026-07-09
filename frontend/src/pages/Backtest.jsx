@@ -178,11 +178,11 @@ const Backtest = () => {
       });
       setShowHistory(false);
       
-      if (data.run_details.equity_curve && Array.isArray(data.run_details.equity_curve)) {
-        initEquityChart(data.run_details.equity_curve);
-      } else {
-        console.warn("No equity curve data available for this run.");
-      }
+      // if (data.run_details.equity_curve && Array.isArray(data.run_details.equity_curve)) {
+      //   initEquityChart(data.run_details.equity_curve);
+      // } else {
+      //   console.warn("No equity curve data available for this run.");
+      // }
     } catch (e) { 
       console.error("Load Run Error:", e);
       alert(`Error loading run: ${e.message}`); 
@@ -330,7 +330,7 @@ const Backtest = () => {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+            {/* <div className="lg:col-span-2 bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
               <div className="flex justify-between items-center mb-4">
                 <h3 className="text-sm font-semibold text-gray-400 flex items-center gap-2">
                   <TrendingUp size={16} /> Equity Growth Map
@@ -338,7 +338,7 @@ const Backtest = () => {
                 <span className="text-[10px] text-gray-500 uppercase">Interactive TradingView-style Chart</span>
               </div>
               <div ref={chartContainerRef} className="w-full" />
-            </div>
+            </div> */}
             
             <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
               <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
