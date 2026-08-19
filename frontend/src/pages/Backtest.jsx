@@ -5,18 +5,24 @@ import { API_URL } from '../api';
 import { Activity, TrendingUp, AlertCircle, RotateCcw } from 'lucide-react';
 
 const Backtest = () => {
+  const DEFAULT_PARAMS = {
+    trend_ema_period: 50,
+    rsi_oversold: 40, rsi_overbought: 60, adx_min: 10, macd_hist_min: 5,
+    atr_regime_ratio: 0.5, enable_momentum_entry: true, cooldown_bars: 0,
+    stop_loss_atr: 1.2, take_profit_atr: 14.0, trail_activation_atr: 0.8,
+    trail_distance_atr: 0.3, breakeven_atr: 0.75,
+    leverage: 2, margin_pct: 0.15,
+    dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
+  };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
-  const [params, setParams] = useState({
-    trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22,
-    macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 10.0,
-    trail_activation_atr: 1.5, trail_distance_atr: 0.5,
-  });
+  const [params, setParams] = useState({ ...DEFAULT_PARAMS });
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [dates, setDates] = useState({ start: '2023-04-01', end: '2026-04-01' });
+  const [dates, setDates] = useState({ start: '2020-07-04', end: '2026-07-04' });
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [expandedTrade, setExpandedTrade] = useState(null);
 
   // Chart Refs
   const chartContainerRef = useRef();
@@ -24,9 +30,10 @@ const Backtest = () => {
   const seriesRef = useRef();
 
   const paramGroups = {
-    "Trend Alignment": ["trend_ema_period"],
-    "Momentum & Volatility": ["rsi_oversold", "rsi_overbought", "adx_min", "macd_hist_min", "atr_regime_ratio"],
-    "Risk & Exit Model": ["stop_loss_atr", "take_profit_atr", "trail_activation_atr", "trail_distance_atr"]
+    "Trend & Regime": ["trend_ema_period", "atr_regime_ratio", "cooldown_bars"],
+    "Entries (v3)": ["rsi_oversold", "rsi_overbought", "adx_min", "macd_hist_min", "enable_momentum_entry"],
+    "Risk & Exit Model": ["stop_loss_atr", "take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
+    "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
   };
 
   const fetchStrategies = async () => {
@@ -62,11 +69,36 @@ const Backtest = () => {
   }, [results]);
 
   const resetParams = () => {
-    setParams({
-      trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22,
-      macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 10.0,
-      trail_activation_atr: 1.5, trail_distance_atr: 0.5,
+    setParams({ ...DEFAULT_PARAMS });
+  };
+
+  // Export full trade+condition log as CSV (client-side, from the loaded run)
+  const exportTradesCSV = () => {
+    if (!results?.trades?.length) return;
+    const cols = [
+      'signal_candle_time', 'entry_time', 'exit_time', 'direction', 'setup',
+      'candle_type', 'trend_4h', 'rsi14', 'macd_hist', 'adx', 'atr14', 'ema50_1h', 'ema50_4h',
+      'entry_price', 'sl', 'tp', 'exit_price', 'exit_reason', 'lots', 'margin', 'notional',
+      'gross_pnl', 'fees', 'net_pnl', 'equity_after', 'drawdown', 'hold_bars',
+    ];
+    const condCols = ['cond_adx_ok', 'cond_macd_hist_ok', 'cond_atr_regime_ok', 'cond_rsi_ok', 'cond_macd_confirm_ok'];
+    const header = [...cols, ...condCols];
+    const rows = results.trades.map(t => {
+      const conds = t.conditions || {};
+      const mapped = cols.map(c => t[c] ?? '');
+      const mappedConds = [
+        conds.adx_ok, conds.macd_hist_ok, conds.atr_regime_ok, conds.rsi_ok, conds.macd_confirm_ok
+      ].map(v => v === undefined || v === null ? '' : (v ? 'TRUE' : 'FALSE'));
+      return [...mapped, ...mappedConds];
     });
+    const csv = [header.join(','), ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `phantom_trades_run_${results.name || 'export'}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const runBacktest = async () => {
@@ -297,10 +329,19 @@ const Backtest = () => {
                   <div className="grid grid-cols-1 gap-3">
                     {fields.map(field => (
                       <div key={field} className="flex flex-col">
-                        <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace('_', ' ')}</label>
-                        <input type="number" step="0.01" value={params[field]}
-                          onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
-                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
+                        <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
+                        {field === 'enable_momentum_entry' ? (
+                          <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={!!params[field]}
+                              onChange={e => setParams({ ...params, [field]: e.target.checked })}
+                              className="accent-blue-500" />
+                            Momentum entries
+                          </label>
+                        ) : (
+                          <input type="number" step="0.01" value={params[field]}
+                            onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
+                            className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
+                        )}
                       </div>
                     ))}
                   </div>
@@ -366,41 +407,94 @@ const Backtest = () => {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-xl">
               <div className="p-4 border-b border-gray-700 bg-gray-700/30 flex justify-between items-center">
-                <h3 className="font-bold text-gray-200">Detailed Trade Logs</h3>
-                <span className="text-[10px] bg-gray-900 px-2 py-1 rounded text-gray-400">Sorted by Time</span>
+                <h3 className="font-bold text-gray-200">Detailed Trade Logs <span className="text-xs text-gray-500 font-normal">(entry conditions per candle)</span></h3>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] bg-gray-900 px-2 py-1 rounded text-gray-400">{results.trades?.length || 0} trades</span>
+                  <button onClick={exportTradesCSV} className="text-[10px] bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded font-bold transition">⬇ CSV Export</button>
+                </div>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-gray-900 text-gray-500 uppercase">
                     <tr>
-                      <th className="p-4 font-semibold">Entry Time</th>
-                      <th className="p-4 font-semibold">Exit Time</th>
-                      <th className="p-4 font-semibold">Dir</th>
-                      <th className="p-4 font-semibold">Entry</th>
-                      <th className="p-4 font-semibold">Exit</th>
-                      <th className="p-4 font-semibold">Lots</th>
-                      <th className="p-4 font-semibold">Margin</th>
-                      <th className="p-4 font-semibold">Net PnL</th>
-                      <th className="p-4 font-semibold">Reason</th>
-                      <th className="p-4 font-semibold">Equity</th>
-                      <th className="p-4 font-semibold">Hold</th>
+                      <th className="p-3 font-semibold">Signal Candle</th>
+                      <th className="p-3 font-semibold">Entry</th>
+                      <th className="p-3 font-semibold">Exit</th>
+                      <th className="p-3 font-semibold">Dir</th>
+                      <th className="p-3 font-semibold">Setup</th>
+                      <th className="p-3 font-semibold">Candle</th>
+                      <th className="p-3 font-semibold">4H Trend</th>
+                      <th className="p-3 font-semibold">RSI</th>
+                      <th className="p-3 font-semibold">ADX</th>
+                      <th className="p-3 font-semibold">Net PnL</th>
+                      <th className="p-3 font-semibold">Reason</th>
+                      <th className="p-3 font-semibold">Cond.</th>
                     </tr>
                   </thead>
                   <tbody>
                     {results.trades?.map((t, i) => (
-                      <tr key={i} className="border-b border-gray-700 hover:bg-gray-700/30 transition">
-                        <td className="p-4 font-mono text-gray-400">{t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A'}</td>
-                        <td className="p-4 font-mono text-gray-400">{t.exit_time ? new Date(t.exit_time).toLocaleString() : 'N/A'}</td>
-                        <td className={`p-4 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
-                        <td className="p-4">{(t.entry_price || 0).toFixed(2)}</td>
-                        <td className="p-4">{(t.exit_price || 0).toFixed(2)}</td>
-                        <td className="p-4">{(t.lots || 0).toFixed(4)}</td>
-                        <td className="p-4">₹{(t.margin || 0).toFixed(0)}</td>
-                        <td className={`p-4 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
-                        <td className="p-4"><span className="bg-gray-900 px-2 py-1 rounded text-[10px] text-gray-400 border border-gray-700">{t.exit_reason || 'N/A'}</span></td>
-                        <td className="p-4">₹{(t.equity_after || 0).toFixed(0)}</td>
-                        <td className="p-4">{t.hold_bars || 0}b</td>
-                      </tr>
+                      <React.Fragment key={i}>
+                        <tr className="border-b border-gray-700 hover:bg-gray-700/30 transition cursor-pointer"
+                            onClick={() => setExpandedTrade(expandedTrade === i ? null : i)}>
+                          <td className="p-3 font-mono text-gray-400">{t.signal_candle_time ? new Date(t.signal_candle_time).toLocaleString() : (t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A')}</td>
+                          <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
+                          <td className="p-3">{(t.exit_price || 0).toFixed(2)}</td>
+                          <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
+                          <td className="p-3"><span className={`px-2 py-0.5 rounded text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
+                          <td className={`p-3 ${t.candle_type === 'GREEN' ? 'text-green-400' : t.candle_type === 'RED' ? 'text-red-400' : 'text-gray-400'}`}>{t.candle_type || '—'}</td>
+                          <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
+                          <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
+                          <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
+                          <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
+                          <td className="p-3"><span className="bg-gray-900 px-2 py-1 rounded text-[10px] text-gray-400 border border-gray-700">{t.exit_reason || 'N/A'}</span></td>
+                          <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
+                        </tr>
+                        {expandedTrade === i && (
+                          <tr className="bg-gray-900/60 border-b border-gray-700">
+                            <td colSpan={12} className="p-4">
+                              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[11px]">
+                                <div>
+                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Entry Conditions</div>
+                                  <div className="flex flex-wrap gap-1">
+                                    <CondChip ok={t.conditions?.adx_ok} label={`ADX≥min (${t.adx?.toFixed(1) ?? '?'})`} />
+                                    <CondChip ok={t.conditions?.macd_hist_ok} label="MACD-hist mag" />
+                                    <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
+                                    <CondChip ok={t.conditions?.rsi_ok} label="RSI trigger" />
+                                    <CondChip ok={t.conditions?.macd_confirm_ok} label="MACD confirm" />
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Indicators @ Signal Candle</div>
+                                  <div className="font-mono text-gray-300 space-y-0.5">
+                                    <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
+                                    <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
+                                    <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
+                                    <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Risk Model</div>
+                                  <div className="font-mono text-gray-300 space-y-0.5">
+                                    <div>SL: {t.sl?.toFixed(2) ?? '—'}</div>
+                                    <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
+                                    <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
+                                    <div>Lots: {(t.lots || 0).toFixed(4)} &bull; DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Result</div>
+                                  <div className="font-mono text-gray-300 space-y-0.5">
+                                    <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} &bull; Fees: ₹{(t.fees || 0).toFixed(2)}</div>
+                                    <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
+                                    <div>Exit: {t.exit_time ? new Date(t.exit_time).toLocaleString() : '—'} ({t.hold_bars || 0} bars)</div>
+                                    <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} &bull; DD: {(t.drawdown || 0).toFixed(2)}%</div>
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
@@ -464,6 +558,16 @@ const MetricRow = ({ label, value, color = "text-gray-200" }) => (
     <span className="text-xs text-gray-500">{label}</span>
     <span className={`text-xs font-mono font-bold ${color}`}>{value}</span>
   </div>
+);
+
+const CondChip = ({ ok, label }) => (
+  <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+    ok ? 'bg-green-900/30 text-green-400 border-green-800/40'
+       : ok === false || ok === 0
+         ? 'bg-red-900/30 text-red-400 border-red-800/40'
+         : 'bg-gray-800 text-gray-500 border-gray-700'}`}>
+    {ok ? '✓' : (ok === false || ok === 0 ? '✗' : '·')} {label}
+  </span>
 );
 
 export default Backtest;

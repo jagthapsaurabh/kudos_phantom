@@ -16,6 +16,11 @@ class User(Base):
     initial_capital = Column(Float, default=20000.0)
     margin_deployment_pct = Column(Float, default=25.0)
     virtual_balance = Column(Float, default=20000.0)
+    # PHANTOM v3: roles & permissions (admin manages clients)
+    role = Column(String, default="client")          # 'admin' | 'client'
+    is_active = Column(Integer, default=1)           # 0 = login blocked
+    can_paper = Column(Integer, default=1)           # paper-trading allowed
+    can_live = Column(Integer, default=0)            # live trading requires admin grant
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Klines(Base):
@@ -58,6 +63,7 @@ class BacktestRun(Base):
     max_drawdown = Column(Float)
     roi = Column(Float)
     equity_curve = Column(JSON, nullable=True)
+    rejected_reasons = Column(String, nullable=True)  # JSON: signal rejection counts
     trades = relationship("Trade", back_populates="run")
 
 class Trade(Base):
@@ -119,6 +125,17 @@ def migrate_db():
                 if col.name not in existing and col.name != 'id':
                     coltype = col.type.compile(engine.dialect)
                     conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {col.name} {coltype}"))
+        # Backfill role/permission columns on pre-existing user rows
+        user_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+        if 'role' in user_cols:
+            conn.execute(text("UPDATE users SET role='client' WHERE role IS NULL"))
+            conn.execute(text("UPDATE users SET role='admin' WHERE username='admin'"))
+        if 'is_active' in user_cols:
+            conn.execute(text("UPDATE users SET is_active=1 WHERE is_active IS NULL"))
+        if 'can_paper' in user_cols:
+            conn.execute(text("UPDATE users SET can_paper=1 WHERE can_paper IS NULL"))
+        if 'can_live' in user_cols:
+            conn.execute(text("UPDATE users SET can_live=0 WHERE can_live IS NULL"))
 
 
 def init_db():

@@ -206,6 +206,9 @@ class BacktestEngine:
                                                               margin_inr, conversion_rate)
                             if new_trade is not None:
                                 open_ctx_box[symbol] = ctx
+                            else:
+                                # Notional below the minimum 0.001 BTC lot
+                                rejected_reasons['LOT_TOO_SMALL'] = rejected_reasons.get('LOT_TOO_SMALL', 0) + 1
                         else:
                             reason = val.reason
                             rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1

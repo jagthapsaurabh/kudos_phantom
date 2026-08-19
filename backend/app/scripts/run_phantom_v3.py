@@ -21,13 +21,19 @@ BASELINE = {
 }
 
 FALLBACK_V3 = dict(
-    adx_min=14.0, macd_hist_min=10.0, rsi_oversold=33, rsi_overbought=67,
-    atr_regime_ratio=0.35, enable_momentum_entry=True,
-    stop_loss_atr=1.6, trail_activation_atr=1.2, trail_distance_atr=0.5,
-    take_profit_atr=10.0, timeout_bars=72, cooldown_bars=2,
-    breakeven_atr=1.0, dd_soft_pct=18.0, dd_halt_pct=30.0, dd_resume_pct=20.0,
+    adx_min=10.0, macd_hist_min=5.0, rsi_oversold=40, rsi_overbought=60,
+    atr_regime_ratio=0.5, enable_momentum_entry=True,
+    stop_loss_atr=1.2, trail_activation_atr=0.8, trail_distance_atr=0.3,
+    take_profit_atr=14.0, timeout_bars=72, cooldown_bars=0,
+    breakeven_atr=0.75, leverage=2, margin_pct=0.15, reduced_margin_pct=0.075,
+    dd_soft_pct=8.0, dd_halt_pct=100.0, dd_resume_pct=100.0,
     allow_reverse=False, allow_overlap=False,
 )
+
+CONFIG_CANDIDATES = [
+    'backend/logs/champion_lowdd_config.json',
+    'backend/logs/champion_config.json',
+]
 
 
 def comparison_table(name, r):
@@ -47,8 +53,8 @@ def comparison_table(name, r):
 
 def main():
     init_db()
-    cfg_path = 'backend/logs/champion_config.json'
-    if os.path.exists(cfg_path):
+    cfg_path = next((p for p in CONFIG_CANDIDATES if os.path.exists(p)), None)
+    if cfg_path:
         with open(cfg_path) as f:
             kw = json.load(f)
         src = f"champion config ({cfg_path})"

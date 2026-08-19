@@ -6,19 +6,29 @@
 3. **Log every trade with the market conditions at that moment and the exact candle**
 4. **Increase overall Phantom strategy performance**
 
-## Baseline (v2.5, full dataset 2020-06 → 2026-06, ₹20,000 start, 7x leverage)
+## Baseline (v2.5, full dataset 2020-06 → 2026-06, ₹20,000 start)
 
-| Metric | v2.5 baseline | PHANTOM v3 | Δ |
-| :--- | ---: | ---: | :--- |
-| Total trades | 263 | **1,332** | **+406%** |
-| Max drawdown | 30.34% | **20.0%** (hard cap) | **–10.3 pts / –34%** |
-| Win rate | 51.71% | **60.21%** | +8.5 pts |
-| Profit factor | 1.27 | **1.94** | +53% |
-| Sharpe (monthly) | 0.74 | **2.75** | +272% |
-| Max consecutive losses | — | 7 | new metric |
+| Metric | v2.5 baseline | v3 balanced profile | **v3 low-DD profile (shipped champion)** |
+| :--- | ---: | ---: | ---: |
+| Total trades | 263 | 1,332 | **1,081** |
+| Max drawdown | 30.34% | 20.0% (hard cap) | **4.17%** |
+| Win rate | 51.71% | 60.21% | **59.48%** |
+| Profit factor | 1.27 | 1.94 | **1.83** |
+| Sharpe (monthly) | 0.74 | 2.75 | **2.40** |
+| Max consecutive losses | — | 7 | **7** |
 
-Out-of-sample check (unseen 2024-05 → 2026-06 test split, no DD halt):
+The low-DD profile (leverage 2, 15% margin, 7.5% when throttled past 8% DD) was
+selected by `optimize_sizing.py`: the natural MaxDD is 4.17% without the circuit
+breaker ever needing to fire. A more aggressive alternative (lev 7, 5% margin)
+yields 1,919 trades / PF 1.88 at 7.2% DD — switchable via config.
+
+Out-of-sample check (unseen 2024-05 → 2026-06 test split):
 697 trades, WR 61.7%, PF 1.64, Sharpe 3.61 — the tuned edge holds on unseen data.
+
+> Note on minimum lot size: at 2x leverage the 0.001 BTC lot floor needs
+> roughly ₹35k capital when BTC trades near $120k (larger windows starting from
+> the cheap-price era compound normally). Signals rejected for this reason are
+> now counted as `LOT_TOO_SMALL` in the run's rejected-signal stats.
 
 > Absolute ROI/equity figures are not meaningful on the bundled synthetic
 > dataset (fixed-fractional 25% margin × 7x leverage compounding over a
@@ -71,11 +81,39 @@ Every trade records 35 fields (`backend/logs/phantom_v3_trades.csv`):
   `GET /backtest/results/{run_id}`.
 - `BacktestEngine.run(..., trade_log_path='…csv')` exports the CSV.
 
-### Optimizer (`app/scripts/optimize_phantom.py`)
+### Optimizer (`app/scripts/optimize_phantom.py` + `optimize_sizing.py`)
 Two-stage search on a 65/35 train/test split: entry grid sweep → greedy
 coordinate descent over risk/exit params, scored with a drawdown-weighted
 Calmar-style objective. Leaderboard: `backend/logs/optimize_results.csv`;
 champion: `backend/logs/champion_config.json`.
+A second sizing sweep (`optimize_sizing.py`) explores leverage × margin ×
+DD-throttle thresholds and picked the shipped low-DD champion
+(`backend/logs/champion_lowdd_config.json`, full table `optimize_sizing.csv`).
+
+### Platform: roles, client management, signal overlay (v3.1)
+- **Roles & permissions** on `users`: `role` (admin/client), `is_active`,
+  `can_paper`, `can_live` — auto-migrated on `init_db()`. Login returns the role;
+  the frontend routes admins to `/admin` and clients to the dashboard.
+- **Admin panel** (`/admin`, admin-only):
+  - *Client Management*: create client accounts (username/password/capital/margin),
+    toggle paper/live trading per client, activate/deactivate accounts, reset
+    passwords, inspect each client's paper/live sessions and recent backtests.
+  - *Phantom Strategy*: full documentation of every entry condition (Setup A/B),
+    filter, exit rule and the drawdown guard, plus the live champion config.
+  - *Paper Control*: start/stop paper sessions.
+- **Client capabilities**: clients log in with their own credentials and can
+  paper-trade (`can_paper`) and live-trade (`can_live`, admin-granted) with the
+  strategies they own; API enforces the permissions server-side (403 otherwise),
+  and deactivating a client stops their sessions and blocks login.
+- **Signal-candle overlay**: `GET /phantom/signals` returns every bar where the
+  tuned strategy fires (time, direction, setup, RSI, ADX); the Market Chart page
+  draws ▲/▼ markers with setup+RSI+ADX labels on the exact signal candles.
+- **Backtest UI**: trade table now carries the condition columns (signal candle,
+  setup, candle type, 4h trend, RSI/ADX, expandable per-trade condition chips and
+  risk model) + one-click CSV export of the full log; v3 parameters exposed in
+  the form (momentum toggle, sizing & drawdown-guard group).
+- Fixed pre-existing bugs: `/klines` 500 (`Klines` not imported), trade insert on
+  legacy schema, custom-strategy backtest positional args.
 
 ### Bug fixes along the way
 - `main.py`: custom-strategy backtest passed dates positionally into
