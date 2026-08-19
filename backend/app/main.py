@@ -193,7 +193,9 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
                 def run(self, symbol="BTCUSDT", start_date=None, end_date=None):
                     original_engine = BacktestEngine(self.config)
                     original_engine.strategy_service = self.strategy_service
-                    return original_engine.run(symbol, start_date, end_date)
+                    # NOTE: pass by keyword - the engine signature is
+                    # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
+                    return original_engine.run(symbol=symbol, start_date=start_date, end_date=end_date)
             engine = DynamicBacktestEngine(strat.rules)
 
         results = engine.run(symbol="BTCUSDT", start_date=start_date_str, end_date=end_date_str)
@@ -209,8 +211,17 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             run.roi = float(results['roi'])
             run.equity_curve = results['equity_curve']
             
+            trade_cols = {c.name for c in Trade.__table__.columns}
             for t in results['trades']:
-                db.add(Trade(run_id=run.id, **t))
+                row = {k: v for k, v in t.items() if k in trade_cols}
+                # SQLite stores bools as ints; normalise numpy/pandas scalars
+                for k, v in row.items():
+                    if hasattr(v, 'item'):
+                        try: row[k] = v.item()
+                        except Exception: pass
+                    if isinstance(row.get(k), bool):
+                        row[k] = int(row[k])
+                db.add(Trade(run_id=run.id, **row))
             db.commit()
     except Exception as e:
         print(f"Backtest Task Error: {e}")
@@ -255,7 +266,20 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
     run = db.query(BacktestRun).filter(BacktestRun.id == run_id, BacktestRun.user_id == user.id).first()
     if not run: raise HTTPException(status_code=404, detail="Run not found")
     trades = db.query(Trade).filter(Trade.run_id == run_id).all()
-    trade_list = [{ "entry_time": t.entry_time, "exit_time": t.exit_time, "direction": t.direction, "entry_price": t.entry_price, "exit_price": t.exit_price, "lots": t.lots, "margin": t.margin, "notional": t.notional, "net_pnl": t.net_pnl, "fees": t.fees, "exit_reason": t.exit_reason, "equity_after": t.equity_after, "drawdown": t.drawdown, "hold_bars": t.hold_bars } for t in trades]
+    trade_list = [{ "entry_time": t.entry_time, "exit_time": t.exit_time, "direction": t.direction, "entry_price": t.entry_price, "exit_price": t.exit_price, "lots": t.lots, "margin": t.margin, "notional": t.notional, "net_pnl": t.net_pnl, "fees": t.fees, "exit_reason": t.exit_reason, "equity_after": t.equity_after, "drawdown": t.drawdown, "hold_bars": t.hold_bars,
+                    # PHANTOM v3: entry-condition snapshot (candle, setup, indicators)
+                    "signal_candle_time": t.signal_candle_time, "setup": t.setup,
+                    "candle_type": t.candle_type, "trend_4h": t.trend_4h,
+                    "rsi14": t.rsi14, "macd_hist": t.macd_hist, "adx": t.adx,
+                    "atr14": t.atr14, "ema50_1h": t.ema50_1h, "ema50_4h": t.ema50_4h,
+                    "conditions": {
+                        "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
+                        "atr_regime_ok": t.cond_atr_regime_ok, "rsi_ok": t.cond_rsi_ok,
+                        "macd_confirm_ok": t.cond_macd_confirm_ok,
+                    },
+                    "gross_pnl": t.gross_pnl, "sl": t.sl, "tp": t.tp,
+                    "entry_dd_pct": t.entry_dd_pct, "margin_pct_used": t.margin_pct_used,
+                    "equity_at_entry": t.equity_at_entry } for t in trades]
     return {
         "run_details": {
             "name": run.name, "start_date": run.start_date, "end_date": run.end_date,

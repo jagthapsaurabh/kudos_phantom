@@ -82,6 +82,14 @@ class OrderManager:
                 # Trail advances based on peak
                 new_tsl = trade.peak_price - (self.config.trail_distance_atr * current_atr_usd)
                 trade.trail_stop = max(trade.trail_stop, new_tsl)
+
+            # 1b. Breakeven stop (v3): once +breakeven_atr x ATR in favour,
+            # the hard stop can never lose money.
+            be = getattr(self.config, 'breakeven_atr', 0.0)
+            if be > 0 and trade.peak_price >= trade.entry_price + be * trade.atr_at_entry:
+                trade.sl = max(trade.sl, trade.entry_price)
+                if trade.peak_price >= trade.trail_activation:
+                    trade.trail_stop = max(trade.trail_stop, trade.entry_price)
             
             # 2. Check TSL / SL FIRST
             stop_level = trade.trail_stop if trade.peak_price >= trade.trail_activation else trade.sl
@@ -97,6 +105,13 @@ class OrderManager:
             if trade.peak_price <= trade.trail_activation:
                 new_tsl = trade.peak_price + (self.config.trail_distance_atr * current_atr_usd)
                 trade.trail_stop = min(trade.trail_stop, new_tsl)
+
+            # Breakeven stop (v3) for shorts
+            be = getattr(self.config, 'breakeven_atr', 0.0)
+            if be > 0 and trade.peak_price <= trade.entry_price - be * trade.atr_at_entry:
+                trade.sl = min(trade.sl, trade.entry_price)
+                if trade.peak_price <= trade.trail_activation:
+                    trade.trail_stop = min(trade.trail_stop, trade.entry_price)
                 
             stop_level = trade.trail_stop if trade.peak_price <= trade.trail_activation else trade.sl
             if current_price_usd >= stop_level:
