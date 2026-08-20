@@ -37,57 +37,125 @@ class PhantomV2Config(BaseModel):
     taker_fee_bps: float = Field(default=float(os.getenv("TAKER_FEE_BPS", 5.9)), ge=0.0)
     maker_fee_bps: float = Field(default=float(os.getenv("MAKER_FEE_BPS", 2.36)), ge=0.0)
     liquidation_buffer: float = Field(default=0.005, ge=0.0)
+    # ------------------------------------------------------------------
+    # PHANTOM v3 additions (defaults preserve the v2.5 baseline behaviour)
+    # ------------------------------------------------------------------
+    # Setup B: momentum continuation entries (MACD-hist zero-cross with DI
+    # confirmation, trading in the direction of the 4h trend). Increases
+    # trade frequency in trending regimes where Setup A rarely fires.
+    enable_momentum_entry: bool = Field(default=False)
+    momentum_rsi_min: float = Field(default=50.0, ge=0.0, le=100.0)
+    # Breakeven stop: once price moves `breakeven_atr` x ATR in favour the
+    # hard stop is moved to the entry price. 0.0 disables the feature.
+    breakeven_atr: float = Field(default=0.0, ge=0.0)
+    # Portfolio-level drawdown throttle (all values in % of peak equity).
+    #  - dd_soft_pct  : past this DD, position size is cut to reduced_margin_pct
+    #  - dd_halt_pct  : past this DD, new entries stop entirely
+    #  - dd_resume_pct: entries resume once DD recovers below this level
+    # 100.0 means "never triggers" -> v2.5 behaviour.
+    dd_soft_pct: float = Field(default=100.0, ge=0.0, le=100.0)
+    dd_halt_pct: float = Field(default=100.0, ge=0.0, le=100.0)
+    dd_resume_pct: float = Field(default=100.0, ge=0.0, le=100.0)
+    reduced_margin_pct: float = Field(default=0.125, gt=0.0, le=1.0)
+    # Engine trade-management switches
+    allow_reverse: bool = Field(default=False)   # close & reverse on opposite signal
+    allow_overlap: bool = Field(default=False)   # v2.5 behaviour: overwrite open trade
 
 class StrategyService:
     def __init__(self, config: PhantomV2Config = PhantomV2Config()):
         self.config = config
 
-    def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+    # ------------------------------------------------------------------
+    # Vectorised core: returns (signals, metadata). Metadata carries the
+    # full indicator snapshot + pass/fail of every filter for each bar so
+    # every trade can be logged together with the market conditions that
+    # produced it (and the exact candle it fired on).
+    # ------------------------------------------------------------------
+    def _compute(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+        cfg = self.config
         df_1h = df_1h.sort_index()
         df_4h = df_4h.sort_index()
         ind_1h = compute_indicators(df_1h)
         ind_4h = compute_indicators(df_4h)
-        
-        # 1. MODERATE Trend Alignment (4h close vs EMA50)
-        df_1h_with_trend = pd.merge_asof(
-            df_1h,
-            pd.DataFrame({'ema50_4h': ind_4h['ema50']}, index=df_4h.index), 
-            left_index=True, right_index=True, direction='backward'
-        )
-        trend_col = np.where(df_1h['close'].values > df_1h_with_trend['ema50_4h'].values, 1, -1)
-        
-        # 2. ATR Regime Filter
-        atr_vals = ind_1h['atr14']
-        atr_sma50 = sma(atr_vals, 50)
-        atr_regime_ok = atr_vals >= (self.config.atr_regime_ratio * atr_sma50)
+        n = len(df_1h)
 
-        signals = np.zeros(len(df_1h))
-        for i in range(1, len(df_1h)):
-            # Filter 1: ADX minimum
-            if ind_1h['adx'][i] < self.config.adx_min: continue
-            # Filter 2: MACD histogram magnitude
-            if abs(ind_1h['macd_hist'][i]) < self.config.macd_hist_min: continue
-            # Filter 3: Volatility Regime
-            if not atr_regime_ok[i]: continue
-            
-            trend = trend_col[i]
-            
-            # Filter 4: RSI Reversal
-            # Long: Previous bar RSI < 30 AND current bar is green
-            is_long_rsi = (ind_1h['rsi14'][i-1] < self.config.rsi_oversold) and ind_1h['is_green'][i]
-            # Short: Previous bar RSI > 70 AND current bar is red
-            is_short_rsi = (ind_1h['rsi14'][i-1] > self.config.rsi_overbought) and ind_1h['is_red'][i]
-            
-            # Filter 5: MACD Histogram Confirmation
-            is_long_macd = ind_1h['macd_hist'][i] > ind_1h['macd_hist'][i-1]
-            is_short_macd = ind_1h['macd_hist'][i] < ind_1h['macd_hist'][i-1]
-            
-            if trend == 1 and is_long_rsi and is_long_macd: 
-                signals[i] = 1
-            elif trend == -1 and is_short_rsi and is_short_macd: 
-                signals[i] = -1
-                
+        # 1. MODERATE Trend Alignment (4h close vs EMA50, asof-mapped to 1h)
+        ema50_4h_map = pd.merge_asof(
+            df_1h,
+            pd.DataFrame({'ema50_4h': ind_4h['ema50']}, index=df_4h.index),
+            left_index=True, right_index=True, direction='backward'
+        )['ema50_4h'].values.astype(np.float64)
+        close = df_1h['close'].values.astype(np.float64)
+        trend_col = np.where(close > ema50_4h_map, 1, -1)
+
+        # 2. ATR Regime Filter
+        atr_v = ind_1h['atr14']
+        regime_ok = atr_v >= (cfg.atr_regime_ratio * sma(atr_v, 50))
+
+        rsi_v = ind_1h['rsi14']
+        hist = ind_1h['macd_hist']
+        adx_v = ind_1h['adx']
+        pdi, mdi = ind_1h['pdi'], ind_1h['mdi']
+        is_green = ind_1h['is_green'].astype(bool)
+        is_red = ind_1h['is_red'].astype(bool)
+
+        adx_ok = adx_v >= cfg.adx_min
+        hist_ok = np.abs(hist) >= cfg.macd_hist_min
+
+        rsi_prev = np.roll(rsi_v, 1)
+        hist_prev = np.roll(hist, 1)
+        valid = np.arange(n) >= 1  # baseline loop started at bar 1
+
+        # ---------------- Setup A: RSI reversal (v2.5 baseline) ----------
+        long_rsi_A = (rsi_prev < cfg.rsi_oversold) & is_green
+        short_rsi_A = (rsi_prev > cfg.rsi_overbought) & is_red
+        long_macd_A = hist > hist_prev
+        short_macd_A = hist < hist_prev
+
+        long_A = valid & (trend_col == 1) & adx_ok & hist_ok & regime_ok & long_rsi_A & long_macd_A
+        short_A = valid & (trend_col == -1) & adx_ok & hist_ok & regime_ok & short_rsi_A & short_macd_A
+
+        # ------------- Setup B: momentum continuation (v3, optional) ------
+        # Fires when the MACD histogram crosses zero in the trend direction
+        # with DI confirmation and RSI agreement.
+        cross_up = (hist_prev <= 0) & (hist > 0)
+        cross_dn = (hist_prev >= 0) & (hist < 0)
+        long_B = valid & (trend_col == 1) & adx_ok & regime_ok & (pdi > mdi) & cross_up & (rsi_v >= cfg.momentum_rsi_min)
+        short_B = valid & (trend_col == -1) & adx_ok & regime_ok & (mdi > pdi) & cross_dn & (rsi_v <= 100.0 - cfg.momentum_rsi_min)
+        if not cfg.enable_momentum_entry:
+            long_B[:] = False
+            short_B[:] = False
+
+        signals = np.zeros(n)
+        signals[long_A | long_B] = 1
+        signals[short_A | short_B] = -1
+
+        setup = np.full(n, '', dtype=object)
+        setup[long_B | short_B] = 'MOMENTUM'
+        setup[long_A | short_A] = 'REVERSAL'
+
+        meta = {
+            'rsi14': rsi_v, 'macd_hist': hist, 'adx': adx_v, 'atr14': atr_v,
+            'ema50_1h': ind_1h['ema50'], 'ema50_4h': ema50_4h_map,
+            'pdi': pdi, 'mdi': mdi,
+            'trend': trend_col, 'is_green': is_green, 'is_red': is_red,
+            'cond_adx_ok': adx_ok, 'cond_macd_hist_ok': hist_ok,
+            'cond_atr_regime_ok': regime_ok,
+            'cond_long_rsi': long_rsi_A, 'cond_short_rsi': short_rsi_A,
+            'cond_long_macd': long_macd_A, 'cond_short_macd': short_macd_A,
+            'setup': setup,
+            'long_A': long_A, 'short_A': short_A, 'long_B': long_B, 'short_B': short_B,
+        }
+        return signals, meta
+
+    def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+        """Backward-compatible entry point used by API / paper / live traders."""
+        signals, _ = self._compute(df_1h, df_4h)
         return signals
+
+    def generate_signals_with_metadata(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+        """Signals plus the per-bar condition snapshot used for trade logging."""
+        return self._compute(df_1h, df_4h)
 
 class FastTestStrategyService:
     """Simple strategy to generate very frequent signals for testing Paper/Live trading."""
@@ -97,10 +165,10 @@ class FastTestStrategyService:
     def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
         df_1h = df_1h.sort_index()
         ind_1h = compute_indicators(df_1h)
-        
+
         signals = np.zeros(len(df_1h))
         rsi = ind_1h['rsi14']
-        
+
         for i in range(1, len(df_1h)):
             # For testing purposes, we use very loose bounds so signals happen almost every bar
             # Long if RSI is below 55, Short if RSI is above 45.

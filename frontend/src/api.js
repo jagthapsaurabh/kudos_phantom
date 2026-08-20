@@ -1,7 +1,17 @@
 import axios from 'axios';
 
-// Standardized API Base URL using environment variables
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Standardized API Base URL: env override wins; otherwise reuse the current
+// host on port 8000 (works for localhost dev AND hosted port-based previews).
+const resolveApiUrl = () => {
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
+  if (typeof window === 'undefined' || !window.location) return 'http://localhost:8000';
+  const { protocol, hostname } = window.location;
+  // Hosted preview pattern: "<port>-<id>.e2b.app" -> swap the leading port
+  const m = hostname.match(/^\d+-(.+)$/);
+  if (m) return `${protocol}//8000-${m[1]}`;
+  return `${protocol}//${hostname}:8000`;
+};
+const API_URL = resolveApiUrl();
 
 const api = axios.create({
   baseURL: API_URL,

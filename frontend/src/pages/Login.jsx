@@ -26,7 +26,10 @@ const Login = () => {
       
       const data = await res.json();
       localStorage.setItem('token', data.access_token);
-      window.location.href = '/'; 
+      localStorage.setItem('role', data.role || 'client');
+      localStorage.setItem('username', data.username || form.username);
+      localStorage.setItem('can_live', String(data.can_live ?? 0));
+      window.location.href = (data.role === 'admin') ? '/admin' : '/';
     } catch (e) {
       setError(e.message);
     }
@@ -77,7 +80,7 @@ const Login = () => {
         </form>
         
         <div className="mt-8 text-center text-gray-500 text-xs">
-          Secure Access Only &bull; PHANTOM v2.5
+          Secure Access Only &bull; PHANTOM v3
         </div>
       </div>
     </div>
