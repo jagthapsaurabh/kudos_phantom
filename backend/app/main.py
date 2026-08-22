@@ -124,6 +124,32 @@ def register(username: str, password: str, db=Depends(get_db)):
     db.commit()
     return {"status": "User registered"}
 
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def change_password(payload: ChangePasswordRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Change the logged-in user's password."""
+    try:
+        import bcrypt
+        # Verify current password
+        if not bcrypt.checkpw(payload.current_password.encode('utf-8'), user.password_hash.encode('utf-8')):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        if len(payload.new_password) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+        # Hash and save
+        user.password_hash = bcrypt.hashpw(payload.new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        db.commit()
+        return {"status": "Password changed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to change password: {str(e)}")
+
 # --- HEALTH CHECK ---
 @app.get("/")
 def health_check():
@@ -251,6 +277,9 @@ def update_client(client_id: int, payload: ClientUpdate, admin=Depends(require_a
         if payload.can_paper is not None: user.can_paper = int(payload.can_paper)
         if payload.can_live is not None: user.can_live = int(payload.can_live)
         if payload.is_active is not None:
+            # Never allow deactivation of admin users
+            if user.role == 'admin' and not payload.is_active:
+                raise HTTPException(status_code=400, detail="Admin accounts cannot be deactivated")
             user.is_active = int(payload.is_active)
             if not payload.is_active:
                 # Stop the client's running sessions
@@ -497,6 +526,26 @@ def clear_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error clearing history: {str(e)}")
 
+
+@app.delete("/backtest/{run_id}")
+def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Delete a single backtest run and its associated trades."""
+    try:
+        run = db.query(BacktestRun).filter(BacktestRun.id == run_id, BacktestRun.user_id == user.id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        run_name = run.name
+        # Delete associated trades first
+        db.query(Trade).filter(Trade.run_id == run_id).delete()
+        db.delete(run)
+        db.commit()
+        return {"status": f"Backtest run '{run_name}' (#{run_id}) deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error deleting run: {str(e)}")
+
 # --- PAPER TRADING ---
 @app.post("/paper-trade/start")
 def start_paper_trade(
@@ -555,9 +604,21 @@ def get_paper_status(user=Depends(get_current_user)):
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
-                "equity_inr": service.equity_inr, "is_running": service.is_running, "active_trades": active_trades
+                "equity_inr": service.equity_inr, "is_running": service.is_running, "active_trades": active_trades,
+                "open_trade_count": len(service.oms.active_trades),
             })
     return status_list
+
+
+@app.get("/paper-trade/logs")
+def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
+    """Return the live log buffer for a paper-trade instance owned by this user."""
+    if f"_{user.username}_" not in instance_key:
+        raise HTTPException(status_code=403, detail="Not your instance")
+    service = paper_trade_instances.get(instance_key)
+    if not service:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return {"instance_key": instance_key, "logs": service.logs[-150:]}
 
 # --- LIVE TRADING ---
 @app.post("/live-trade/start")
