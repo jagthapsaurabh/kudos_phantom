@@ -8,6 +8,8 @@ import requests
 from app.core.indicators import compute_indicators
 
 class PaperTradeService:
+    MAX_LOG_LINES = 200  # keep last N log entries per instance
+
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0, is_custom=False):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
@@ -29,26 +31,39 @@ class PaperTradeService:
         self.equity_inr = initial_capital
         self.margin_pct = margin_pct
         self.conversion_rate = 85.0
+        # Live log buffer: list of {"ts": ISO, "level": "info|warn|error|trade", "msg": str}
+        self.logs: list = []
+        self._log("info", f"Instance initialised — strategy={strategy_id}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
+
+    def _log(self, level: str, msg: str):
+        entry = {"ts": datetime.utcnow().isoformat(timespec="seconds"), "level": level, "msg": msg}
+        self.logs.append(entry)
+        if len(self.logs) > self.MAX_LOG_LINES:
+            self.logs = self.logs[-self.MAX_LOG_LINES:]
 
     async def start(self):
         self.is_running = True
+        self._log("info", f"🟢 Paper trading started — strategy={self.strategy_id}")
         print(f"🟢 Paper Trading Started for Strategy: {self.strategy_id}")
         while self.is_running:
             try:
                 await self.tick()
             except Exception as e:
+                self._log("error", f"Tick error: {e}")
                 print(f"Paper Trade Error [{self.strategy_id}]: {e}")
             await asyncio.sleep(60) # Check every minute
 
     async def stop(self):
         self.is_running = False
+        self._log("info", "🔴 Paper trading stopped by user")
         print(f"🔴 Paper Trading Stopped for Strategy: {self.strategy_id}")
 
     async def tick(self):
         df_1h = self._fetch_candles("1h", 100)
         df_4h = self._fetch_candles("4h", 100)
         
-        if df_1h is None or df_4h is None: 
+        if df_1h is None or df_4h is None:
+            self._log("warn", "Candle data fetch failed — retrying next tick")
             print(f"[{self.strategy_id}] Data fetch failed")
             return
 
@@ -69,6 +84,7 @@ class PaperTradeService:
                 price_diff = (result.exit_price - result.entry_price) * result.direction
                 pnl_inr = (result.lots * price_diff) * self.conversion_rate
                 self.equity_inr += pnl_inr
+                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — PnL ₹{pnl_inr:+,.2f} | Equity ₹{self.equity_inr:,.2f}")
                 print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason}, PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
 
         if last_sig != 0:
@@ -77,10 +93,14 @@ class PaperTradeService:
             if validation.passed:
                 margin_inr = self.equity_inr * (self.margin_pct / 100.0)
                 self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time, margin_inr, self.conversion_rate)
+                side = "LONG" if last_sig == 1 else "SHORT"
+                self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | Margin ₹{margin_inr:,.0f}")
                 print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {'LONG' if last_sig==1 else 'SHORT'} at {current_price}")
             else:
+                self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
                 print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
         else:
+            self._log("info", f"Scanning… BTCUSDT {current_price:,.2f} — no signal")
             print(f"🔍 [{self.strategy_id}] Scanning... Current Price: {current_price:.2f}, No signal.")
 
     def _fetch_candles(self, interval, limit):

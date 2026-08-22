@@ -8,6 +8,7 @@ import Backtest from './pages/Backtest';
 import PaperTrade from './pages/PaperTrade';
 import Strategies from './pages/Strategies';
 import BrokerSettings from './pages/BrokerSettings';
+import AdminPanel from './pages/AdminPanel';
 import Navbar from './components/Navbar';
 
 const ProtectedRoute = ({ children }) => {
@@ -25,6 +26,7 @@ root.render(
       <Route path="/paper" element={<ProtectedRoute><Navbar /><PaperTrade /></ProtectedRoute>} />
       <Route path="/strategies" element={<ProtectedRoute><Navbar /><Strategies /></ProtectedRoute>} />
       <Route path="/broker" element={<ProtectedRoute><Navbar /><BrokerSettings /></ProtectedRoute>} />
+      <Route path="/admin" element={<ProtectedRoute><Navbar /><AdminPanel /></ProtectedRoute>} />
     </Routes>
   </BrowserRouter>
 );

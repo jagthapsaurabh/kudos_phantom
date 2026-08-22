@@ -2,7 +2,24 @@ import React, { useState, useEffect, useRef } from 'react';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { createChart } from 'lightweight-charts';
 import { API_URL } from '../api';
-import { Activity, TrendingUp, AlertCircle, RotateCcw } from 'lucide-react';
+import { Activity, TrendingUp, AlertCircle, RotateCcw, Trash2, Tag } from 'lucide-react';
+
+// ---------- Confirmation modal ----------
+const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onCancel}>
+      <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+        <h3 className="text-lg font-bold text-white mb-2">{title}</h3>
+        <p className="text-sm text-gray-400 mb-6">{message}</p>
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-300 hover:text-white bg-gray-700 hover:bg-gray-600 transition">Cancel</button>
+          <button onClick={onConfirm} className={`px-4 py-2 rounded-lg text-sm font-bold text-white transition ${confirmColor}`}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const Backtest = () => {
   const DEFAULT_PARAMS = {
@@ -23,6 +40,8 @@ const Backtest = () => {
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
   const [expandedTrade, setExpandedTrade] = useState(null);
+  const [runName, setRunName] = useState('');
+  const [confirm, setConfirm] = useState(null); // { type, runId, ... }
 
   // Chart Refs
   const chartContainerRef = useRef();
@@ -36,11 +55,11 @@ const Backtest = () => {
     "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
   };
 
+  const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}` });
+
   const fetchStrategies = async () => {
     try {
-      const res = await fetch(`${API_URL}/strategies`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
-      });
+      const res = await fetch(`${API_URL}/strategies`, { headers: authHeaders() });
       const data = await res.json();
       setStrategies(data);
     } catch (e) { }
@@ -48,31 +67,22 @@ const Backtest = () => {
 
   const fetchHistory = async () => {
     try {
-      const res = await fetch(`${API_URL}/backtest/history`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
-      });
+      const res = await fetch(`${API_URL}/backtest/history`, { headers: authHeaders() });
       const data = await res.json();
       setHistory(data);
-      if (data) {
-        setShowHistory(true);
-      }
+      if (data && data.length > 0) setShowHistory(true);
     } catch (e) { }
   };
 
   useEffect(() => {
     if (results && results.equity_curve) {
-      const timer = setTimeout(() => {
-        initEquityChart(results.equity_curve);
-      }, 100);
+      const timer = setTimeout(() => { initEquityChart(results.equity_curve); }, 100);
       return () => clearTimeout(timer);
     }
   }, [results]);
 
-  const resetParams = () => {
-    setParams({ ...DEFAULT_PARAMS });
-  };
+  const resetParams = () => setParams({ ...DEFAULT_PARAMS });
 
-  // Export full trade+condition log as CSV (client-side, from the loaded run)
   const exportTradesCSV = () => {
     if (!results?.trades?.length) return;
     const cols = [
@@ -86,9 +96,8 @@ const Backtest = () => {
     const rows = results.trades.map(t => {
       const conds = t.conditions || {};
       const mapped = cols.map(c => t[c] ?? '');
-      const mappedConds = [
-        conds.adx_ok, conds.macd_hist_ok, conds.atr_regime_ok, conds.rsi_ok, conds.macd_confirm_ok
-      ].map(v => v === undefined || v === null ? '' : (v ? 'TRUE' : 'FALSE'));
+      const mappedConds = [conds.adx_ok, conds.macd_hist_ok, conds.atr_regime_ok, conds.rsi_ok, conds.macd_confirm_ok]
+        .map(v => v === undefined || v === null ? '' : (v ? 'TRUE' : 'FALSE'));
       return [...mapped, ...mappedConds];
     });
     const csv = [header.join(','), ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\n');
@@ -104,18 +113,16 @@ const Backtest = () => {
   const runBacktest = async () => {
     setLoading(true);
     try {
+      const strategyName = runName.trim() || (selectedStrategyId === 'PhantomV2' ? 'Phantom Optimization' : `Custom Run ${selectedStrategyId}`);
       const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({
           params: params,
           strategy_id: selectedStrategyId,
           start_date: dates.start,
           end_date: dates.end,
-          strategy_name: selectedStrategyId === 'PhantomV2' ? "Phantom Optimization" : `Custom Run ${selectedStrategyId}`,
+          strategy_name: strategyName,
         }),
       });
 
@@ -130,26 +137,21 @@ const Backtest = () => {
       // Poll for results
       const pollInterval = setInterval(async () => {
         try {
-          const res = await fetch(`${API_URL}/backtest/results/${runId}`, {
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
-          });
+          const res = await fetch(`${API_URL}/backtest/results/${runId}`, { headers: authHeaders() });
           const resultData = await res.json();
 
-          // Check if results are fully computed (ROI should not be 0.0 if trades occurred)
           if (resultData.run_details && resultData.run_details.total_trades !== undefined && resultData.run_details.total_trades !== 0) {
             setResults({
               ...resultData.run_details,
               final_equity_inr: resultData.run_details.final_equity,
               trades: resultData.trades
             });
-            initEquityChart(resultData.run_details.equity_curve);
             setLoading(false);
             clearInterval(pollInterval);
             fetchHistory();
+            setRunName('');
           }
-        } catch (e) {
-          console.error("Polling error:", e);
-        }
+        } catch (e) { console.error("Polling error:", e); }
       }, 2000);
 
     } catch (error) {
@@ -161,78 +163,57 @@ const Backtest = () => {
   const initEquityChart = (equityData) => {
     if (!chartContainerRef.current) return;
     if (chartRef.current) chartRef.current.remove();
-
     const chart = createChart(chartContainerRef.current, {
       layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
       grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
       width: chartContainerRef.current.clientWidth,
       height: 400,
     });
-
     const areaSeries = chart.addAreaSeries({
       lineColor: '#3b82f6',
       topColor: 'rgba(59, 130, 246, 0.4)',
       bottomColor: 'rgba(59, 130, 246, 0)',
       lineWidth: 2,
     });
-
-    const formattedData = equityData.map((val, idx) => ({
-      time: idx,
-      value: val,
-    }));
-
-    areaSeries.setData(formattedData);
+    areaSeries.setData(equityData.map((val, idx) => ({ time: idx, value: val })));
     chart.timeScale().fitContent();
     chartRef.current = chart;
   };
 
   const loadRun = async (runId) => {
     try {
-      const res = await fetch(`${API_URL}/backtest/results/${runId}`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Run not found on server");
-      }
-
+      const res = await fetch(`${API_URL}/backtest/results/${runId}`, { headers: authHeaders() });
+      if (!res.ok) throw new Error((await res.json()).detail || "Run not found");
       const data = await res.json();
-
-      if (!data.run_details) {
-        throw new Error("Run details are missing from the server response");
-      }
-
-      setResults({
-        ...data.run_details,
-        final_equity_inr: data.run_details.final_equity,
-        trades: data.trades
-      });
+      if (!data.run_details) throw new Error("Run details missing");
+      setResults({ ...data.run_details, final_equity_inr: data.run_details.final_equity, trades: data.trades });
       setShowHistory(false);
-
-      // if (data.run_details.equity_curve && Array.isArray(data.run_details.equity_curve)) {
-      //   initEquityChart(data.run_details.equity_curve);
-      // } else {
-      //   console.warn("No equity curve data available for this run.");
-      // }
-    } catch (e) {
-      console.error("Load Run Error:", e);
-      alert(`Error loading run: ${e.message}`);
-    }
+    } catch (e) { alert(`Error loading run: ${e.message}`); }
   };
 
-  const clearHistory = async () => {
-    if (!window.confirm("Are you sure you want to clear all backtest history?")) return;
+  const requestDeleteRun = (runId, name) => {
+    setConfirm({ type: 'deleteRun', runId, name });
+  };
+
+  const requestClearAll = () => {
+    setConfirm({ type: 'clearAll' });
+  };
+
+  const doConfirm = async () => {
+    if (!confirm) return;
     try {
-      const res = await fetch(`${API_URL}/backtest/clear`, {
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
-      });
-      if (res.ok) {
-        setHistory([]);
-        setResults(null);
+      if (confirm.type === 'deleteRun') {
+        const res = await fetch(`${API_URL}/backtest/${confirm.runId}`, { method: 'DELETE', headers: authHeaders() });
+        if (res.ok) {
+          setHistory(h => h.filter(r => r.id !== confirm.runId));
+          if (results && results.id === confirm.runId) setResults(null);
+        }
+      } else if (confirm.type === 'clearAll') {
+        const res = await fetch(`${API_URL}/backtest/clear`, { method: 'DELETE', headers: authHeaders() });
+        if (res.ok) { setHistory([]); setResults(null); }
       }
     } catch (e) { alert(e.message); }
+    setConfirm(null);
   };
 
   const stats = results ? {
@@ -244,36 +225,36 @@ const Backtest = () => {
     profitFactor: results.profit_factor,
     sharpe: results.sharpe_ratio,
     maxDD: results.max_drawdown,
-    exitDist: results.trades?.reduce((acc, t) => {
-      acc[t.exit_reason] = (acc[t.exit_reason] || 0) + 1;
-      return acc;
-    }, {}),
-    directionDist: results.trades?.reduce((acc, t) => {
-      const dir = t.direction === 1 ? 'Long' : 'Short';
-      acc[dir] = (acc[dir] || 0) + 1;
-      return acc;
-    }, {}),
+    exitDist: results.trades?.reduce((acc, t) => { acc[t.exit_reason] = (acc[t.exit_reason] || 0) + 1; return acc; }, {}),
+    directionDist: results.trades?.reduce((acc, t) => { const dir = t.direction === 1 ? 'Long' : 'Short'; acc[dir] = (acc[dir] || 0) + 1; return acc; }, {}),
     rejections: results.rejected_reasons || {}
   } : null;
 
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 
-  useEffect(() => {
-    fetchStrategies();
-    fetchHistory();
-  }, []);
+  useEffect(() => { fetchStrategies(); fetchHistory(); }, []);
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
+      <ConfirmModal
+        open={!!confirm}
+        title={confirm?.type === 'deleteRun' ? 'Delete Backtest Run?' : confirm?.type === 'clearAll' ? 'Clear All Backtest History?' : 'Confirm'}
+        message={confirm?.type === 'deleteRun' ? `This will permanently delete "${confirm?.name}" and all its trade data.` : confirm?.type === 'clearAll' ? 'This will permanently delete ALL backtest runs and their trade data. This cannot be undone.' : ''}
+        confirmLabel={confirm?.type === 'clearAll' ? 'Yes, Clear All' : 'Yes, Delete'}
+        confirmColor="bg-red-600 hover:bg-red-500"
+        onCancel={() => setConfirm(null)}
+        onConfirm={doConfirm}
+      />
+
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-extrabold text-blue-400 tracking-tight">Strategy Optimizer</h1>
           <p className="text-gray-500 text-sm">Refine PHANTOM v2.5 parameters and validate equity growth</p>
         </div>
         <div className="flex gap-3">
-          <button onClick={clearHistory} className="bg-red-900/20 text-red-400 px-4 py-2 rounded-lg border border-red-900/50 hover:bg-red-900/40 transition text-sm font-semibold">
-            🗑️ Clear History
+          <button onClick={requestClearAll} className="bg-red-900/20 text-red-400 px-4 py-2 rounded-lg border border-red-900/50 hover:bg-red-900/40 transition text-sm font-semibold flex items-center gap-2">
+            <Trash2 size={14} /> Clear History
           </button>
           <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition text-sm font-semibold">
             {showHistory ? 'Close History' : '📜 View History'}
@@ -283,16 +264,24 @@ const Backtest = () => {
 
       {showHistory && (
         <div className="mb-8 bg-gray-800 p-6 rounded-2xl border border-gray-700 animate-in slide-in-from-top-4">
-          <h2 className="text-xl font-semibold mb-4 text-gray-300">Backtest History</h2>
+          <h2 className="text-xl font-semibold mb-4 text-gray-300">Backtest History ({history.length} runs)</h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {history.map(run => (
-              <div key={run.id} onClick={() => loadRun(run.id)} className="p-4 bg-gray-900 rounded-xl border border-gray-700 cursor-pointer hover:border-blue-500 transition group">
-                <div className="font-bold text-gray-200 group-hover:text-blue-400 transition">{run.name}</div>
-                <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} to {run.end_date?.split('T')[0]}</div>
-                <div className="text-green-400 font-mono text-sm mt-2">ROI: {run.roi?.toFixed(2)}%</div>
+              <div key={run.id} className="p-4 bg-gray-900 rounded-xl border border-gray-700 hover:border-blue-500 transition group relative">
+                <div className="cursor-pointer" onClick={() => loadRun(run.id)}>
+                  <div className="font-bold text-gray-200 group-hover:text-blue-400 transition">{run.name || 'Unnamed Run'}</div>
+                  <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]}</div>
+                  <div className={`font-mono text-sm mt-2 ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); requestDeleteRun(run.id, run.name); }}
+                        className="absolute top-3 right-3 p-1.5 rounded-lg text-gray-600 hover:text-red-400 hover:bg-red-900/20 transition opacity-0 group-hover:opacity-100"
+                        title="Delete this run">
+                  <Trash2 size={14} />
+                </button>
               </div>
             ))}
           </div>
+          {history.length === 0 && <p className="text-gray-500 text-center py-4">No backtest runs yet.</p>}
         </div>
       )}
 
@@ -318,6 +307,11 @@ const Backtest = () => {
                 <option value="PhantomV2">Phantom V2.5 (Default)</option>
                 {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
+            </div>
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run Name (optional)</label>
+              <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
+                className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
             </div>
           </div>
 
@@ -371,16 +365,6 @@ const Backtest = () => {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* <div className="lg:col-span-2 bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-sm font-semibold text-gray-400 flex items-center gap-2">
-                  <TrendingUp size={16} /> Equity Growth Map
-                </h3>
-                <span className="text-[10px] text-gray-500 uppercase">Interactive TradingView-style Chart</span>
-              </div>
-              <div ref={chartContainerRef} className="w-full" />
-            </div> */}
-
             <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
               <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
               <div className="flex-1">
@@ -464,7 +448,7 @@ const Backtest = () => {
                                   </div>
                                 </div>
                                 <div>
-                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Indicators @ Signal Candle</div>
+                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Indicators @ Signal</div>
                                   <div className="font-mono text-gray-300 space-y-0.5">
                                     <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
                                     <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
@@ -478,16 +462,16 @@ const Backtest = () => {
                                     <div>SL: {t.sl?.toFixed(2) ?? '—'}</div>
                                     <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
                                     <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
-                                    <div>Lots: {(t.lots || 0).toFixed(4)} &bull; DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
+                                    <div>Lots: {(t.lots || 0).toFixed(4)} • DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
                                   </div>
                                 </div>
                                 <div>
                                   <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Result</div>
                                   <div className="font-mono text-gray-300 space-y-0.5">
-                                    <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} &bull; Fees: ₹{(t.fees || 0).toFixed(2)}</div>
+                                    <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
                                     <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
                                     <div>Exit: {t.exit_time ? new Date(t.exit_time).toLocaleString() : '—'} ({t.hold_bars || 0} bars)</div>
-                                    <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} &bull; DD: {(t.drawdown || 0).toFixed(2)}%</div>
+                                    <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
                                   </div>
                                 </div>
                               </div>
