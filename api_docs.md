@@ -25,7 +25,7 @@ All protected endpoints require a Bearer Token in the header:
 | :--- | :--- | :--- | :--- |
 | `GET` | `/klines` | `symbol`, `interval`, `limit` | Fetch candle data (with volume) for charts |
 | `GET` | `/symbols` | None | List symbols available in the local market-data store |
-| `GET` | `/phantom/signals` | `symbol`, `start_date`, `end_date` | Signal candles for the chart overlay |
+| `GET` | `/phantom/signals` | `symbol`, `start_date`, `end_date`, `strategy_id` | Signal candles for the chart overlay. `strategy_id` may be `PhantomV2` (default, tuned champion), `FastTest`, or a custom strategy id created in the Strategies manager. |
 
 ### 4. Paper Trading
 | Method | Endpoint | Request Body | Description |
@@ -63,3 +63,4 @@ All protected endpoints require a Bearer Token in the header:
 | `GET` | `/klines` | `symbol`, `interval`, `limit` | Fetch raw market data for charts |
 | `GET` | `/strategies` | None | List available custom strategies |
 | `POST` | `/strategies/create` | `name`, `rules` | Create a new custom strategy |
+| `POST` | `/strategies/scan` | `rules`, `symbol`, `interval`, `start_date`, `end_date`, `limit` | Chartink-style scan: returns the latest candles that match an unsaved rule set (for the strategy builder live preview) |

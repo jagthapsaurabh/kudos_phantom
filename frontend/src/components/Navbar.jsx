@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, ShieldCheck, Users, LineChart } from 'lucide-react';
+import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, ShieldCheck, Users, LineChart, Radio } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -21,6 +21,7 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
 const Navbar = () => {
   const navigate = useNavigate();
   const role = localStorage.getItem('role') || 'client';
+  const canLive = localStorage.getItem('can_live') === '1' || role === 'admin';
   const [showLogout, setShowLogout] = useState(false);
 
   const handleLogout = () => {
@@ -36,6 +37,7 @@ const Navbar = () => {
     { name: 'Market Chart', path: '/chart', icon: <LineChart size={20} /> },
     { name: 'Backtesting', path: '/backtest', icon: <TrendingUp size={20} /> },
     { name: 'Paper Trade', path: '/paper', icon: <Activity size={20} /> },
+    ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: <Radio size={20} /> }] : []),
     { name: 'Strategies', path: '/strategies', icon: <PlayCircle size={20} /> },
     { name: 'Broker', path: '/broker', icon: <Settings size={20} /> },
     ...(role === 'admin' ? [{ name: 'Admin Panel', path: '/admin', icon: <Users size={20} /> }] : []),

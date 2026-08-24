@@ -218,6 +218,51 @@ def delete_strategy(strat_id: int, user=Depends(get_current_user), db=Depends(ge
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- STRATEGY SCANNER (Chartink-style live preview) ----------------------
+class ScanRequest(BaseModel):
+    rules: Union[List[Dict], Dict]
+    symbol: str = "BTCUSDT"
+    interval: str = "1h"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    limit: int = 25
+
+@app.post("/strategies/scan")
+def scan_strategy(payload: ScanRequest, user=Depends(get_current_user)):
+    """Scan the market data against an unsaved rule set (Chartink-style).
+
+    Returns the most recent candles that satisfy the rule group so the
+    strategy builder can show a live 'conditions met' preview.
+    """
+    try:
+        from .core.dynamic_strategy import DynamicStrategyService
+        engine = BacktestEngine(PhantomV2Config())
+        df_1h = engine._get_data_from_db(payload.symbol, payload.interval, payload.start_date, payload.end_date)
+        df_4h = engine._get_data_from_db(payload.symbol, "4h", payload.start_date, payload.end_date)
+        if df_1h.empty or df_4h.empty:
+            return []
+
+        svc = DynamicStrategyService(payload.rules)
+        signals = svc.generate_signals(df_1h, df_4h)
+
+        out = []
+        closes = df_1h['close'].values
+        opens = df_1h['open'].values
+        highs = df_1h['high'].values
+        lows = df_1h['low'].values
+        for i in range(1, len(df_1h)):
+            if signals[i] != 0:
+                out.append({
+                    "time": int(_utc_ts(df_1h.index[i])),
+                    "direction": int(signals[i]),
+                    "open": float(opens[i]), "high": float(highs[i]),
+                    "low": float(lows[i]), "close": float(closes[i]),
+                })
+        # Return the most recent matches
+        return out[-payload.limit:]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scan error: {str(e)}")
+
 # --- ADMIN: CLIENT MANAGEMENT ---
 class ClientCreate(BaseModel):
     username: str
@@ -389,30 +434,76 @@ def phantom_config(user=Depends(get_current_user)):
 
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
-                    symbol: str = "BTCUSDT", user=Depends(get_current_user)):
-    """Signal candles for chart overlay (uses the tuned champion config)."""
-    cfg = _load_champion_config()
-    engine = BacktestEngine(cfg)
+                    symbol: str = "BTCUSDT", strategy_id: Optional[str] = "PhantomV2",
+                    user=Depends(get_current_user), db=Depends(get_db)):
+    """Signal candles for the chart overlay.
+
+    By default it overlays the tuned Phantom champion config. Pass
+    `strategy_id` to overlay the signals of a specific strategy instead
+    (e.g. a custom strategy created in the Strategies manager, or "FastTest").
+    """
+    if strategy_id == "PhantomV2":
+        cfg = _load_champion_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = engine.strategy_service
+        wants_metadata = True
+        label = None
+    elif strategy_id == "FastTest":
+        cfg = PhantomV2Config()
+        engine = BacktestEngine(cfg)
+        from .core.strategy import FastTestStrategyService
+        strategy_service = FastTestStrategyService(cfg)
+        wants_metadata = False
+        label = "FastTest"
+    else:
+        try:
+            strat = db.query(CustomStrategy).filter(
+                CustomStrategy.id == int(strategy_id),
+                CustomStrategy.user_id == user.id,
+            ).first()
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid strategy id")
+        if not strat:
+            raise HTTPException(status_code=404, detail="Custom strategy not found")
+        from .core.dynamic_strategy import DynamicStrategyService
+        cfg = PhantomV2Config()
+        engine = BacktestEngine(cfg)
+        strategy_service = DynamicStrategyService(strat.rules)
+        wants_metadata = False
+        label = strat.name
+
     df_1h = engine._get_data_from_db(symbol, "1h", start_date, end_date)
     df_4h = engine._get_data_from_db(symbol, "4h", start_date, end_date)
     if df_1h.empty or df_4h.empty:
         return []
-    # include some warmup history so indicators are stable on the window
-    signals, meta = engine.strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+
+    if wants_metadata:
+        signals, meta = strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+    else:
+        signals = strategy_service.generate_signals(df_1h, df_4h)
+        meta = None
+
     out = []
     closes = df_1h['close'].values
     for i in range(1, len(df_1h)):
         s = signals[i]
         if s == 0:
             continue
-        out.append({
+        item = {
             "time": int(_utc_ts(df_1h.index[i])),
             "direction": int(s),
             "price": float(closes[i]),
-            "setup": str(meta['setup'][i]),
-            "rsi14": round(float(meta['rsi14'][i]), 2),
-            "adx": round(float(meta['adx'][i]), 2),
-        })
+            "setup": None,
+            "rsi14": None,
+            "adx": None,
+        }
+        if meta is not None:
+            item["setup"] = str(meta['setup'][i])
+            item["rsi14"] = round(float(meta['rsi14'][i]), 2)
+            item["adx"] = round(float(meta['adx'][i]), 3)
+        else:
+            item["setup"] = label or "CUSTOM"
+        out.append(item)
         if len(out) >= 2000:
             break
     return out
