@@ -42,6 +42,7 @@ const Backtest = () => {
   const [expandedTrade, setExpandedTrade] = useState(null);
   const [runName, setRunName] = useState('');
   const [confirm, setConfirm] = useState(null); // { type, runId, ... }
+  const [capital, setCapital] = useState(20000); // starting capital for the run (default = admin set)
 
   // Chart Refs
   const chartContainerRef = useRef();
@@ -73,6 +74,15 @@ const Backtest = () => {
       if (data && data.length > 0) setShowHistory(true);
     } catch (e) { }
   };
+
+  // Load the user's (admin-set) default capital to prefill the form.
+  useEffect(() => {
+    fetch(`${API_URL}/broker-settings`, { headers: authHeaders() })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => { if (data && data.initial_capital) setCapital(data.initial_capital); })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (results && results.equity_curve) {
@@ -124,6 +134,7 @@ const Backtest = () => {
           start_date: dates.start,
           end_date: dates.end,
           strategy_name: strategyName,
+          initial_capital: parseFloat(capital),
         }),
       });
 
@@ -223,8 +234,9 @@ const Backtest = () => {
 
   const stats = results ? {
     totalTrades: results.total_trades,
+    initialCapital: results.initial_capital || 20000,
     finalEquity: results.final_equity_inr,
-    netProfit: results.final_equity_inr - 20000,
+    netProfit: results.final_equity_inr - (results.initial_capital || 20000),
     roi: results.roi,
     winRate: results.win_rate,
     profitFactor: results.profit_factor,
@@ -316,6 +328,11 @@ const Backtest = () => {
             <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
           </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
+            <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+          </div>
         </div>
 
         {/* Parameter groups */}
@@ -380,8 +397,9 @@ const Backtest = () => {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= 20000 ? 'text-green-400' : 'text-red-400'} />
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+            <StatCard label="Initial Capital" value={`₹${stats?.initialCapital?.toLocaleString()}`} color="text-yellow-400" />
+            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= (stats?.initialCapital || 0) ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="Net Profit" value={`₹${stats?.netProfit?.toLocaleString()}`} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="ROI" value={`${stats?.roi?.toFixed(2)}%`} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="Win Rate" value={`${stats?.winRate?.toFixed(2)}%`} color="text-purple-400" />

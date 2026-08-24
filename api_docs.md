@@ -30,7 +30,7 @@ All protected endpoints require a Bearer Token in the header:
 ### 4. Paper Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/paper-trade/start` | `strategy_id` | Starts a new simulation instance |
+| `POST` | `/paper-trade/start` | `strategy_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a new simulation instance. `initial_capital`/`margin_pct` default to the user's (admin-set) values. |
 | `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance |
 | `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history |
 | `GET` | `/paper-trade/logs` | `instance_key` | Live log buffer for an instance |
@@ -45,9 +45,9 @@ All protected endpoints require a Bearer Token in the header:
 ### 6. Backtesting
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name` | Triggers a background backtest |
-| `GET` | `/backtest/history` | None | Lists all previous backtest runs |
-| `GET` | `/backtest/results/{id}` | None | Get detailed trades and equity curve for a run |
+| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional) | Triggers a background backtest with a custom starting capital. Defaults to the user's (admin-set) initial capital. |
+| `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `initial_capital`) |
+| `GET` | `/backtest/results/{id}` | None | Get detailed trades and equity curve for a run (incl. `initial_capital`) |
 | `DELETE` | `/backtest/{id}` | None | Delete a single backtest run and its trades |
 | `DELETE` | `/backtest/clear` | None | Delete all of the user's backtest runs |
 

@@ -69,6 +69,9 @@ class BacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     strategy_name: str = "Default Run"
+    # Capital to run the backtest with. If omitted, the user's (admin-set)
+    # initial_capital is used.
+    initial_capital: Optional[float] = None
 
 def get_db():
     db = SessionLocal()
@@ -514,7 +517,15 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
     try:
         start_date_str = req.start_date or "2020-07-04"
         end_date_str = req.end_date or "2026-07-04"
-        
+
+        # Resolve starting capital: run record (already stored by run_backtest),
+        # else explicit request value, else the user's (admin-set default)
+        # initial capital, else the engine default.
+        run0 = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        default_capital = (user.initial_capital if user and user.initial_capital else 20000.0)
+        capital = float(run0.initial_capital) if (run0 and run0.initial_capital) else (float(req.initial_capital) if req.initial_capital else float(default_capital))
+
         if req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=req.params)
         else:
@@ -529,15 +540,15 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
                     self.validator_service = ValidatorService()
                     from .services.order_manager import OrderManager
                     self.oms = OrderManager(self.config)
-                def run(self, symbol="BTCUSDT", start_date=None, end_date=None):
+                def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
                     original_engine = BacktestEngine(self.config)
                     original_engine.strategy_service = self.strategy_service
                     # NOTE: pass by keyword - the engine signature is
                     # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
-                    return original_engine.run(symbol=symbol, start_date=start_date, end_date=end_date)
+                    return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, start_date=start_date, end_date=end_date)
             engine = DynamicBacktestEngine(strat.rules)
 
-        results = engine.run(symbol="BTCUSDT", start_date=start_date_str, end_date=end_date_str)
+        results = engine.run(symbol="BTCUSDT", initial_capital_inr=capital, start_date=start_date_str, end_date=end_date_str)
         
         run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
         if run:
@@ -577,6 +588,10 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
         start_date_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
         end_date_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
 
+        # Resolve the starting capital once so it is stored on the run and
+        # reused by the background task: explicit value, else the user's default.
+        capital = float(req.initial_capital) if req.initial_capital else float(user.initial_capital or 20000.0)
+
         # Create a placeholder run record
         run = BacktestRun(
             user_id=user.id,
@@ -584,6 +599,7 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
             start_date=start_date_dt,
             end_date=end_date_dt,
             config_json=json.dumps(req.params.dict()),
+            initial_capital=capital,
             roi=0.0 # Placeholder
         )
         db.add(run)
@@ -599,7 +615,8 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
 @app.get("/backtest/history")
 def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).order_by(BacktestRun.timestamp.desc()).all()
-    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date, "roi": r.roi, "timestamp": r.timestamp} for r in runs]
+    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date,
+             "roi": r.roi, "initial_capital": r.initial_capital or 20000, "timestamp": r.timestamp} for r in runs]
 
 @app.get("/backtest/results/{run_id}")
 def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends(get_db)):
@@ -623,6 +640,7 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
     return {
         "run_details": {
             "name": run.name, "start_date": run.start_date, "end_date": run.end_date,
+            "initial_capital": run.initial_capital or 20000,
             "final_equity": run.final_equity, "total_trades": run.total_trades,
             "win_rate": run.win_rate, "profit_factor": run.profit_factor,
             "sharpe_ratio": run.sharpe_ratio, "max_drawdown": run.max_drawdown,
@@ -667,35 +685,47 @@ def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(
         raise HTTPException(status_code=500, detail=f"Error deleting run: {str(e)}")
 
 # --- PAPER TRADING ---
+class TradeStartRequest(BaseModel):
+    strategy_id: str
+    # Optional starting capital. If omitted, the user's (admin-set default)
+    # initial capital is used.
+    initial_capital: Optional[float] = None
+    margin_pct: Optional[float] = None
+
 @app.post("/paper-trade/start")
 def start_paper_trade(
-    strategy_id: str = Body(..., embed=True), 
+    payload: TradeStartRequest,
     user=Depends(get_current_user), 
     db=Depends(get_db), 
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not (user.can_paper if user.can_paper is not None else 1):
         raise HTTPException(status_code=403, detail="Paper trading is disabled for this account. Contact admin.")
+    strategy_id = payload.strategy_id
+    # Overridable capital: explicit request value, else the user's default.
+    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
+    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{strategy_id}_{instance_id}"
-    
+
     if strategy_id == "FastTest":
         # Fixed: Import within the function to avoid UnboundLocalError if not available at module level
         from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct)
+        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=capital, margin_pct=margin_pct)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
             strat_id_int = int(strategy_id)
             strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = PaperTradeService(strategy_id, strat.rules, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=True)
+            service = PaperTradeService(strategy_id, strat.rules, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
         # Use the tuned champion config (same settings that drive the chart overlay)
         # so paper trades match the strategy being analysed.
-        service = PaperTradeService(strategy_id, _load_champion_config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        service = PaperTradeService(strategy_id, _load_champion_config(), initial_capital=capital, margin_pct=margin_pct, is_custom=False)
 
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
@@ -749,7 +779,7 @@ def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
 # --- LIVE TRADING ---
 @app.post("/live-trade/start")
 def start_live_trade(
-    strategy_id: str = Body(..., embed=True), 
+    payload: TradeStartRequest,
     user=Depends(get_current_user), 
     db=Depends(get_db), 
     background_tasks: BackgroundTasks = BackgroundTasks()
@@ -757,23 +787,27 @@ def start_live_trade(
     if not (user.can_live if user.can_live is not None else 0):
         raise HTTPException(status_code=403, detail="Live trading is not enabled for this account. Contact admin.")
     if not user.api_key or not user.api_secret: raise HTTPException(status_code=400, detail="Broker API keys not configured")
+    strategy_id = payload.strategy_id
+    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
+    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
         from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct)
+        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
             strat_id_int = int(strategy_id)
             strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = LiveTradeService(strategy_id, strat.rules, user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=True)
+            service = LiveTradeService(strategy_id, strat.rules, user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=False)
 
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)

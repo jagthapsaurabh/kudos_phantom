@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
-import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2 } from 'lucide-react';
+import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet } from 'lucide-react';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -468,6 +468,76 @@ const PaperTab = () => {
   );
 };
 
+// ------------------------------------------------------ Capital settings --
+const CapitalTab = () => {
+  const [admins, setAdmins] = useState([]);
+  const [capital, setCapital] = useState(20000);
+  const [margin, setMargin] = useState(25);
+  const [msg, setMsg] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    const res = await fetch(`${API_URL}/admin/clients`, { headers: authHeaders() });
+    if (res.ok) {
+      const list = await res.json();
+      const admin = list.find(c => c.role === 'admin');
+      if (admin) {
+        setAdmins(list);
+        setCapital(admin.initial_capital || 20000);
+        setMargin(admin.margin_deployment_pct || 25);
+      }
+    }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setMsg(null);
+    const admin = admins.find(c => c.role === 'admin');
+    if (!admin) { setMsg({ ok: false, text: 'No admin account found' }); setSaving(false); return; }
+    try {
+      const res = await fetch(`${API_URL}/admin/clients/${admin.id}`, {
+        method: 'PUT', headers: authHeaders(),
+        body: JSON.stringify({ initial_capital: parseFloat(capital), margin_deployment_pct: parseFloat(margin) }),
+      });
+      const data = await res.json();
+      if (res.ok) setMsg({ ok: true, text: `Default capital set to ₹${Number(capital).toLocaleString()}. It is used as the default for new backtests & paper-trade instances.` });
+      else setMsg({ ok: false, text: data.detail || 'Failed to save' });
+    } catch (e) { setMsg({ ok: false, text: 'Network error' }); }
+    setSaving(false);
+  };
+
+  return (
+    <div className="max-w-xl">
+      <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+        <h3 className="text-sm font-bold text-gray-300 uppercase tracking-wider mb-2 flex items-center gap-2"><Wallet size={16} /> Default Trading Capital (Admin)</h3>
+        <p className="text-xs text-gray-500 mb-5">
+          This is the starting capital used by default for new <b>backtests</b> and <b>paper-trade</b> instances. You can still override it per run when you start one.
+        </p>
+        <form onSubmit={save} className="space-y-4">
+          <div>
+            <label className="text-[10px] text-gray-500 uppercase block mb-1">Initial Capital (₹)</label>
+            <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
+              className="w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm" />
+          </div>
+          <div>
+            <label className="text-[10px] text-gray-500 uppercase block mb-1">Margin Deployment (%)</label>
+            <input type="number" min="1" max="100" step="1" value={margin} onChange={e => setMargin(e.target.value)}
+              className="w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm" />
+          </div>
+          <div className="flex items-center gap-4">
+            <button disabled={saving} className="bg-blue-600 hover:bg-blue-500 px-6 py-2.5 rounded-lg font-bold text-sm transition disabled:opacity-50">
+              {saving ? 'Saving…' : 'Save Default Capital'}
+            </button>
+            {msg && <span className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</span>}
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 // ------------------------------------------------------------------- Main --
 const AdminPanel = () => {
   const [tab, setTab] = useState('clients');
@@ -506,6 +576,7 @@ const AdminPanel = () => {
 
   const tabs = [
     { id: 'clients', label: 'Client Management', icon: <Users size={16} /> },
+    { id: 'capital', label: 'Capital Settings', icon: <Wallet size={16} /> },
     { id: 'password', label: 'Change Password', icon: <Lock size={16} /> },
     { id: 'strategy', label: 'Phantom Strategy', icon: <BookOpen size={16} /> },
     { id: 'paper', label: 'Paper Control', icon: <Activity size={16} /> },
@@ -563,6 +634,7 @@ const AdminPanel = () => {
       </div>
 
       {tab === 'clients' && <ClientsTab onConfirm={setConfirm} />}
+      {tab === 'capital' && <CapitalTab />}
       {tab === 'password' && <ChangePasswordTab />}
       {tab === 'strategy' && <StrategyTab profile={champion?.profile} champion={champion} />}
       {tab === 'paper' && <PaperTab />}

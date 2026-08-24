@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle } from 'lucide-react';
+import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle } from 'lucide-react';
 import { API_URL } from '../api';
 
 // ---------- Confirmation modal ----------
@@ -195,11 +195,23 @@ const PaperTrade = () => {
   const [strategies, setStrategies] = useState([]);
   const [selectedInstance, setSelectedInstance] = useState(null);
   const [confirm, setConfirm] = useState(null); // { type, key, ... }
+  const [capital, setCapital] = useState(20000);
+  const [marginPct, setMarginPct] = useState(25);
 
   useEffect(() => {
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
+    // Load the user's (admin-set) default capital & margin for new instances.
+    fetch(`${API_URL}/broker-settings`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (data) {
+          if (data.initial_capital) setCapital(data.initial_capital);
+          if (data.margin_deployment_pct) setMarginPct(data.margin_deployment_pct);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   const fetchStatus = useCallback(async () => {
@@ -230,7 +242,11 @@ const PaperTrade = () => {
       const res = await fetch(`${API_URL}/paper-trade/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ strategy_id: selectedStrategy })
+        body: JSON.stringify({
+          strategy_id: selectedStrategy,
+          initial_capital: parseFloat(capital),
+          margin_pct: parseFloat(marginPct),
+        })
       });
       if (res.ok) {
         const data = await res.json();
@@ -287,17 +303,29 @@ const PaperTrade = () => {
           </h1>
           <p className="text-gray-400 text-sm mt-1">Simulating trades with real-time market data</p>
         </div>
-        <div className="flex gap-3 items-center">
+        <div className="flex flex-wrap gap-3 items-center">
           <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             <option value="PhantomV2">Phantom V2.5 (Default)</option>
             <option value="FastTest">Fast Test Strategy</option>
             {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
-          <button onClick={startTrade} disabled={loading}
-                  className="px-6 py-2 rounded-lg font-bold transition bg-blue-600 hover:bg-blue-500 disabled:opacity-50 flex items-center gap-2">
-            <Play size={18} /> {loading ? 'Starting…' : 'Start Instance'}
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Capital (₹)</label>
+              <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
+                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-32 outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Margin %</label>
+              <input type="number" min="1" max="100" step="1" value={marginPct} onChange={e => setMarginPct(e.target.value)}
+                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-20 outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <button onClick={startTrade} disabled={loading}
+                    className="self-end px-6 py-2 rounded-lg font-bold transition bg-blue-600 hover:bg-blue-500 disabled:opacity-50 flex items-center gap-2">
+              <Play size={18} /> {loading ? 'Starting…' : 'Start Instance'}
+            </button>
+          </div>
         </div>
       </div>
 

@@ -73,6 +73,7 @@ class BacktestRun(Base):
     end_date = Column(DateTime)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
     config_json = Column(String)
+    initial_capital = Column(Float, nullable=True)   # capital the run started with (default = user's/admin-set)
     final_equity = Column(Float)
     total_trades = Column(Integer)
     win_rate = Column(Float)
