@@ -16,7 +16,7 @@ from .database.models import init_db, SessionLocal, User, CustomStrategy, Backte
 import bcrypt
 from passlib.context import CryptContext
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Load environment variables
 load_dotenv()
@@ -39,6 +39,16 @@ import uuid
 # Global state
 paper_trade_instances: Dict[str, PaperTradeService] = {}
 live_trade_instances: Dict[str, LiveTradeService] = {}
+
+
+def _utc_ts(dt):
+    """Return a UTC UNIX timestamp (seconds) from a datetime, regardless of
+    whether the datetime is timezone-aware or naive (assumed UTC)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 class StrategyParams(PhantomV2Config):
     pass
@@ -216,6 +226,11 @@ class ClientCreate(BaseModel):
     margin_deployment_pct: float = 25.0
     can_paper: bool = True
     can_live: bool = False
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    email: Optional[str] = None
+    company: Optional[str] = None
+    notes: Optional[str] = None
 
 class ClientUpdate(BaseModel):
     password: Optional[str] = None
@@ -224,6 +239,11 @@ class ClientUpdate(BaseModel):
     can_paper: Optional[bool] = None
     can_live: Optional[bool] = None
     is_active: Optional[bool] = None
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    email: Optional[str] = None
+    company: Optional[str] = None
+    notes: Optional[str] = None
 
 def _client_dict(u: User):
     return {
@@ -233,6 +253,8 @@ def _client_dict(u: User):
         "can_live": u.can_live if u.can_live is not None else 0,
         "initial_capital": u.initial_capital, "margin_deployment_pct": u.margin_deployment_pct,
         "virtual_balance": u.virtual_balance, "broker_name": u.broker_name,
+        "full_name": u.full_name, "mobile": u.mobile, "email": u.email,
+        "company": u.company, "notes": u.notes,
         "has_api_keys": bool(u.api_key and u.api_secret), "created_at": u.created_at,
     }
 
@@ -253,7 +275,9 @@ def create_client(payload: ClientCreate, admin=Depends(require_admin), db=Depend
                     margin_deployment_pct=payload.margin_deployment_pct,
                     virtual_balance=payload.initial_capital,
                     can_paper=int(payload.can_paper), can_live=int(payload.can_live),
-                    is_active=1)
+                    is_active=1,
+                    full_name=payload.full_name, mobile=payload.mobile,
+                    email=payload.email, company=payload.company, notes=payload.notes)
         db.add(user)
         db.commit()
         db.refresh(user)
@@ -276,6 +300,11 @@ def update_client(client_id: int, payload: ClientUpdate, admin=Depends(require_a
         if payload.margin_deployment_pct is not None: user.margin_deployment_pct = payload.margin_deployment_pct
         if payload.can_paper is not None: user.can_paper = int(payload.can_paper)
         if payload.can_live is not None: user.can_live = int(payload.can_live)
+        if payload.full_name is not None: user.full_name = payload.full_name
+        if payload.mobile is not None: user.mobile = payload.mobile
+        if payload.email is not None: user.email = payload.email
+        if payload.company is not None: user.company = payload.company
+        if payload.notes is not None: user.notes = payload.notes
         if payload.is_active is not None:
             # Never allow deactivation of admin users
             if user.role == 'admin' and not payload.is_active:
@@ -377,7 +406,7 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         if s == 0:
             continue
         out.append({
-            "time": int(df_1h.index[i].timestamp()),
+            "time": int(_utc_ts(df_1h.index[i])),
             "direction": int(s),
             "price": float(closes[i]),
             "setup": str(meta['setup'][i]),
@@ -573,10 +602,9 @@ def start_paper_trade(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        # Fixed: Explicitly use the imported PhantomV2Config from the top of the file
-        # The issue was a scope conflict where the name PhantomV2Config was being shadowed or accessed incorrectly
-        from .core.strategy import PhantomV2Config as PConfig
-        service = PaperTradeService(strategy_id, PConfig(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        # Use the tuned champion config (same settings that drive the chart overlay)
+        # so paper trades match the strategy being analysed.
+        service = PaperTradeService(strategy_id, _load_champion_config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
 
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
@@ -597,15 +625,22 @@ def get_paper_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
+                current = getattr(trade, 'current_price', None) or trade.peak_price
+                pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * service.conversion_rate
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": trade.peak_price, "pnl": (trade.peak_price - trade.entry_price) * trade.direction * trade.lots * 85.0,
+                    "current": current, "pnl": pnl_inr,
+                    "entry_time": str(trade.entry_time), "bars_held": trade.bars_held,
                     "margin": trade.margin_inr
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
-                "equity_inr": service.equity_inr, "is_running": service.is_running, "active_trades": active_trades,
+                "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
+                "is_running": service.is_running, "active_trades": active_trades,
                 "open_trade_count": len(service.oms.active_trades),
+                "closed_trades": service.closed_trades[-50:],
+                "last_price": service.last_price, "last_checked": service.last_checked,
+                "conversion_rate": service.conversion_rate,
             })
     return status_list
 
@@ -688,37 +723,52 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
             Klines.symbol == symbol, 
             Klines.interval == interval
         ).order_by(Klines.event_time.desc()).limit(limit).all()
-        
+
         if data:
             # Reverse to get chronological order
             data.reverse()
             formatted = []
             for k in data:
                 formatted.append({
-                    "time": k.event_time.timestamp(),
+                    "time": int(_utc_ts(k.event_time)),
                     "open": k.open,
                     "high": k.high,
                     "low": k.low,
                     "close": k.close,
+                    "volume": k.volume,
                 })
             return formatted
 
         # Fallback to API if DB is empty
         import requests
         url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=10).json()
         formatted = []
         for k in res:
             formatted.append({
-                "time": k[0] / 1000,
+                "time": int(k[0] / 1000),
                 "open": float(k[1]),
                 "high": float(k[2]),
                 "low": float(k[3]),
                 "close": float(k[4]),
+                "volume": float(k[5]),
             })
         return formatted
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Klines fetch error: {str(e)}")
+        # No local data and the remote API is unreachable — return an empty
+        # series so the UI shows an empty chart instead of a hard error.
+        print(f"Klines fetch error for {symbol}/{interval}: {e}")
+        return []
+
+@app.get("/symbols")
+def list_symbols(user=Depends(get_current_user), db=Depends(get_db)):
+    """Distinct symbols available in the local market-data store."""
+    try:
+        rows = db.query(Klines.symbol).distinct().all()
+        return [r[0] for r in rows]
+    except Exception:
+        return ["BTCUSDT"]
+
 
 class BrokerSettingsUpdate(BaseModel):
     api_key: str

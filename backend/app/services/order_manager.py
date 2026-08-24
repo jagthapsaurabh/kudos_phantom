@@ -22,6 +22,7 @@ class Trade:
     lots: float
     status: OrderStatus = OrderStatus.OPEN
     peak_price: float = 0.0
+    current_price: float = 0.0     # latest market price while the trade is open
     exit_price: float = 0.0
     exit_time: any = None
     exit_reason: str = ""
@@ -65,7 +66,7 @@ class OrderManager:
             symbol=symbol, direction=direction, entry_price=price_usd, sl=sl, tp=tp, 
             trail_activation=trail_act, trail_stop=trail_stop, atr_at_entry=atr_usd, 
             entry_time=timestamp, margin_inr=margin_inr, notional_usd=notional_usd, lots=lots,
-            peak_price=price_usd
+            peak_price=price_usd, current_price=price_usd
         )
         self.active_trades[symbol] = trade
         return trade
@@ -74,7 +75,7 @@ class OrderManager:
         if symbol not in self.active_trades: return None
         trade = self.active_trades[symbol]
         trade.bars_held += 1
-        
+        trade.current_price = current_price_usd
         if trade.direction == 1:
             # 1. Update peak and activate trail
             trade.peak_price = max(trade.peak_price, current_price_usd)

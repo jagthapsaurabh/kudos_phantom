@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, ShieldCheck, Users } from 'lucide-react';
+import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, ShieldCheck, Users, LineChart } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -33,6 +33,7 @@ const Navbar = () => {
 
   const navItems = [
     { name: 'Dashboard', path: '/', icon: <LayoutDashboard size={20} /> },
+    { name: 'Market Chart', path: '/chart', icon: <LineChart size={20} /> },
     { name: 'Backtesting', path: '/backtest', icon: <TrendingUp size={20} /> },
     { name: 'Paper Trade', path: '/paper', icon: <Activity size={20} /> },
     { name: 'Strategies', path: '/strategies', icon: <PlayCircle size={20} /> },

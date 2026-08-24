@@ -30,16 +30,17 @@ const TradeCard = ({ trade, onClose }) => (
         </div>
       </div>
       <div className="text-right">
-        <div className="text-xs text-gray-500 uppercase font-bold">PnL</div>
+        <div className="text-xs text-gray-500 uppercase font-bold">Unrealised PnL</div>
         <div className={`text-lg font-mono font-bold ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-          {trade.pnl >= 0 ? '+' : ''}{trade.pnl.toFixed(2)}
+          {trade.pnl >= 0 ? '+' : ''}{Number(trade.pnl).toFixed(2)}
         </div>
       </div>
     </div>
-    <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
-      <div className="bg-gray-800/50 p-1 rounded">Entry: <span className="text-white">{trade.entry.toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-1 rounded">Current: <span className="text-white">{trade.current.toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-1 rounded">Margin: <span className="text-white">₹{trade.margin.toFixed(0)}</span></div>
+    <div className="grid grid-cols-2 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
+      <div className="bg-gray-800/50 p-2 rounded">Entry<br /><span className="text-white text-xs">{Number(trade.entry).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Current<br /><span className="text-white text-xs">{Number(trade.current).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Margin<br /><span className="text-white text-xs">₹{Number(trade.margin).toFixed(0)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Bars Held<br /><span className="text-white text-xs">{trade.bars_held ?? 0}</span></div>
     </div>
     {onClose && (
       <button onClick={onClose} className="mt-3 w-full text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 py-1 rounded border border-red-900/40 hover:bg-red-900/20 transition">
@@ -48,6 +49,48 @@ const TradeCard = ({ trade, onClose }) => (
     )}
   </div>
 );
+
+// ---------- Closed Trades Panel ----------
+const ClosedTradesPanel = ({ closedTrades }) => {
+  if (!closedTrades || closedTrades.length === 0) {
+    return (
+      <div className="bg-gray-800/50 p-6 rounded-2xl border border-dashed border-gray-700 text-center text-sm text-gray-600">
+        No closed trades yet. Closed trades will appear here as the simulator fills & exits positions.
+      </div>
+    );
+  }
+  return (
+    <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
+      <h4 className="text-xs font-bold text-gray-400 uppercase mb-3">Trade Reply / Closed Trades ({closedTrades.length})</h4>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead className="bg-gray-900 text-gray-500 uppercase">
+            <tr>
+              <th className="p-2">Dir</th>
+              <th className="p-2">Entry</th>
+              <th className="p-2">Exit</th>
+              <th className="p-2">PnL</th>
+              <th className="p-2">Reason</th>
+              <th className="p-2">Held</th>
+            </tr>
+          </thead>
+          <tbody>
+            {closedTrades.map((t, i) => (
+              <tr key={i} className="border-b border-gray-700/60">
+                <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
+                <td className="p-2 font-mono text-gray-300">{Number(t.entry).toFixed(2)}</td>
+                <td className="p-2 font-mono text-gray-300">{Number(t.exit).toFixed(2)}</td>
+                <td className={`p-2 font-mono font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(2)}</td>
+                <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{t.reason || '—'}</span></td>
+                <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
 
 // ---------- Log Panel ----------
 const LogPanel = ({ instanceKey }) => {
@@ -115,6 +158,7 @@ const LogPanel = ({ instanceKey }) => {
 // ---------- Instance Card ----------
 const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
   const activeTrades = inst.active_trades || [];
+  const lastChecked = inst.last_checked ? new Date(inst.last_checked).toLocaleTimeString() : '—';
   return (
     <div onClick={() => onSelect(inst.instance_key)}
          className={`p-4 rounded-xl border cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
@@ -127,9 +171,10 @@ const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
           {inst.is_running ? 'Running' : 'Stopped'}
         </span>
       </div>
-      <div className="text-xl font-mono text-yellow-400 mb-2">₹{(inst.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+      <div className="text-xl font-mono text-yellow-400 mb-1">₹{(inst.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+      <div className="text-[10px] text-gray-500 font-mono mb-2">Last: {inst.last_price ? Number(inst.last_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'} · {lastChecked}</div>
       <div className="flex justify-between items-center text-xs text-gray-500">
-        <span>{activeTrades.length} open trade(s)</span>
+        <span>{activeTrades.length} open · {(inst.closed_trades || []).length} closed</span>
         <span className="font-mono text-gray-600">{inst.instance_key.split('_').pop()}</span>
       </div>
       {inst.is_running && (
@@ -305,7 +350,10 @@ const PaperTrade = () => {
                 <Activity size={20} className="text-blue-400" /> Simulated Positions
               </h3>
               {currentInstance && (
-                <span className="text-xs text-gray-500 font-mono">{currentInstance.instance_key.split('_').pop()}</span>
+                <div className="flex items-center gap-3 text-xs">
+                  <span className="text-gray-500">Equity <span className="text-yellow-400 font-mono">₹{(currentInstance.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</span></span>
+                  <span className="text-gray-500 font-mono">{currentInstance.instance_key.split('_').pop()}</span>
+                </div>
               )}
             </div>
             {activeTrades.length > 0 ? (
@@ -319,6 +367,9 @@ const PaperTrade = () => {
               </div>
             )}
           </div>
+
+          {/* Closed trades / trade reply for selected instance */}
+          <ClosedTradesPanel closedTrades={currentInstance?.closed_trades} />
         </div>
 
         {/* Right col: Live logs */}

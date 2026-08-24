@@ -31,8 +31,12 @@ def factory_reset():
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
     
     admin_user = User(
-        username=username, 
+        username=username,
         password_hash=hashed,
+        role='admin',
+        is_active=1,
+        can_paper=1,
+        can_live=1,
         initial_capital=20000.0,
         margin_deployment_pct=25.0
     )

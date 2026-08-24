@@ -2,8 +2,20 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import datetime
+import os
 
 Base = declarative_base()
+
+# ---------------------------------------------------------------------------
+# Database location
+# ---------------------------------------------------------------------------
+# Anchor the SQLite file to the backend directory so the app uses the SAME
+# database regardless of the process working directory. Override with the
+# DATABASE_URL environment variable (e.g. postgres://... or sqlite:///...).
+# __file__ = backend/app/database/models.py -> go up 3 levels to backend/
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, 'trading_system.db')
+DATABASE_URL = os.getenv('DATABASE_URL', f'sqlite:///{_DEFAULT_DB_PATH}')
 
 class User(Base):
     __tablename__ = 'users'
@@ -21,6 +33,12 @@ class User(Base):
     is_active = Column(Integer, default=1)           # 0 = login blocked
     can_paper = Column(Integer, default=1)           # paper-trading allowed
     can_live = Column(Integer, default=0)            # live trading requires admin grant
+    # ---- Client profile / basic info (v3.2) ----
+    full_name = Column(String, nullable=True)        # e.g. "Rahul Sharma"
+    mobile = Column(String, nullable=True)           # contact mobile number
+    email = Column(String, nullable=True)            # contact email
+    company = Column(String, nullable=True)          # firm / organisation
+    notes = Column(String, nullable=True)            # admin notes
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Klines(Base):
@@ -108,7 +126,7 @@ class Trade(Base):
     equity_at_entry = Column(Float, nullable=True)
     run = relationship("BacktestRun", back_populates="trades")
 
-engine = create_engine('sqlite:///trading_system.db', connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 
 def migrate_db():

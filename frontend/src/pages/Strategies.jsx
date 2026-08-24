@@ -342,7 +342,8 @@ const Strategies = () => {
   const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [editingStrat, setEditingStrat] = useState(null);
-  const [stratType, setStratType] = useState('params'); 
+  const [stratType, setStratType] = useState('params');
+  const [confirm, setConfirm] = useState(null); // { id, name }
   const [rootGroup, setRootGroup] = useState({ 
     id: 'root', type: 'group', operator: 'AND', children: [], enabled: true 
   });
@@ -366,6 +367,27 @@ const Strategies = () => {
   };
 
   useEffect(() => { fetchStrategies(); }, []);
+
+  const doDelete = async () => {
+    if (!confirm) return;
+    try {
+      const res = await fetch(`${API_URL}/strategies/${confirm.id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      if (res.ok) {
+        setStrategies(strats => strats.filter(s => s.id !== confirm.id));
+      } else {
+        const data = await res.json();
+        alert(data.detail || 'Failed to delete strategy');
+      }
+    } catch (e) {
+      alert('Network error');
+    }
+    setConfirm(null);
+  };
+
+  const requestDelete = (id, name) => setConfirm({ id, name });
 
   const handleSave = async () => {
     setLoading(true);
@@ -445,6 +467,18 @@ const Strategies = () => {
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+      {confirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setConfirm(null)}>
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-bold text-white mb-2">Delete Strategy?</h3>
+            <p className="text-sm text-gray-400 mb-6">This will permanently delete "{confirm.name}". This action cannot be undone.</p>
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setConfirm(null)} className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-300 hover:text-white bg-gray-700 hover:bg-gray-600 transition">Cancel</button>
+              <button onClick={doDelete} className="px-4 py-2 rounded-lg text-sm font-bold text-white bg-red-600 hover:bg-red-500 transition">Yes, Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="flex justify-between items-center mb-8">
         <h1 className="text-3xl font-bold text-blue-400">Strategies Manager</h1>
         <button onClick={() => { 
@@ -479,6 +513,9 @@ const Strategies = () => {
                 <td className="p-4 text-gray-400 text-sm">{new Date(s.created_at).toLocaleDateString()}</td>
                 <td className="p-4">
                   <button onClick={() => openEdit(s)} className="text-blue-400 hover:text-blue-300 mr-4">Edit</button>
+                  <button onClick={() => requestDelete(s.id, s.name)} className="text-red-400 hover:text-red-300">
+                    <Trash2 size={14} className="inline" />
+                  </button>
                 </td>
               </tr>
             ))}

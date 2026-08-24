@@ -23,7 +23,8 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
 
 // ---------------------------------------------------------------- Clients --
 const AddClientForm = ({ onCreated }) => {
-  const [form, setForm] = useState({ username: '', password: '', initial_capital: 20000, margin_deployment_pct: 25, can_paper: true, can_live: false });
+  const initialForm = { username: '', password: '', full_name: '', mobile: '', email: '', company: '', notes: '', initial_capital: 20000, margin_deployment_pct: 25, can_paper: true, can_live: false };
+  const [form, setForm] = useState(initialForm);
   const [msg, setMsg] = useState(null);
   const [showPw, setShowPw] = useState(false);
 
@@ -37,39 +38,59 @@ const AddClientForm = ({ onCreated }) => {
     const data = await res.json();
     if (res.ok) {
       setMsg({ ok: true, text: `Client '${data.client.username}' created` });
-      setForm({ username: '', password: '', initial_capital: 20000, margin_deployment_pct: 25, can_paper: true, can_live: false });
+      setForm(initialForm);
       onCreated();
     } else {
       setMsg({ ok: false, text: data.detail || 'Failed to create client' });
     }
   };
 
+  const field = 'bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm w-full';
+
   return (
     <form onSubmit={submit} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 mb-6">
       <h3 className="text-sm font-bold text-gray-300 uppercase tracking-wider mb-4 flex items-center gap-2"><Plus size={16} /> Add New Client</h3>
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
-        <div className="md:col-span-2">
-          <label className="text-[10px] text-gray-500 uppercase block mb-1">Username</label>
-          <input required value={form.username} onChange={e => setForm({ ...form, username: e.target.value })}
-            className="w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm" />
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Username *</label>
+          <input required value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} className={field} />
         </div>
-        <div className="md:col-span-2 relative">
-          <label className="text-[10px] text-gray-500 uppercase block mb-1">Password</label>
-          <input required type={showPw ? 'text' : 'password'} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })}
-            className="w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm pr-8" />
-          <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-2 bottom-2 text-gray-500 hover:text-gray-300">
-            {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Password *</label>
+          <div className="relative">
+            <input required type={showPw ? 'text' : 'password'} value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} className={`${field} pr-8`} />
+            <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-2 bottom-2 text-gray-500 hover:text-gray-300">
+              {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Full Name</label>
+          <input value={form.full_name} onChange={e => setForm({ ...form, full_name: e.target.value })} className={field} placeholder="e.g. Rahul Sharma" />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Mobile No.</label>
+          <input value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value })} className={field} placeholder="+91 98xxxxxxx" />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Email</label>
+          <input type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} className={field} placeholder="client@example.com" />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Company / Firm</label>
+          <input value={form.company} onChange={e => setForm({ ...form, company: e.target.value })} className={field} />
         </div>
         <div>
           <label className="text-[10px] text-gray-500 uppercase block mb-1">Capital (₹)</label>
-          <input type="number" value={form.initial_capital} onChange={e => setForm({ ...form, initial_capital: e.target.value })}
-            className="w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm" />
+          <input type="number" value={form.initial_capital} onChange={e => setForm({ ...form, initial_capital: e.target.value })} className={field} />
         </div>
         <div>
           <label className="text-[10px] text-gray-500 uppercase block mb-1">Margin %</label>
-          <input type="number" value={form.margin_deployment_pct} onChange={e => setForm({ ...form, margin_deployment_pct: e.target.value })}
-            className="w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm" />
+          <input type="number" value={form.margin_deployment_pct} onChange={e => setForm({ ...form, margin_deployment_pct: e.target.value })} className={field} />
+        </div>
+        <div>
+          <label className="text-[10px] text-gray-500 uppercase block mb-1">Notes</label>
+          <input value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className={field} />
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-6 mt-4">
@@ -119,17 +140,26 @@ const ClientRow = ({ client, onChanged, onConfirm }) => {
     <>
       <tr className={`border-b border-gray-800 hover:bg-gray-800/40 ${isAdmin ? 'bg-purple-900/10' : ''}`}>
         <td className="p-3">
-          <div className="font-bold text-gray-200">{client.username}</div>
-          <div className={`text-[10px] uppercase font-bold ${isAdmin ? 'text-purple-400' : 'text-blue-400'}`}>{client.role}</div>
+          <div className="font-bold text-gray-200">{client.full_name || client.username}</div>
+          <div className="text-[10px] text-gray-500">@{client.username} · <span className={`uppercase font-bold ${isAdmin ? 'text-purple-400' : 'text-blue-400'}`}>{client.role}</span></div>
+          {(client.mobile || client.email) && (
+            <div className="text-[10px] text-gray-500 mt-0.5">
+              {client.mobile && <span>{client.mobile}</span>}
+              {client.mobile && client.email && <span> · </span>}
+              {client.email && <span>{client.email}</span>}
+            </div>
+          )}
         </td>
         <td className="p-3 font-mono text-gray-300">₹{(client.initial_capital || 0).toLocaleString()}</td>
         <td className="p-3 font-mono text-gray-400">{client.margin_deployment_pct}%</td>
         <td className="p-3">
-          <Toggle value={!!client.can_paper} onClick={() => patch({ can_paper: !client.can_paper })}
+          <Toggle value={!!client.can_paper}
+            onClick={() => onConfirm({ type: 'toggle', field: 'can_paper', clientId: client.id, username: client.username, newValue: !client.can_paper, label: 'paper trading' })}
             okColor="bg-green-900/40 text-green-400 border-green-800/50" title="Allow paper trading" disabled={isAdmin} />
         </td>
         <td className="p-3">
-          <Toggle value={!!client.can_live} onClick={() => patch({ can_live: !client.can_live })}
+          <Toggle value={!!client.can_live}
+            onClick={() => onConfirm({ type: 'toggle', field: 'can_live', clientId: client.id, username: client.username, newValue: !client.can_live, label: 'live trading' })}
             okColor="bg-red-900/40 text-red-400 border-red-800/50" title="Allow live trading" disabled={isAdmin} />
         </td>
         <td className="p-3">
@@ -453,13 +483,23 @@ const AdminPanel = () => {
 
   const doConfirm = async () => {
     if (!confirm) return;
-    if (confirm.type === 'deactivate') {
-      await fetch(`${API_URL}/admin/clients/${confirm.clientId}`, {
-        method: 'PUT', headers: authHeaders(),
-        body: JSON.stringify({ is_active: confirm.newValue }),
-      });
-      // Trigger reload by toggling tab briefly
-      window.location.reload();
+    try {
+      if (confirm.type === 'deactivate') {
+        await fetch(`${API_URL}/admin/clients/${confirm.clientId}`, {
+          method: 'PUT', headers: authHeaders(),
+          body: JSON.stringify({ is_active: confirm.newValue }),
+        });
+        // Trigger reload by toggling tab briefly
+        window.location.reload();
+      } else if (confirm.type === 'toggle') {
+        await fetch(`${API_URL}/admin/clients/${confirm.clientId}`, {
+          method: 'PUT', headers: authHeaders(),
+          body: JSON.stringify({ [confirm.field]: confirm.newValue }),
+        });
+        window.location.reload();
+      }
+    } catch (e) {
+      alert(e.message || 'Action failed');
     }
     setConfirm(null);
   };
@@ -475,10 +515,28 @@ const AdminPanel = () => {
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
       <ConfirmModal
         open={!!confirm}
-        title={confirm?.type === 'deactivate' ? (confirm?.newValue === false ? 'Deactivate Client?' : 'Reactivate Client?') : 'Confirm'}
-        message={confirm?.type === 'deactivate' ? (confirm?.newValue === false ? `Are you sure you want to deactivate "${confirm?.username}"? They will not be able to log in.` : `Reactivate "${confirm?.username}"? They will be able to log in again.`) : ''}
-        confirmLabel={confirm?.newValue === false ? 'Yes, Deactivate' : 'Yes, Reactivate'}
-        confirmColor={confirm?.newValue === false ? 'bg-red-600 hover:bg-red-500' : 'bg-green-600 hover:bg-green-500'}
+        title={
+          confirm?.type === 'deactivate'
+            ? (confirm?.newValue === false ? 'Deactivate Client?' : 'Reactivate Client?')
+            : confirm?.type === 'toggle'
+              ? (confirm?.newValue === false ? `Disable ${confirm?.label}?` : `Enable ${confirm?.label}?`)
+              : 'Confirm'
+        }
+        message={
+          confirm?.type === 'deactivate'
+            ? (confirm?.newValue === false ? `Are you sure you want to deactivate "${confirm?.username}"? They will not be able to log in.` : `Reactivate "${confirm?.username}"? They will be able to log in again.`)
+            : confirm?.type === 'toggle'
+              ? (confirm?.newValue === false ? `Disable ${confirm?.label} for "${confirm?.username}"? They will lose this capability.` : `Enable ${confirm?.label} for "${confirm?.username}"?`)
+              : ''
+        }
+        confirmLabel={
+          confirm?.type === 'deactivate'
+            ? (confirm?.newValue === false ? 'Yes, Deactivate' : 'Yes, Reactivate')
+            : confirm?.type === 'toggle'
+              ? (confirm?.newValue === false ? 'Yes, Disable' : 'Yes, Enable')
+              : 'Confirm'
+        }
+        confirmColor={(confirm?.newValue === false ? 'bg-red-600 hover:bg-red-500' : 'bg-green-600 hover:bg-green-500')}
         onCancel={() => setConfirm(null)}
         onConfirm={doConfirm}
       />
