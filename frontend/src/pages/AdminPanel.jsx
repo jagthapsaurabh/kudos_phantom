@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
-import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet } from 'lucide-react';
+import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet, Percent, Plug, Database, Upload, Save } from 'lucide-react';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -538,6 +538,66 @@ const CapitalTab = () => {
   );
 };
 
+
+// ------------------------------------------------------------- Fee schedules --
+const FeeSettingsTab = () => {
+  const [fees, setFees] = useState([]);
+  const [brokers, setBrokers] = useState([]);
+  const [msg, setMsg] = useState(null);
+  const load = async () => {
+    const [f, b] = await Promise.all([
+      fetch(`${API_URL}/admin/fee-settings`, { headers: authHeaders() }).then(r => r.json()),
+      fetch(`${API_URL}/admin/brokers`, { headers: authHeaders() }).then(r => r.json()),
+    ]);
+    setFees(Array.isArray(f) ? f : []); setBrokers(Array.isArray(b) ? b : []);
+  };
+  useEffect(() => { load(); }, []);
+  const update = (id, key, value) => setFees(rows => rows.map(row => row.id === id ? { ...row, [key]: value } : row));
+  const save = async row => {
+    const res = await fetch(`${API_URL}/admin/fee-settings`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({
+      broker_code: row.broker_code, mode: row.mode, taker_fee_bps: Number(row.taker_fee_bps), maker_fee_bps: Number(row.maker_fee_bps), enabled: !!row.enabled,
+    }) });
+    setMsg(res.ok ? { ok: true, text: `${row.broker_code} ${row.mode} schedule saved.` } : { ok: false, text: (await res.json()).detail || 'Save failed' });
+    if (res.ok) load();
+  };
+  return <div className="space-y-5 max-w-6xl">
+    <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Percent size={16} className="text-yellow-400" /> Exchange fee schedules</h3><p className="text-xs text-gray-500 mt-2">These basis-point values are applied to every new backtest, paper session and live session. TP exits use the maker rate; all other fills use the taker rate. Existing runs keep their recorded schedule.</p></div>
+    <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="bg-gray-900 text-gray-500 text-[10px] uppercase"><tr><th className="p-3">Broker / data</th><th className="p-3">Mode</th><th className="p-3">Taker (bps)</th><th className="p-3">Maker (bps)</th><th className="p-3">Status</th><th className="p-3"></th></tr></thead><tbody>{fees.map(row => <tr key={row.id} className="border-t border-gray-700"><td className="p-3 font-bold text-gray-200">{row.broker_code}</td><td className="p-3"><span className="px-2 py-1 rounded bg-blue-900/30 text-blue-300 text-xs uppercase">{row.mode}</span></td><td className="p-3"><input type="number" min="0" step="0.01" value={row.taker_fee_bps} onChange={e => update(row.id, 'taker_fee_bps', e.target.value)} className="w-28 bg-gray-900 border border-gray-700 rounded p-2" /></td><td className="p-3"><input type="number" min="0" step="0.01" value={row.maker_fee_bps} onChange={e => update(row.id, 'maker_fee_bps', e.target.value)} className="w-28 bg-gray-900 border border-gray-700 rounded p-2" /></td><td className="p-3"><button onClick={() => update(row.id, 'enabled', !row.enabled)} className={`text-[10px] font-bold px-2 py-1 rounded border ${row.enabled ? 'text-green-400 border-green-800 bg-green-900/20' : 'text-gray-500 border-gray-700'}`}>{row.enabled ? 'ACTIVE' : 'DISABLED'}</button></td><td className="p-3"><button onClick={() => save(row)} className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded text-xs font-bold flex items-center gap-1"><Save size={12} /> Save</button></td></tr>)}</tbody></table></div>{fees.length === 0 && <div className="p-8 text-center text-gray-500 text-sm">No schedules found. Restart the API to seed the built-in defaults.</div>}</div>
+    {msg && <div className={msg.ok ? 'text-green-400 text-xs font-semibold' : 'text-red-400 text-xs font-semibold'}>{msg.text}</div>}
+  </div>;
+};
+
+// --------------------------------------------------------- Broker registry --
+const BrokerIntegrationsTab = () => {
+  const blank = { code: '', name: '', kind: 'generic', market_data_url: '', trading_api_url: '', notes: '' };
+  const [form, setForm] = useState(blank); const [rows, setRows] = useState([]); const [msg, setMsg] = useState(null);
+  const load = () => fetch(`${API_URL}/admin/brokers`, { headers: authHeaders() }).then(r => r.json()).then(setRows).catch(() => {});
+  useEffect(() => { load(); }, []);
+  const add = async e => { e.preventDefault(); const res = await fetch(`${API_URL}/admin/brokers`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(form) }); const data = await res.json(); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Could not add integration' }); else { setMsg({ ok: true, text: `${form.name} added.` }); setForm(blank); load(); } };
+  const toggle = async row => { const res = await fetch(`${API_URL}/admin/brokers/${row.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ ...row, enabled: !row.enabled }) }); if (res.ok) load(); };
+  const f = 'w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
+  return <div className="space-y-5 max-w-6xl">
+    <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Plug size={16} className="text-green-400" /> Broker integrations</h3><p className="text-xs text-gray-500 mt-2">Binance Futures and Delta Exchange are ready-to-use adapters. Register another provider here so it is available as a named source; a runtime adapter is required before live orders can be sent.</p></div>
+    <form onSubmit={add} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 grid grid-cols-1 md:grid-cols-3 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Code *</label><input required placeholder="Bybit" className={f} value={form.code} onChange={e => setForm({ ...form, code: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Display name *</label><input required placeholder="Bybit Futures" className={f} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Adapter kind</label><select className={f} value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value })}><option value="generic">Generic / custom</option><option value="binance">Binance-compatible</option><option value="delta">Delta-compatible</option></select></div><div><label className="text-[10px] text-gray-500 uppercase">Market data URL</label><input className={f} placeholder="https://…" value={form.market_data_url} onChange={e => setForm({ ...form, market_data_url: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Trading API URL</label><input className={f} placeholder="https://…" value={form.trading_api_url} onChange={e => setForm({ ...form, trading_api_url: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Notes</label><input className={f} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></div><button className="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-bold text-sm md:col-span-3 w-fit">Add Integration</button>{msg && <span className="text-xs text-green-400">{msg.text}</span>}</form>
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">{rows.map(row => <div key={row.id} className="bg-gray-800 p-5 rounded-xl border border-gray-700 flex justify-between gap-3"><div><div className="font-bold text-gray-200">{row.name} <span className="text-[10px] text-gray-500 ml-2">{row.code}</span></div><div className="text-xs text-gray-500 mt-1">{row.kind} adapter · {row.is_builtin ? 'built-in' : 'admin configured'}</div><div className="text-[10px] text-gray-600 mt-1">{row.market_data_url || 'No market endpoint configured'}</div></div><button onClick={() => toggle(row)} className={`self-start px-2 py-1 text-[10px] rounded border ${row.enabled ? 'text-green-400 border-green-800' : 'text-gray-500 border-gray-700'}`}>{row.enabled ? 'ENABLED' : 'DISABLED'}</button></div>)}</div>
+  </div>;
+};
+
+// --------------------------------------------------------------- Seed data --
+const SeedDataTab = () => {
+  const [defs, setDefs] = useState([]); const [fetchAll, setFetchAll] = useState(false); const [source, setSource] = useState('Binance'); const [symbol, setSymbol] = useState('BTCUSDT'); const [intervals, setIntervals] = useState(['1m', '5m', '15m', '1h', '4h', '1d']); const [start, setStart] = useState(''); const [end, setEnd] = useState(''); const [limit, setLimit] = useState(1000); const [status, setStatus] = useState([]); const [busy, setBusy] = useState(false); const [msg, setMsg] = useState(null); const [file, setFile] = useState(null); const [csvInterval, setCsvInterval] = useState('1h');
+  const f = 'bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
+  const load = async () => { const [d, s] = await Promise.all([fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.json()), fetch(`${API_URL}/admin/market-data/status`, { headers: authHeaders() }).then(r => r.json())]); setDefs(d || []); setStatus(s || []); };
+  useEffect(() => { load(); }, []);
+  const seed = async e => { e.preventDefault(); setBusy(true); setMsg(null); const res = await fetch(`${API_URL}/admin/market-data/seed`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ source, symbol: symbol.toUpperCase(), intervals, start_date: start || null, end_date: end || null, limit: Number(limit), fetch_all: fetchAll }) }); const data = await res.json(); setBusy(false); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Seed failed' }); else { setMsg({ ok: true, text: `Seeded ${data.summary?.reduce((n, x) => n + (x.fetched || 0), 0) || 0} OHLCV candles.` }); load(); } };
+  const upload = async e => { e.preventDefault(); if (!file) return; setBusy(true); const body = new FormData(); body.append('file', file); body.append('source', source); body.append('symbol', symbol.toUpperCase()); body.append('interval', csvInterval); const res = await fetch(`${API_URL}/admin/market-data/seed-csv`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }, body }); const data = await res.json(); setBusy(false); setMsg(res.ok ? { ok: true, text: `Imported ${data.summary?.fetched || 0} candles with volume.` } : { ok: false, text: data.detail || 'CSV import failed' }); if (res.ok) load(); };
+  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><input type="date" className={f} value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><input type="date" className={f} value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Seeding…' : 'Fetch & Seed OHLCV'}</button></form></div>
+    <form onSubmit={upload} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex flex-wrap items-end gap-4"><div><label className="text-[10px] text-gray-500 uppercase block">CSV file (event_time, open, high, low, close, volume)</label><input type="file" accept=".csv" onChange={e => setFile(e.target.files?.[0])} className="text-sm text-gray-400 mt-2" /></div><div><label className="text-[10px] text-gray-500 uppercase block">CSV interval</label><select className={f} value={csvInterval} onChange={e => setCsvInterval(e.target.value)}>{['1m','5m','15m','1h','4h','1d'].map(i => <option key={i}>{i}</option>)}</select></div><button disabled={!file || busy} className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm flex items-center gap-2"><Upload size={14} /> Import CSV</button></form>
+    {msg && <div className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
+    <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="p-4 border-b border-gray-700 flex justify-between"><h3 className="font-bold text-gray-300">Seeded datasets</h3><button onClick={load} className="text-gray-400 hover:text-white"><RefreshCw size={15} /></button></div><div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 text-blue-300 font-bold">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{row.count}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>{status.length === 0 && <div className="p-8 text-center text-gray-500">No seeded data yet.</div>}</div>
+  </div>;
+};
+
 // ------------------------------------------------------------------- Main --
 const AdminPanel = () => {
   const [tab, setTab] = useState('clients');
@@ -580,6 +640,9 @@ const AdminPanel = () => {
     { id: 'password', label: 'Change Password', icon: <Lock size={16} /> },
     { id: 'strategy', label: 'Phantom Strategy', icon: <BookOpen size={16} /> },
     { id: 'paper', label: 'Paper Control', icon: <Activity size={16} /> },
+    { id: 'fees', label: 'Fees', icon: <Percent size={16} /> },
+    { id: 'brokers', label: 'Broker Integrations', icon: <Plug size={16} /> },
+    { id: 'seed', label: 'Seed Data', icon: <Database size={16} /> },
   ];
 
   return (
@@ -638,6 +701,9 @@ const AdminPanel = () => {
       {tab === 'password' && <ChangePasswordTab />}
       {tab === 'strategy' && <StrategyTab profile={champion?.profile} champion={champion} />}
       {tab === 'paper' && <PaperTab />}
+      {tab === 'fees' && <FeeSettingsTab />}
+      {tab === 'brokers' && <BrokerIntegrationsTab />}
+      {tab === 'seed' && <SeedDataTab />}
     </div>
   );
 };

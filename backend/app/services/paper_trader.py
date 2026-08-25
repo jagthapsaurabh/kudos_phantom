@@ -13,9 +13,14 @@ class PaperTradeService:
     MAX_LOG_LINES = 200  # keep last N log entries per instance
     MAX_CLOSED_TRADES = 100  # keep last N closed trades per instance
 
-    def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0, is_custom=False):
+    def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
+                 is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None, broker_definition=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
+        self.market_source = market_source or "Binance"
+        self.broker_name = broker_name or self.market_source
+        self.broker_definition = broker_definition
+        self.fee_schedule = fee_schedule
         self.initial_capital_inr = initial_capital
 
         if is_custom:
@@ -35,6 +40,9 @@ class PaperTradeService:
         self.equity_inr = initial_capital
         self.margin_pct = margin_pct
         self.conversion_rate = 85.0
+        if fee_schedule:
+            self.config.taker_fee_bps = float(getattr(fee_schedule, "taker_fee_bps", self.config.taker_fee_bps))
+            self.config.maker_fee_bps = float(getattr(fee_schedule, "maker_fee_bps", self.config.maker_fee_bps))
         self.last_price = None
         self.last_checked = None
         # Live log buffer: list of {"ts": ISO, "level": "info|warn|error|trade", "msg": str}
@@ -49,7 +57,7 @@ class PaperTradeService:
         if len(self.logs) > self.MAX_LOG_LINES:
             self.logs = self.logs[-self.MAX_LOG_LINES:]
 
-    def _record_closed(self, trade, pnl_inr):
+    def _record_closed(self, trade, pnl_inr, fees_inr=0.0, gross_pnl=None):
         """Append a closed trade to the instance history."""
         self.closed_trades.append({
             "symbol": trade.symbol,
@@ -57,6 +65,8 @@ class PaperTradeService:
             "entry": trade.entry_price,
             "exit": trade.exit_price,
             "pnl": pnl_inr,
+            "gross_pnl": gross_pnl if gross_pnl is not None else pnl_inr,
+            "fees": fees_inr,
             "reason": trade.exit_reason,
             "entry_time": str(trade.entry_time),
             "exit_time": str(trade.exit_time),
@@ -110,11 +120,16 @@ class PaperTradeService:
             result = self.oms.update_trade(symbol, current_price, current_atr, current_time)
             if result:
                 price_diff = (result.exit_price - result.entry_price) * result.direction
-                pnl_inr = (result.lots * price_diff) * self.conversion_rate
+                gross_pnl = (result.lots * price_diff) * self.conversion_rate
+                taker = float(getattr(self.config, "taker_fee_bps", 0.0))
+                maker = float(getattr(self.config, "maker_fee_bps", 0.0))
+                entry_fee = result.notional_usd * taker / 10000 * self.conversion_rate
+                exit_fee = result.notional_usd * (maker if result.exit_reason == "TP" else taker) / 10000 * self.conversion_rate
+                pnl_inr = gross_pnl - entry_fee - exit_fee
                 self.equity_inr += pnl_inr
-                self._record_closed(result, pnl_inr)
-                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — PnL ₹{pnl_inr:+,.2f} | Equity ₹{self.equity_inr:,.2f}")
-                print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason}, PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
+                self._record_closed(result, pnl_inr, entry_fee + exit_fee, gross_pnl)
+                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | Equity ₹{self.equity_inr:,.2f}")
+                print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason}, Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
 
         # ---- New entries --------------------------------------------
         if last_sig != 0:
@@ -134,27 +149,27 @@ class PaperTradeService:
             print(f"🔍 [{self.strategy_id}] Scanning... Current Price: {current_price:.2f}, No signal.")
 
     def _fetch_candles(self, interval, limit):
-        """Prefer locally-seeded DB candles (fast & offline-safe), then Binance API."""
+        """Use candles seeded for this source, then the source public API."""
         df = self._get_data_from_db("BTCUSDT", interval, limit)
         if df is not None and not df.empty:
             return df
         try:
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
-            res = requests.get(url, timeout=10).json()
-            df = pd.DataFrame(res, columns=['event_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'tbb', 'tbq', 'ignore'])
-            df['event_time'] = pd.to_datetime(df['event_time'], unit='ms')
-            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+            rows = BrokerClient(broker_name=self.market_source, definition=self.broker_definition).fetch_klines("BTCUSDT", interval, limit)
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return df
             df.set_index('event_time', inplace=True)
-            return df
+            return df.sort_index()
         except Exception:
             return None
 
     def _get_data_from_db(self, symbol, interval, limit=500):
-        """Return the most recent `limit` candles for a symbol/interval as a DataFrame."""
+        """Return the most recent candles for the selected source."""
         try:
             db = SessionLocal()
             data = db.query(Klines).filter(
-                Klines.symbol == symbol, Klines.interval == interval
+                Klines.symbol == symbol, Klines.interval == interval,
+                Klines.source == self.market_source
             ).order_by(Klines.event_time.desc()).limit(limit).all()
             db.close()
             if not data:
@@ -165,7 +180,6 @@ class PaperTradeService:
                 for k in data
             ])
             df.set_index('event_time', inplace=True)
-            df = df.sort_index()
-            return df
+            return df.sort_index()
         except Exception:
             return pd.DataFrame()

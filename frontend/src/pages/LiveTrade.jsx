@@ -48,9 +48,22 @@ const LiveTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
+  const [dataSource, setDataSource] = useState('Binance');
+  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  const [connections, setConnections] = useState([]);
+  const [connectionId, setConnectionId] = useState('');
+  const [capital, setCapital] = useState(20000);
+  const [marginPct, setMarginPct] = useState(25);
   const [confirm, setConfirm] = useState(null); // { instanceKey }
 
   useEffect(() => {
+    fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(list => {
+      if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
+    }).catch(() => {});
+    fetch(`${API_URL}/broker-connections`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(setConnections).catch(() => {});
+    fetch(`${API_URL}/broker-settings`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : null).then(data => {
+      if (data) { setDataSource(data.broker_name || 'Binance'); setCapital(data.initial_capital || 20000); setMarginPct(data.margin_deployment_pct || 25); }
+    }).catch(() => {});
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
@@ -59,12 +72,14 @@ const LiveTrade = () => {
   const startTrade = async () => {
     setLoading(true);
     try {
-      await fetch(`${API_URL}/live-trade/start`, {
+      const res = await fetch(`${API_URL}/live-trade/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ strategy_id: selectedStrategy })
+        body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
+          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct) })
       });
-    } catch (e) { console.error(e); }
+      if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
+    } catch (e) { console.error(e); alert(e.message); }
     setLoading(false);
   };
 
@@ -73,10 +88,9 @@ const LiveTrade = () => {
   const stopTrade = async () => {
     if (!confirm) return;
     try {
-      await fetch(`${API_URL}/live-trade/stop`, {
+      await fetch(`${API_URL}/live-trade/stop?instance_key=${encodeURIComponent(confirm.instanceKey)}`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ instance_key: confirm.instanceKey })
       });
       setConfirm(null);
     } catch (e) { console.error(e); }
@@ -91,12 +105,15 @@ const LiveTrade = () => {
   };
 
   useEffect(() => {
+    fetchStatus();
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, []);
 
-  const myInstances = status.filter(s => s.strategy_id === selectedStrategy);
-  const activeTrades = myInstances.flatMap(inst => inst.active_trades.map(t => ({...t, instance_key: inst.instance_key})));
+  // Every broker/strategy worker is independent; show all of them so an
+  // operator can monitor Binance and Delta concurrently.
+  const myInstances = status;
+  const activeTrades = myInstances.flatMap(inst => (inst.active_trades || []).map(t => ({...t, instance_key: inst.instance_key})));
   const marginUsed = activeTrades.reduce((sum, t) => sum + t.margin, 0);
 
   return (
@@ -117,7 +134,28 @@ const LiveTrade = () => {
           </h1>
           <p className="text-gray-400 text-sm mt-1">Executing real trades on your broker account</p>
         </div>
-        <div className="flex gap-4 items-center">
+        <div className="flex gap-4 items-center flex-wrap">
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Broker / Data</label>
+            <select value={dataSource} onChange={e => { setDataSource(e.target.value); setConnectionId(''); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+              {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Connection</label>
+            <select value={connectionId} onChange={e => setConnectionId(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+              <option value="">Primary / legacy</option>
+              {connections.filter(c => c.broker_code === dataSource).map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
+            <input type="number" value={capital} onChange={e => setCapital(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-28" />
+          </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Margin %</label>
+            <input type="number" value={marginPct} onChange={e => setMarginPct(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-20" />
+          </div>
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Active Strategy</label>
             <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
@@ -160,7 +198,7 @@ const LiveTrade = () => {
                 <div key={inst.instance_key} className="flex items-center justify-between p-3 bg-gray-900 rounded-lg border border-gray-700">
                   <div className="flex items-center gap-2">
                     <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                    <span className="text-xs font-mono">{inst.instance_key.split('_').pop()}</span>
+                    <span className="text-xs font-mono">{inst.broker_name || 'Binance'} · {inst.instance_key.split('_').pop()}</span>
                   </div>
                   <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">
                     <StopCircle size={16} />
@@ -186,7 +224,7 @@ const LiveTrade = () => {
             ) : (
               <div className="flex flex-col items-center justify-center h-[400px] text-gray-600">
                 <TrendingUp size={48} className="mb-4 opacity-20" />
-                <p>No live positions open. Scanning for institutional entries...</p>
+                <p>No live positions open. Scanning {dataSource} for institutional entries...</p>
               </div>
             )}
           </div>

@@ -7,15 +7,19 @@ from ..database.models import SessionLocal, Klines
 from datetime import datetime
 
 class BacktestEngine:
-    def __init__(self, config: PhantomV2Config = PhantomV2Config()):
+    def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Binance"):
         self.config = config
+        self.fee_schedule = fee_schedule
+        self.data_source = data_source
         self.strategy_service = StrategyService(config)
         self.validator_service = ValidatorService()
         self.oms = OrderManager(config)
 
-    def _get_data_from_db(self, symbol, interval, start_date=None, end_date=None):
+    def _get_data_from_db(self, symbol, interval, start_date=None, end_date=None, source=None):
         db = SessionLocal()
         query = db.query(Klines).filter(Klines.symbol == symbol, Klines.interval == interval)
+        if source:
+            query = query.filter(Klines.source == source)
         if start_date: query = query.filter(Klines.event_time >= start_date)
         if end_date: query = query.filter(Klines.event_time <= end_date)
         data = query.order_by(Klines.event_time.asc()).all()
@@ -38,8 +42,15 @@ class BacktestEngine:
         pnl_usd = result.lots * price_diff
         pnl_inr = pnl_usd * conversion_rate
 
-        entry_fee_inr = (result.notional_usd * (self.config.taker_fee_bps / 10000)) * conversion_rate
-        exit_rate = self.config.maker_fee_bps if result.exit_reason == "TP" else self.config.taker_fee_bps
+        fee = self.fee_schedule or self.config
+        if isinstance(fee, dict):
+            taker = float(fee.get("taker_fee_bps", 0.0))
+            maker = float(fee.get("maker_fee_bps", 0.0))
+        else:
+            taker = float(getattr(fee, "taker_fee_bps", 0.0))
+            maker = float(getattr(fee, "maker_fee_bps", 0.0))
+        entry_fee_inr = (result.notional_usd * (taker / 10000)) * conversion_rate
+        exit_rate = maker if result.exit_reason == "TP" else taker
         exit_fee_inr = (result.notional_usd * (exit_rate / 10000)) * conversion_rate
 
         net_pnl_inr = pnl_inr - entry_fee_inr - exit_fee_inr
@@ -88,9 +99,9 @@ class BacktestEngine:
             start_date=None, end_date=None, df_1h=None, df_4h=None,
             trade_log_path=None):
         if df_1h is None:
-            df_1h = self._get_data_from_db(symbol, "1h", start_date, end_date)
+            df_1h = self._get_data_from_db(symbol, "1h", start_date, end_date, self.data_source)
         if df_4h is None:
-            df_4h = self._get_data_from_db(symbol, "4h", start_date, end_date)
+            df_4h = self._get_data_from_db(symbol, "4h", start_date, end_date, self.data_source)
 
         if df_1h.empty or df_4h.empty:
             raise ValueError("Insufficient data in DB for the selected date range.")
