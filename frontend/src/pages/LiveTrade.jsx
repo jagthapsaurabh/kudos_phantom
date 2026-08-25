@@ -2,6 +2,23 @@ import React, { useState, useEffect } from 'react';
 import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet } from 'lucide-react';
 import { API_URL } from '../api';
 
+// ---------- Confirmation modal ----------
+const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onCancel}>
+      <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+        <h3 className="text-lg font-bold text-white mb-2">{title}</h3>
+        <p className="text-sm text-gray-400 mb-6">{message}</p>
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-300 hover:text-white bg-gray-700 hover:bg-gray-600 transition">Cancel</button>
+          <button onClick={onConfirm} className={`px-4 py-2 rounded-lg text-sm font-bold text-white transition ${confirmColor}`}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const TradeCard = ({ trade }) => (
   <div className={`p-4 rounded-xl border border-green-500/30 bg-green-500/5 transition hover:scale-[1.01]`}>
     <div className="flex justify-between items-start mb-3">
@@ -31,6 +48,7 @@ const LiveTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
+  const [confirm, setConfirm] = useState(null); // { instanceKey }
 
   useEffect(() => {
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
@@ -50,13 +68,17 @@ const LiveTrade = () => {
     setLoading(false);
   };
 
-  const stopTrade = async (instanceKey) => {
+  const requestStop = (instanceKey) => setConfirm({ instanceKey });
+
+  const stopTrade = async () => {
+    if (!confirm) return;
     try {
       await fetch(`${API_URL}/live-trade/stop`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ instance_key: instanceKey })
+        body: JSON.stringify({ instance_key: confirm.instanceKey })
       });
+      setConfirm(null);
     } catch (e) { console.error(e); }
   };
 
@@ -79,6 +101,15 @@ const LiveTrade = () => {
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+      <ConfirmModal
+        open={!!confirm}
+        title="Stop Live Trade Instance?"
+        message={`This will stop instance "${confirm?.instanceKey?.split('_').pop()}" and attempt to close any open positions. Confirmation required.`}
+        confirmLabel="Yes, Stop"
+        confirmColor="bg-red-600 hover:bg-red-500"
+        onCancel={() => setConfirm(null)}
+        onConfirm={stopTrade}
+      />
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold flex items-center gap-3 text-green-400">
@@ -131,7 +162,7 @@ const LiveTrade = () => {
                     <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
                     <span className="text-xs font-mono">{inst.instance_key.split('_').pop()}</span>
                   </div>
-                  <button onClick={() => stopTrade(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1">
+                  <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">
                     <StopCircle size={16} />
                   </button>
                 </div>

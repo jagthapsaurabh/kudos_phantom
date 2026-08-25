@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
-import { createChart } from 'lightweight-charts';
+import { createChart, AreaSeries } from 'lightweight-charts';
 import { API_URL } from '../api';
-import { Activity, TrendingUp, AlertCircle, RotateCcw, Trash2, Tag } from 'lucide-react';
+import { Activity, TrendingUp, AlertCircle, RotateCcw, Trash2, Tag, Download, Timer } from 'lucide-react';
 
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -42,11 +42,12 @@ const Backtest = () => {
   const [expandedTrade, setExpandedTrade] = useState(null);
   const [runName, setRunName] = useState('');
   const [confirm, setConfirm] = useState(null); // { type, runId, ... }
+  const [capital, setCapital] = useState(20000); // starting capital for the run (default = admin set)
 
   // Chart Refs
   const chartContainerRef = useRef();
   const chartRef = useRef();
-  const seriesRef = useRef();
+  const resultsRef = useRef(null);
 
   const paramGroups = {
     "Trend & Regime": ["trend_ema_period", "atr_regime_ratio", "cooldown_bars"],
@@ -74,8 +75,18 @@ const Backtest = () => {
     } catch (e) { }
   };
 
+  // Load the user's (admin-set) default capital to prefill the form.
+  useEffect(() => {
+    fetch(`${API_URL}/broker-settings`, { headers: authHeaders() })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => { if (data && data.initial_capital) setCapital(data.initial_capital); })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     if (results && results.equity_curve) {
+      resultsRef.current = results;
       const timer = setTimeout(() => { initEquityChart(results.equity_curve); }, 100);
       return () => clearTimeout(timer);
     }
@@ -123,6 +134,7 @@ const Backtest = () => {
           start_date: dates.start,
           end_date: dates.end,
           strategy_name: strategyName,
+          initial_capital: parseFloat(capital),
         }),
       });
 
@@ -140,7 +152,7 @@ const Backtest = () => {
           const res = await fetch(`${API_URL}/backtest/results/${runId}`, { headers: authHeaders() });
           const resultData = await res.json();
 
-          if (resultData.run_details && resultData.run_details.total_trades !== undefined && resultData.run_details.total_trades !== 0) {
+          if (resultData.run_details && resultData.run_details.total_trades !== undefined) {
             setResults({
               ...resultData.run_details,
               final_equity_inr: resultData.run_details.final_equity,
@@ -167,15 +179,19 @@ const Backtest = () => {
       layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
       grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
       width: chartContainerRef.current.clientWidth,
-      height: 400,
+      height: 380,
+      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 4 },
     });
-    const areaSeries = chart.addAreaSeries({
+    const areaSeries = chart.addSeries(AreaSeries, {
       lineColor: '#3b82f6',
       topColor: 'rgba(59, 130, 246, 0.4)',
       bottomColor: 'rgba(59, 130, 246, 0)',
       lineWidth: 2,
+      priceLineVisible: true,
+      lastValueVisible: true,
     });
-    areaSeries.setData(equityData.map((val, idx) => ({ time: idx, value: val })));
+    const start = resultsRef.current?.start_date ? new Date(resultsRef.current.start_date).getTime() / 1000 : 0;
+    areaSeries.setData(equityData.map((val, idx) => ({ time: Math.floor(start + idx * 3600), value: val })));
     chart.timeScale().fitContent();
     chartRef.current = chart;
   };
@@ -218,8 +234,9 @@ const Backtest = () => {
 
   const stats = results ? {
     totalTrades: results.total_trades,
+    initialCapital: results.initial_capital || 20000,
     finalEquity: results.final_equity_inr,
-    netProfit: results.final_equity_inr - 20000,
+    netProfit: results.final_equity_inr - (results.initial_capital || 20000),
     roi: results.roi,
     winRate: results.win_rate,
     profitFactor: results.profit_factor,
@@ -274,7 +291,7 @@ const Backtest = () => {
                   <div className={`font-mono text-sm mt-2 ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
                 </div>
                 <button onClick={(e) => { e.stopPropagation(); requestDeleteRun(run.id, run.name); }}
-                        className="absolute top-3 right-3 p-1.5 rounded-lg text-gray-600 hover:text-red-400 hover:bg-red-900/20 transition opacity-0 group-hover:opacity-100"
+                        className="absolute top-3 right-3 p-1.5 rounded-lg text-gray-500 hover:text-red-400 hover:bg-red-900/20 transition"
                         title="Delete this run">
                   <Trash2 size={14} />
                 </button>
@@ -285,86 +302,117 @@ const Backtest = () => {
         </div>
       )}
 
-      <div className="bg-gray-800 p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
-        <div className="flex flex-wrap items-start gap-8">
-          <div className="flex flex-col gap-4 w-full lg:w-auto shrink-0">
-            <div className="flex gap-4">
-              <div className="flex flex-col">
-                <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start Date</label>
-                <input type="date" value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })}
-                  className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
-              </div>
-              <div className="flex flex-col">
-                <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End Date</label>
-                <input type="date" value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })}
-                  className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
-              </div>
-            </div>
-            <div className="flex flex-col">
-              <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
-              <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
-                className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
-                <option value="PhantomV2">Phantom V2.5 (Default)</option>
-                {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-            </div>
-            <div className="flex flex-col">
-              <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run Name (optional)</label>
-              <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
-                className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
-            </div>
+      <div className="bg-gray-800 p-6 md:p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
+        {/* Top controls */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start Date</label>
+            <input type="date" value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
           </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End Date</label>
+            <input type="date" value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+          </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
+            <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+              <option value="PhantomV2">Phantom V2.5 (Default)</option>
+              {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run Name (optional)</label>
+            <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
+          </div>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
+            <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+          </div>
+        </div>
 
-          {selectedStrategyId === 'PhantomV2' && (
-            <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-6 border-l border-gray-700 pl-8">
-              {Object.entries(paramGroups).map(([groupName, fields]) => (
-                <div key={groupName} className="space-y-3">
-                  <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
-                  <div className="grid grid-cols-1 gap-3">
-                    {fields.map(field => (
-                      <div key={field} className="flex flex-col">
-                        <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
-                        {field === 'enable_momentum_entry' ? (
-                          <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
-                            <input type="checkbox" checked={!!params[field]}
-                              onChange={e => setParams({ ...params, [field]: e.target.checked })}
-                              className="accent-blue-500" />
-                            Momentum entries
-                          </label>
-                        ) : (
-                          <input type="number" step="0.01" value={params[field]}
-                            onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
-                            className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition" />
-                        )}
-                      </div>
-                    ))}
-                  </div>
+        {/* Parameter groups */}
+        {selectedStrategyId === 'PhantomV2' && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 border-t border-gray-700 pt-6">
+            {Object.entries(paramGroups).map(([groupName, fields]) => (
+              <div key={groupName} className="space-y-3">
+                <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
+                <div className="space-y-3">
+                  {fields.map(field => (
+                    <div key={field} className="flex flex-col">
+                      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
+                      {field === 'enable_momentum_entry' ? (
+                        <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
+                          <input type="checkbox" checked={!!params[field]}
+                            onChange={e => setParams({ ...params, [field]: e.target.checked })}
+                            className="accent-blue-500" />
+                          Momentum entries
+                        </label>
+                      ) : (
+                        <input type="number" step="0.01" value={params[field]}
+                          onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
+                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
+                      )}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-
-          <div className="flex flex-col justify-end gap-3 shrink-0">
-            <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2">
-              <RotateCcw size={14} /> Reset to Defaults
-            </button>
-            <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-8 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
-              {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : '🚀 Run Backtest'}
-            </button>
+              </div>
+            ))}
           </div>
+        )}
+
+        {/* Actions */}
+        <div className="mt-6 flex flex-col sm:flex-row justify-end items-stretch sm:items-center gap-3 border-t border-gray-700 pt-6">
+          <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2 px-4">
+            <RotateCcw size={14} /> Reset to Defaults
+          </button>
+          <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-10 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
+            {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : '🚀 Run Backtest'}
+          </button>
         </div>
       </div>
 
       {results ? (
         <div className="space-y-8 animate-in fade-in duration-500">
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= 20000 ? 'text-green-400' : 'text-red-400'} />
+          <div className="flex flex-wrap justify-between items-center gap-3 bg-gray-800 p-5 rounded-2xl border border-gray-700">
+            <div>
+              <h2 className="text-xl font-bold text-gray-200 flex items-center gap-2">
+                <Timer size={18} className="text-blue-400" /> {results.name || 'Unnamed Run'}
+              </h2>
+              <p className="text-xs text-gray-500 mt-1">
+                {results.start_date ? new Date(results.start_date).toLocaleDateString() : ''} → {results.end_date ? new Date(results.end_date).toLocaleDateString() : ''} · {results.total_trades} trades
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={exportTradesCSV} className="text-xs bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg font-bold transition flex items-center gap-2">
+                <Download size={14} /> CSV Export
+              </button>
+              <button onClick={() => requestDeleteRun(results.id, results.name)} className="text-xs bg-red-900/30 hover:bg-red-900/50 text-red-300 px-4 py-2 rounded-lg font-bold transition flex items-center gap-2">
+                <Trash2 size={14} /> Delete
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+            <StatCard label="Initial Capital" value={`₹${stats?.initialCapital?.toLocaleString()}`} color="text-yellow-400" />
+            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= (stats?.initialCapital || 0) ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="Net Profit" value={`₹${stats?.netProfit?.toLocaleString()}`} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="ROI" value={`${stats?.roi?.toFixed(2)}%`} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
             <StatCard label="Win Rate" value={`${stats?.winRate?.toFixed(2)}%`} color="text-purple-400" />
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+            <h3 className="text-sm font-semibold text-gray-400 mb-4 flex items-center gap-2">
+              <TrendingUp size={16} /> Equity Curve
+            </h3>
+            <div ref={chartContainerRef} className="w-full" />
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
               <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
               <div className="flex-1">
@@ -386,11 +434,41 @@ const Backtest = () => {
                 ))}
               </div>
             </div>
+
+            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+              <h3 className="text-sm font-semibold text-gray-400 mb-4 flex items-center gap-2">
+                <Activity size={16} /> Core Metrics
+              </h3>
+              <div className="space-y-4">
+                <MetricRow label="Total Trades" value={stats?.totalTrades} />
+                <MetricRow label="Profit Factor" value={`${stats?.profitFactor?.toFixed(2)}`} />
+                <MetricRow label="Sharpe Ratio" value={`${stats?.sharpe?.toFixed(2)}`} />
+                <MetricRow label="Max Drawdown" value={`${stats?.maxDD?.toFixed(2)}%`} color="text-red-400" />
+                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Long || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
+                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Short || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
+
+                <div className="border-t border-gray-700 mt-6 pt-6">
+                  <div className="flex justify-between items-center mb-3">
+                    <span className="text-xs font-bold text-gray-500 uppercase">Rejected Signals</span>
+                    <span className="bg-red-900/30 text-red-400 px-2 py-0.5 rounded text-xs font-bold border border-red-900/50">
+                      {Object.values(stats?.rejections || {}).reduce((a, b) => a + b, 0)}
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(stats?.rejections || {}).map(([reason, count]) => (
+                      <div key={reason} className="flex justify-between items-center p-2 bg-gray-900 rounded-lg border border-gray-700/50">
+                        <span className="text-[10px] text-gray-500 italic">{reason}</span>
+                        <span className="text-xs font-mono font-bold text-gray-300">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-xl">
-              <div className="p-4 border-b border-gray-700 bg-gray-700/30 flex justify-between items-center">
+          <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-xl">
+              <div className="p-4 border-b border-gray-700 bg-gray-700/30 flex flex-wrap justify-between items-center gap-2">
                 <h3 className="font-bold text-gray-200">Detailed Trade Logs <span className="text-xs text-gray-500 font-normal">(entry conditions per candle)</span></h3>
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] bg-gray-900 px-2 py-1 rounded text-gray-400">{results.trades?.length || 0} trades</span>
@@ -484,38 +562,6 @@ const Backtest = () => {
                 </table>
               </div>
             </div>
-
-            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-              <h3 className="text-sm font-semibold text-gray-400 mb-6 flex items-center gap-2">
-                <Activity size={16} /> Core Metrics
-              </h3>
-              <div className="space-y-4">
-                <MetricRow label="Total Trades" value={stats?.totalTrades} />
-                <MetricRow label="Profit Factor" value={`${stats?.profitFactor?.toFixed(2)}`} />
-                <MetricRow label="Sharpe Ratio" value={`${stats?.sharpe?.toFixed(2)}`} />
-                <MetricRow label="Max Drawdown" value={`${stats?.maxDD?.toFixed(2)}%`} color="text-red-400" />
-                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${((stats?.directionDist?.Long || 0) / stats?.totalTrades * 100).toFixed(1)}%)`} />
-                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${((stats?.directionDist?.Short || 0) / stats?.totalTrades * 100).toFixed(1)}%)`} />
-
-                <div className="border-t border-gray-700 mt-6 pt-6">
-                  <div className="flex justify-between items-center mb-3">
-                    <span className="text-xs font-bold text-gray-500 uppercase">Rejected Signals</span>
-                    <span className="bg-red-900/30 text-red-400 px-2 py-0.5 rounded text-xs font-bold border border-red-900/50">
-                      {Object.values(stats?.rejections || {}).reduce((a, b) => a + b, 0)}
-                    </span>
-                  </div>
-                  <div className="space-y-2">
-                    {Object.entries(stats?.rejections || {}).map(([reason, count]) => (
-                      <div key={reason} className="flex justify-between items-center p-2 bg-gray-900 rounded-lg border border-gray-700/50">
-                        <span className="text-[10px] text-gray-500 italic">{reason}</span>
-                        <span className="text-xs font-mono font-bold text-gray-300">{count}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
         </div>
       ) : (
         <div className="bg-gray-800 p-20 rounded-2xl border border-gray-700 text-center shadow-inner">

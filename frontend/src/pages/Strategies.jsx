@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus, FilePlus, Search, Settings, Info } from 'lucide-react';
+import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus, FilePlus, Search, Settings, Info, Radio, LineChart, ScanSearch } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../api';
 
 // --- Constants ---
@@ -338,14 +339,19 @@ const RuleGroup = ({ group, updateGroup, removeGroup, addRule, addGroup }) => {
 };
 
 const Strategies = () => {
+  const navigate = useNavigate();
   const [strategies, setStrategies] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [editingStrat, setEditingStrat] = useState(null);
-  const [stratType, setStratType] = useState('params'); 
+  const [stratType, setStratType] = useState('params');
+  const [confirm, setConfirm] = useState(null); // { id, name }
   const [rootGroup, setRootGroup] = useState({ 
     id: 'root', type: 'group', operator: 'AND', children: [], enabled: true 
   });
+  const [scanning, setScanning] = useState(false);
+  const [scanResults, setScanResults] = useState([]);
+  const [scanMeta, setScanMeta] = useState(null);
   const [form, setForm] = useState({
     name: '',
     params: {
@@ -366,6 +372,27 @@ const Strategies = () => {
   };
 
   useEffect(() => { fetchStrategies(); }, []);
+
+  const doDelete = async () => {
+    if (!confirm) return;
+    try {
+      const res = await fetch(`${API_URL}/strategies/${confirm.id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      if (res.ok) {
+        setStrategies(strats => strats.filter(s => s.id !== confirm.id));
+      } else {
+        const data = await res.json();
+        alert(data.detail || 'Failed to delete strategy');
+      }
+    } catch (e) {
+      alert('Network error');
+    }
+    setConfirm(null);
+  };
+
+  const requestDelete = (id, name) => setConfirm({ id, name });
 
   const handleSave = async () => {
     setLoading(true);
@@ -443,8 +470,47 @@ const Strategies = () => {
     enabled: true,
   });
 
+  // Chartink-style live preview: scan current rules against real BTCUSDT data
+  const runScan = async () => {
+    if (stratType !== 'rules') { alert('The live preview works with the rule-based builder.'); return; }
+    setScanning(true);
+    setScanResults([]);
+    setScanMeta(null);
+    try {
+      const res = await fetch(`${API_URL}/strategies/scan`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rules: rootGroup, symbol: 'BTCUSDT', interval: '1h', limit: 25 }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setScanResults(Array.isArray(data) ? data : []);
+        setScanMeta({ count: Array.isArray(data) ? data.length : 0 });
+      } else {
+        alert(data.detail || 'Scan failed');
+      }
+    } catch (e) {
+      alert('Scan network error');
+    }
+    setScanning(false);
+  };
+
+  const viewOnChart = (id) => navigate(`/chart?strategy=${id}`);
+
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+      {confirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setConfirm(null)}>
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-bold text-white mb-2">Delete Strategy?</h3>
+            <p className="text-sm text-gray-400 mb-6">This will permanently delete "{confirm.name}". This action cannot be undone.</p>
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setConfirm(null)} className="px-4 py-2 rounded-lg text-sm font-semibold text-gray-300 hover:text-white bg-gray-700 hover:bg-gray-600 transition">Cancel</button>
+              <button onClick={doDelete} className="px-4 py-2 rounded-lg text-sm font-bold text-white bg-red-600 hover:bg-red-500 transition">Yes, Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="flex justify-between items-center mb-8">
         <h1 className="text-3xl font-bold text-blue-400">Strategies Manager</h1>
         <button onClick={() => { 
@@ -478,7 +544,17 @@ const Strategies = () => {
                 </td>
                 <td className="p-4 text-gray-400 text-sm">{new Date(s.created_at).toLocaleDateString()}</td>
                 <td className="p-4">
-                  <button onClick={() => openEdit(s)} className="text-blue-400 hover:text-blue-300 mr-4">Edit</button>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => viewOnChart(s.id)}
+                      className="text-green-400 hover:text-green-300 flex items-center gap-1 text-xs font-semibold mr-1"
+                      title="Show this strategy's signals on the market chart">
+                      <LineChart size={14} /> Chart
+                    </button>
+                    <button onClick={() => openEdit(s)} className="text-blue-400 hover:text-blue-300 mr-1">Edit</button>
+                    <button onClick={() => requestDelete(s.id, s.name)} className="text-red-400 hover:text-red-300">
+                      <Trash2 size={14} className="inline" />
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -493,7 +569,7 @@ const Strategies = () => {
               <div className="flex items-center gap-3">
                 <h2 className="text-2xl font-bold">{editingStrat ? 'Edit' : 'Create'} Strategy</h2>
                 <div className="flex items-center gap-1 px-2 py-1 bg-blue-900/30 text-blue-400 rounded text-[10px] font-bold border border-blue-500/30">
-                  <Info size={12} /> Builder v2.5
+                  <Info size={12} /> Chartink-style builder · BTCUSDT
                 </div>
               </div>
               <button onClick={() => setShowModal(false)} className="p-2 text-gray-400 hover:text-white"><X size={24} /></button>
@@ -531,16 +607,57 @@ const Strategies = () => {
                     addRule={(r) => setRootGroup({ ...rootGroup, children: [...rootGroup.children, r] })}
                     addGroup={(g) => setRootGroup({ ...rootGroup, children: [...rootGroup.children, g] })}
                   />
-                  <div className="flex gap-3 mt-4">
-                    <button onClick={() => setRootGroup({ ...rootGroup, children: [...rootGroup.children, createNewRule()] })} 
-                            className="flex items-center gap-2 bg-blue-600 px-4 py-2 rounded-lg text-xs font-bold hover:bg-blue-500 transition">
-                      <FilePlus size={14} /> Add Root Rule
-                    </button>
-                    <button onClick={() => setRootGroup({ ...rootGroup, children: [...rootGroup.children, createNewGroup()] })} 
-                            className="flex items-center gap-2 bg-gray-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-gray-600 transition">
-                      <FolderPlus size={14} /> Add Root Group
+                  <div className="flex flex-wrap gap-3 mt-4 items-center justify-between">
+                    <div className="flex gap-3">
+                      <button onClick={() => setRootGroup({ ...rootGroup, children: [...rootGroup.children, createNewRule()] })} 
+                              className="flex items-center gap-2 bg-blue-600 px-4 py-2 rounded-lg text-xs font-bold hover:bg-blue-500 transition">
+                        <FilePlus size={14} /> Add Root Rule
+                      </button>
+                      <button onClick={() => setRootGroup({ ...rootGroup, children: [...rootGroup.children, createNewGroup()] })} 
+                              className="flex items-center gap-2 bg-gray-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-gray-600 transition">
+                        <FolderPlus size={14} /> Add Root Group
+                      </button>
+                    </div>
+                    <button onClick={runScan} disabled={scanning}
+                            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-xs font-bold transition disabled:opacity-50">
+                      {scanning ? <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <ScanSearch size={14} />}
+                      {scanning ? 'Scanning…' : 'Preview Signals'}
                     </button>
                   </div>
+
+                  {scanMeta && (
+                    <div className="mt-4 bg-gray-900 rounded-2xl border border-gray-700 p-4 animate-in fade-in slide-in-from-top-2">
+                      <div className="flex items-center justify-between mb-3">
+                        <h4 className="text-xs font-bold text-gray-400 uppercase flex items-center gap-2">
+                          <Radio size={14} className="text-green-400" /> Latest BTCUSDT signal candles
+                        </h4>
+                        <span className="text-[10px] bg-emerald-900/40 text-emerald-300 px-2 py-0.5 rounded font-bold">{scanResults.length} match(es)</span>
+                      </div>
+                      {scanResults.length > 0 ? (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs">
+                            <thead className="bg-gray-800 text-gray-500 uppercase">
+                              <tr><th className="p-2">Time</th><th className="p-2">Dir</th><th className="p-2">Open</th><th className="p-2">High</th><th className="p-2">Low</th><th className="p-2">Close</th></tr>
+                            </thead>
+                            <tbody>
+                              {scanResults.map((r, i) => (
+                                <tr key={i} className="border-b border-gray-800">
+                                  <td className="p-2 font-mono text-gray-400">{new Date(r.time * 1000).toLocaleString()}</td>
+                                  <td className={`p-2 font-bold ${r.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{r.direction === 1 ? 'LONG' : 'SHORT'}</td>
+                                  <td className="p-2 font-mono">{Number(r.open).toFixed(2)}</td>
+                                  <td className="p-2 font-mono text-green-400">{Number(r.high).toFixed(2)}</td>
+                                  <td className="p-2 font-mono text-red-400">{Number(r.low).toFixed(2)}</td>
+                                  <td className="p-2 font-mono">{Number(r.close).toFixed(2)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <p className="text-gray-500 text-xs text-center py-3">No candles matched the current rules on BTCUSDT 1h.</p>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

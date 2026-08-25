@@ -58,6 +58,29 @@ python3 app/scripts/reset_db.py
 ```
 *This will delete the old DB, create a new one, seed all BTC data from CSVs, and create the admin user.*
 
+> ⚠️ **The database is NOT in Git.** SQLite database files (`*.db`, `*.sqlite`)
+> are git-ignored because they hold live trading data. If the server has a
+> `backend/trading_system.db` with real data, **`git switch`/`git checkout` will
+> refuse to change branches** ("local changes would be overwritten") because that
+> file looks like a tracked-but-modified file.
+>
+> To deploy WITHOUT losing the live data, on the server run:
+> ```bash
+> cd /var/www/kudos_phantom
+> cp backend/trading_system.db backend/trading_system.db.bak   # backup (always)
+> git rm --cached backend/trading_system.db                     # untrack, keep file
+> [ -f trading_system.db ] && git rm --cached trading_system.db # legacy root DB
+> git add .gitignore
+> git commit -m "Untrack database files for clean deploys"
+> git switch arena/<your-branch>
+> ls -la backend/trading_system.db || cp backend/trading_system.db.bak backend/trading_system.db
+> pm2 restart phantom-backend
+> ```
+> The app always opens the DB at `backend/trading_system.db` regardless of the
+> working directory (see `app/database/models.py`), so the code deploy never
+> replaces the live database. Schema changes are applied on startup as
+> **additive** `ALTER TABLE` migrations that preserve existing rows.
+
 ### 4. Run with PM2
 ```bash
 sudo npm install -g pm2

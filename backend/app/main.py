@@ -16,7 +16,7 @@ from .database.models import init_db, SessionLocal, User, CustomStrategy, Backte
 import bcrypt
 from passlib.context import CryptContext
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +40,16 @@ import uuid
 paper_trade_instances: Dict[str, PaperTradeService] = {}
 live_trade_instances: Dict[str, LiveTradeService] = {}
 
+
+def _utc_ts(dt):
+    """Return a UTC UNIX timestamp (seconds) from a datetime, regardless of
+    whether the datetime is timezone-aware or naive (assumed UTC)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
 class StrategyParams(PhantomV2Config):
     pass
 
@@ -59,6 +69,9 @@ class BacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     strategy_name: str = "Default Run"
+    # Capital to run the backtest with. If omitted, the user's (admin-set)
+    # initial_capital is used.
+    initial_capital: Optional[float] = None
 
 def get_db():
     db = SessionLocal()
@@ -208,6 +221,51 @@ def delete_strategy(strat_id: int, user=Depends(get_current_user), db=Depends(ge
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- STRATEGY SCANNER (Chartink-style live preview) ----------------------
+class ScanRequest(BaseModel):
+    rules: Union[List[Dict], Dict]
+    symbol: str = "BTCUSDT"
+    interval: str = "1h"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    limit: int = 25
+
+@app.post("/strategies/scan")
+def scan_strategy(payload: ScanRequest, user=Depends(get_current_user)):
+    """Scan the market data against an unsaved rule set (Chartink-style).
+
+    Returns the most recent candles that satisfy the rule group so the
+    strategy builder can show a live 'conditions met' preview.
+    """
+    try:
+        from .core.dynamic_strategy import DynamicStrategyService
+        engine = BacktestEngine(PhantomV2Config())
+        df_1h = engine._get_data_from_db(payload.symbol, payload.interval, payload.start_date, payload.end_date)
+        df_4h = engine._get_data_from_db(payload.symbol, "4h", payload.start_date, payload.end_date)
+        if df_1h.empty or df_4h.empty:
+            return []
+
+        svc = DynamicStrategyService(payload.rules)
+        signals = svc.generate_signals(df_1h, df_4h)
+
+        out = []
+        closes = df_1h['close'].values
+        opens = df_1h['open'].values
+        highs = df_1h['high'].values
+        lows = df_1h['low'].values
+        for i in range(1, len(df_1h)):
+            if signals[i] != 0:
+                out.append({
+                    "time": int(_utc_ts(df_1h.index[i])),
+                    "direction": int(signals[i]),
+                    "open": float(opens[i]), "high": float(highs[i]),
+                    "low": float(lows[i]), "close": float(closes[i]),
+                })
+        # Return the most recent matches
+        return out[-payload.limit:]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scan error: {str(e)}")
+
 # --- ADMIN: CLIENT MANAGEMENT ---
 class ClientCreate(BaseModel):
     username: str
@@ -216,6 +274,11 @@ class ClientCreate(BaseModel):
     margin_deployment_pct: float = 25.0
     can_paper: bool = True
     can_live: bool = False
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    email: Optional[str] = None
+    company: Optional[str] = None
+    notes: Optional[str] = None
 
 class ClientUpdate(BaseModel):
     password: Optional[str] = None
@@ -224,6 +287,11 @@ class ClientUpdate(BaseModel):
     can_paper: Optional[bool] = None
     can_live: Optional[bool] = None
     is_active: Optional[bool] = None
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    email: Optional[str] = None
+    company: Optional[str] = None
+    notes: Optional[str] = None
 
 def _client_dict(u: User):
     return {
@@ -233,6 +301,8 @@ def _client_dict(u: User):
         "can_live": u.can_live if u.can_live is not None else 0,
         "initial_capital": u.initial_capital, "margin_deployment_pct": u.margin_deployment_pct,
         "virtual_balance": u.virtual_balance, "broker_name": u.broker_name,
+        "full_name": u.full_name, "mobile": u.mobile, "email": u.email,
+        "company": u.company, "notes": u.notes,
         "has_api_keys": bool(u.api_key and u.api_secret), "created_at": u.created_at,
     }
 
@@ -253,7 +323,9 @@ def create_client(payload: ClientCreate, admin=Depends(require_admin), db=Depend
                     margin_deployment_pct=payload.margin_deployment_pct,
                     virtual_balance=payload.initial_capital,
                     can_paper=int(payload.can_paper), can_live=int(payload.can_live),
-                    is_active=1)
+                    is_active=1,
+                    full_name=payload.full_name, mobile=payload.mobile,
+                    email=payload.email, company=payload.company, notes=payload.notes)
         db.add(user)
         db.commit()
         db.refresh(user)
@@ -276,6 +348,11 @@ def update_client(client_id: int, payload: ClientUpdate, admin=Depends(require_a
         if payload.margin_deployment_pct is not None: user.margin_deployment_pct = payload.margin_deployment_pct
         if payload.can_paper is not None: user.can_paper = int(payload.can_paper)
         if payload.can_live is not None: user.can_live = int(payload.can_live)
+        if payload.full_name is not None: user.full_name = payload.full_name
+        if payload.mobile is not None: user.mobile = payload.mobile
+        if payload.email is not None: user.email = payload.email
+        if payload.company is not None: user.company = payload.company
+        if payload.notes is not None: user.notes = payload.notes
         if payload.is_active is not None:
             # Never allow deactivation of admin users
             if user.role == 'admin' and not payload.is_active:
@@ -360,30 +437,76 @@ def phantom_config(user=Depends(get_current_user)):
 
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
-                    symbol: str = "BTCUSDT", user=Depends(get_current_user)):
-    """Signal candles for chart overlay (uses the tuned champion config)."""
-    cfg = _load_champion_config()
-    engine = BacktestEngine(cfg)
+                    symbol: str = "BTCUSDT", strategy_id: Optional[str] = "PhantomV2",
+                    user=Depends(get_current_user), db=Depends(get_db)):
+    """Signal candles for the chart overlay.
+
+    By default it overlays the tuned Phantom champion config. Pass
+    `strategy_id` to overlay the signals of a specific strategy instead
+    (e.g. a custom strategy created in the Strategies manager, or "FastTest").
+    """
+    if strategy_id == "PhantomV2":
+        cfg = _load_champion_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = engine.strategy_service
+        wants_metadata = True
+        label = None
+    elif strategy_id == "FastTest":
+        cfg = PhantomV2Config()
+        engine = BacktestEngine(cfg)
+        from .core.strategy import FastTestStrategyService
+        strategy_service = FastTestStrategyService(cfg)
+        wants_metadata = False
+        label = "FastTest"
+    else:
+        try:
+            strat = db.query(CustomStrategy).filter(
+                CustomStrategy.id == int(strategy_id),
+                CustomStrategy.user_id == user.id,
+            ).first()
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid strategy id")
+        if not strat:
+            raise HTTPException(status_code=404, detail="Custom strategy not found")
+        from .core.dynamic_strategy import DynamicStrategyService
+        cfg = PhantomV2Config()
+        engine = BacktestEngine(cfg)
+        strategy_service = DynamicStrategyService(strat.rules)
+        wants_metadata = False
+        label = strat.name
+
     df_1h = engine._get_data_from_db(symbol, "1h", start_date, end_date)
     df_4h = engine._get_data_from_db(symbol, "4h", start_date, end_date)
     if df_1h.empty or df_4h.empty:
         return []
-    # include some warmup history so indicators are stable on the window
-    signals, meta = engine.strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+
+    if wants_metadata:
+        signals, meta = strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+    else:
+        signals = strategy_service.generate_signals(df_1h, df_4h)
+        meta = None
+
     out = []
     closes = df_1h['close'].values
     for i in range(1, len(df_1h)):
         s = signals[i]
         if s == 0:
             continue
-        out.append({
-            "time": int(df_1h.index[i].timestamp()),
+        item = {
+            "time": int(_utc_ts(df_1h.index[i])),
             "direction": int(s),
             "price": float(closes[i]),
-            "setup": str(meta['setup'][i]),
-            "rsi14": round(float(meta['rsi14'][i]), 2),
-            "adx": round(float(meta['adx'][i]), 2),
-        })
+            "setup": None,
+            "rsi14": None,
+            "adx": None,
+        }
+        if meta is not None:
+            item["setup"] = str(meta['setup'][i])
+            item["rsi14"] = round(float(meta['rsi14'][i]), 2)
+            item["adx"] = round(float(meta['adx'][i]), 3)
+        else:
+            item["setup"] = label or "CUSTOM"
+        out.append(item)
         if len(out) >= 2000:
             break
     return out
@@ -394,7 +517,15 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
     try:
         start_date_str = req.start_date or "2020-07-04"
         end_date_str = req.end_date or "2026-07-04"
-        
+
+        # Resolve starting capital: run record (already stored by run_backtest),
+        # else explicit request value, else the user's (admin-set default)
+        # initial capital, else the engine default.
+        run0 = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        default_capital = (user.initial_capital if user and user.initial_capital else 20000.0)
+        capital = float(run0.initial_capital) if (run0 and run0.initial_capital) else (float(req.initial_capital) if req.initial_capital else float(default_capital))
+
         if req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=req.params)
         else:
@@ -409,15 +540,15 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
                     self.validator_service = ValidatorService()
                     from .services.order_manager import OrderManager
                     self.oms = OrderManager(self.config)
-                def run(self, symbol="BTCUSDT", start_date=None, end_date=None):
+                def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
                     original_engine = BacktestEngine(self.config)
                     original_engine.strategy_service = self.strategy_service
                     # NOTE: pass by keyword - the engine signature is
                     # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
-                    return original_engine.run(symbol=symbol, start_date=start_date, end_date=end_date)
+                    return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, start_date=start_date, end_date=end_date)
             engine = DynamicBacktestEngine(strat.rules)
 
-        results = engine.run(symbol="BTCUSDT", start_date=start_date_str, end_date=end_date_str)
+        results = engine.run(symbol="BTCUSDT", initial_capital_inr=capital, start_date=start_date_str, end_date=end_date_str)
         
         run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
         if run:
@@ -457,6 +588,10 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
         start_date_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
         end_date_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
 
+        # Resolve the starting capital once so it is stored on the run and
+        # reused by the background task: explicit value, else the user's default.
+        capital = float(req.initial_capital) if req.initial_capital else float(user.initial_capital or 20000.0)
+
         # Create a placeholder run record
         run = BacktestRun(
             user_id=user.id,
@@ -464,6 +599,7 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
             start_date=start_date_dt,
             end_date=end_date_dt,
             config_json=json.dumps(req.params.dict()),
+            initial_capital=capital,
             roi=0.0 # Placeholder
         )
         db.add(run)
@@ -479,7 +615,8 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
 @app.get("/backtest/history")
 def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).order_by(BacktestRun.timestamp.desc()).all()
-    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date, "roi": r.roi, "timestamp": r.timestamp} for r in runs]
+    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date,
+             "roi": r.roi, "initial_capital": r.initial_capital or 20000, "timestamp": r.timestamp} for r in runs]
 
 @app.get("/backtest/results/{run_id}")
 def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends(get_db)):
@@ -503,6 +640,7 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
     return {
         "run_details": {
             "name": run.name, "start_date": run.start_date, "end_date": run.end_date,
+            "initial_capital": run.initial_capital or 20000,
             "final_equity": run.final_equity, "total_trades": run.total_trades,
             "win_rate": run.win_rate, "profit_factor": run.profit_factor,
             "sharpe_ratio": run.sharpe_ratio, "max_drawdown": run.max_drawdown,
@@ -547,36 +685,47 @@ def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(
         raise HTTPException(status_code=500, detail=f"Error deleting run: {str(e)}")
 
 # --- PAPER TRADING ---
+class TradeStartRequest(BaseModel):
+    strategy_id: str
+    # Optional starting capital. If omitted, the user's (admin-set default)
+    # initial capital is used.
+    initial_capital: Optional[float] = None
+    margin_pct: Optional[float] = None
+
 @app.post("/paper-trade/start")
 def start_paper_trade(
-    strategy_id: str = Body(..., embed=True), 
+    payload: TradeStartRequest,
     user=Depends(get_current_user), 
     db=Depends(get_db), 
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not (user.can_paper if user.can_paper is not None else 1):
         raise HTTPException(status_code=403, detail="Paper trading is disabled for this account. Contact admin.")
+    strategy_id = payload.strategy_id
+    # Overridable capital: explicit request value, else the user's default.
+    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
+    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{strategy_id}_{instance_id}"
-    
+
     if strategy_id == "FastTest":
         # Fixed: Import within the function to avoid UnboundLocalError if not available at module level
         from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct)
+        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=capital, margin_pct=margin_pct)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
             strat_id_int = int(strategy_id)
             strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = PaperTradeService(strategy_id, strat.rules, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=True)
+            service = PaperTradeService(strategy_id, strat.rules, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        # Fixed: Explicitly use the imported PhantomV2Config from the top of the file
-        # The issue was a scope conflict where the name PhantomV2Config was being shadowed or accessed incorrectly
-        from .core.strategy import PhantomV2Config as PConfig
-        service = PaperTradeService(strategy_id, PConfig(), initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        # Use the tuned champion config (same settings that drive the chart overlay)
+        # so paper trades match the strategy being analysed.
+        service = PaperTradeService(strategy_id, _load_champion_config(), initial_capital=capital, margin_pct=margin_pct, is_custom=False)
 
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
@@ -597,15 +746,22 @@ def get_paper_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
+                current = getattr(trade, 'current_price', None) or trade.peak_price
+                pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * service.conversion_rate
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": trade.peak_price, "pnl": (trade.peak_price - trade.entry_price) * trade.direction * trade.lots * 85.0,
+                    "current": current, "pnl": pnl_inr,
+                    "entry_time": str(trade.entry_time), "bars_held": trade.bars_held,
                     "margin": trade.margin_inr
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
-                "equity_inr": service.equity_inr, "is_running": service.is_running, "active_trades": active_trades,
+                "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
+                "is_running": service.is_running, "active_trades": active_trades,
                 "open_trade_count": len(service.oms.active_trades),
+                "closed_trades": service.closed_trades[-50:],
+                "last_price": service.last_price, "last_checked": service.last_checked,
+                "conversion_rate": service.conversion_rate,
             })
     return status_list
 
@@ -623,7 +779,7 @@ def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
 # --- LIVE TRADING ---
 @app.post("/live-trade/start")
 def start_live_trade(
-    strategy_id: str = Body(..., embed=True), 
+    payload: TradeStartRequest,
     user=Depends(get_current_user), 
     db=Depends(get_db), 
     background_tasks: BackgroundTasks = BackgroundTasks()
@@ -631,23 +787,27 @@ def start_live_trade(
     if not (user.can_live if user.can_live is not None else 0):
         raise HTTPException(status_code=403, detail="Live trading is not enabled for this account. Contact admin.")
     if not user.api_key or not user.api_secret: raise HTTPException(status_code=400, detail="Broker API keys not configured")
+    strategy_id = payload.strategy_id
+    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
+    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
         from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct)
+        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
             strat_id_int = int(strategy_id)
             strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = LiveTradeService(strategy_id, strat.rules, user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=True)
+            service = LiveTradeService(strategy_id, strat.rules, user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=user.initial_capital, margin_pct=user.margin_deployment_pct, is_custom=False)
+        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=False)
 
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
@@ -688,37 +848,52 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
             Klines.symbol == symbol, 
             Klines.interval == interval
         ).order_by(Klines.event_time.desc()).limit(limit).all()
-        
+
         if data:
             # Reverse to get chronological order
             data.reverse()
             formatted = []
             for k in data:
                 formatted.append({
-                    "time": k.event_time.timestamp(),
+                    "time": int(_utc_ts(k.event_time)),
                     "open": k.open,
                     "high": k.high,
                     "low": k.low,
                     "close": k.close,
+                    "volume": k.volume,
                 })
             return formatted
 
         # Fallback to API if DB is empty
         import requests
         url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=10).json()
         formatted = []
         for k in res:
             formatted.append({
-                "time": k[0] / 1000,
+                "time": int(k[0] / 1000),
                 "open": float(k[1]),
                 "high": float(k[2]),
                 "low": float(k[3]),
                 "close": float(k[4]),
+                "volume": float(k[5]),
             })
         return formatted
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Klines fetch error: {str(e)}")
+        # No local data and the remote API is unreachable — return an empty
+        # series so the UI shows an empty chart instead of a hard error.
+        print(f"Klines fetch error for {symbol}/{interval}: {e}")
+        return []
+
+@app.get("/symbols")
+def list_symbols(user=Depends(get_current_user), db=Depends(get_db)):
+    """Distinct symbols available in the local market-data store."""
+    try:
+        rows = db.query(Klines.symbol).distinct().all()
+        return [r[0] for r in rows]
+    except Exception:
+        return ["BTCUSDT"]
+
 
 class BrokerSettingsUpdate(BaseModel):
     api_key: str
