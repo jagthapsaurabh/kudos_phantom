@@ -152,7 +152,8 @@ class DataSyncService:
                 if not page:
                     break
                 rows.extend(page)
-                if not fetch_all or len(page) < limit:
+                page_limit = min(limit, 1500 if source == 'Binance' else 2000)
+                if not fetch_all or len(page) < page_limit:
                     break
                 last = max(cls._as_datetime(r["event_time"]) for r in page)
                 next_cursor = last + timedelta(seconds=interval_seconds.get(interval, 60))
