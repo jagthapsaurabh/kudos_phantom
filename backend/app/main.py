@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -12,11 +12,15 @@ from .core.strategy import PhantomV2Config, StrategyService
 from .services.paper_trader import PaperTradeService
 from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
-from .database.models import init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines
+from .database.models import (
+    init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
+    BrokerDefinition, BrokerConnection, FeeSetting,
+)
 import bcrypt
 from passlib.context import CryptContext
 import asyncio
 from datetime import datetime, timezone
+from sqlalchemy import func
 
 # Load environment variables
 load_dotenv()
@@ -72,6 +76,8 @@ class BacktestRequest(BaseModel):
     # Capital to run the backtest with. If omitted, the user's (admin-set)
     # initial_capital is used.
     initial_capital: Optional[float] = None
+    data_source: str = 'Binance'
+    fee_mode: str = 'backtest'
 
 def get_db():
     db = SessionLocal()
@@ -88,6 +94,45 @@ def require_admin(user=Depends(get_current_user)):
     if getattr(user, 'role', 'client') != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+def normalize_source(source: Optional[str]) -> str:
+    value = (source or 'Binance').strip()
+    return {'binance': 'Binance', 'delta': 'Delta', 'delta exchange': 'Delta'}.get(value.lower(), value)
+
+
+def _fee_dict(row, broker_code=None, mode=None):
+    return {
+        'id': getattr(row, 'id', None), 'broker_code': getattr(row, 'broker_code', broker_code),
+        'mode': getattr(row, 'mode', mode),
+        'taker_fee_bps': float(getattr(row, 'taker_fee_bps', 0.0)),
+        'maker_fee_bps': float(getattr(row, 'maker_fee_bps', 0.0)),
+        'enabled': bool(getattr(row, 'enabled', 1)), 'updated_at': getattr(row, 'updated_at', None),
+    }
+
+
+def resolve_fees(db, broker_code: str, mode: str, fallback=None):
+    """Resolve the admin schedule; fall back to the strategy/.env defaults."""
+    broker_code = normalize_source(broker_code)
+    mode = (mode or 'backtest').lower()
+    row = db.query(FeeSetting).filter_by(broker_code=broker_code, mode=mode, enabled=1).first()
+    if row:
+        return row
+    return fallback or type('FeeSchedule', (), {
+        'taker_fee_bps': float(os.getenv('TAKER_FEE_BPS', '5.9')),
+        'maker_fee_bps': float(os.getenv('MAKER_FEE_BPS', '2.36')),
+    })()
+
+
+def _fee_config(config, fees):
+    """Make a fee-adjusted copy without changing the request model."""
+    try:
+        return config.model_copy(update={'taker_fee_bps': float(fees.taker_fee_bps),
+                                         'maker_fee_bps': float(fees.maker_fee_bps)})
+    except AttributeError:
+        return config.copy(update={'taker_fee_bps': float(fees.taker_fee_bps),
+                                   'maker_fee_bps': float(fees.maker_fee_bps)})
+
 
 async def daily_sync_task():
     while True:
@@ -226,6 +271,7 @@ class ScanRequest(BaseModel):
     rules: Union[List[Dict], Dict]
     symbol: str = "BTCUSDT"
     interval: str = "1h"
+    source: str = "Binance"
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     limit: int = 25
@@ -240,8 +286,8 @@ def scan_strategy(payload: ScanRequest, user=Depends(get_current_user)):
     try:
         from .core.dynamic_strategy import DynamicStrategyService
         engine = BacktestEngine(PhantomV2Config())
-        df_1h = engine._get_data_from_db(payload.symbol, payload.interval, payload.start_date, payload.end_date)
-        df_4h = engine._get_data_from_db(payload.symbol, "4h", payload.start_date, payload.end_date)
+        df_1h = engine._get_data_from_db(payload.symbol, payload.interval, payload.start_date, payload.end_date, normalize_source(payload.source))
+        df_4h = engine._get_data_from_db(payload.symbol, "4h", payload.start_date, payload.end_date, normalize_source(payload.source))
         if df_1h.empty or df_4h.empty:
             return []
 
@@ -406,6 +452,241 @@ def client_activity(client_id: int, admin=Depends(require_admin), db=Depends(get
                               "total_trades": r.total_trades, "timestamp": r.timestamp} for r in runs],
     }
 
+# --- BROKERS, FEE SCHEDULES & MARKET DATA -------------------------------
+class FeeSettingPayload(BaseModel):
+    broker_code: str
+    mode: str
+    taker_fee_bps: float
+    maker_fee_bps: float
+    enabled: bool = True
+
+
+class BrokerDefinitionPayload(BaseModel):
+    code: str
+    name: str
+    kind: str = 'generic'
+    market_data_url: Optional[str] = None
+    trading_api_url: Optional[str] = None
+    enabled: bool = True
+    notes: Optional[str] = None
+
+
+def _broker_dict(row):
+    return {'id': row.id, 'code': row.code, 'name': row.name, 'kind': row.kind,
+            'market_data_url': row.market_data_url, 'trading_api_url': row.trading_api_url,
+            'enabled': bool(row.enabled), 'is_builtin': bool(row.is_builtin), 'notes': row.notes}
+
+
+@app.get('/broker-definitions')
+def broker_definitions(user=Depends(get_current_user), db=Depends(get_db)):
+    return [_broker_dict(b) for b in db.query(BrokerDefinition).filter(BrokerDefinition.enabled == 1).order_by(BrokerDefinition.name).all()]
+
+
+@app.get('/admin/brokers')
+def admin_brokers(admin=Depends(require_admin), db=Depends(get_db)):
+    return [_broker_dict(b) for b in db.query(BrokerDefinition).order_by(BrokerDefinition.name).all()]
+
+
+@app.post('/admin/brokers')
+def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin), db=Depends(get_db)):
+    code = normalize_source(payload.code)
+    if db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first():
+        raise HTTPException(status_code=400, detail='Broker code already exists')
+    row = BrokerDefinition(code=code, name=payload.name, kind=payload.kind.lower(),
+                           market_data_url=payload.market_data_url, trading_api_url=payload.trading_api_url,
+                           enabled=int(payload.enabled), is_builtin=0, notes=payload.notes)
+    db.add(row)
+    db.flush()
+    default_taker = float(os.getenv('TAKER_FEE_BPS', '5.9'))
+    default_maker = float(os.getenv('MAKER_FEE_BPS', '2.36'))
+    for mode in ('backtest', 'paper', 'live'):
+        db.add(FeeSetting(broker_code=code, mode=mode, taker_fee_bps=default_taker,
+                          maker_fee_bps=default_maker, enabled=1))
+    db.commit(); db.refresh(row)
+    return _broker_dict(row)
+
+
+@app.put('/admin/brokers/{broker_id}')
+def update_broker(broker_id: int, payload: BrokerDefinitionPayload, admin=Depends(require_admin), db=Depends(get_db)):
+    row = db.query(BrokerDefinition).filter(BrokerDefinition.id == broker_id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker integration not found')
+    row.name = payload.name; row.kind = payload.kind.lower(); row.market_data_url = payload.market_data_url
+    row.trading_api_url = payload.trading_api_url; row.enabled = int(payload.enabled); row.notes = payload.notes
+    db.commit(); db.refresh(row)
+    return _broker_dict(row)
+
+
+@app.delete('/admin/brokers/{broker_id}')
+def delete_broker(broker_id: int, admin=Depends(require_admin), db=Depends(get_db)):
+    row = db.query(BrokerDefinition).filter(BrokerDefinition.id == broker_id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker integration not found')
+    if row.is_builtin: raise HTTPException(status_code=400, detail='Built-in integrations cannot be deleted; disable them instead')
+    row.enabled = 0; db.commit()
+    return {'status': 'Broker integration disabled'}
+
+
+@app.get('/admin/fee-settings')
+def admin_fee_settings(admin=Depends(require_admin), db=Depends(get_db)):
+    return [_fee_dict(f) for f in db.query(FeeSetting).order_by(FeeSetting.broker_code, FeeSetting.mode).all()]
+
+
+@app.get('/fee-settings')
+def fee_settings(broker_code: str = 'Binance', mode: str = 'backtest', user=Depends(get_current_user), db=Depends(get_db)):
+    return _fee_dict(resolve_fees(db, broker_code, mode), normalize_source(broker_code), mode)
+
+
+@app.post('/admin/fee-settings')
+def save_fee_setting(payload: FeeSettingPayload, admin=Depends(require_admin), db=Depends(get_db)):
+    broker = normalize_source(payload.broker_code)
+    mode = payload.mode.lower().strip()
+    if mode not in ('backtest', 'paper', 'live'):
+        raise HTTPException(status_code=400, detail='mode must be backtest, paper, or live')
+    if payload.taker_fee_bps < 0 or payload.maker_fee_bps < 0:
+        raise HTTPException(status_code=400, detail='Fees cannot be negative')
+    row = db.query(FeeSetting).filter_by(broker_code=broker, mode=mode).first()
+    if not row:
+        row = FeeSetting(broker_code=broker, mode=mode)
+        db.add(row)
+    row.taker_fee_bps = payload.taker_fee_bps; row.maker_fee_bps = payload.maker_fee_bps
+    row.enabled = int(payload.enabled); row.updated_at = datetime.utcnow()
+    db.commit(); db.refresh(row)
+    return _fee_dict(row)
+
+
+@app.put('/admin/fee-settings/{fee_id}')
+def update_fee_setting(fee_id: int, payload: FeeSettingPayload, admin=Depends(require_admin), db=Depends(get_db)):
+    row = db.query(FeeSetting).filter(FeeSetting.id == fee_id).first()
+    if not row: raise HTTPException(status_code=404, detail='Fee schedule not found')
+    row.broker_code = normalize_source(payload.broker_code); row.mode = payload.mode.lower()
+    row.taker_fee_bps = payload.taker_fee_bps; row.maker_fee_bps = payload.maker_fee_bps
+    row.enabled = int(payload.enabled); row.updated_at = datetime.utcnow()
+    db.commit(); db.refresh(row)
+    return _fee_dict(row)
+
+
+class BrokerConnectionPayload(BaseModel):
+    broker_code: str
+    label: Optional[str] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    passphrase: Optional[str] = None
+    is_testnet: bool = False
+    is_active: bool = True
+
+
+def _mask(value):
+    if not value: return ''
+    return value[:4] + ('•' * max(0, len(value) - 8)) + value[-4:] if len(value) > 8 else '••••••••'
+
+
+def _connection_dict(row):
+    return {'id': row.id, 'broker_code': row.broker_code, 'label': row.label or row.broker_code,
+            'api_key': _mask(row.api_key), 'has_secret': bool(row.api_secret),
+            'is_testnet': bool(row.is_testnet), 'is_active': bool(row.is_active), 'created_at': row.created_at}
+
+
+@app.get('/broker-connections')
+def list_broker_connections(user=Depends(get_current_user), db=Depends(get_db)):
+    rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).order_by(BrokerConnection.created_at).all()
+    # A legacy account still gets a selectable connection without a migration step.
+    result = [_connection_dict(r) for r in rows]
+    if not result and user.api_key:
+        result.append({'id': None, 'broker_code': user.broker_name or 'Binance', 'label': 'Legacy account',
+                       'api_key': _mask(user.api_key), 'has_secret': bool(user.api_secret), 'is_testnet': False,
+                       'is_active': True, 'legacy': True})
+    return result
+
+
+@app.post('/broker-connections')
+def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+    code = normalize_source(payload.broker_code)
+    if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
+        raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
+    if not payload.api_key or not payload.api_secret:
+        raise HTTPException(status_code=400, detail='API key and secret are required')
+    row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label, api_key=payload.api_key,
+                           api_secret=payload.api_secret, passphrase=payload.passphrase,
+                           is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
+    db.add(row); db.commit(); db.refresh(row)
+    return _connection_dict(row)
+
+
+@app.put('/broker-connections/{connection_id}')
+def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    row.broker_code = normalize_source(payload.broker_code); row.label = payload.label
+    # Empty secrets mean "keep the existing secret" in the edit form.
+    if payload.api_key: row.api_key = payload.api_key
+    if payload.api_secret: row.api_secret = payload.api_secret
+    if payload.passphrase is not None: row.passphrase = payload.passphrase
+    row.is_testnet = int(payload.is_testnet); row.is_active = int(payload.is_active)
+    db.commit(); db.refresh(row)
+    return _connection_dict(row)
+
+
+@app.delete('/broker-connections/{connection_id}')
+def delete_broker_connection(connection_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    db.delete(row); db.commit(); return {'status': 'Broker connection removed'}
+
+
+class MarketSeedPayload(BaseModel):
+    source: str = 'Binance'
+    symbol: str = 'BTCUSDT'
+    intervals: List[str] = ['1m', '5m', '15m', '1h', '4h', '1d']
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    limit: int = 1000
+    fetch_all: bool = False
+
+
+@app.get('/admin/market-data/status')
+def market_data_status(admin=Depends(require_admin), db=Depends(get_db)):
+    rows = db.query(
+        Klines.source, Klines.symbol, Klines.interval,
+        func.count(Klines.id).label('count'), func.count(Klines.volume).label('volume_rows'),
+        func.min(Klines.event_time).label('first'), func.max(Klines.event_time).label('last'),
+    ).group_by(Klines.source, Klines.symbol, Klines.interval).order_by(
+        Klines.source, Klines.symbol, Klines.interval).all()
+    return [{'source': source or 'Binance', 'symbol': symbol, 'interval': interval,
+             'count': int(count), 'volume_rows': int(volume_rows), 'first': first, 'last': last}
+            for source, symbol, interval, count, volume_rows, first, last in rows]
+
+
+@app.post('/admin/market-data/seed')
+def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin)):
+    try:
+        from .services.data_sync import DataSyncService
+        intervals = [i for i in payload.intervals if i in DataSyncService.TIMEFRAMES]
+        if not intervals: raise HTTPException(status_code=400, detail='Select at least one valid interval')
+        return {'status': 'Seed completed', 'summary': DataSyncService.seed_market_data(
+            normalize_source(payload.source), payload.symbol.upper(), intervals,
+            payload.start_date, payload.end_date, max(1, min(payload.limit, 2000)))}
+    except HTTPException: raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post('/admin/market-data/seed-csv')
+async def seed_market_data_csv(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
+                         clear_existing: bool = False, file: UploadFile = File(...), admin=Depends(require_admin)):
+    try:
+        import tempfile
+        from .services.data_sync import DataSyncService
+        content = await file.read() if hasattr(file, 'read') else file.file.read()
+        with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as handle:
+            handle.write(content); path = handle.name
+        try:
+            result = DataSyncService.seed_from_csv(path, interval, symbol.upper(), normalize_source(source), clear_existing)
+        finally:
+            os.unlink(path)
+        return {'status': 'CSV imported with OHLCV volume', 'summary': result}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 # --- PHANTOM v3: config + signal overlay for charts ---
 _LOGS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
 
@@ -438,7 +719,7 @@ def phantom_config(user=Depends(get_current_user)):
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
                     symbol: str = "BTCUSDT", strategy_id: Optional[str] = "PhantomV2",
-                    user=Depends(get_current_user), db=Depends(get_db)):
+                    source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
     """Signal candles for the chart overlay.
 
     By default it overlays the tuned Phantom champion config. Pass
@@ -475,8 +756,8 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         wants_metadata = False
         label = strat.name
 
-    df_1h = engine._get_data_from_db(symbol, "1h", start_date, end_date)
-    df_4h = engine._get_data_from_db(symbol, "4h", start_date, end_date)
+    df_1h = engine._get_data_from_db(symbol, "1h", start_date, end_date, normalize_source(source))
+    df_4h = engine._get_data_from_db(symbol, "4h", start_date, end_date, normalize_source(source))
     if df_1h.empty or df_4h.empty:
         return []
 
@@ -526,22 +807,25 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         default_capital = (user.initial_capital if user and user.initial_capital else 20000.0)
         capital = float(run0.initial_capital) if (run0 and run0.initial_capital) else (float(req.initial_capital) if req.initial_capital else float(default_capital))
 
+        source = normalize_source(req.data_source)
+        fees = resolve_fees(db, source, req.fee_mode, req.params)
+        config = _fee_config(req.params, fees)
         if req.strategy_id == "PhantomV2":
-            engine = BacktestEngine(config=req.params)
+            engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         else:
             strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(req.strategy_id), CustomStrategy.user_id == user_id).first()
             if not strat: return
             from .core.dynamic_strategy import DynamicStrategyService
             class DynamicBacktestEngine:
                 def __init__(self, rules):
-                    self.config = PhantomV2Config()
+                    self.config = _fee_config(PhantomV2Config(), fees)
                     self.strategy_service = DynamicStrategyService(rules)
                     from .core.strategy import ValidatorService
                     self.validator_service = ValidatorService()
                     from .services.order_manager import OrderManager
                     self.oms = OrderManager(self.config)
                 def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
-                    original_engine = BacktestEngine(self.config)
+                    original_engine = BacktestEngine(self.config, fee_schedule=fees, data_source=source)
                     original_engine.strategy_service = self.strategy_service
                     # NOTE: pass by keyword - the engine signature is
                     # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
@@ -561,6 +845,10 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             run.roi = float(results['roi'])
             run.equity_curve = results['equity_curve']
             run.rejected_reasons = json.dumps(results.get('rejected_reasons', {}))
+            run.data_source = source
+            run.fee_mode = req.fee_mode
+            run.taker_fee_bps = float(fees.taker_fee_bps)
+            run.maker_fee_bps = float(fees.maker_fee_bps)
             
             trade_cols = {c.name for c in Trade.__table__.columns}
             for t in results['trades']:
@@ -600,6 +888,8 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
             end_date=end_date_dt,
             config_json=json.dumps(req.params.dict()),
             initial_capital=capital,
+            data_source=normalize_source(req.data_source),
+            fee_mode=req.fee_mode,
             roi=0.0 # Placeholder
         )
         db.add(run)
@@ -616,7 +906,9 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
 def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).order_by(BacktestRun.timestamp.desc()).all()
     return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date,
-             "roi": r.roi, "initial_capital": r.initial_capital or 20000, "timestamp": r.timestamp} for r in runs]
+             "roi": r.roi, "initial_capital": r.initial_capital or 20000,
+             "data_source": r.data_source or 'Binance', "taker_fee_bps": r.taker_fee_bps,
+             "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp} for r in runs]
 
 @app.get("/backtest/results/{run_id}")
 def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends(get_db)):
@@ -691,50 +983,83 @@ class TradeStartRequest(BaseModel):
     # initial capital is used.
     initial_capital: Optional[float] = None
     margin_pct: Optional[float] = None
+    broker_name: str = 'Binance'
+    data_source: Optional[str] = None
+    connection_id: Optional[int] = None
+    testnet: bool = False
+
+def resolve_broker_context(payload, user, db, require_credentials=False):
+    code = normalize_source(payload.data_source or payload.broker_name)
+    definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code, BrokerDefinition.enabled == 1).first()
+    if not definition:
+        raise HTTPException(status_code=400, detail=f"Broker/data source '{code}' is not configured or enabled")
+    connection = None
+    if payload.connection_id is not None:
+        connection = db.query(BrokerConnection).filter(
+            BrokerConnection.id == payload.connection_id, BrokerConnection.user_id == user.id,
+            BrokerConnection.is_active == 1).first()
+        if not connection:
+            raise HTTPException(status_code=404, detail="Selected broker connection not found or disabled")
+        if connection.broker_code != code:
+            raise HTTPException(status_code=400, detail="Connection does not belong to the selected broker")
+    else:
+        connection = db.query(BrokerConnection).filter(
+            BrokerConnection.user_id == user.id, BrokerConnection.broker_code == code,
+            BrokerConnection.is_active == 1).order_by(BrokerConnection.created_at).first()
+    api_key = connection.api_key if connection else (user.api_key if (user.broker_name or 'Binance') == code else '')
+    api_secret = connection.api_secret if connection else (user.api_secret if (user.broker_name or 'Binance') == code else '')
+    passphrase = connection.passphrase if connection else ''
+    testnet = bool(connection.is_testnet) if connection else bool(payload.testnet)
+    if require_credentials and (not api_key or not api_secret):
+        raise HTTPException(status_code=400, detail=f"API keys not configured for {code}. Add a connection in Broker Settings.")
+    return code, definition, api_key or '', api_secret or '', passphrase or '', testnet, connection
+
 
 @app.post("/paper-trade/start")
 def start_paper_trade(
     payload: TradeStartRequest,
-    user=Depends(get_current_user), 
-    db=Depends(get_db), 
+    user=Depends(get_current_user),
+    db=Depends(get_db),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not (user.can_paper if user.can_paper is not None else 1):
         raise HTTPException(status_code=403, detail="Paper trading is disabled for this account. Contact admin.")
-    strategy_id = payload.strategy_id
-    # Overridable capital: explicit request value, else the user's default.
+    source, definition, api_key, api_secret, passphrase, testnet, connection = resolve_broker_context(payload, user, db)
+    fees = resolve_fees(db, source, 'paper')
+    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
-
+    strategy_id = payload.strategy_id
     instance_id = str(uuid.uuid4())[:8]
-    instance_key = f"paper_{user.username}_{strategy_id}_{instance_id}"
+    instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        # Fixed: Import within the function to avoid UnboundLocalError if not available at module level
-        from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = PaperTradeService(strategy_id, PhantomV2Config(), initial_capital=capital, margin_pct=margin_pct)
+        from .core.strategy import FastTestStrategyService
+        service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
+                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
-            strat_id_int = int(strategy_id)
-            strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
+            strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(strategy_id), CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = PaperTradeService(strategy_id, strat.rules, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
+            service = PaperTradeService(strategy_id, strat.rules, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=True, broker_definition=definition)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        # Use the tuned champion config (same settings that drive the chart overlay)
-        # so paper trades match the strategy being analysed.
-        service = PaperTradeService(strategy_id, _load_champion_config(), initial_capital=capital, margin_pct=margin_pct, is_custom=False)
-
+        service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
+                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
-    return {"status": "Paper trade started", "instance_key": instance_key}
+    return {"status": "Paper trade started", "instance_key": instance_key, "data_source": source,
+            "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
-def stop_paper_trade(instance_key: str):
+async def stop_paper_trade(instance_key: str, user=Depends(get_current_user)):
+    if f"_{user.username}_" not in instance_key:
+        raise HTTPException(status_code=403, detail="Not your instance")
     if instance_key in paper_trade_instances:
-        paper_trade_instances[instance_key].stop()
+        await paper_trade_instances[instance_key].stop()
         del paper_trade_instances[instance_key]
         return {"status": "Paper trade stopped"}
     raise HTTPException(status_code=404, detail="Instance not found")
@@ -756,6 +1081,8 @@ def get_paper_status(user=Depends(get_current_user)):
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
+                "data_source": service.market_source, "broker_name": service.broker_name,
+                "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
                 "is_running": service.is_running, "active_trades": active_trades,
                 "open_trade_count": len(service.oms.active_trades),
@@ -780,43 +1107,51 @@ def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
 @app.post("/live-trade/start")
 def start_live_trade(
     payload: TradeStartRequest,
-    user=Depends(get_current_user), 
-    db=Depends(get_db), 
+    user=Depends(get_current_user),
+    db=Depends(get_db),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not (user.can_live if user.can_live is not None else 0):
         raise HTTPException(status_code=403, detail="Live trading is not enabled for this account. Contact admin.")
-    if not user.api_key or not user.api_secret: raise HTTPException(status_code=400, detail="Broker API keys not configured")
+    source, definition, api_key, api_secret, passphrase, testnet, connection = resolve_broker_context(payload, user, db, True)
+    fees = resolve_fees(db, source, 'live')
+    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     strategy_id = payload.strategy_id
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
-
     instance_id = str(uuid.uuid4())[:8]
-    instance_key = f"live_{user.username}_{strategy_id}_{instance_id}"
+    instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        from .core.strategy import FastTestStrategyService, PhantomV2Config
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct)
+        from .core.strategy import FastTestStrategyService
+        service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
+                                   margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
+                                   testnet=testnet, fee_schedule=fees, definition=definition)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         try:
-            strat_id_int = int(strategy_id)
-            strat = db.query(CustomStrategy).filter(CustomStrategy.id == strat_id_int, CustomStrategy.user_id == user.id).first()
+            strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(strategy_id), CustomStrategy.user_id == user.id).first()
             if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = LiveTradeService(strategy_id, strat.rules, user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=True)
+            service = LiveTradeService(strategy_id, strat.rules, api_key, api_secret, initial_capital=capital,
+                                       margin_pct=margin_pct, is_custom=True, broker_name=source,
+                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
-        service = LiveTradeService(strategy_id, PhantomV2Config(), user.api_key, user.api_secret, initial_capital=capital, margin_pct=margin_pct, is_custom=False)
-
+        service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
+                                   margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
+                                   testnet=testnet, fee_schedule=fees, definition=definition)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
-    return {"status": "Live trade started", "instance_key": instance_key}
+    return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
+            "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
-def stop_live_trade(instance_key: str):
+async def stop_live_trade(instance_key: str, user=Depends(get_current_user)):
+    if f"_{user.username}_" not in instance_key:
+        raise HTTPException(status_code=403, detail="Not your instance")
     if instance_key in live_trade_instances:
-        live_trade_instances[instance_key].stop()
+        await live_trade_instances[instance_key].stop()
         del live_trade_instances[instance_key]
         return {"status": "Live trade stopped"}
     raise HTTPException(status_code=404, detail="Instance not found")
@@ -835,18 +1170,22 @@ def get_live_status(user=Depends(get_current_user)):
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
+                "broker_name": service.broker_name, "data_source": service.market_source,
+                "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
+                "last_price": service.last_price, "last_checked": service.last_checked,
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list
 
 # --- DATA ENDPOINTS ---
 @app.get("/klines")
-def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, db=Depends(get_db)):
+def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, source: str = "Binance", db=Depends(get_db)):
     try:
         # First, try to fetch from the database for speed and history
         data = db.query(Klines).filter(
-            Klines.symbol == symbol, 
-            Klines.interval == interval
+            Klines.symbol == symbol,
+            Klines.interval == interval,
+            Klines.source == normalize_source(source)
         ).order_by(Klines.event_time.desc()).limit(limit).all()
 
         if data:
@@ -864,21 +1203,12 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
                 })
             return formatted
 
-        # Fallback to API if DB is empty
-        import requests
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=10).json()
-        formatted = []
-        for k in res:
-            formatted.append({
-                "time": int(k[0] / 1000),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
-        return formatted
+        # Fallback to the selected source's public API if its seed is empty.
+        from .services.data_sync import DataSyncService
+        rows = DataSyncService.fetch_klines(normalize_source(source), symbol, interval, limit=limit)
+        return [{"time": int(pd.Timestamp(row['event_time']).timestamp()),
+                 "open": row['open'], "high": row['high'], "low": row['low'],
+                 "close": row['close'], "volume": row.get('volume', 0)} for row in rows]
     except Exception as e:
         # No local data and the remote API is unreachable — return an empty
         # series so the UI shows an empty chart instead of a hard error.
@@ -886,40 +1216,65 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
         return []
 
 @app.get("/symbols")
-def list_symbols(user=Depends(get_current_user), db=Depends(get_db)):
-    """Distinct symbols available in the local market-data store."""
+def list_symbols(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
+    """Distinct symbols available in the selected source's local store."""
     try:
-        rows = db.query(Klines.symbol).distinct().all()
+        rows = db.query(Klines.symbol).filter(Klines.source == normalize_source(source)).distinct().all()
         return [r[0] for r in rows]
     except Exception:
         return ["BTCUSDT"]
 
 
 class BrokerSettingsUpdate(BaseModel):
-    api_key: str
-    api_secret: str
+    api_key: Optional[str] = ''
+    api_secret: Optional[str] = ''
     initial_capital: float = 20000.0
     margin_pct: float = 25.0
     broker_name: str = "Binance"
+    connection_id: Optional[int] = None
+    passphrase: Optional[str] = None
+    is_testnet: bool = False
+
 
 @app.post("/broker-settings")
 def update_broker_settings(settings: BrokerSettingsUpdate, user=Depends(get_current_user), db=Depends(get_db)):
-    user.api_key = settings.api_key
-    user.api_secret = settings.api_secret
+    code = normalize_source(settings.broker_name)
+    if settings.connection_id:
+        row = db.query(BrokerConnection).filter(BrokerConnection.id == settings.connection_id,
+                                                BrokerConnection.user_id == user.id).first()
+        if not row: raise HTTPException(status_code=404, detail="Broker connection not found")
+        if settings.api_key: row.api_key = settings.api_key
+        if settings.api_secret: row.api_secret = settings.api_secret
+        row.broker_code = code; row.passphrase = settings.passphrase; row.is_testnet = int(settings.is_testnet)
+    elif settings.api_key and settings.api_secret:
+        row = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id,
+                                                BrokerConnection.broker_code == code).first()
+        if row:
+            row.api_key = settings.api_key; row.api_secret = settings.api_secret
+            row.is_testnet = int(settings.is_testnet)
+        else:
+            db.add(BrokerConnection(user_id=user.id, broker_code=code, label='Primary',
+                                    api_key=settings.api_key, api_secret=settings.api_secret,
+                                    passphrase=settings.passphrase, is_testnet=int(settings.is_testnet), is_active=1))
+        # Keep legacy columns synchronized for old workers and clients.
+        user.api_key = settings.api_key; user.api_secret = settings.api_secret; user.broker_name = code
     user.initial_capital = settings.initial_capital
     user.margin_deployment_pct = settings.margin_pct
-    user.broker_name = settings.broker_name
+    user.broker_name = code
     db.commit()
-    return {"status": "Settings updated"}
+    return {"status": "Settings updated", "broker_name": code}
+
 
 @app.get("/broker-settings")
-def get_broker_settings(user=Depends(get_current_user)):
-    return { 
-        "api_key": user.api_key, 
-        "api_secret": user.api_secret, 
-        "broker_name": user.broker_name,
+def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
+    rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).all()
+    return {
+        "api_key": _mask(user.api_key),
+        "api_secret": _mask(user.api_secret),
+        "broker_name": user.broker_name or 'Binance',
         "initial_capital": user.initial_capital,
-        "margin_deployment_pct": user.margin_deployment_pct
+        "margin_deployment_pct": user.margin_deployment_pct,
+        "connections": [_connection_dict(row) for row in rows],
     }
 
 # --- DASHBOARD ---

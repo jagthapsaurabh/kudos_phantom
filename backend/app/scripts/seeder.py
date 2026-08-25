@@ -51,6 +51,7 @@ def seed_to_db(symbol="BTCUSDT", interval="1h", years=6):
         batch = klines[i:i+batch_size]
         records = [
             Klines(
+                source="Binance",
                 symbol=symbol,
                 interval=interval,
                 event_time=pd.to_datetime(k[0], unit='ms'),
@@ -81,13 +82,14 @@ def seed_from_csv(csv_path, interval, symbol="BTCUSDT"):
     db = SessionLocal()
     
     # Clear existing data for this interval to avoid duplicates
-    db.query(Klines).filter_by(symbol=symbol, interval=interval).delete()
+    db.query(Klines).filter_by(source="Binance", symbol=symbol, interval=interval).delete()
     
     batch_size = 1000
     for i in range(0, len(df), batch_size):
         batch = df.iloc[i:i+batch_size]
         records = [
             Klines(
+                source="Binance",
                 symbol=symbol,
                 interval=interval,
                 event_time=row.event_time,
@@ -111,7 +113,7 @@ def update_daily_data(symbol="BTCUSDT", intervals=["1h", "4h"]):
     db = SessionLocal()
     
     for interval in intervals:
-        last_candle = db.query(Klines).filter_by(symbol=symbol, interval=interval).order_by(Klines.event_time.desc()).first()
+        last_candle = db.query(Klines).filter_by(source="Binance", symbol=symbol, interval=interval).order_by(Klines.event_time.desc()).first()
         
         start_time = last_candle.event_time if last_candle else (datetime.utcnow() - timedelta(days=365*6))
         end_time = datetime.utcnow()

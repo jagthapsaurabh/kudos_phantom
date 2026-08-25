@@ -52,6 +52,8 @@ const ChartPage = () => {
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [symbols, setSymbols] = useState(['BTCUSDT']);
+  const [dataSource, setDataSource] = useState('Binance');
+  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   const [showSignals, setShowSignals] = useState(true);
   const [signalRange, setSignalRange] = useState({ start: '2026-01-01', end: '2026-06-25' });
   const [signalCount, setSignalCount] = useState(0);
@@ -70,7 +72,10 @@ const ChartPage = () => {
 
   // --- Symbols + strategies -----------------------------------------
   useEffect(() => {
-    fetch(`${API_URL}/symbols`, { headers: authHeaders() })
+    fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []).then(list => {
+      if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
+    }).catch(() => {});
+    fetch(`${API_URL}/symbols?source=${encodeURIComponent(dataSource)}`, { headers: authHeaders() })
       .then(r => (r.ok ? r.json() : ['BTCUSDT']))
       .then(list => {
         if (Array.isArray(list) && list.length) {
@@ -93,6 +98,13 @@ const ChartPage = () => {
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    fetch(`${API_URL}/symbols?source=${encodeURIComponent(dataSource)}`, { headers: authHeaders() })
+      .then(r => r.ok ? r.json() : ['BTCUSDT']).then(list => {
+        if (Array.isArray(list) && list.length) { setSymbols(list); if (!list.includes(symbol)) setSymbol(list[0]); }
+      }).catch(() => {});
+  }, [dataSource]);
 
   // --- Chart init ----------------------------------------------------
   const initChart = useCallback(() => {
@@ -219,7 +231,7 @@ const ChartPage = () => {
     if (!candleSeriesRef.current) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/klines?symbol=${symbol}&interval=${interval}&limit=500`);
+      const res = await fetch(`${API_URL}/klines?symbol=${symbol}&interval=${interval}&limit=500&source=${encodeURIComponent(dataSource)}`);
       const data = await res.json();
       candlesRef.current = data;
       timesRef.current = data.map(d => d.time);
@@ -250,7 +262,7 @@ const ChartPage = () => {
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, interval, showSignals, overlayStrategy]);
+  }, [symbol, interval, showSignals, overlayStrategy, dataSource]);
 
   useEffect(() => {
     if (chartRef.current && candleSeriesRef.current) fetchData();
@@ -339,7 +351,7 @@ const ChartPage = () => {
       return;
     }
     try {
-      const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}`;
+      const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
       const res = await fetch(url, { headers: authHeaders() });
       if (!res.ok) { if (markersRef.current) markersRef.current.setMarkers([]); setSignalCount(0); return; }
       const sigs = await res.json();
@@ -361,7 +373,7 @@ const ChartPage = () => {
       if (markersRef.current) markersRef.current.setMarkers([]);
       setSignalCount(0);
     }
-  }, [symbol, interval, signalRange, overlayStrategy, authHeaders]);
+  }, [symbol, interval, signalRange, overlayStrategy, dataSource, authHeaders]);
 
   useEffect(() => { applySignals(showSignals); }, [applySignals, showSignals]);
 
@@ -404,6 +416,11 @@ const ChartPage = () => {
                 {int}
               </button>
             ))}
+          </div>
+          <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded-lg border border-gray-700">
+            <select value={dataSource} onChange={e => setDataSource(e.target.value)} className="bg-transparent text-sm font-bold text-white outline-none cursor-pointer">
+              {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
+            </select>
           </div>
           <div className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded-lg border border-gray-700">
             <Layers size={16} className="text-gray-400" />
@@ -477,7 +494,7 @@ const ChartPage = () => {
       <div className="relative bg-gray-900 p-3 rounded-2xl border border-gray-700 shadow-2xl">
         <div className="absolute top-4 left-6 z-10 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-800/90 border border-gray-700 text-xs">
           <Radio size={14} className="text-green-400 animate-pulse" />
-          <span className="font-mono font-bold text-green-400">{symbol}</span>
+          <span className="font-mono font-bold text-green-400">{dataSource} · {symbol}</span>
           <span className="text-gray-500">/</span>
           <span className="text-gray-400">{interval}</span>
           <span className="mx-1 text-gray-600">•</span>

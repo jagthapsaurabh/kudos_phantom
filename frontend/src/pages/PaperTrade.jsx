@@ -69,7 +69,8 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Dir</th>
               <th className="p-2">Entry</th>
               <th className="p-2">Exit</th>
-              <th className="p-2">PnL</th>
+              <th className="p-2">Net PnL</th>
+              <th className="p-2">Fees</th>
               <th className="p-2">Reason</th>
               <th className="p-2">Held</th>
             </tr>
@@ -166,6 +167,7 @@ const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
         <div className="flex items-center gap-2">
           <div className={`w-2 h-2 rounded-full ${inst.is_running ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
           <span className="font-bold text-sm text-gray-200">{inst.strategy_id}</span>
+          <span className="text-[10px] text-blue-300 ml-2">{inst.data_source || 'Binance'} · {inst.taker_fee_bps ?? '—'}/{inst.maker_fee_bps ?? '—'} bps</span>
         </div>
         <span className={`text-[10px] font-bold uppercase ${inst.is_running ? 'text-green-400' : 'text-red-400'}`}>
           {inst.is_running ? 'Running' : 'Stopped'}
@@ -197,8 +199,14 @@ const PaperTrade = () => {
   const [confirm, setConfirm] = useState(null); // { type, key, ... }
   const [capital, setCapital] = useState(20000);
   const [marginPct, setMarginPct] = useState(25);
+  const [dataSource, setDataSource] = useState('Binance');
+  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
 
   useEffect(() => {
+    fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => r.ok ? r.json() : []).then(list => {
+        if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
+      }).catch(() => {});
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
@@ -246,6 +254,8 @@ const PaperTrade = () => {
           strategy_id: selectedStrategy,
           initial_capital: parseFloat(capital),
           margin_pct: parseFloat(marginPct),
+          broker_name: dataSource,
+          data_source: dataSource,
         })
       });
       if (res.ok) {
@@ -255,8 +265,11 @@ const PaperTrade = () => {
           fetchStatus();
           setSelectedInstance(data.instance_key);
         }, 500);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert(err.detail || 'Could not start paper trade');
       }
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error(e); alert(e.message); }
     setLoading(false);
   };
 
@@ -304,6 +317,10 @@ const PaperTrade = () => {
           <p className="text-gray-400 text-sm mt-1">Simulating trades with real-time market data</p>
         </div>
         <div className="flex flex-wrap gap-3 items-center">
+          <select value={dataSource} onChange={e => setDataSource(e.target.value)}
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+            {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
+          </select>
           <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             <option value="PhantomV2">Phantom V2.5 (Default)</option>

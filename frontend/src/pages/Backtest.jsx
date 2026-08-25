@@ -43,6 +43,9 @@ const Backtest = () => {
   const [runName, setRunName] = useState('');
   const [confirm, setConfirm] = useState(null); // { type, runId, ... }
   const [capital, setCapital] = useState(20000); // starting capital for the run (default = admin set)
+  const [dataSource, setDataSource] = useState('Binance');
+  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  const [fees, setFees] = useState({ taker_fee_bps: 5.9, maker_fee_bps: 2.36 });
 
   // Chart Refs
   const chartContainerRef = useRef();
@@ -83,6 +86,11 @@ const Backtest = () => {
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    fetch(`${API_URL}/fee-settings?broker_code=${encodeURIComponent(dataSource)}&mode=backtest`, { headers: authHeaders() })
+      .then(r => r.ok ? r.json() : null).then(v => v && setFees(v)).catch(() => {});
+  }, [dataSource]);
 
   useEffect(() => {
     if (results && results.equity_curve) {
@@ -135,6 +143,8 @@ const Backtest = () => {
           end_date: dates.end,
           strategy_name: strategyName,
           initial_capital: parseFloat(capital),
+          data_source: dataSource,
+          fee_mode: 'backtest',
         }),
       });
 
@@ -250,7 +260,12 @@ const Backtest = () => {
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 
-  useEffect(() => { fetchStrategies(); fetchHistory(); }, []);
+  useEffect(() => {
+    fetchStrategies(); fetchHistory();
+    fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []).then(list => {
+      if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
+    }).catch(() => {});
+  }, []);
 
   return (
     <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
@@ -287,7 +302,7 @@ const Backtest = () => {
               <div key={run.id} className="p-4 bg-gray-900 rounded-xl border border-gray-700 hover:border-blue-500 transition group relative">
                 <div className="cursor-pointer" onClick={() => loadRun(run.id)}>
                   <div className="font-bold text-gray-200 group-hover:text-blue-400 transition">{run.name || 'Unnamed Run'}</div>
-                  <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]}</div>
+                  <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Binance'}</div>
                   <div className={`font-mono text-sm mt-2 ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
                 </div>
                 <button onClick={(e) => { e.stopPropagation(); requestDeleteRun(run.id, run.name); }}
@@ -316,6 +331,13 @@ const Backtest = () => {
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
           </div>
           <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Market Data / Exchange</label>
+            <select value={dataSource} onChange={e => setDataSource(e.target.value)}
+              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+              {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
             <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
@@ -333,6 +355,12 @@ const Backtest = () => {
             <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
           </div>
+        </div>
+        <div className="mb-5 flex flex-wrap items-center gap-3 text-[11px] text-gray-400 bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2">
+          <span className="text-blue-300 font-bold">{dataSource} fee schedule</span>
+          <span>Taker: <b className="text-white">{Number(fees.taker_fee_bps).toFixed(2)} bps</b></span>
+          <span>Maker: <b className="text-white">{Number(fees.maker_fee_bps).toFixed(2)} bps</b></span>
+          <span className="text-gray-600">Managed by admin</span>
         </div>
 
         {/* Parameter groups */}
@@ -384,7 +412,7 @@ const Backtest = () => {
                 <Timer size={18} className="text-blue-400" /> {results.name || 'Unnamed Run'}
               </h2>
               <p className="text-xs text-gray-500 mt-1">
-                {results.start_date ? new Date(results.start_date).toLocaleDateString() : ''} → {results.end_date ? new Date(results.end_date).toLocaleDateString() : ''} · {results.total_trades} trades
+                {results.start_date ? new Date(results.start_date).toLocaleDateString() : ''} → {results.end_date ? new Date(results.end_date).toLocaleDateString() : ''} · {results.data_source || 'Binance'} · {results.total_trades} trades · fees {results.taker_fee_bps ?? '—'}/{results.maker_fee_bps ?? '—'} bps
               </p>
             </div>
             <div className="flex items-center gap-2">

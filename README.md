@@ -82,6 +82,16 @@ v2.5 behaviour, so the API, paper trader and live trader remain fully backward c
 
 ---
 
+## 🔌 Exchanges, fees & seeded market data
+The admin panel now includes separate **Fees**, **Broker Integrations**, and **Seed Data** tabs:
+
+- Admins manage taker and maker fees in basis points independently for **backtest**, **paper**, and **live** modes and per exchange. New runs snapshot the selected schedule, so changing fees never rewrites historical results. `.env` values remain the first-install fallback only.
+- Binance Futures and Delta Exchange are built-in market-data and live-order adapters. Admins can register additional named integrations (a compatible runtime adapter is required before live orders are enabled).
+- Seed data is stored as `source + symbol + interval + event_time` and always includes OHLCV volume. The Seed Data tab supports exchange API seeding and CSV import with the required columns `event_time,open,high,low,close,volume`.
+- Users choose Binance or Delta for each backtest, chart, paper instance, and live instance. Broker Settings supports multiple credential connections, and the existing instance workers allow multiple exchange/strategy sessions to run concurrently.
+
+Useful API endpoints include `GET /broker-definitions`, `GET /broker-connections`, `GET /fee-settings`, `POST /admin/fee-settings`, `POST /admin/market-data/seed`, and `POST /admin/market-data/seed-csv`.
+
 ## ⚙️ Configuration
 All critical variables are managed in `backend/.env`:
 - `DATABASE_URL`: Path to SQLite or Postgres DB.
