@@ -3,7 +3,7 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
-import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet } from 'lucide-react';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp } from 'lucide-react';
 
 const PARAM_META = {
   trend_ema_period: { label: 'Trend EMA', hint: 'How far back the 4h trend looks. Higher = slower, fewer trades.' },
@@ -27,6 +27,39 @@ const PARAM_META = {
   dd_resume_pct: { label: 'Resume drawdown %', hint: 'Start entries again once drawdown falls below this.' },
 };
 
+const isBacktestComplete = (runDetails) => Boolean(
+  runDetails
+  && runDetails.total_trades !== null
+  && runDetails.total_trades !== undefined
+  && runDetails.final_equity !== null
+  && runDetails.final_equity !== undefined
+  && Array.isArray(runDetails.equity_curve)
+);
+
+const normalizeBacktestResults = (runDetails, trades = []) => {
+  if (!runDetails) return null;
+  return {
+    ...runDetails,
+    final_equity_inr: runDetails.final_equity ?? runDetails.final_equity_inr ?? null,
+    trades: Array.isArray(trades) ? trades : [],
+    rejected_reasons: runDetails.rejected_reasons && typeof runDetails.rejected_reasons === 'object'
+      ? runDetails.rejected_reasons
+      : {},
+  };
+};
+
+const formatCurrencyValue = (value, digits = 0) => (
+  value === null || value === undefined || Number.isNaN(Number(value))
+    ? '—'
+    : `₹${Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`
+);
+
+const formatPercentValue = (value, digits = 2) => (
+  value === null || value === undefined || Number.isNaN(Number(value))
+    ? '—'
+    : `${Number(value).toFixed(digits)}%`
+);
+
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
   if (!open) return null;
@@ -43,6 +76,33 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
     </div>
   );
 };
+
+const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle, actions, className = '', children }) => (
+  <div className={`bg-gray-800 rounded-2xl border border-gray-700 shadow-xl ${className}`}>
+    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          {Icon ? <Icon size={16} className="shrink-0 text-blue-400" /> : null}
+          <h2 className="text-sm font-bold uppercase tracking-wider text-gray-200">{title}</h2>
+        </div>
+        {subtitle ? <p className="mt-1 text-xs text-gray-500">{subtitle}</p> : null}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        {actions}
+        {onToggle && (
+          <button
+            onClick={onToggle}
+            className="inline-flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-1.5 text-xs font-semibold text-gray-300 transition hover:border-blue-500 hover:text-white"
+          >
+            {collapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+            {collapsed ? 'View' : 'Hide'}
+          </button>
+        )}
+      </div>
+    </div>
+    {!collapsed && <div className="px-4 pb-4 sm:px-6 sm:pb-6">{children}</div>}
+  </div>
+);
 
 const Backtest = () => {
   const DEFAULT_PARAMS = {
@@ -78,11 +138,42 @@ const Backtest = () => {
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   const [fees, setFees] = useState({ taker_fee_bps: 5.9, maker_fee_bps: 2.36 });
+  const defaultSectionVisibility = {
+    history: true,
+    setup: true,
+    config: true,
+    preview: true,
+    summary: true,
+    equity: true,
+    breakdown: true,
+    trades: true,
+  };
+  const completedRunSectionVisibility = {
+    history: false,
+    setup: false,
+    config: false,
+    preview: false,
+    summary: true,
+    equity: true,
+    breakdown: true,
+    trades: false,
+  };
+  const [sectionVisibility, setSectionVisibility] = useState(() => {
+    if (typeof window === 'undefined') return defaultSectionVisibility;
+    try {
+      const saved = JSON.parse(localStorage.getItem('backtest_section_visibility') || '{}');
+      return { ...defaultSectionVisibility, ...saved };
+    } catch {
+      return defaultSectionVisibility;
+    }
+  });
 
   // Chart Refs
   const chartContainerRef = useRef();
   const chartRef = useRef();
   const resultsRef = useRef(null);
+  const pollIntervalRef = useRef(null);
+  const resultsSectionRef = useRef(null);
 
   // Fields that the backtest shows live per-direction with the toggle ON.
   const directionalFields = [
@@ -105,6 +196,7 @@ const Backtest = () => {
   };
   const useDirection = !!(params.entry_conditions && params.entry_conditions.use_direction_conditions);
 
+  const toggleSection = (key) => setSectionVisibility(prev => ({ ...prev, [key]: !prev[key] }));
   const setSharedField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
 
   const setDirField = (side, field, value) => setParams(prev => ({
@@ -190,13 +282,14 @@ const Backtest = () => {
     } catch (e) { }
   };
 
-  const fetchHistory = async () => {
+  const fetchHistory = async (options = {}) => {
+    const { autoOpen = false } = options;
     try {
       const res = await fetch(`${API_URL}/backtest/history`, { headers: authHeaders() });
       const data = await res.json();
       if (Array.isArray(data)) {
         setHistory(data);
-        if (data.length > 0) setShowHistory(true);
+        if (autoOpen && data.length > 0) setShowHistory(true);
       }
     } catch (e) { }
   };
@@ -216,12 +309,57 @@ const Backtest = () => {
   }, [dataSource]);
 
   useEffect(() => {
-    if (results && results.equity_curve) {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('backtest_section_visibility', JSON.stringify(sectionVisibility));
+    }
+  }, [sectionVisibility]);
+
+  useEffect(() => {
+    if (preview) {
+      setSectionVisibility(prev => ({ ...prev, preview: true }));
+    }
+  }, [preview]);
+
+  useEffect(() => {
+    if (results) {
+      setExpandedTrade(null);
+      setShowHistory(false);
+      setPreview(null);
+      setSectionVisibility(prev => ({
+        ...prev,
+        ...completedRunSectionVisibility,
+      }));
+      window.requestAnimationFrame(() => {
+        resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }, [results]);
+
+  useEffect(() => {
+    if (results && results.equity_curve && sectionVisibility.equity) {
       resultsRef.current = results;
       const timer = setTimeout(() => { initEquityChart(results.equity_curve); }, 100);
       return () => clearTimeout(timer);
     }
-  }, [results]);
+  }, [results, sectionVisibility.equity]);
+
+  useEffect(() => {
+    if (!sectionVisibility.equity && chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+    }
+  }, [sectionVisibility.equity]);
+
+  useEffect(() => () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+    }
+  }, []);
 
   const resetParams = () => setParams(JSON.parse(JSON.stringify(DEFAULT_PARAMS)));
 
@@ -279,27 +417,42 @@ const Backtest = () => {
       const data = await response.json();
       const runId = data.run_id;
 
-      // Poll for results
-      const pollInterval = setInterval(async () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+
+      const pollForResults = async () => {
         try {
           const res = await fetch(`${API_URL}/backtest/results/${runId}`, { headers: authHeaders() });
+          if (!res.ok) return false;
           const resultData = await res.json();
+          if (!isBacktestComplete(resultData.run_details)) return false;
 
-          if (resultData.run_details && resultData.run_details.total_trades !== undefined) {
-            setResults({
-              ...resultData.run_details,
-              final_equity_inr: resultData.run_details.final_equity,
-              trades: resultData.trades
-            });
-            setLoading(false);
-            clearInterval(pollInterval);
-            fetchHistory();
-            setRunName('');
+          setResults(normalizeBacktestResults({ id: runId, ...resultData.run_details }, resultData.trades));
+          setLoading(false);
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
           }
-        } catch (e) { console.error("Polling error:", e); }
-      }, 2000);
+          fetchHistory();
+          setRunName('');
+          return true;
+        } catch (e) {
+          console.error('Polling error:', e);
+          return false;
+        }
+      };
 
+      const completed = await pollForResults();
+      if (!completed) {
+        pollIntervalRef.current = setInterval(pollForResults, 2000);
+      }
     } catch (error) {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
       alert(error.message);
       setLoading(false);
     }
@@ -395,7 +548,7 @@ const Backtest = () => {
       if (!res.ok) throw new Error((await res.json()).detail || "Run not found");
       const data = await res.json();
       if (!data.run_details) throw new Error("Run details missing");
-      setResults({ ...data.run_details, final_equity_inr: data.run_details.final_equity, trades: data.trades });
+      setResults(normalizeBacktestResults({ id: runId, ...data.run_details }, data.trades));
       setShowHistory(false);
     } catch (e) { alert(`Error loading run: ${e.message}`); }
   };
@@ -426,17 +579,19 @@ const Backtest = () => {
   };
 
   const stats = results ? {
-    totalTrades: results.total_trades,
-    initialCapital: results.initial_capital || 20000,
-    finalEquity: results.final_equity_inr,
-    netProfit: results.final_equity_inr - (results.initial_capital || 20000),
+    totalTrades: results.total_trades ?? 0,
+    initialCapital: results.initial_capital ?? 20000,
+    finalEquity: results.final_equity_inr ?? results.final_equity ?? null,
+    netProfit: (results.final_equity_inr ?? results.final_equity) != null
+      ? (results.final_equity_inr ?? results.final_equity) - (results.initial_capital ?? 20000)
+      : null,
     roi: results.roi,
     winRate: results.win_rate,
     profitFactor: results.profit_factor,
     sharpe: results.sharpe_ratio,
     maxDD: results.max_drawdown,
-    exitDist: results.trades?.reduce((acc, t) => { acc[t.exit_reason] = (acc[t.exit_reason] || 0) + 1; return acc; }, {}),
-    directionDist: results.trades?.reduce((acc, t) => { const dir = t.direction === 1 ? 'Long' : 'Short'; acc[dir] = (acc[dir] || 0) + 1; return acc; }, {}),
+    exitDist: (results.trades || []).reduce((acc, t) => { acc[t.exit_reason] = (acc[t.exit_reason] || 0) + 1; return acc; }, {}),
+    directionDist: (results.trades || []).reduce((acc, t) => { const dir = t.direction === 1 ? 'Long' : 'Short'; acc[dir] = (acc[dir] || 0) + 1; return acc; }, {}),
     rejections: results.rejected_reasons || {}
   } : null;
 
@@ -444,7 +599,7 @@ const Backtest = () => {
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 
   useEffect(() => {
-    fetchStrategies(); fetchHistory();
+    fetchStrategies(); fetchHistory({ autoOpen: true });
     fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []).then(list => {
       if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
     }).catch(() => {});
@@ -462,117 +617,153 @@ const Backtest = () => {
         onConfirm={doConfirm}
       />
 
-      <div className="flex justify-between items-center mb-8">
+      <div className="mb-8 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h1 className="text-3xl font-extrabold text-blue-400 tracking-tight">Strategy Optimizer</h1>
-          <p className="text-gray-500 text-sm">Refine PHANTOM v2.5 parameters and validate equity growth</p>
+          <h1 className="text-3xl font-extrabold tracking-tight text-blue-400">Backtest</h1>
+          <p className="text-sm text-gray-500">Strategy optimizer with collapsible setup, configuration and results sections.</p>
         </div>
-        <div className="flex gap-3">
-          <button onClick={requestClearAll} className="bg-red-900/20 text-red-400 px-4 py-2 rounded-lg border border-red-900/50 hover:bg-red-900/40 transition text-sm font-semibold flex items-center gap-2">
+        <div className="flex flex-wrap gap-3">
+          <button onClick={requestClearAll} className="flex items-center gap-2 rounded-lg border border-red-900/50 bg-red-900/20 px-4 py-2 text-sm font-semibold text-red-400 transition hover:bg-red-900/40">
             <Trash2 size={14} /> Clear History
           </button>
-          <button onClick={() => setShowHistory(!showHistory)} className="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 hover:bg-gray-700 transition text-sm font-semibold">
-            {showHistory ? 'Close History' : '📜 View History'}
+          <button onClick={() => setShowHistory(!showHistory)} className="rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm font-semibold transition hover:bg-gray-700">
+            {showHistory ? 'Hide History' : 'View History'}
           </button>
         </div>
       </div>
 
       {showHistory && (
-        <div className="mb-8 bg-gray-800 p-6 rounded-2xl border border-gray-700 animate-in slide-in-from-top-4">
-          <h2 className="text-xl font-semibold mb-4 text-gray-300">Backtest History ({history.length} runs)</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <SectionCard
+          title={`Backtest History (${history.length} runs)`}
+          subtitle="Open a previous run or remove it from saved history."
+          icon={Timer}
+          collapsed={!sectionVisibility.history}
+          onToggle={() => toggleSection('history')}
+          actions={
+            <button onClick={() => setShowHistory(false)} className="text-xs text-gray-500 transition hover:text-white">
+              Close
+            </button>
+          }
+          className="mb-8"
+        >
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             {history.map(run => (
-              <div key={run.id} className="p-4 bg-gray-900 rounded-xl border border-gray-700 hover:border-blue-500 transition group relative">
+              <div key={run.id} className="group relative rounded-xl border border-gray-700 bg-gray-900 p-4 transition hover:border-blue-500">
                 <div className="cursor-pointer" onClick={() => loadRun(run.id)}>
-                  <div className="font-bold text-gray-200 group-hover:text-blue-400 transition">{run.name || 'Unnamed Run'}</div>
+                  <div className="font-bold text-gray-200 transition group-hover:text-blue-400">{run.name || 'Unnamed Run'}</div>
                   <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Binance'}</div>
-                  <div className={`font-mono text-sm mt-2 ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
+                  <div className={`mt-2 text-sm font-mono ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
                 </div>
                 <button onClick={(e) => { e.stopPropagation(); requestDeleteRun(run.id, run.name); }}
-                        className="absolute top-3 right-3 p-1.5 rounded-lg text-gray-500 hover:text-red-400 hover:bg-red-900/20 transition"
+                        className="absolute right-3 top-3 rounded-lg p-1.5 text-gray-500 transition hover:bg-red-900/20 hover:text-red-400"
                         title="Delete this run">
                   <Trash2 size={14} />
                 </button>
               </div>
             ))}
           </div>
-          {history.length === 0 && <p className="text-gray-500 text-center py-4">No backtest runs yet.</p>}
-        </div>
+          {history.length === 0 && <p className="py-4 text-center text-gray-500">No backtest runs yet.</p>}
+        </SectionCard>
       )}
 
-      <div className="bg-gray-800 p-4 sm:p-6 md:p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
-        <div className="flex items-center gap-2 mb-4">
-          <CalendarRange size={16} className="text-blue-400" />
-          <h2 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Run setup</h2>
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
+      <SectionCard
+        title="Run Setup"
+        subtitle="Choose the date range, exchange, strategy and starting capital for the next run."
+        icon={CalendarRange}
+        collapsed={!sectionVisibility.setup}
+        onToggle={() => toggleSection('setup')}
+        className="mb-8"
+      >
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start date</label>
+            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Start date</label>
             <DateInput value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End date</label>
+            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">End date</label>
             <DateInput value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Market data / exchange</label>
+            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Market data / exchange</label>
             <select value={dataSource} onChange={e => setDataSource(e.target.value)}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
               {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Strategy to test</label>
+            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Strategy to test</label>
             <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
               <option value="PhantomV2">Phantom V2.5 (Default)</option>
               {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run name (optional)</label>
+            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500"><Tag size={10} /> Run name (optional)</label>
             <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
+              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500" maxLength={60} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Wallet size={10} /> Starting capital (₹)</label>
+            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500"><Wallet size={10} /> Starting capital (₹)</label>
             <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500" />
           </div>
-          <div className="sm:col-span-2 flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">{dataSource} fee schedule</label>
-            <div className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 flex flex-wrap items-center gap-x-5 gap-y-1 min-h-[38px]">
-              <span className="text-[11px] text-gray-400">Taker <b className="text-white font-mono ml-1">{Number(fees.taker_fee_bps || 0).toFixed(2)} bps</b></span>
-              <span className="text-[11px] text-gray-400">Maker <b className="text-white font-mono ml-1">{Number(fees.maker_fee_bps || 0).toFixed(2)} bps</b></span>
+          <div className="flex flex-col sm:col-span-2">
+            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">{dataSource} fee schedule</label>
+            <div className="flex min-h-[38px] flex-wrap items-center gap-x-5 gap-y-1 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2">
+              <span className="text-[11px] text-gray-400">Taker <b className="ml-1 font-mono text-white">{Number(fees.taker_fee_bps || 0).toFixed(2)} bps</b></span>
+              <span className="text-[11px] text-gray-400">Maker <b className="ml-1 font-mono text-white">{Number(fees.maker_fee_bps || 0).toFixed(2)} bps</b></span>
               <span className="text-[10px] text-gray-600">Applied to every fill in this run</span>
             </div>
           </div>
         </div>
+      </SectionCard>
 
-        {/* Parameter groups */}
-        {showParamForm && (
-          <>
-            {/* Direction-specific override toggle */}
-            <div className="border-t border-gray-700 pt-6 mb-6">
-              <label className="flex items-start gap-3 bg-gray-900 p-3 rounded-lg border border-gray-700 text-sm text-gray-300 cursor-pointer">
-                <input type="checkbox" checked={useDirection}
-                  onChange={e => setUseDirection(e.target.checked)}
-                  className="accent-blue-500 w-4 h-4 mt-0.5" />
-                <div>
-                  <div className="font-bold text-white">Use separate conditions for Long / Short</div>
-                  <div className="text-[11px] text-gray-500 mt-0.5">
-                    When ON, tune MACD-hist min, stop-loss ATR, ATR regime floor + max-ATR cap and RSI/ADX independently for LONG and SHORT.
-                    Off = shared conditions (current v2.5 behaviour).
+      {showParamForm && (
+        <SectionCard
+          title="Strategy Configuration"
+          subtitle="Tune PHANTOM parameters, then hide this section when you want more room for results."
+          icon={SlidersHorizontal}
+          collapsed={!sectionVisibility.config}
+          onToggle={() => toggleSection('config')}
+          className="mb-8"
+        >
+          <div className="mb-6">
+            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-700 bg-gray-900 p-3 text-sm text-gray-300">
+              <input type="checkbox" checked={useDirection}
+                onChange={e => setUseDirection(e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-blue-500" />
+              <div>
+                <div className="font-bold text-white">Use separate conditions for Long / Short</div>
+                <div className="mt-0.5 text-[11px] text-gray-500">
+                  When ON, tune MACD-hist min, stop-loss ATR, ATR regime floor + max-ATR cap and RSI/ADX independently for LONG and SHORT.
+                  Off = shared conditions (current v2.5 behaviour).
+                </div>
+              </div>
+            </label>
+          </div>
+
+          {!useDirection && (
+            <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
+              {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
+                <div key={groupName} className="space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
+                  <div className="space-y-3">
+                    {fields.map(field => field === 'enable_momentum_entry'
+                      ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
+                      : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
                   </div>
                 </div>
-              </label>
+              ))}
             </div>
+          )}
 
-            {!useDirection && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 border-t border-gray-700 pt-6">
-                {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
+          {useDirection && (
+            <>
+              <div className="mb-6 grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-4">
+                {Object.entries(sharedGroups).map(([groupName, fields]) => (
                   <div key={groupName} className="space-y-3">
-                    <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
                     <div className="space-y-3">
                       {fields.map(field => field === 'enable_momentum_entry'
                         ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
@@ -581,126 +772,117 @@ const Backtest = () => {
                   </div>
                 ))}
               </div>
-            )}
 
-            {useDirection && (
-              <>
-                {/* Shared (non-directional) groups */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 mb-6">
-                  {Object.entries(sharedGroups).map(([groupName, fields]) => (
-                    <div key={groupName} className="space-y-3">
-                      <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
-                      <div className="space-y-3">
-                        {fields.map(field => field === 'enable_momentum_entry'
-                          ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
-                          : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
-                      </div>
+              <div className="border-t border-gray-700 pt-5">
+                <div className="mb-4 flex gap-2">
+                  {['long', 'short'].map(side => (
+                    <button key={side} onClick={() => setActiveDirTab(side)}
+                      className={`rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-wider transition ${
+                        activeDirTab === side
+                          ? side === 'long'
+                            ? 'bg-green-600 text-white shadow-lg shadow-green-900/20'
+                            : 'bg-red-600 text-white shadow-lg shadow-red-900/20'
+                          : 'border border-gray-700 bg-gray-900 text-gray-400 hover:text-white'}`}>
+                      {side === 'long' ? 'Long' : 'Short'}
+                      <span className="ml-1 opacity-80">{side === 'long' ? '▲' : '▼'}</span>
+                    </button>
+                  ))}
+                  <span className="ml-auto self-center text-[10px] text-gray-500">
+                    Editing: <b className={activeDirTab === 'long' ? 'text-green-400' : 'text-red-400'}>{activeDirTab}</b> conditions
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+                  {directionalFields.map(field => (
+                    <div key={field} className="flex flex-col">
+                      <label className="mb-1 flex items-center gap-1 text-[10px] font-semibold text-gray-400">
+                        {(PARAM_META[field]?.label) || field.replace(/_/g, ' ')}
+                        <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
+                        {PARAM_META[field]?.hint && <span title={PARAM_META[field].hint} className="cursor-help text-gray-600"><HelpCircle size={11} /></span>}
+                      </label>
+                      <input type="number" step="0.01"
+                        value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
+                        onChange={e => {
+                          const val = e.target.value;
+                          setDirField(activeDirTab, field, val === '' ? null : parseFloat(val));
+                        }}
+                        className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none transition focus:border-blue-500" />
+                      {field === 'atr_regime_max' && (
+                        <span className="mt-0.5 text-[9px] text-gray-600">max-ATR cap (multiples of SMA; blank = off)</span>
+                      )}
+                      {field === 'atr_regime_ratio' && (
+                        <span className="mt-0.5 text-[9px] text-gray-600">min-ATR floor (lower = more trades)</span>
+                      )}
+                      {field === 'macd_hist_min' && (
+                        <span className="mt-0.5 text-[9px] text-gray-600">{activeDirTab === 'long' ? 'require hist ≥ this' : 'require hist ≤ this (use negative for bearish)'}</span>
+                      )}
                     </div>
                   ))}
                 </div>
+              </div>
+            </>
+          )}
+        </SectionCard>
+      )}
 
-                {/* LONG / SHORT tabs */}
-                <div className="border-t border-gray-700 pt-5">
-                  <div className="flex gap-2 mb-4">
-                    {['long', 'short'].map(side => (
-                      <button key={side} onClick={() => setActiveDirTab(side)}
-                        className={`px-5 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition ${
-                          activeDirTab === side
-                            ? side === 'long'
-                              ? 'bg-green-600 text-white shadow-lg shadow-green-900/20'
-                              : 'bg-red-600 text-white shadow-lg shadow-red-900/20'
-                            : 'bg-gray-900 text-gray-400 border border-gray-700 hover:text-white'}`}>
-                        {side === 'long' ? 'Long' : 'Short'}
-                        <span className="ml-1 opacity-80">{side === 'long' ? '▲' : '▼'}</span>
-                      </button>
-                    ))}
-                    <span className="ml-auto self-center text-[10px] text-gray-500">
-                      Editing: <b className={activeDirTab === 'long' ? 'text-green-400' : 'text-red-400'}>{activeDirTab}</b> conditions
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-                    {directionalFields.map(field => (
-                      <div key={field} className="flex flex-col">
-                        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
-                          {(PARAM_META[field]?.label) || field.replace(/_/g, ' ')}
-                          <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
-                          {PARAM_META[field]?.hint && <span title={PARAM_META[field].hint} className="text-gray-600 cursor-help"><HelpCircle size={11} /></span>}
-                        </label>
-                        <input type="number" step="0.01"
-                          value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
-                          onChange={e => {
-                            const val = e.target.value;
-                            // Optional field (atr_regime_max): blank => null (disabled).
-                            setDirField(activeDirTab, field, val === '' ? null : parseFloat(val));
-                          }}
-                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
-                        {field === 'atr_regime_max' && (
-                          <span className="text-[9px] text-gray-600 mt-0.5">max-ATR cap (multiples of SMA; blank = off)</span>
-                        )}
-                        {field === 'atr_regime_ratio' && (
-                          <span className="text-[9px] text-gray-600 mt-0.5">min-ATR floor (lower = more trades)</span>
-                        )}
-                        {field === 'macd_hist_min' && (
-                          <span className="text-[9px] text-gray-600 mt-0.5">{activeDirTab === 'long' ? 'require hist ≥ this' : 'require hist ≤ this (use negative for bearish)'}</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
-            )}
-          </>
-        )}
-
-        {/* Actions */}
-        <div className="mt-6 flex flex-col lg:flex-row justify-between items-stretch lg:items-center gap-3 border-t border-gray-700 pt-6">
-          <p className="text-[11px] text-gray-500 max-w-md">
-            <SlidersHorizontal size={12} className="inline mr-1 text-gray-600" />
+      <SectionCard
+        title="Run Controls"
+        subtitle="Preview filters, save the current settings, or run the full backtest."
+        icon={Play}
+        className="mb-8"
+      >
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <p className="max-w-md text-[11px] text-gray-500">
+            <SlidersHorizontal size={12} className="mr-1 inline text-gray-600" />
             Preview Filters is a fast quality check. Run Backtest builds the full equity curve and trade log.
           </p>
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-wrap">
-            <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2 px-4">
+          <div className="flex flex-col flex-wrap gap-2 sm:flex-row sm:items-center">
+            <button onClick={resetParams} className="flex items-center justify-center gap-2 px-4 py-2 text-xs text-gray-500 transition hover:text-white">
               <RotateCcw size={14} /> Reset defaults
             </button>
             <button onClick={runFilterPreview} disabled={previewLoading || loading}
-              className="flex items-center justify-center gap-2 text-xs text-blue-300 border border-blue-800/50 hover:bg-blue-900/20 transition py-2 px-4 rounded-xl font-semibold">
-              {previewLoading ? <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div> : 'Preview Filters'}
+              className="flex items-center justify-center gap-2 rounded-xl border border-blue-800/50 px-4 py-2 text-xs font-semibold text-blue-300 transition hover:bg-blue-900/20 disabled:opacity-50">
+              {previewLoading ? <div className="h-3 w-3 rounded-full border-2 border-blue-400 border-t-transparent animate-spin"></div> : 'Preview Filters'}
             </button>
             <button onClick={saveAsNewStrategy} disabled={saving}
-              className="flex items-center justify-center gap-2 text-xs text-white bg-green-700 hover:bg-green-600 transition py-2 px-4 rounded-xl font-bold">
+              className="flex items-center justify-center gap-2 rounded-xl bg-green-700 px-4 py-2 text-xs font-bold text-white transition hover:bg-green-600 disabled:opacity-50">
               <Download size={14} /> {saving ? 'Saving...' : 'Save as strategy'}
             </button>
-            <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-8 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
-              {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <><Play size={16} /> Run Backtest</>}
+            <button onClick={runBacktest} disabled={loading} className="flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-8 py-3 font-bold shadow-lg shadow-blue-900/20 transition hover:bg-blue-500 disabled:opacity-50">
+              {loading ? <div className="h-4 w-4 rounded-full border-2 border-white border-t-transparent animate-spin"></div> : <><Play size={16} /> Run Backtest</>}
             </button>
           </div>
         </div>
-      </div>
+      </SectionCard>
 
       {preview && (
-        <div className="mb-8 bg-gray-800 p-6 rounded-2xl border border-blue-800/40 animate-in fade-in duration-300">
-          <div className="flex justify-between items-center mb-3">
-            <h2 className="text-sm font-bold text-blue-300 flex items-center gap-2">
-              <Activity size={16} /> Filter Preview — per bucket
-              {preview.use_direction_conditions && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/40">direction-specific ON</span>}
-            </h2>
-            <button onClick={() => setPreview(null)} className="text-xs text-gray-500 hover:text-white transition">✕ Close</button>
-          </div>
-          <p className="text-xs text-gray-500 mb-4">
-            {preview.total_trades} trades · WR {preview.total_win_rate}% · PF {preview.total_profit_factor}
-            <span className="ml-2 text-gray-600">— buckets reflect the conditions currently set in the form.</span>
+        <SectionCard
+          title="Filter Preview — per bucket"
+          subtitle={`${preview.total_trades} trades · WR ${preview.total_win_rate}% · PF ${preview.total_profit_factor}`}
+          icon={Activity}
+          collapsed={!sectionVisibility.preview}
+          onToggle={() => toggleSection('preview')}
+          actions={
+            <>
+              {preview.use_direction_conditions && <span className="rounded border border-purple-800/40 bg-purple-900/40 px-2 py-0.5 text-[10px] text-purple-300">direction-specific ON</span>}
+              <button onClick={() => setPreview(null)} className="text-xs text-gray-500 transition hover:text-white">Close</button>
+            </>
+          }
+          className="mb-8 border-blue-800/40"
+        >
+          <p className="mb-4 text-xs text-gray-500">
+            Buckets reflect the conditions currently set in the configuration form.
           </p>
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
             {Object.entries(preview.buckets || {}).map(([key, b]) => {
               const side = key.split('_')[0];
               const isLong = side === 'LONG';
               return (
-                <div key={key} className={`p-4 rounded-xl border ${isLong ? 'border-green-800/40 bg-green-900/10' : 'border-red-800/40 bg-red-900/10'}`}>
-                  <div className="flex items-center justify-between mb-2">
+                <div key={key} className={`rounded-xl border p-4 ${isLong ? 'border-green-800/40 bg-green-900/10' : 'border-red-800/40 bg-red-900/10'}`}>
+                  <div className="mb-2 flex items-center justify-between">
                     <span className={`text-xs font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>{key}</span>
-                    <span className="text-[10px] bg-gray-900 px-2 py-0.5 rounded text-gray-400">{b.count} trades</span>
+                    <span className="rounded bg-gray-900 px-2 py-0.5 text-[10px] text-gray-400">{b.count} trades</span>
                   </div>
-                  <div className="space-y-1 text-[11px] font-mono">
+                  <div className="space-y-1 font-mono text-[11px]">
                     <div className="flex justify-between"><span className="text-gray-500">Win rate</span><span className="text-white">{b.win_rate}%</span></div>
                     <div className="flex justify-between"><span className="text-gray-500">Profit factor</span><span className="text-white">{b.profit_factor}</span></div>
                     <div className="flex justify-between"><span className="text-gray-500">Avg PnL</span><span className={b.avg_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>₹{b.avg_pnl}</span></div>
@@ -710,203 +892,218 @@ const Backtest = () => {
               );
             })}
           </div>
-        </div>
+        </SectionCard>
       )}
 
       {results ? (
-        <div className="space-y-8 animate-in fade-in duration-500">
-          <div className="flex flex-wrap justify-between items-center gap-3 bg-gray-800 p-5 rounded-2xl border border-gray-700">
-            <div>
-              <h2 className="text-xl font-bold text-gray-200 flex items-center gap-2">
-                <Timer size={18} className="text-blue-400" /> {results.name || 'Unnamed Run'}
-              </h2>
-              <p className="text-xs text-gray-500 mt-1">
-                {results.start_date ? new Date(results.start_date).toLocaleDateString() : ''} → {results.end_date ? new Date(results.end_date).toLocaleDateString() : ''} · {results.data_source || 'Binance'} · {results.total_trades} trades · fees {results.taker_fee_bps ?? '—'}/{results.maker_fee_bps ?? '—'} bps
-              </p>
+        <div ref={resultsSectionRef} className="animate-in space-y-8 fade-in duration-500">
+          <SectionCard
+            title="Backtest Summary"
+            subtitle={`${results.name || 'Unnamed Run'} · ${results.start_date ? new Date(results.start_date).toLocaleDateString() : '—'} → ${results.end_date ? new Date(results.end_date).toLocaleDateString() : '—'} · ${results.data_source || 'Binance'} · ${results.total_trades ?? 0} trades · fees ${results.taker_fee_bps != null ? Number(results.taker_fee_bps).toFixed(2) : '—'}/${results.maker_fee_bps != null ? Number(results.maker_fee_bps).toFixed(2) : '—'} bps`}
+            icon={Timer}
+            collapsed={!sectionVisibility.summary}
+            onToggle={() => toggleSection('summary')}
+            actions={
+              <>
+                <button onClick={exportTradesCSV} className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold transition hover:bg-blue-500">
+                  <Download size={14} /> CSV Export
+                </button>
+                <button onClick={() => requestDeleteRun(results.id, results.name)} className="flex items-center gap-2 rounded-lg bg-red-900/30 px-4 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/50">
+                  <Trash2 size={14} /> Delete
+                </button>
+              </>
+            }
+          >
+            <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-5">
+              <StatCard label="Initial Capital" value={formatCurrencyValue(stats?.initialCapital)} color="text-yellow-400" />
+              <StatCard label="Final Equity" value={formatCurrencyValue(stats?.finalEquity)} color={stats?.finalEquity >= (stats?.initialCapital || 0) ? 'text-green-400' : 'text-red-400'} />
+              <StatCard label="Net Profit" value={formatCurrencyValue(stats?.netProfit)} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
+              <StatCard label="ROI" value={formatPercentValue(stats?.roi)} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
+              <StatCard label="Win Rate" value={formatPercentValue(stats?.winRate)} color="text-purple-400" />
             </div>
-            <div className="flex items-center gap-2">
-              <button onClick={exportTradesCSV} className="text-xs bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg font-bold transition flex items-center gap-2">
-                <Download size={14} /> CSV Export
-              </button>
-              <button onClick={() => requestDeleteRun(results.id, results.name)} className="text-xs bg-red-900/30 hover:bg-red-900/50 text-red-300 px-4 py-2 rounded-lg font-bold transition flex items-center gap-2">
-                <Trash2 size={14} /> Delete
-              </button>
-            </div>
-          </div>
+          </SectionCard>
 
-          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
-            <StatCard label="Initial Capital" value={`₹${stats?.initialCapital?.toLocaleString()}`} color="text-yellow-400" />
-            <StatCard label="Final Equity" value={`₹${stats?.finalEquity?.toLocaleString()}`} color={stats?.finalEquity >= (stats?.initialCapital || 0) ? 'text-green-400' : 'text-red-400'} />
-            <StatCard label="Net Profit" value={`₹${stats?.netProfit?.toLocaleString()}`} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
-            <StatCard label="ROI" value={`${stats?.roi?.toFixed(2)}%`} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
-            <StatCard label="Win Rate" value={`${stats?.winRate?.toFixed(2)}%`} color="text-purple-400" />
-          </div>
-
-          <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-            <h3 className="text-sm font-semibold text-gray-400 mb-4 flex items-center gap-2">
-              <TrendingUp size={16} /> Equity Curve
-            </h3>
+          <SectionCard
+            title="Equity Curve"
+            subtitle="Expand this section to inspect the run's equity growth over time."
+            icon={TrendingUp}
+            collapsed={!sectionVisibility.equity}
+            onToggle={() => toggleSection('equity')}
+          >
             <div ref={chartContainerRef} className="w-full" />
-          </div>
+          </SectionCard>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
-              <h3 className="text-sm font-semibold text-gray-400 mb-4">Exit Distribution</h3>
-              <div className="flex-1">
-                <ResponsiveContainer width="100%" height={250}>
-                  <PieChart>
-                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
-                      {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
-                    </Pie>
-                    <Tooltip contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', color: '#fff' }} />
-                  </PieChart>
-                </ResponsiveContainer>
+          <SectionCard
+            title="Performance Breakdown"
+            subtitle="Exit distribution, core metrics and rejected signal counts."
+            icon={Activity}
+            collapsed={!sectionVisibility.breakdown}
+            onToggle={() => toggleSection('breakdown')}
+          >
+            <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+              <div className="flex flex-col rounded-2xl border border-gray-700 bg-gray-800 p-6 shadow-xl">
+                <h3 className="mb-4 text-sm font-semibold text-gray-400">Exit Distribution</h3>
+                <div className="flex-1">
+                  <ResponsiveContainer width="100%" height={250}>
+                    <PieChart>
+                      <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
+                        {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
+                      </Pie>
+                      <Tooltip contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', color: '#fff' }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="mt-4 space-y-2">
+                  {Object.entries(stats?.exitDist || {}).map(([reason, count]) => (
+                    <div key={reason} className="flex justify-between text-xs">
+                      <span className="text-gray-500">{reason}</span>
+                      <span className="font-mono font-bold">{count}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div className="mt-4 space-y-2">
-                {Object.entries(stats?.exitDist || {}).map(([reason, count]) => (
-                  <div key={reason} className="flex justify-between text-xs">
-                    <span className="text-gray-500">{reason}</span>
-                    <span className="font-mono font-bold">{count}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
 
-            <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-              <h3 className="text-sm font-semibold text-gray-400 mb-4 flex items-center gap-2">
-                <Activity size={16} /> Core Metrics
-              </h3>
-              <div className="space-y-4">
-                <MetricRow label="Total Trades" value={stats?.totalTrades} />
-                <MetricRow label="Profit Factor" value={`${stats?.profitFactor?.toFixed(2)}`} />
-                <MetricRow label="Sharpe Ratio" value={`${stats?.sharpe?.toFixed(2)}`} />
-                <MetricRow label="Max Drawdown" value={`${stats?.maxDD?.toFixed(2)}%`} color="text-red-400" />
-                <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Long || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
-                <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Short || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
+              <div className="rounded-2xl border border-gray-700 bg-gray-800 p-6 shadow-xl">
+                <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-400">
+                  <Activity size={16} /> Core Metrics
+                </h3>
+                <div className="space-y-4">
+                  <MetricRow label="Total Trades" value={stats?.totalTrades ?? 0} />
+                  <MetricRow label="Profit Factor" value={stats?.profitFactor != null ? Number(stats.profitFactor).toFixed(2) : '—'} />
+                  <MetricRow label="Sharpe Ratio" value={stats?.sharpe != null ? Number(stats.sharpe).toFixed(2) : '—'} />
+                  <MetricRow label="Max Drawdown" value={formatPercentValue(stats?.maxDD)} color="text-red-400" />
+                  <MetricRow label="Longs" value={`${stats?.directionDist?.Long || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Long || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
+                  <MetricRow label="Shorts" value={`${stats?.directionDist?.Short || 0} (${stats?.totalTrades ? ((stats?.directionDist?.Short || 0) / stats?.totalTrades * 100).toFixed(1) : 0}%)`} />
 
-                <div className="border-t border-gray-700 mt-6 pt-6">
-                  <div className="flex justify-between items-center mb-3">
-                    <span className="text-xs font-bold text-gray-500 uppercase">Rejected Signals</span>
-                    <span className="bg-red-900/30 text-red-400 px-2 py-0.5 rounded text-xs font-bold border border-red-900/50">
-                      {Object.values(stats?.rejections || {}).reduce((a, b) => a + b, 0)}
-                    </span>
-                  </div>
-                  <div className="space-y-2">
-                    {Object.entries(stats?.rejections || {}).map(([reason, count]) => (
-                      <div key={reason} className="flex justify-between items-center p-2 bg-gray-900 rounded-lg border border-gray-700/50">
-                        <span className="text-[10px] text-gray-500 italic">{reason}</span>
-                        <span className="text-xs font-mono font-bold text-gray-300">{count}</span>
-                      </div>
-                    ))}
+                  <div className="mt-6 border-t border-gray-700 pt-6">
+                    <div className="mb-3 flex items-center justify-between">
+                      <span className="text-xs font-bold uppercase text-gray-500">Rejected Signals</span>
+                      <span className="rounded border border-red-900/50 bg-red-900/30 px-2 py-0.5 text-xs font-bold text-red-400">
+                        {Object.values(stats?.rejections || {}).reduce((a, b) => a + b, 0)}
+                      </span>
+                    </div>
+                    <div className="space-y-2">
+                      {Object.entries(stats?.rejections || {}).map(([reason, count]) => (
+                        <div key={reason} className="flex items-center justify-between rounded-lg border border-gray-700/50 bg-gray-900 p-2">
+                          <span className="text-[10px] italic text-gray-500">{reason}</span>
+                          <span className="text-xs font-mono font-bold text-gray-300">{count}</span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
+          </SectionCard>
 
-          <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden shadow-xl">
-              <div className="p-4 border-b border-gray-700 bg-gray-700/30 flex flex-wrap justify-between items-center gap-2">
-                <h3 className="font-bold text-gray-200">Detailed Trade Logs <span className="text-xs text-gray-500 font-normal">(entry conditions per candle)</span></h3>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] bg-gray-900 px-2 py-1 rounded text-gray-400">{results.trades?.length || 0} trades</span>
-                  <button onClick={exportTradesCSV} className="text-[10px] bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded font-bold transition">⬇ CSV Export</button>
-                </div>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-gray-900 text-gray-500 uppercase">
-                    <tr>
-                      <th className="p-3 font-semibold">Signal Candle</th>
-                      <th className="p-3 font-semibold">Entry</th>
-                      <th className="p-3 font-semibold">Exit</th>
-                      <th className="p-3 font-semibold">Dir</th>
-                      <th className="p-3 font-semibold">Setup</th>
-                      <th className="p-3 font-semibold">Candle</th>
-                      <th className="p-3 font-semibold">4H Trend</th>
-                      <th className="p-3 font-semibold">RSI</th>
-                      <th className="p-3 font-semibold">ADX</th>
-                      <th className="p-3 font-semibold">Net PnL</th>
-                      <th className="p-3 font-semibold">Reason</th>
-                      <th className="p-3 font-semibold">Cond.</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.trades?.map((t, i) => (
-                      <React.Fragment key={i}>
-                        <tr className="border-b border-gray-700 hover:bg-gray-700/30 transition cursor-pointer"
-                            onClick={() => setExpandedTrade(expandedTrade === i ? null : i)}>
-                          <td className="p-3 font-mono text-gray-400">{t.signal_candle_time ? new Date(t.signal_candle_time).toLocaleString() : (t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A')}</td>
-                          <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
-                          <td className="p-3">{(t.exit_price || 0).toFixed(2)}</td>
-                          <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
-                          <td className="p-3"><span className={`px-2 py-0.5 rounded text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
-                          <td className={`p-3 ${t.candle_type === 'GREEN' ? 'text-green-400' : t.candle_type === 'RED' ? 'text-red-400' : 'text-gray-400'}`}>{t.candle_type || '—'}</td>
-                          <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
-                          <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
-                          <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
-                          <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
-                          <td className="p-3"><span className="bg-gray-900 px-2 py-1 rounded text-[10px] text-gray-400 border border-gray-700">{t.exit_reason || 'N/A'}</span></td>
-                          <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
-                        </tr>
-                        {expandedTrade === i && (
-                          <tr className="bg-gray-900/60 border-b border-gray-700">
-                            <td colSpan={12} className="p-4">
-                              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[11px]">
-                                <div>
-                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Entry Conditions</div>
-                                  <div className="flex flex-wrap gap-1">
-                                    <CondChip ok={t.conditions?.adx_ok} label={`ADX≥min (${t.adx?.toFixed(1) ?? '?'})`} />
-                                    <CondChip ok={t.conditions?.macd_hist_ok} label="MACD-hist mag" />
-                                    <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
-                                    <CondChip ok={t.conditions?.rsi_ok} label="RSI trigger" />
-                                    <CondChip ok={t.conditions?.macd_confirm_ok} label="MACD confirm" />
-                                  </div>
-                                </div>
-                                <div>
-                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Indicators @ Signal</div>
-                                  <div className="font-mono text-gray-300 space-y-0.5">
-                                    <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
-                                    <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
-                                    <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
-                                    <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
-                                  </div>
-                                </div>
-                                <div>
-                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Risk Model</div>
-                                  <div className="font-mono text-gray-300 space-y-0.5">
-                                    <div>SL: {t.sl?.toFixed(2) ?? '—'}</div>
-                                    <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
-                                    <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
-                                    <div>Lots: {(t.lots || 0).toFixed(4)} • DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
-                                  </div>
-                                </div>
-                                <div>
-                                  <div className="text-gray-500 uppercase text-[9px] font-bold mb-1">Result</div>
-                                  <div className="font-mono text-gray-300 space-y-0.5">
-                                    <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
-                                    <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
-                                    <div>Exit: {t.exit_time ? new Date(t.exit_time).toLocaleString() : '—'} ({t.hold_bars || 0} bars)</div>
-                                    <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
-                                  </div>
+          <SectionCard
+            title={`Detailed Trade Logs (${results.trades?.length || 0})`}
+            subtitle="Entry conditions per candle. Expand a row for deeper inspection."
+            icon={Activity}
+            collapsed={!sectionVisibility.trades}
+            onToggle={() => toggleSection('trades')}
+            actions={
+              <button onClick={exportTradesCSV} className="rounded bg-blue-600 px-3 py-1 text-[10px] font-bold transition hover:bg-blue-500">
+                ⬇ CSV Export
+              </button>
+            }
+            className="overflow-hidden"
+          >
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-gray-900 uppercase text-gray-500">
+                  <tr>
+                    <th className="p-3 font-semibold">Signal Candle</th>
+                    <th className="p-3 font-semibold">Entry</th>
+                    <th className="p-3 font-semibold">Exit</th>
+                    <th className="p-3 font-semibold">Dir</th>
+                    <th className="p-3 font-semibold">Setup</th>
+                    <th className="p-3 font-semibold">Candle</th>
+                    <th className="p-3 font-semibold">4H Trend</th>
+                    <th className="p-3 font-semibold">RSI</th>
+                    <th className="p-3 font-semibold">ADX</th>
+                    <th className="p-3 font-semibold">Net PnL</th>
+                    <th className="p-3 font-semibold">Reason</th>
+                    <th className="p-3 font-semibold">Cond.</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.trades?.map((t, i) => (
+                    <React.Fragment key={i}>
+                      <tr className="cursor-pointer border-b border-gray-700 transition hover:bg-gray-700/30"
+                          onClick={() => setExpandedTrade(expandedTrade === i ? null : i)}>
+                        <td className="p-3 font-mono text-gray-400">{t.signal_candle_time ? new Date(t.signal_candle_time).toLocaleString() : (t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A')}</td>
+                        <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
+                        <td className="p-3">{(t.exit_price || 0).toFixed(2)}</td>
+                        <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
+                        <td className="p-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
+                        <td className={`p-3 ${t.candle_type === 'GREEN' ? 'text-green-400' : t.candle_type === 'RED' ? 'text-red-400' : 'text-gray-400'}`}>{t.candle_type || '—'}</td>
+                        <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
+                        <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
+                        <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
+                        <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
+                        <td className="p-3"><span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span></td>
+                        <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
+                      </tr>
+                      {expandedTrade === i && (
+                        <tr className="border-b border-gray-700 bg-gray-900/60">
+                          <td colSpan={12} className="p-4">
+                            <div className="grid grid-cols-2 gap-3 text-[11px] md:grid-cols-4">
+                              <div>
+                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Entry Conditions</div>
+                                <div className="flex flex-wrap gap-1">
+                                  <CondChip ok={t.conditions?.adx_ok} label={`ADX≥min (${t.adx?.toFixed(1) ?? '?'})`} />
+                                  <CondChip ok={t.conditions?.macd_hist_ok} label="MACD-hist mag" />
+                                  <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
+                                  <CondChip ok={t.conditions?.rsi_ok} label="RSI trigger" />
+                                  <CondChip ok={t.conditions?.macd_confirm_ok} label="MACD confirm" />
                                 </div>
                               </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                              <div>
+                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Indicators @ Signal</div>
+                                <div className="space-y-0.5 font-mono text-gray-300">
+                                  <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
+                                  <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
+                                  <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
+                                  <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
+                                </div>
+                              </div>
+                              <div>
+                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Risk Model</div>
+                                <div className="space-y-0.5 font-mono text-gray-300">
+                                  <div>SL: {t.sl?.toFixed(2) ?? '—'}</div>
+                                  <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
+                                  <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
+                                  <div>Lots: {(t.lots || 0).toFixed(4)} • DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
+                                </div>
+                              </div>
+                              <div>
+                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Result</div>
+                                <div className="space-y-0.5 font-mono text-gray-300">
+                                  <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
+                                  <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
+                                  <div>Exit: {t.exit_time ? new Date(t.exit_time).toLocaleString() : '—'} ({t.hold_bars || 0} bars)</div>
+                                  <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
             </div>
+          </SectionCard>
         </div>
       ) : (
-        <div className="bg-gray-800 p-8 sm:p-16 rounded-2xl border border-gray-700 text-center shadow-inner">
-          <div className="bg-gray-900 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 text-gray-600">
+        <div className="rounded-2xl border border-gray-700 bg-gray-800 p-8 text-center shadow-inner sm:p-16">
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-gray-900 text-gray-600">
             <TrendingUp size={32} />
           </div>
           <h3 className="text-xl font-bold text-gray-400">No Backtest Data</h3>
-          <p className="text-gray-600 text-sm mt-2 max-w-md mx-auto">Configure your strategy parameters and date range, then hit "Run Backtest" to analyze the equity curve.</p>
+          <p className="mx-auto mt-2 max-w-md text-sm text-gray-600">Configure your strategy parameters and date range, then hit "Run Backtest" to analyze the equity curve.</p>
         </div>
       )}
     </div>

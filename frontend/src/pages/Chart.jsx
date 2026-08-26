@@ -49,6 +49,7 @@ const ChartPage = () => {
   const timesRef = useRef([]);         // aligned times array
   const closesRef = useRef([]);        // aligned closes array
   const crosshairRef = useRef(null);   // subscription handler
+  const fullscreenRef = useRef(false);
 
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
@@ -70,6 +71,7 @@ const ChartPage = () => {
   const [showIndPanel, setShowIndPanel] = useState(false);
 
   const authHeaders = useCallback(() => ({ Authorization: `Bearer ${localStorage.getItem('token')}` }), []);
+  const getChartHeight = useCallback(() => (fullscreenRef.current ? window.innerHeight - 20 : 560), []);
 
   // --- Symbols + strategies -----------------------------------------
   useEffect(() => {
@@ -147,7 +149,7 @@ const ChartPage = () => {
           barSpacing: 8,
         },
         width: chartContainerRef.current.clientWidth,
-        height: fullscreen ? window.innerHeight - 20 : 560,
+        height: getChartHeight(),
       });
       chartRef.current = chart;
 
@@ -203,7 +205,7 @@ const ChartPage = () => {
         if (chartRef.current && chartContainerRef.current) {
           chartRef.current.applyOptions({
             width: chartContainerRef.current.clientWidth,
-            height: fullscreen ? window.innerHeight - 20 : 560,
+            height: getChartHeight(),
           });
         }
       };
@@ -217,7 +219,7 @@ const ChartPage = () => {
     } catch (error) {
       console.error('Critical error initializing chart:', error);
     }
-  }, [fullscreen]);
+  }, [getChartHeight]);
 
   useEffect(() => {
     const cleanup = initChart();
@@ -225,7 +227,7 @@ const ChartPage = () => {
       if (cleanup) cleanup();
       if (chartRef.current) { chartRef.current.remove(); chartRef.current = null; }
     };
-  }, [initChart, interval, symbol]);
+  }, [initChart]);
 
   // --- Data fetch ----------------------------------------------------
   const fetchData = useCallback(async () => {
@@ -286,8 +288,9 @@ const ChartPage = () => {
             color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
           }, 0);
         }
-        const vals = seriesObj.map((v) => ({ time, value: v }))
-          .filter((d, i) => d.value !== null && d.value !== undefined);
+        const vals = seriesObj
+          .map((v, i) => ({ time: times[i], value: v }))
+          .filter(d => d.time !== undefined && d.value !== null && d.value !== undefined);
         overlayRefs.current[key].setData(vals);
         overlayRefs.current[key].data = seriesObj;
       } else if (overlayRefs.current[key]) {
@@ -390,6 +393,17 @@ const ChartPage = () => {
       setFullscreen(false);
     }
   };
+
+  useEffect(() => {
+    fullscreenRef.current = fullscreen;
+    if (chartRef.current && chartContainerRef.current) {
+      chartRef.current.applyOptions({
+        width: chartContainerRef.current.clientWidth,
+        height: getChartHeight(),
+      });
+      chartRef.current.timeScale().fitContent();
+    }
+  }, [fullscreen, getChartHeight]);
 
   useEffect(() => {
     const onFs = () => setFullscreen(!!document.fullscreenElement);

@@ -60,7 +60,7 @@ const Navbar = () => {
   const navItems = [
     { name: 'Dashboard', path: '/', icon: LayoutDashboard },
     { name: 'Market Chart', path: '/chart', icon: LineChart },
-    { name: 'Optimizer', path: '/backtest', icon: TrendingUp },
+    { name: 'Backtest', path: '/backtest', icon: TrendingUp },
     { name: 'Paper Trade', path: '/paper', icon: Activity },
     ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: Radio }] : []),
     { name: 'Strategies', path: '/strategies', icon: PlayCircle },
