@@ -498,7 +498,7 @@ const Strategies = () => {
   const viewOnChart = (id) => navigate(`/chart?strategy=${id}`);
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+    <div className="page-shell">
       {confirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setConfirm(null)}>
           <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
@@ -511,8 +511,8 @@ const Strategies = () => {
           </div>
         </div>
       )}
-      <div className="flex justify-between items-center mb-8">
-        <h1 className="text-3xl font-bold text-blue-400">Strategies Manager</h1>
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-8">
+        <h1 className="text-2xl sm:text-3xl font-bold text-blue-400">Strategies Manager</h1>
         <button onClick={() => { 
           setEditingStrat(null); 
           setForm({name: '', params: { trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22, macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 1.2, trail_activation_atr: 1.5, trail_distance_atr: 0.5 }}); 
@@ -525,8 +525,8 @@ const Strategies = () => {
         </button>
       </div>
       
-      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
-        <table className="w-full text-left">
+      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden overflow-x-auto">
+        <table className="w-full text-left min-w-[640px]">
           <thead className="bg-gray-700 text-gray-300 text-sm">
             <tr>
               <th className="p-4">Strategy Name</th>
@@ -588,7 +588,7 @@ const Strategies = () => {
               </div>
 
               {stratType === 'params' ? (
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   {Object.keys(form.params || {}).map(key => (
                     <div key={key} className="flex flex-col">
                       <label className="text-xs text-gray-400 capitalize mb-1">{key.replace('_', ' ')}</label>

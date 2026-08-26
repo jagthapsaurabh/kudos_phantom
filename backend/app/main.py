@@ -1417,8 +1417,34 @@ def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
 # --- DASHBOARD ---
 @app.get("/dashboard/stats")
 def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
-    runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).all()
-    if not runs: return {"best_roi": 0, "total_runs": 0, "avg_win_rate": 0}
-    best_roi = max(r.roi for r in runs)
-    avg_win_rate = sum(r.win_rate for r in runs) / len(runs)
-    return { "best_roi": best_roi, "total_runs": len(runs), "avg_win_rate": avg_win_rate }
+    """Aggregate backtest stats for the signed-in user.
+
+    Incomplete placeholder runs (roi / win_rate still NULL) used to crash this
+    endpoint with a TypeError, which made the dashboard cards look broken.
+    """
+    try:
+        runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id)\
+            .order_by(BacktestRun.timestamp.desc()).all()
+        completed = [r for r in runs if r.total_trades is not None]
+        rois = [float(r.roi) for r in completed if r.roi is not None]
+        win_rates = [float(r.win_rate) for r in completed if r.win_rate is not None]
+        last = completed[0] if completed else None
+        return {
+            "best_roi": max(rois) if rois else 0.0,
+            "avg_roi": (sum(rois) / len(rois)) if rois else 0.0,
+            "total_runs": len(runs),
+            "completed_runs": len(completed),
+            "avg_win_rate": (sum(win_rates) / len(win_rates)) if win_rates else 0.0,
+            "best_win_rate": max(win_rates) if win_rates else 0.0,
+            "last_run": None if not last else {
+                "id": last.id, "name": last.name, "roi": last.roi,
+                "win_rate": last.win_rate, "total_trades": last.total_trades,
+                "timestamp": last.timestamp,
+            },
+        }
+    except Exception as e:
+        print(f"Dashboard stats error: {e}")
+        return {
+            "best_roi": 0.0, "avg_roi": 0.0, "total_runs": 0, "completed_runs": 0,
+            "avg_win_rate": 0.0, "best_win_rate": 0.0, "last_run": None,
+        }

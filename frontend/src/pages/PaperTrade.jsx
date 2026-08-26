@@ -297,7 +297,7 @@ const PaperTrade = () => {
   const runningCount = status.filter(s => s.is_running).length;
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+    <div className="page-shell">
       <ConfirmModal
         open={!!confirm}
         title={confirm?.type === 'stop' ? 'Stop Paper Trade Instance?' : 'Confirm'}
@@ -309,14 +309,14 @@ const PaperTrade = () => {
       />
 
       {/* Header */}
-      <div className="flex justify-between items-center mb-6">
+      <div className="flex flex-col xl:flex-row xl:justify-between xl:items-start gap-4 mb-6">
         <div>
-          <h1 className="text-3xl font-bold flex items-center gap-3 text-blue-400">
-            <Activity size={32} /> Paper Trading
+          <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-3 text-blue-400">
+            <Activity size={28} /> Paper Trading
           </h1>
           <p className="text-gray-400 text-sm mt-1">Simulating trades with real-time market data</p>
         </div>
-        <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex flex-wrap gap-3 items-end">
           <select value={dataSource} onChange={e => setDataSource(e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}

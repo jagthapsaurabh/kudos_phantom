@@ -2,11 +2,27 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --sidebar-w: 200px;
+  color-scheme: dark;
+}
+
+html.sidebar-collapsed {
+  --sidebar-w: 68px;
+}
+
+@media (max-width: 767px) {
+  :root,
+  html.sidebar-collapsed {
+    --sidebar-w: 0px;
+  }
+}
+
 body {
   margin: 0;
   padding: 0;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background-color: #0f172a; /* phantom-dark */
+  background-color: #0f172a;
   color: #f8fafc;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -14,4 +30,79 @@ body {
 
 * {
   box-sizing: border-box;
+}
+
+.page-shell {
+  margin-left: var(--sidebar-w);
+  padding: 4.5rem 0.85rem 1.25rem;
+  min-height: 100vh;
+  background-color: #111827;
+  color: #fff;
+  transition: margin-left 0.2s ease;
+}
+
+@media (min-width: 768px) {
+  .page-shell {
+    padding: 1.25rem 1.25rem 1.5rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .page-shell {
+    padding: 1.5rem 1.75rem 2rem;
+  }
+}
+
+/* Native date inputs: hide the often-invisible dark-mode glyph and let our
+   wrapper / the stretched indicator open the calendar on any click. */
+.date-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.date-input-field {
+  width: 100%;
+  background: #111827;
+  color: #fff;
+  border: 1px solid #374151;
+  border-radius: 0.5rem;
+  padding: 0.5rem 2.25rem 0.5rem 0.65rem;
+  font-size: 0.875rem;
+  outline: none;
+  color-scheme: dark;
+  cursor: pointer;
+}
+
+.date-input-field:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.35);
+}
+
+.date-input-field::-webkit-calendar-picker-indicator {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.date-input-icon {
+  position: absolute;
+  right: 0.55rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #93c5fd;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+input[type='date'] {
+  color-scheme: dark;
 }

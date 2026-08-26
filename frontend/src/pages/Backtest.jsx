@@ -2,7 +2,30 @@ import React, { useState, useEffect, useRef } from 'react';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import { API_URL } from '../api';
-import { Activity, TrendingUp, AlertCircle, RotateCcw, Trash2, Tag, Download, Timer } from 'lucide-react';
+import DateInput from '../components/DateInput';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet } from 'lucide-react';
+
+const PARAM_META = {
+  trend_ema_period: { label: 'Trend EMA', hint: 'How far back the 4h trend looks. Higher = slower, fewer trades.' },
+  rsi_oversold: { label: 'RSI oversold', hint: 'Long reversal fires after RSI was below this level.' },
+  rsi_overbought: { label: 'RSI overbought', hint: 'Short reversal fires after RSI was above this level.' },
+  adx_min: { label: 'Min ADX', hint: 'Skip choppy markets. Higher = only strong trends.' },
+  macd_hist_min: { label: 'MACD hist min', hint: 'Minimum momentum size. Longs: hist ≥ this. Shorts: hist ≤ this (use a negative).' },
+  atr_regime_ratio: { label: 'Min ATR floor', hint: 'Require ATR ≥ this × its 50-bar average. Lower = more trades.' },
+  atr_regime_max: { label: 'Max ATR cap', hint: 'Optional: skip high-volatility. Blank = off.' },
+  enable_momentum_entry: { label: 'Momentum entries', hint: 'Also take trend-continuation trades, not just reversals.' },
+  cooldown_bars: { label: 'Cooldown bars', hint: 'Wait this many candles after a close before a new entry.' },
+  stop_loss_atr: { label: 'Stop loss (ATR)', hint: 'Distance of the stop from entry, in ATRs. Higher = wider stop.' },
+  take_profit_atr: { label: 'Take profit (ATR)', hint: 'Distance of the profit target from entry, in ATRs.' },
+  trail_activation_atr: { label: 'Trail activation', hint: 'Start trailing the stop after this much profit (ATR).' },
+  trail_distance_atr: { label: 'Trail distance', hint: 'How tightly the trail follows price, in ATRs.' },
+  breakeven_atr: { label: 'Breakeven after', hint: 'Move stop to entry once profit reaches this many ATRs.' },
+  leverage: { label: 'Leverage', hint: 'Position notional = margin × leverage.' },
+  margin_pct: { label: 'Margin % of equity', hint: 'Share of equity used as margin per trade (0.15 = 15%).' },
+  dd_soft_pct: { label: 'Soft drawdown %', hint: 'Past this equity drawdown, position size is reduced.' },
+  dd_halt_pct: { label: 'Halt drawdown %', hint: 'Past this, new entries stop. 100 = guard off.' },
+  dd_resume_pct: { label: 'Resume drawdown %', hint: 'Start entries again once drawdown falls below this.' },
+};
 
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -125,24 +148,37 @@ const Backtest = () => {
       s.rules && typeof s.rules === 'object' && !Array.isArray(s.rules) &&
       ('entry_conditions' in s.rules || 'rsi_oversold' in s.rules));
 
-  const renderNumberInput = (field, value, onChange) => (
-    <div className="flex flex-col">
-      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
-      <input type="number" step="0.01" value={value}
-        onChange={onChange}
-        className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
-    </div>
-  );
+  const renderNumberInput = (field, value, onChange) => {
+    const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
+    return (
+      <div className="flex flex-col">
+        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
+          {meta.label}
+          {meta.hint && <span title={meta.hint} className="text-gray-600 hover:text-blue-400 cursor-help"><HelpCircle size={11} /></span>}
+        </label>
+        <input type="number" step="0.01" value={value ?? ''}
+          onChange={onChange}
+          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
+        {meta.hint && <span className="text-[10px] text-gray-600 mt-0.5 leading-snug hidden xl:block">{meta.hint}</span>}
+      </div>
+    );
+  };
 
-  const renderCheckInput = (field, checked, onChange) => (
-    <div className="flex flex-col">
-      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
-      <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
-        <input type="checkbox" checked={checked} onChange={onChange} className="accent-blue-500" />
-        Momentum entries
-      </label>
-    </div>
-  );
+  const renderCheckInput = (field, checked, onChange) => {
+    const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
+    return (
+      <div className="flex flex-col">
+        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
+          {meta.label}
+          {meta.hint && <span title={meta.hint} className="text-gray-600 hover:text-blue-400 cursor-help"><HelpCircle size={11} /></span>}
+        </label>
+        <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
+          <input type="checkbox" checked={checked} onChange={onChange} className="accent-blue-500" />
+          Allow momentum continuation trades
+        </label>
+      </div>
+    );
+  };
 
   const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}` });
 
@@ -150,7 +186,7 @@ const Backtest = () => {
     try {
       const res = await fetch(`${API_URL}/strategies`, { headers: authHeaders() });
       const data = await res.json();
-      setStrategies(data);
+      setStrategies(Array.isArray(data) ? data : []);
     } catch (e) { }
   };
 
@@ -158,8 +194,10 @@ const Backtest = () => {
     try {
       const res = await fetch(`${API_URL}/backtest/history`, { headers: authHeaders() });
       const data = await res.json();
-      setHistory(data);
-      if (data && data.length > 0) setShowHistory(true);
+      if (Array.isArray(data)) {
+        setHistory(data);
+        if (data.length > 0) setShowHistory(true);
+      }
     } catch (e) { }
   };
 
@@ -413,7 +451,7 @@ const Backtest = () => {
   }, []);
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
+    <div className="page-shell font-sans">
       <ConfirmModal
         open={!!confirm}
         title={confirm?.type === 'deleteRun' ? 'Delete Backtest Run?' : confirm?.type === 'clearAll' ? 'Clear All Backtest History?' : 'Confirm'}
@@ -462,28 +500,29 @@ const Backtest = () => {
         </div>
       )}
 
-      <div className="bg-gray-800 p-6 md:p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
-        {/* Top controls */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="bg-gray-800 p-4 sm:p-6 md:p-8 rounded-2xl border border-gray-700 mb-8 shadow-xl">
+        <div className="flex items-center gap-2 mb-4">
+          <CalendarRange size={16} className="text-blue-400" />
+          <h2 className="text-sm font-bold text-gray-200 uppercase tracking-wider">Run setup</h2>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start Date</label>
-            <input type="date" value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Start date</label>
+            <DateInput value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End Date</label>
-            <input type="date" value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })}
-              className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">End date</label>
+            <DateInput value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Market Data / Exchange</label>
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Market data / exchange</label>
             <select value={dataSource} onChange={e => setDataSource(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
               {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Strategy to test</label>
             <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
               <option value="PhantomV2">Phantom V2.5 (Default)</option>
@@ -491,21 +530,23 @@ const Backtest = () => {
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run Name (optional)</label>
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Tag size={10} /> Run name (optional)</label>
             <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" maxLength={60} />
           </div>
           <div className="flex flex-col">
-            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1 flex items-center gap-1"><Wallet size={10} /> Starting capital (₹)</label>
             <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition" />
           </div>
-        </div>
-        <div className="mb-5 flex flex-wrap items-center gap-3 text-[11px] text-gray-400 bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2">
-          <span className="text-blue-300 font-bold">{dataSource} fee schedule</span>
-          <span>Taker: <b className="text-white">{Number(fees.taker_fee_bps).toFixed(2)} bps</b></span>
-          <span>Maker: <b className="text-white">{Number(fees.maker_fee_bps).toFixed(2)} bps</b></span>
-          <span className="text-gray-600">Managed by admin</span>
+          <div className="sm:col-span-2 flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">{dataSource} fee schedule</label>
+            <div className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 flex flex-wrap items-center gap-x-5 gap-y-1 min-h-[38px]">
+              <span className="text-[11px] text-gray-400">Taker <b className="text-white font-mono ml-1">{Number(fees.taker_fee_bps || 0).toFixed(2)} bps</b></span>
+              <span className="text-[11px] text-gray-400">Maker <b className="text-white font-mono ml-1">{Number(fees.maker_fee_bps || 0).toFixed(2)} bps</b></span>
+              <span className="text-[10px] text-gray-600">Applied to every fill in this run</span>
+            </div>
+          </div>
         </div>
 
         {/* Parameter groups */}
@@ -580,8 +621,10 @@ const Backtest = () => {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
                     {directionalFields.map(field => (
                       <div key={field} className="flex flex-col">
-                        <label className="text-[10px] text-gray-500 uppercase mb-1">
-                          {field.replace(/_/g, ' ')} <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
+                        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
+                          {(PARAM_META[field]?.label) || field.replace(/_/g, ' ')}
+                          <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
+                          {PARAM_META[field]?.hint && <span title={PARAM_META[field].hint} className="text-gray-600 cursor-help"><HelpCircle size={11} /></span>}
                         </label>
                         <input type="number" step="0.01"
                           value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
@@ -610,21 +653,27 @@ const Backtest = () => {
         )}
 
         {/* Actions */}
-        <div className="mt-6 flex flex-col sm:flex-row justify-end items-stretch sm:items-center gap-3 border-t border-gray-700 pt-6 flex-wrap">
-          <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2 px-4">
-            <RotateCcw size={14} /> Reset to Defaults
-          </button>
-          <button onClick={runFilterPreview} disabled={previewLoading || loading}
-            className="flex items-center justify-center gap-2 text-xs text-blue-300 border border-blue-800/50 hover:bg-blue-900/20 transition py-2 px-4 rounded-xl font-semibold">
-            {previewLoading ? <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div> : '🔍 Preview Filters'}
-          </button>
-          <button onClick={saveAsNewStrategy} disabled={saving}
-            className="flex items-center justify-center gap-2 text-xs text-white bg-green-700 hover:bg-green-600 transition py-2 px-4 rounded-xl font-bold">
-            <Download size={14} /> {saving ? 'Saving...' : 'Save as New Strategy'}
-          </button>
-          <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-10 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
-            {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : '🚀 Run Backtest'}
-          </button>
+        <div className="mt-6 flex flex-col lg:flex-row justify-between items-stretch lg:items-center gap-3 border-t border-gray-700 pt-6">
+          <p className="text-[11px] text-gray-500 max-w-md">
+            <SlidersHorizontal size={12} className="inline mr-1 text-gray-600" />
+            Preview Filters is a fast quality check. Run Backtest builds the full equity curve and trade log.
+          </p>
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-wrap">
+            <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2 px-4">
+              <RotateCcw size={14} /> Reset defaults
+            </button>
+            <button onClick={runFilterPreview} disabled={previewLoading || loading}
+              className="flex items-center justify-center gap-2 text-xs text-blue-300 border border-blue-800/50 hover:bg-blue-900/20 transition py-2 px-4 rounded-xl font-semibold">
+              {previewLoading ? <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div> : 'Preview Filters'}
+            </button>
+            <button onClick={saveAsNewStrategy} disabled={saving}
+              className="flex items-center justify-center gap-2 text-xs text-white bg-green-700 hover:bg-green-600 transition py-2 px-4 rounded-xl font-bold">
+              <Download size={14} /> {saving ? 'Saving...' : 'Save as strategy'}
+            </button>
+            <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-8 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
+              {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : <><Play size={16} /> Run Backtest</>}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -852,7 +901,7 @@ const Backtest = () => {
             </div>
         </div>
       ) : (
-        <div className="bg-gray-800 p-20 rounded-2xl border border-gray-700 text-center shadow-inner">
+        <div className="bg-gray-800 p-8 sm:p-16 rounded-2xl border border-gray-700 text-center shadow-inner">
           <div className="bg-gray-900 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 text-gray-600">
             <TrendingUp size={32} />
           </div>

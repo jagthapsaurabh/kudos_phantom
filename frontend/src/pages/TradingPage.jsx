@@ -80,7 +80,7 @@ const TradingPage = ({ type }) => {
   }, []);
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+    <div className="page-shell">
       <div className="flex justify-between items-center mb-8">
         <div>
           <h1 className="text-3xl font-bold flex items-center gap-3">

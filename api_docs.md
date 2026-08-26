@@ -103,6 +103,7 @@ uses the legacy shared conditions. When `True`, the LONG and SHORT branches each
 ## 🛠️ Utility
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
+| `GET` | `/dashboard/stats` | None | Per-user backtest aggregates (`best_roi`, `avg_roi`, `total_runs`, `completed_runs`, `avg_win_rate`, `best_win_rate`, `last_run`). Incomplete runs with null ROI/win-rate are skipped. |
 | `GET` | `/admin/clients` | None | List clients (admin) |
 | `POST` | `/admin/clients` | `username`, `password`, `full_name`, `mobile`, `email`, `company`, `notes`, `initial_capital`, `margin_deployment_pct`, `can_paper`, `can_live` | Create a client account (admin) |
 | `PUT` | `/admin/clients/{id}` | any of the above | Update client account (admin) |

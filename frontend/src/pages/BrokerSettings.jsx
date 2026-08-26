@@ -60,10 +60,10 @@ const BrokerSettings = () => {
   };
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
-      <div className="flex justify-between items-start mb-8">
+    <div className="page-shell">
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-start gap-3 mb-8">
         <div>
-          <h1 className="text-3xl font-bold text-blue-400 flex items-center gap-3"><KeyRound size={30} /> Broker & Data Sources</h1>
+          <h1 className="text-2xl sm:text-3xl font-bold text-blue-400 flex items-center gap-3"><KeyRound size={28} /> Broker & Data Sources</h1>
           <p className="text-gray-400 text-sm mt-1">Connect more than one exchange. Each paper/live instance can use a different source.</p>
         </div>
         <button onClick={load} className="text-gray-400 hover:text-white flex items-center gap-2 text-xs"><RefreshCw size={14} /> Refresh</button>
