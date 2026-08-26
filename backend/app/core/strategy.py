@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
@@ -100,6 +100,15 @@ class PhantomV2Config(BaseModel):
     # ------------------------------------------------------------------
     entry_conditions: EntryConditions = Field(default_factory=EntryConditions)
 
+    @model_validator(mode="after")
+    def _validate_macd_periods(self):
+        # MACD requires a valid slow > fast relationship or the indicator is
+        # meaningless (EMA(fast) − EMA(slow) flips sign). Raise so bad values
+        # never silently produce garbage signals.
+        if self.macd_slow <= self.macd_fast:
+            raise ValueError(f"macd_slow ({self.macd_slow}) must be greater than macd_fast ({self.macd_fast})")
+        return self
+
     # ------------------------------------------------------------------
     # Resolvers: return the per-direction value when the toggle is ON and a
     # value is set, else the legacy shared field. `direction` is +1 (long)
@@ -165,8 +174,8 @@ class StrategyService:
         cfg = self.config
         df_1h = df_1h.sort_index()
         df_4h = df_4h.sort_index()
-        ind_1h = compute_indicators(df_1h)
-        ind_4h = compute_indicators(df_4h)
+        ind_1h = compute_indicators(df_1h, macd_fast=cfg.macd_fast, macd_slow=cfg.macd_slow, macd_signal=cfg.macd_signal)
+        ind_4h = compute_indicators(df_4h, macd_fast=cfg.macd_fast, macd_slow=cfg.macd_slow, macd_signal=cfg.macd_signal)
         n = len(df_1h)
 
         # 1. MODERATE Trend Alignment (4h close vs EMA50, asof-mapped to 1h)
@@ -294,7 +303,7 @@ class FastTestStrategyService:
 
     def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
         df_1h = df_1h.sort_index()
-        ind_1h = compute_indicators(df_1h)
+        ind_1h = compute_indicators(df_1h, macd_fast=self.config.macd_fast, macd_slow=self.config.macd_slow, macd_signal=self.config.macd_signal)
 
         signals = np.zeros(len(df_1h))
         rsi = ind_1h['rsi14']

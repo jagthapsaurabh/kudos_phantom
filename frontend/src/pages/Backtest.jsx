@@ -10,6 +10,9 @@ const PARAM_META = {
   rsi_oversold: { label: 'RSI oversold', hint: 'Long reversal fires after RSI was below this level.' },
   rsi_overbought: { label: 'RSI overbought', hint: 'Short reversal fires after RSI was above this level.' },
   adx_min: { label: 'Min ADX', hint: 'Skip choppy markets. Higher = only strong trends.' },
+  macd_fast: { label: 'MACD fast (EMA)', hint: 'Short MACD period. MACD line = EMA(fast) − EMA(slow).' },
+  macd_slow: { label: 'MACD slow (EMA)', hint: 'Long MACD period. Must be greater than fast.' },
+  macd_signal: { label: 'MACD signal', hint: 'Signal-line period: Signal = EMA(MACD_line, signal). Histogram = MACD_line − Signal.' },
   macd_hist_min: { label: 'MACD hist min', hint: 'Minimum momentum size. Longs: hist ≥ this. Shorts: hist ≤ this (use a negative).' },
   atr_regime_ratio: { label: 'Min ATR floor', hint: 'Require ATR ≥ this × its 50-bar average. Lower = more trades.' },
   atr_regime_max: { label: 'Max ATR cap', hint: 'Optional: skip high-volatility. Blank = off.' },
@@ -107,6 +110,7 @@ const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle,
 const Backtest = () => {
   const DEFAULT_PARAMS = {
     trend_ema_period: 50,
+    macd_fast: 12, macd_slow: 26, macd_signal: 9,
     rsi_oversold: 40, rsi_overbought: 60, adx_min: 10, macd_hist_min: 5,
     atr_regime_ratio: 0.5, enable_momentum_entry: true, cooldown_bars: 0,
     stop_loss_atr: 1.2, take_profit_atr: 14.0, trail_activation_atr: 0.8,
@@ -183,6 +187,7 @@ const Backtest = () => {
   // Shared groups shown always (they stay single regardless of the toggle).
   const sharedGroups = {
     "Trend & Regime": ["trend_ema_period", "cooldown_bars"],
+    "MACD Indicator": ["macd_fast", "macd_slow", "macd_signal"],
     "Entries (v3)": ["enable_momentum_entry"],
     "Risk & Exit Model": ["take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
     "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
@@ -190,6 +195,7 @@ const Backtest = () => {
   // Param groups when the toggle is OFF (all fields shared, legacy layout).
   const sharedParamGroups = {
     "Trend & Regime": ["trend_ema_period", "atr_regime_ratio", "cooldown_bars"],
+    "MACD Indicator": ["macd_fast", "macd_slow", "macd_signal"],
     "Entries (v3)": ["rsi_oversold", "rsi_overbought", "adx_min", "macd_hist_min", "enable_momentum_entry"],
     "Risk & Exit Model": ["stop_loss_atr", "take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
     "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
