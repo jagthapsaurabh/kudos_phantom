@@ -5,7 +5,7 @@ import numpy as np
 import os
 from typing import Optional
 from dotenv import load_dotenv
-from .indicators import compute_indicators, sma
+from .indicators import compute_indicators, sma, macd as _macd
 
 load_dotenv()
 
@@ -19,6 +19,9 @@ class BranchConditions(BaseModel):
     working unchanged. This is the ``entry_conditions.long.*`` /
     ``entry_conditions.short.*`` section persisted in the run/strategy JSON.
     """
+    macd_fast: Optional[int] = None         # per-direction MACD EMA fast period
+    macd_slow: Optional[int] = None         # per-direction MACD EMA slow period
+    macd_signal: Optional[int] = None       # per-direction MACD signal period
     macd_hist_min: Optional[float] = None   # signed: long hist >= val, short hist <= val
     stop_loss_atr: Optional[float] = None   # SL distance expressed in ATR units
     atr_regime_ratio: Optional[float] = None  # ATR >= ratio * SMA(ATR, 50) (legacy floor)
@@ -107,6 +110,15 @@ class PhantomV2Config(BaseModel):
         # never silently produce garbage signals.
         if self.macd_slow <= self.macd_fast:
             raise ValueError(f"macd_slow ({self.macd_slow}) must be greater than macd_fast ({self.macd_fast})")
+        # Same check for per-direction overrides.
+        if self.entry_conditions.use_direction_conditions:
+            for side in ("long", "short"):
+                b = getattr(self.entry_conditions, side)
+                fast = b.macd_fast if b.macd_fast is not None else self.macd_fast
+                slow = b.macd_slow if b.macd_slow is not None else self.macd_slow
+                if slow <= fast:
+                    raise ValueError(
+                        f"{side} macd_slow ({slow}) must be greater than {side} macd_fast ({fast})")
         return self
 
     # ------------------------------------------------------------------
@@ -126,6 +138,21 @@ class PhantomV2Config(BaseModel):
         if val is not None:
             return val
         return getattr(self, shared_name)
+
+    def macd_periods_for(self, direction: int) -> tuple:
+        """Return (fast, slow, signal) MACD periods for the trade side.
+
+        When the direction-condition toggle is ON and that side supplies its
+        own periods, they are used; otherwise fall back to the shared periods.
+        """
+        ec = self.entry_conditions
+        if ec.use_direction_conditions:
+            b = ec.long if direction == 1 else ec.short
+            fast = b.macd_fast if b.macd_fast is not None else self.macd_fast
+            slow = b.macd_slow if b.macd_slow is not None else self.macd_slow
+            signal = b.macd_signal if b.macd_signal is not None else self.macd_signal
+            return fast, slow, signal
+        return self.macd_fast, self.macd_slow, self.macd_signal
 
     def macd_hist_min_for(self, direction: int) -> float:
         # Directional MACD-hist uses a SIGNED threshold. When the direction
@@ -216,14 +243,28 @@ class StrategyService:
         is_green = ind_1h['is_green'].astype(bool)
         is_red = ind_1h['is_red'].astype(bool)
 
+        # Per-direction MACD periods: when the toggle is ON and a side supplies
+        # its own macd_fast/slow/signal, recompute the histogram for that side
+        # (the shared `hist` stays as the logged/base value).
+        if use_dir:
+            l_f, l_s, l_sig = cfg.macd_periods_for(1)
+            s_f, s_s, s_sig = cfg.macd_periods_for(-1)
+            hist_long = _macd(close, fast=l_f, slow=l_s, signal_period=l_sig)[2]
+            hist_short = _macd(close, fast=s_f, slow=s_s, signal_period=s_sig)[2]
+        else:
+            hist_long = hist
+            hist_short = hist
+
         if use_dir:
             adx_ok_l = adx_v >= cfg.adx_min_for(1)
             adx_ok_s = adx_v >= cfg.adx_min_for(-1)
             # Directional MACD-hist filter uses SIGNED comparisons so shorts
             # can require the histogram to sit clearly below the zero line
             # (negative value) while longs require it to be clearly positive.
-            hist_ok_l = hist >= cfg.macd_hist_min_for(1)
-            hist_ok_s = hist <= cfg.macd_hist_min_for(-1)
+            # The histogram itself is the per-direction one when a side overrides
+            # the MACD periods.
+            hist_ok_l = hist_long >= cfg.macd_hist_min_for(1)
+            hist_ok_s = hist_short <= cfg.macd_hist_min_for(-1)
             rsi_oversold_l = cfg.rsi_oversold_for(1)
             rsi_overbought_s = cfg.rsi_overbought_for(-1)
         else:
@@ -236,13 +277,15 @@ class StrategyService:
 
         rsi_prev = np.roll(rsi_v, 1)
         hist_prev = np.roll(hist, 1)
+        hist_long_prev = np.roll(hist_long, 1)
+        hist_short_prev = np.roll(hist_short, 1)
         valid = np.arange(n) >= 1  # baseline loop started at bar 1
 
         # ---------------- Setup A: RSI reversal (v2.5 baseline) ----------
         long_rsi_A = (rsi_prev < rsi_oversold_l) & is_green
         short_rsi_A = (rsi_prev > rsi_overbought_s) & is_red
-        long_macd_A = hist > hist_prev
-        short_macd_A = hist < hist_prev
+        long_macd_A = hist_long > hist_long_prev
+        short_macd_A = hist_short < hist_short_prev
 
         long_A = valid & (trend_col == 1) & adx_ok_l & hist_ok_l & regime_ok_l & long_rsi_A & long_macd_A
         short_A = valid & (trend_col == -1) & adx_ok_s & hist_ok_s & regime_ok_s & short_rsi_A & short_macd_A
@@ -250,8 +293,8 @@ class StrategyService:
         # ------------- Setup B: momentum continuation (v3, optional) ------
         # Fires when the MACD histogram crosses zero in the trend direction
         # with DI confirmation and RSI agreement.
-        cross_up = (hist_prev <= 0) & (hist > 0)
-        cross_dn = (hist_prev >= 0) & (hist < 0)
+        cross_up = (hist_long_prev <= 0) & (hist_long > 0)
+        cross_dn = (hist_short_prev >= 0) & (hist_short < 0)
         long_B = valid & (trend_col == 1) & adx_ok_l & regime_ok_l & (pdi > mdi) & cross_up & (rsi_v >= cfg.momentum_rsi_min)
         short_B = valid & (trend_col == -1) & adx_ok_s & regime_ok_s & (mdi > pdi) & cross_dn & (rsi_v <= 100.0 - cfg.momentum_rsi_min)
         if not cfg.enable_momentum_entry:

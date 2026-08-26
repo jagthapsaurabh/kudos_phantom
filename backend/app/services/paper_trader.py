@@ -1,12 +1,29 @@
 import asyncio
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from app.core.strategy import StrategyService, PhantomV2Config, ValidatorService
 from app.core.dynamic_strategy import DynamicStrategyService
 from app.services.order_manager import OrderManager
 from app.database.models import SessionLocal, Klines
 import requests
 from app.core.indicators import compute_indicators
+
+# India Standard Time is UTC+5:30. All timestamps shown in the paper-trade UI
+# (last checked, trade entry/exit, log lines) are emitted in IST so the user
+# sees local India time without any client-side conversion.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_now() -> str:
+    return datetime.now(IST).isoformat(timespec="seconds")
+
+
+def _to_ist(value) -> str:
+    """Convert a (possibly naive-UTC) datetime to an IST-offset ISO string."""
+    if isinstance(value, datetime):
+        naive = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return naive.astimezone(IST).isoformat(timespec="seconds")
+    return str(value)
 
 
 class PaperTradeService:
@@ -52,13 +69,17 @@ class PaperTradeService:
         self._log("info", f"Instance initialised — strategy={strategy_id}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
 
     def _log(self, level: str, msg: str):
-        entry = {"ts": datetime.utcnow().isoformat(timespec="seconds"), "level": level, "msg": msg}
+        entry = {"ts": _ist_now(), "level": level, "msg": msg}
         self.logs.append(entry)
         if len(self.logs) > self.MAX_LOG_LINES:
             self.logs = self.logs[-self.MAX_LOG_LINES:]
 
     def _record_closed(self, trade, pnl_inr, fees_inr=0.0, gross_pnl=None):
-        """Append a closed trade to the instance history."""
+        """Append a closed trade to the instance history.
+
+        Entry/exit times are the candle timestamps (naive UTC) which are
+        converted to IST so the UI always shows India time.
+        """
         self.closed_trades.append({
             "symbol": trade.symbol,
             "direction": trade.direction,
@@ -68,8 +89,8 @@ class PaperTradeService:
             "gross_pnl": gross_pnl if gross_pnl is not None else pnl_inr,
             "fees": fees_inr,
             "reason": trade.exit_reason,
-            "entry_time": str(trade.entry_time),
-            "exit_time": str(trade.exit_time),
+            "entry_time": _to_ist(trade.entry_time),
+            "exit_time": _to_ist(trade.exit_time),
             "bars_held": trade.bars_held,
         })
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
@@ -111,7 +132,7 @@ class PaperTradeService:
 
         current_price = float(df_1h['close'].iloc[-1])
         self.last_price = current_price
-        self.last_checked = datetime.utcnow().isoformat(timespec="seconds")
+        self.last_checked = _ist_now()
         current_atr = ind_1h['atr14'][-1]
         current_time = df_1h.index[-1]
 

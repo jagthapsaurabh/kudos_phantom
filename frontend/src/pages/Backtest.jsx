@@ -119,8 +119,8 @@ const Backtest = () => {
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
     entry_conditions: {
       use_direction_conditions: false,
-      long: { macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
-      short: { macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      long: { macd_fast: 12, macd_slow: 26, macd_signal: 9, macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      short: { macd_fast: 12, macd_slow: 26, macd_signal: 9, macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
     },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
@@ -181,7 +181,8 @@ const Backtest = () => {
 
   // Fields that the backtest shows live per-direction with the toggle ON.
   const directionalFields = [
-    'macd_hist_min', 'stop_loss_atr', 'atr_regime_ratio', 'atr_regime_max',
+    'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min', 'stop_loss_atr',
+    'atr_regime_ratio', 'atr_regime_max',
     'rsi_oversold', 'rsi_overbought', 'adx_min',
   ];
   // Shared groups shown always (they stay single regardless of the toggle).
@@ -221,6 +222,14 @@ const Backtest = () => {
     // magnitude so bearish momentum is required (suggested starting value).
     const long = { ...ec.long };
     const short = { ...ec.short };
+    // Per-direction MACD periods default to the shared indicator periods so a
+    // freshly-enabled toggle is behaviour-identical until the user tunes them.
+    long.macd_fast = long.macd_fast ?? prev.macd_fast ?? 12;
+    long.macd_slow = long.macd_slow ?? prev.macd_slow ?? 26;
+    long.macd_signal = long.macd_signal ?? prev.macd_signal ?? 9;
+    short.macd_fast = short.macd_fast ?? prev.macd_fast ?? 12;
+    short.macd_slow = short.macd_slow ?? prev.macd_slow ?? 26;
+    short.macd_signal = short.macd_signal ?? prev.macd_signal ?? 9;
     long.macd_hist_min = prev.macd_hist_min ?? long.macd_hist_min ?? 5;
     long.stop_loss_atr = prev.stop_loss_atr ?? long.stop_loss_atr ?? 1.2;
     long.atr_regime_ratio = prev.atr_regime_ratio ?? long.atr_regime_ratio ?? 0.5;
@@ -805,7 +814,7 @@ const Backtest = () => {
                         <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
                         {PARAM_META[field]?.hint && <span title={PARAM_META[field].hint} className="cursor-help text-gray-600"><HelpCircle size={11} /></span>}
                       </label>
-                      <input type="number" step="0.01"
+                      <input type="number" step={['macd_fast','macd_slow','macd_signal','rsi_oversold','rsi_overbought'].includes(field) ? 1 : 0.01}
                         value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
                         onChange={e => {
                           const val = e.target.value;
@@ -814,6 +823,9 @@ const Backtest = () => {
                         className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none transition focus:border-blue-500" />
                       {field === 'atr_regime_max' && (
                         <span className="mt-0.5 text-[9px] text-gray-600">max-ATR cap (multiples of SMA; blank = off)</span>
+                      )}
+                      {['macd_fast','macd_slow','macd_signal'].includes(field) && (
+                        <span className="mt-0.5 text-[9px] text-gray-600">{field === 'macd_fast' ? 'EMA fast period for this side' : field === 'macd_slow' ? 'EMA slow period (must be > fast)' : 'signal period for this side'}</span>
                       )}
                       {field === 'atr_regime_ratio' && (
                         <span className="mt-0.5 text-[9px] text-gray-600">min-ATR floor (lower = more trades)</span>
