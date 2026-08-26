@@ -3,10 +3,43 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import os
+from typing import Optional
 from dotenv import load_dotenv
 from .indicators import compute_indicators, sma
 
 load_dotenv()
+
+
+class BranchConditions(BaseModel):
+    """Per-direction overrides for a single trade side (LONG / SHORT).
+
+    Every field is optional: when ``None`` (or when the master
+    ``use_direction_conditions`` toggle is OFF) the value falls back to the
+    corresponding shared ``PhantomV2Config`` field, so old saved configs keep
+    working unchanged. This is the ``entry_conditions.long.*`` /
+    ``entry_conditions.short.*`` section persisted in the run/strategy JSON.
+    """
+    macd_hist_min: Optional[float] = None   # signed: long hist >= val, short hist <= val
+    stop_loss_atr: Optional[float] = None   # SL distance expressed in ATR units
+    atr_regime_ratio: Optional[float] = None  # ATR >= ratio * SMA(ATR, 50)
+    rsi_oversold: Optional[int] = None
+    rsi_overbought: Optional[int] = None
+    adx_min: Optional[float] = None
+
+
+class EntryConditions(BaseModel):
+    """Long / Short override container (``entry_conditions`` in the run JSON).
+
+    When ``use_direction_conditions`` is False the engine behaves exactly as the
+    pre-existing shared-condition engine. When True the LONG and SHORT branches
+    each supply their own copy of the directional fields that data shows matter
+    for the two sides (MACD hist min, stop-loss ATR, ATR regime ratio, RSI
+    bounds, ADX min).
+    """
+    use_direction_conditions: bool = False
+    long: BranchConditions = Field(default_factory=BranchConditions)
+    short: BranchConditions = Field(default_factory=BranchConditions)
+
 
 class PhantomV2Config(BaseModel):
     entry_interval: str = "1h"
@@ -60,6 +93,57 @@ class PhantomV2Config(BaseModel):
     # Engine trade-management switches
     allow_reverse: bool = Field(default=False)   # close & reverse on opposite signal
     allow_overlap: bool = Field(default=False)   # v2.5 behaviour: overwrite open trade
+    # ------------------------------------------------------------------
+    # Direction-specific condition overrides (default OFF = shared engine).
+    # See EntryConditions / BranchConditions above.
+    # ------------------------------------------------------------------
+    entry_conditions: EntryConditions = Field(default_factory=EntryConditions)
+
+    # ------------------------------------------------------------------
+    # Resolvers: return the per-direction value when the toggle is ON and a
+    # value is set, else the legacy shared field. `direction` is +1 (long)
+    # or -1 (short).
+    # ------------------------------------------------------------------
+    def _branch(self, direction: int) -> BranchConditions:
+        ec = self.entry_conditions
+        if ec.use_direction_conditions:
+            return ec.long if direction == 1 else ec.short
+        return BranchConditions()
+
+    def _pick(self, direction: int, shared_name: str, dir_attr: str):
+        branch = self._branch(direction)
+        val = getattr(branch, dir_attr, None)
+        if val is not None:
+            return val
+        return getattr(self, shared_name)
+
+    def macd_hist_min_for(self, direction: int) -> float:
+        # Directional MACD-hist uses a SIGNED threshold. When the direction
+        # hasn't set an override we fall back to the shared magnitude applied
+        # to the correct side (long => histogram clearly positive, short =>
+        # clearly negative) so the legacy absolute-value filter is preserved.
+        ec = self.entry_conditions
+        if ec.use_direction_conditions:
+            b = ec.long if direction == 1 else ec.short
+            if b.macd_hist_min is not None:
+                return b.macd_hist_min
+        shared = self.macd_hist_min
+        return abs(shared) if direction == 1 else -abs(shared)
+
+    def stop_loss_atr_for(self, direction: int) -> float:
+        return self._pick(direction, 'stop_loss_atr', 'stop_loss_atr')
+
+    def atr_regime_ratio_for(self, direction: int) -> float:
+        return self._pick(direction, 'atr_regime_ratio', 'atr_regime_ratio')
+
+    def adx_min_for(self, direction: int) -> float:
+        return self._pick(direction, 'adx_min', 'adx_min')
+
+    def rsi_oversold_for(self, direction: int) -> float:
+        return self._pick(direction, 'rsi_oversold', 'rsi_oversold')
+
+    def rsi_overbought_for(self, direction: int) -> float:
+        return self._pick(direction, 'rsi_overbought', 'rsi_overbought')
 
 class StrategyService:
     def __init__(self, config: PhantomV2Config = PhantomV2Config()):
@@ -88,9 +172,16 @@ class StrategyService:
         close = df_1h['close'].values.astype(np.float64)
         trend_col = np.where(close > ema50_4h_map, 1, -1)
 
-        # 2. ATR Regime Filter
+        # 2. ATR Regime Filter (optionally per-direction)
         atr_v = ind_1h['atr14']
-        regime_ok = atr_v >= (cfg.atr_regime_ratio * sma(atr_v, 50))
+        atr_sma = sma(atr_v, 50)
+        use_dir = cfg.entry_conditions.use_direction_conditions
+        if use_dir:
+            regime_ok_l = atr_v >= (cfg.atr_regime_ratio_for(1) * atr_sma)
+            regime_ok_s = atr_v >= (cfg.atr_regime_ratio_for(-1) * atr_sma)
+        else:
+            regime_ok_shared = atr_v >= (cfg.atr_regime_ratio * atr_sma)
+            regime_ok_l = regime_ok_s = regime_ok_shared
 
         rsi_v = ind_1h['rsi14']
         hist = ind_1h['macd_hist']
@@ -99,29 +190,44 @@ class StrategyService:
         is_green = ind_1h['is_green'].astype(bool)
         is_red = ind_1h['is_red'].astype(bool)
 
-        adx_ok = adx_v >= cfg.adx_min
-        hist_ok = np.abs(hist) >= cfg.macd_hist_min
+        if use_dir:
+            adx_ok_l = adx_v >= cfg.adx_min_for(1)
+            adx_ok_s = adx_v >= cfg.adx_min_for(-1)
+            # Directional MACD-hist filter uses SIGNED comparisons so shorts
+            # can require the histogram to sit clearly below the zero line
+            # (negative value) while longs require it to be clearly positive.
+            hist_ok_l = hist >= cfg.macd_hist_min_for(1)
+            hist_ok_s = hist <= cfg.macd_hist_min_for(-1)
+            rsi_oversold_l = cfg.rsi_oversold_for(1)
+            rsi_overbought_s = cfg.rsi_overbought_for(-1)
+        else:
+            adx_ok_shared = adx_v >= cfg.adx_min
+            adx_ok_l = adx_ok_s = adx_ok_shared
+            hist_ok_shared = np.abs(hist) >= cfg.macd_hist_min
+            hist_ok_l = hist_ok_s = hist_ok_shared
+            rsi_oversold_l = cfg.rsi_oversold
+            rsi_overbought_s = cfg.rsi_overbought
 
         rsi_prev = np.roll(rsi_v, 1)
         hist_prev = np.roll(hist, 1)
         valid = np.arange(n) >= 1  # baseline loop started at bar 1
 
         # ---------------- Setup A: RSI reversal (v2.5 baseline) ----------
-        long_rsi_A = (rsi_prev < cfg.rsi_oversold) & is_green
-        short_rsi_A = (rsi_prev > cfg.rsi_overbought) & is_red
+        long_rsi_A = (rsi_prev < rsi_oversold_l) & is_green
+        short_rsi_A = (rsi_prev > rsi_overbought_s) & is_red
         long_macd_A = hist > hist_prev
         short_macd_A = hist < hist_prev
 
-        long_A = valid & (trend_col == 1) & adx_ok & hist_ok & regime_ok & long_rsi_A & long_macd_A
-        short_A = valid & (trend_col == -1) & adx_ok & hist_ok & regime_ok & short_rsi_A & short_macd_A
+        long_A = valid & (trend_col == 1) & adx_ok_l & hist_ok_l & regime_ok_l & long_rsi_A & long_macd_A
+        short_A = valid & (trend_col == -1) & adx_ok_s & hist_ok_s & regime_ok_s & short_rsi_A & short_macd_A
 
         # ------------- Setup B: momentum continuation (v3, optional) ------
         # Fires when the MACD histogram crosses zero in the trend direction
         # with DI confirmation and RSI agreement.
         cross_up = (hist_prev <= 0) & (hist > 0)
         cross_dn = (hist_prev >= 0) & (hist < 0)
-        long_B = valid & (trend_col == 1) & adx_ok & regime_ok & (pdi > mdi) & cross_up & (rsi_v >= cfg.momentum_rsi_min)
-        short_B = valid & (trend_col == -1) & adx_ok & regime_ok & (mdi > pdi) & cross_dn & (rsi_v <= 100.0 - cfg.momentum_rsi_min)
+        long_B = valid & (trend_col == 1) & adx_ok_l & regime_ok_l & (pdi > mdi) & cross_up & (rsi_v >= cfg.momentum_rsi_min)
+        short_B = valid & (trend_col == -1) & adx_ok_s & regime_ok_s & (mdi > pdi) & cross_dn & (rsi_v <= 100.0 - cfg.momentum_rsi_min)
         if not cfg.enable_momentum_entry:
             long_B[:] = False
             short_B[:] = False
@@ -139,8 +245,15 @@ class StrategyService:
             'ema50_1h': ind_1h['ema50'], 'ema50_4h': ema50_4h_map,
             'pdi': pdi, 'mdi': mdi,
             'trend': trend_col, 'is_green': is_green, 'is_red': is_red,
-            'cond_adx_ok': adx_ok, 'cond_macd_hist_ok': hist_ok,
-            'cond_atr_regime_ok': regime_ok,
+            # Per-direction condition masks (used by the engine snapshot to
+            # log which filter passed for the side a trade actually fired on).
+            'cond_adx_ok_long': adx_ok_l, 'cond_adx_ok_short': adx_ok_s,
+            'cond_macd_hist_ok_long': hist_ok_l, 'cond_macd_hist_ok_short': hist_ok_s,
+            'cond_atr_regime_ok_long': regime_ok_l, 'cond_atr_regime_ok_short': regime_ok_s,
+            # Backward-compatible shared keys (identical to the long masks when
+            # the direction toggle is OFF).
+            'cond_adx_ok': adx_ok_l, 'cond_macd_hist_ok': hist_ok_l,
+            'cond_atr_regime_ok': regime_ok_l,
             'cond_long_rsi': long_rsi_A, 'cond_short_rsi': short_rsi_A,
             'cond_long_macd': long_macd_A, 'cond_short_macd': short_macd_A,
             'setup': setup,

@@ -30,10 +30,19 @@ const Backtest = () => {
     trail_distance_atr: 0.3, breakeven_atr: 0.75,
     leverage: 2, margin_pct: 0.15,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
+    entry_conditions: {
+      use_direction_conditions: false,
+      long: { macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      short: { macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+    },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
   const [params, setParams] = useState({ ...DEFAULT_PARAMS });
+  const [activeDirTab, setActiveDirTab] = useState('long');
+  const [preview, setPreview] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [dates, setDates] = useState({ start: '2020-07-04', end: '2026-07-04' });
@@ -52,12 +61,86 @@ const Backtest = () => {
   const chartRef = useRef();
   const resultsRef = useRef(null);
 
-  const paramGroups = {
+  // Fields that the backtest shows live per-direction with the toggle ON.
+  const directionalFields = [
+    'macd_hist_min', 'stop_loss_atr', 'atr_regime_ratio',
+    'rsi_oversold', 'rsi_overbought', 'adx_min',
+  ];
+  // Shared groups shown always (they stay single regardless of the toggle).
+  const sharedGroups = {
+    "Trend & Regime": ["trend_ema_period", "cooldown_bars"],
+    "Entries (v3)": ["enable_momentum_entry"],
+    "Risk & Exit Model": ["take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
+    "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
+  };
+  // Param groups when the toggle is OFF (all fields shared, legacy layout).
+  const sharedParamGroups = {
     "Trend & Regime": ["trend_ema_period", "atr_regime_ratio", "cooldown_bars"],
     "Entries (v3)": ["rsi_oversold", "rsi_overbought", "adx_min", "macd_hist_min", "enable_momentum_entry"],
     "Risk & Exit Model": ["stop_loss_atr", "take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
     "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
   };
+  const useDirection = !!(params.entry_conditions && params.entry_conditions.use_direction_conditions);
+
+  const setSharedField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
+
+  const setDirField = (side, field, value) => setParams(prev => ({
+    ...prev,
+    entry_conditions: {
+      ...prev.entry_conditions,
+      [side]: { ...prev.entry_conditions[side], [field]: value },
+    },
+  }));
+
+  const setUseDirection = (val) => setParams(prev => {
+    const p = { ...prev };
+    const ec = prev.entry_conditions || DEFAULT_PARAMS.entry_conditions;
+    // Pre-fill long/short from the current shared values so nothing breaks
+    // for existing configs; SHORT MACD defaults to the negative of the shared
+    // magnitude so bearish momentum is required (suggested starting value).
+    const long = { ...ec.long };
+    const short = { ...ec.short };
+    long.macd_hist_min = prev.macd_hist_min ?? long.macd_hist_min ?? 5;
+    long.stop_loss_atr = prev.stop_loss_atr ?? long.stop_loss_atr ?? 1.2;
+    long.atr_regime_ratio = prev.atr_regime_ratio ?? long.atr_regime_ratio ?? 0.5;
+    long.rsi_oversold = prev.rsi_oversold ?? long.rsi_oversold ?? 40;
+    long.rsi_overbought = prev.rsi_overbought ?? long.rsi_overbought ?? 60;
+    long.adx_min = prev.adx_min ?? long.adx_min ?? 10;
+    short.macd_hist_min = -(prev.macd_hist_min ?? Math.abs(short.macd_hist_min ?? 5));
+    short.stop_loss_atr = prev.stop_loss_atr ?? short.stop_loss_atr ?? 1.2;
+    short.atr_regime_ratio = prev.atr_regime_ratio ?? short.atr_regime_ratio ?? 0.5;
+    short.rsi_oversold = prev.rsi_oversold ?? short.rsi_oversold ?? 40;
+    short.rsi_overbought = prev.rsi_overbought ?? short.rsi_overbought ?? 60;
+    short.adx_min = prev.adx_min ?? short.adx_min ?? 10;
+    p.entry_conditions = { use_direction_conditions: val, long, short };
+    return p;
+  });
+
+  // The parameter form applies to PhantomV2 and to saved Phantom-style
+  // strategies (params stored as an object, not Chartink rule arrays).
+  const showParamForm = selectedStrategyId === 'PhantomV2' ||
+    strategies.some(s => String(s.id) === String(selectedStrategyId) &&
+      s.rules && typeof s.rules === 'object' && !Array.isArray(s.rules) &&
+      ('entry_conditions' in s.rules || 'rsi_oversold' in s.rules));
+
+  const renderNumberInput = (field, value, onChange) => (
+    <div className="flex flex-col">
+      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
+      <input type="number" step="0.01" value={value}
+        onChange={onChange}
+        className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
+    </div>
+  );
+
+  const renderCheckInput = (field, checked, onChange) => (
+    <div className="flex flex-col">
+      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
+      <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
+        <input type="checkbox" checked={checked} onChange={onChange} className="accent-blue-500" />
+        Momentum entries
+      </label>
+    </div>
+  );
 
   const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}` });
 
@@ -100,7 +183,7 @@ const Backtest = () => {
     }
   }, [results]);
 
-  const resetParams = () => setParams({ ...DEFAULT_PARAMS });
+  const resetParams = () => setParams(JSON.parse(JSON.stringify(DEFAULT_PARAMS)));
 
   const exportTradesCSV = () => {
     if (!results?.trades?.length) return;
@@ -179,6 +262,66 @@ const Backtest = () => {
     } catch (error) {
       alert(error.message);
       setLoading(false);
+    }
+  };
+
+  // Save the current parameter set as a new named strategy so it can be
+  // re-run, paper traded or live traded later.
+  const saveAsNewStrategy = async () => {
+    const name = (runName.trim() || `Phantom ${new Date().toLocaleString()}`).slice(0, 60);
+    setSaving(true);
+    try {
+      const res = await fetch(`${API_URL}/strategies/create`, {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, params }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to save strategy");
+      alert(`Strategy "${name}" saved successfully. You can now run it from the strategy dropdown, or Paper / Live trade it from the Trading page.`);
+      fetchStrategies();
+      setRunName('');
+    } catch (e) {
+      alert(`Error saving strategy: ${e.message}`);
+    }
+    setSaving(false);
+  };
+
+  // Lightweight per-bucket check of the currently-set conditions.
+  const runFilterPreview = async () => {
+    setPreviewLoading(true);
+    setPreview(null);
+    try {
+      const res = await fetch(`${API_URL}/backtest/filter-preview`, {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          params,
+          start_date: dates.start,
+          end_date: dates.end,
+          data_source: dataSource,
+          fee_mode: 'backtest',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Preview failed");
+      setPreview(data);
+    } catch (e) {
+      alert(`Error running filter preview: ${e.message}`);
+    }
+    setPreviewLoading(false);
+  };
+
+  const handleStrategySelect = (sid) => {
+    setSelectedStrategyId(sid);
+    // When a saved Phantom-style strategy is chosen, load its params into the
+    // form so the admin can tweak it before re-running.
+    const found = strategies.find(s => String(s.id) === String(sid));
+    if (found && found.rules && typeof found.rules === 'object' && !Array.isArray(found.rules) &&
+        (found.rules.entry_conditions || 'rsi_oversold' in found.rules)) {
+      const merged = { ...DEFAULT_PARAMS, ...found.rules };
+      setParams(JSON.parse(JSON.stringify(merged)));
+      setRunName(found.name || '');
     }
   };
 
@@ -339,7 +482,7 @@ const Backtest = () => {
           </div>
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-1">Test Strategy</label>
-            <select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)}
+            <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
               className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
               <option value="PhantomV2">Phantom V2.5 (Default)</option>
               {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -364,45 +507,147 @@ const Backtest = () => {
         </div>
 
         {/* Parameter groups */}
-        {selectedStrategyId === 'PhantomV2' && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 border-t border-gray-700 pt-6">
-            {Object.entries(paramGroups).map(([groupName, fields]) => (
-              <div key={groupName} className="space-y-3">
-                <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
-                <div className="space-y-3">
-                  {fields.map(field => (
-                    <div key={field} className="flex flex-col">
-                      <label className="text-[10px] text-gray-500 uppercase mb-1">{field.replace(/_/g, ' ')}</label>
-                      {field === 'enable_momentum_entry' ? (
-                        <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
-                          <input type="checkbox" checked={!!params[field]}
-                            onChange={e => setParams({ ...params, [field]: e.target.checked })}
-                            className="accent-blue-500" />
-                          Momentum entries
-                        </label>
-                      ) : (
-                        <input type="number" step="0.01" value={params[field]}
-                          onChange={e => setParams({ ...params, [field]: parseFloat(e.target.value) })}
-                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
-                      )}
+        {showParamForm && (
+          <>
+            {/* Direction-specific override toggle */}
+            <div className="border-t border-gray-700 pt-6 mb-6">
+              <label className="flex items-start gap-3 bg-gray-900 p-3 rounded-lg border border-gray-700 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" checked={useDirection}
+                  onChange={e => setUseDirection(e.target.checked)}
+                  className="accent-blue-500 w-4 h-4 mt-0.5" />
+                <div>
+                  <div className="font-bold text-white">Use separate conditions for Long / Short</div>
+                  <div className="text-[11px] text-gray-500 mt-0.5">
+                    When ON, tune MACD-hist min, stop-loss ATR, ATR regime ratio and RSI/ADX independently for LONG and SHORT.
+                    Off = shared conditions (current v2.5 behaviour).
+                  </div>
+                </div>
+              </label>
+            </div>
+
+            {!useDirection && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 border-t border-gray-700 pt-6">
+                {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
+                  <div key={groupName} className="space-y-3">
+                    <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
+                    <div className="space-y-3">
+                      {fields.map(field => field === 'enable_momentum_entry'
+                        ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
+                        : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {useDirection && (
+              <>
+                {/* Shared (non-directional) groups */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 mb-6">
+                  {Object.entries(sharedGroups).map(([groupName, fields]) => (
+                    <div key={groupName} className="space-y-3">
+                      <h3 className="text-xs font-bold text-blue-400 uppercase tracking-wider">{groupName}</h3>
+                      <div className="space-y-3">
+                        {fields.map(field => field === 'enable_momentum_entry'
+                          ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
+                          : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
+                      </div>
                     </div>
                   ))}
                 </div>
-              </div>
-            ))}
-          </div>
+
+                {/* LONG / SHORT tabs */}
+                <div className="border-t border-gray-700 pt-5">
+                  <div className="flex gap-2 mb-4">
+                    {['long', 'short'].map(side => (
+                      <button key={side} onClick={() => setActiveDirTab(side)}
+                        className={`px-5 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition ${
+                          activeDirTab === side
+                            ? side === 'long'
+                              ? 'bg-green-600 text-white shadow-lg shadow-green-900/20'
+                              : 'bg-red-600 text-white shadow-lg shadow-red-900/20'
+                            : 'bg-gray-900 text-gray-400 border border-gray-700 hover:text-white'}`}>
+                        {side === 'long' ? 'Long' : 'Short'}
+                        <span className="ml-1 opacity-80">{side === 'long' ? '▲' : '▼'}</span>
+                      </button>
+                    ))}
+                    <span className="ml-auto self-center text-[10px] text-gray-500">
+                      Editing: <b className={activeDirTab === 'long' ? 'text-green-400' : 'text-red-400'}>{activeDirTab}</b> conditions
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                    {directionalFields.map(field => (
+                      <div key={field} className="flex flex-col">
+                        <label className="text-[10px] text-gray-500 uppercase mb-1">
+                          {field.replace(/_/g, ' ')} <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
+                        </label>
+                        <input type="number" step="0.01"
+                          value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? 0}
+                          onChange={e => setDirField(activeDirTab, field, parseFloat(e.target.value))}
+                          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+          </>
         )}
 
         {/* Actions */}
-        <div className="mt-6 flex flex-col sm:flex-row justify-end items-stretch sm:items-center gap-3 border-t border-gray-700 pt-6">
+        <div className="mt-6 flex flex-col sm:flex-row justify-end items-stretch sm:items-center gap-3 border-t border-gray-700 pt-6 flex-wrap">
           <button onClick={resetParams} className="flex items-center justify-center gap-2 text-gray-500 hover:text-white text-xs transition py-2 px-4">
             <RotateCcw size={14} /> Reset to Defaults
+          </button>
+          <button onClick={runFilterPreview} disabled={previewLoading || loading}
+            className="flex items-center justify-center gap-2 text-xs text-blue-300 border border-blue-800/50 hover:bg-blue-900/20 transition py-2 px-4 rounded-xl font-semibold">
+            {previewLoading ? <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin"></div> : '🔍 Preview Filters'}
+          </button>
+          <button onClick={saveAsNewStrategy} disabled={saving}
+            className="flex items-center justify-center gap-2 text-xs text-white bg-green-700 hover:bg-green-600 transition py-2 px-4 rounded-xl font-bold">
+            <Download size={14} /> {saving ? 'Saving...' : 'Save as New Strategy'}
           </button>
           <button onClick={runBacktest} disabled={loading} className="bg-blue-600 px-10 py-3 rounded-xl font-bold hover:bg-blue-500 disabled:opacity-50 transition shadow-lg shadow-blue-900/20 flex items-center justify-center gap-2">
             {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : '🚀 Run Backtest'}
           </button>
         </div>
       </div>
+
+      {preview && (
+        <div className="mb-8 bg-gray-800 p-6 rounded-2xl border border-blue-800/40 animate-in fade-in duration-300">
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="text-sm font-bold text-blue-300 flex items-center gap-2">
+              <Activity size={16} /> Filter Preview — per bucket
+              {preview.use_direction_conditions && <span className="text-[10px] bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/40">direction-specific ON</span>}
+            </h2>
+            <button onClick={() => setPreview(null)} className="text-xs text-gray-500 hover:text-white transition">✕ Close</button>
+          </div>
+          <p className="text-xs text-gray-500 mb-4">
+            {preview.total_trades} trades · WR {preview.total_win_rate}% · PF {preview.total_profit_factor}
+            <span className="ml-2 text-gray-600">— buckets reflect the conditions currently set in the form.</span>
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            {Object.entries(preview.buckets || {}).map(([key, b]) => {
+              const side = key.split('_')[0];
+              const isLong = side === 'LONG';
+              return (
+                <div key={key} className={`p-4 rounded-xl border ${isLong ? 'border-green-800/40 bg-green-900/10' : 'border-red-800/40 bg-red-900/10'}`}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className={`text-xs font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>{key}</span>
+                    <span className="text-[10px] bg-gray-900 px-2 py-0.5 rounded text-gray-400">{b.count} trades</span>
+                  </div>
+                  <div className="space-y-1 text-[11px] font-mono">
+                    <div className="flex justify-between"><span className="text-gray-500">Win rate</span><span className="text-white">{b.win_rate}%</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Profit factor</span><span className="text-white">{b.profit_factor}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Avg PnL</span><span className={b.avg_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>₹{b.avg_pnl}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Net PnL</span><span className={b.net_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>₹{b.net_pnl}</span></div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {results ? (
         <div className="space-y-8 animate-in fade-in duration-500">

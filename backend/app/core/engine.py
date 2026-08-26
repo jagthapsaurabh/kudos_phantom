@@ -74,6 +74,11 @@ class BacktestEngine:
         """Full market/condition snapshot on the signal candle (bar i)."""
         rsi_ok = bool(meta['cond_long_rsi'][i]) if signal_dir == 1 else bool(meta['cond_short_rsi'][i])
         macd_ok = bool(meta['cond_long_macd'][i]) if signal_dir == 1 else bool(meta['cond_short_macd'][i])
+        # Direction-specific filters: pick the mask for the side the trade
+        # actually fired on (they are identical when the toggle is OFF).
+        adx_ok = bool(meta['cond_adx_ok_long'][i]) if signal_dir == 1 else bool(meta['cond_adx_ok_short'][i])
+        hist_ok = bool(meta['cond_macd_hist_ok_long'][i]) if signal_dir == 1 else bool(meta['cond_macd_hist_ok_short'][i])
+        regime_ok = bool(meta['cond_atr_regime_ok_long'][i]) if signal_dir == 1 else bool(meta['cond_atr_regime_ok_short'][i])
         return {
             "signal_candle_time": None,  # filled by caller (needs index)
             "candle_type": "GREEN" if bool(meta['is_green'][i]) else ("RED" if bool(meta['is_red'][i]) else "DOJI"),
@@ -85,9 +90,9 @@ class BacktestEngine:
             "atr14": float(meta['atr14'][i]),
             "ema50_1h": float(meta['ema50_1h'][i]),
             "ema50_4h": float(meta['ema50_4h'][i]),
-            "cond_adx_ok": bool(meta['cond_adx_ok'][i]),
-            "cond_macd_hist_ok": bool(meta['cond_macd_hist_ok'][i]),
-            "cond_atr_regime_ok": bool(meta['cond_atr_regime_ok'][i]),
+            "cond_adx_ok": adx_ok,
+            "cond_macd_hist_ok": hist_ok,
+            "cond_atr_regime_ok": regime_ok,
             "cond_rsi_ok": rsi_ok,
             "cond_macd_confirm_ok": macd_ok,
         }
