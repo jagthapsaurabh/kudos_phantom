@@ -51,7 +51,20 @@ class BrokerClient:
 
     @staticmethod
     def _interval_delta(interval):
-        return {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1D"}.get(interval, interval)
+        # Delta Exchange rejects numeric/seconds resolution values ("15","60",
+        # "240","1D") with HTTP 400. It requires the string label ("15m","1h",
+        # "4h","1d"), which matches the app's own interval names.
+        label = str(interval).lower()
+        alias = {"60m": "1h", "240m": "4h", "2h": "2h", "6h": "6h"}
+        if label in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "1d", "1w"):
+            return label
+        return alias.get(label, label)
+
+    @staticmethod
+    def _interval_seconds(interval):
+        return {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+                "1d": 86400, "1w": 604800}.get(interval, 3600)
 
     def fetch_klines(self, symbol="BTCUSDT", interval="1h", limit=500):
         """Return normalized OHLCV dictionaries with UTC-naive datetimes."""
@@ -67,6 +80,11 @@ class BrokerClient:
         if self.kind == "delta":
             url = f"{self.market_url}/v2/history/candles"
             params = {"symbol": self.normalize_symbol(symbol, "Delta"), "resolution": self._interval_delta(interval), "limit": min(int(limit), 2000)}
+            # `start` and `end` are mandatory for Delta; derive a window from
+            # `limit` when the caller didn't pass one (avoids HTTP 400).
+            now = int(time.time())
+            params.setdefault("start", now - int(self._interval_seconds(interval)) * min(int(limit), 2000))
+            params.setdefault("end", now)
             response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
             payload = response.json()

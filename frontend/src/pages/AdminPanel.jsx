@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
-import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet, Percent, Plug, Database, Upload, Save } from 'lucide-react';
+import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet, Percent, Plug, Database, Upload, Save, Calculator } from 'lucide-react';
 import DateInput from '../components/DateInput';
+import StrategyExplainedTab from './StrategyExplainedTab';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -642,6 +643,7 @@ const AdminPanel = () => {
     { id: 'capital', label: 'Capital Settings', icon: <Wallet size={16} /> },
     { id: 'password', label: 'Change Password', icon: <Lock size={16} /> },
     { id: 'strategy', label: 'Phantom Strategy', icon: <BookOpen size={16} /> },
+    { id: 'explained', label: 'Strategy Explained', icon: <Calculator size={16} /> },
     { id: 'paper', label: 'Paper Control', icon: <Activity size={16} /> },
     { id: 'fees', label: 'Fees', icon: <Percent size={16} /> },
     { id: 'brokers', label: 'Broker Integrations', icon: <Plug size={16} /> },
@@ -703,6 +705,7 @@ const AdminPanel = () => {
       {tab === 'capital' && <CapitalTab />}
       {tab === 'password' && <ChangePasswordTab />}
       {tab === 'strategy' && <StrategyTab profile={champion?.profile} champion={champion} />}
+      {tab === 'explained' && <StrategyExplainedTab champion={champion} />}
       {tab === 'paper' && <PaperTab />}
       {tab === 'fees' && <FeeSettingsTab />}
       {tab === 'brokers' && <BrokerIntegrationsTab />}
