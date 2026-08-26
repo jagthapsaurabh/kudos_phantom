@@ -345,7 +345,8 @@ const StrategyTab = ({ profile, champion }) => {
   const cfg = champion?.config || {};
   const fmt = (v) => (typeof v === 'boolean' ? (v ? 'ON' : 'OFF') : v);
   const interesting = [
-    'adx_min', 'macd_hist_min', 'rsi_oversold', 'rsi_overbought', 'atr_regime_ratio',
+    'adx_min', 'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min',
+    'rsi_oversold', 'rsi_overbought', 'atr_regime_ratio',
     'enable_momentum_entry', 'trend_ema_period', 'stop_loss_atr', 'take_profit_atr',
     'trail_activation_atr', 'trail_distance_atr', 'breakeven_atr', 'timeout_bars',
     'cooldown_bars', 'leverage', 'margin_pct', 'reduced_margin_pct',
@@ -357,7 +358,7 @@ const StrategyTab = ({ profile, champion }) => {
         <p className="text-xs text-gray-500">All five filters must pass on the same 1h candle; entry executes on the next candle's open.</p>
         <Rule name="1. Trend alignment (4h)">Close(1h) &gt; EMA50(4h) — longs only with the macro uptrend. Shorts require Close &lt; EMA50(4h).</Rule>
         <Rule name="2. ADX filter">ADX(14) ≥ {cfg.adx_min ?? 10} — market must be trending, not chopping.</Rule>
-        <Rule name="3. MACD magnitude">|MACD-hist(12,26,9)| ≥ {cfg.macd_hist_min ?? 5} — enough momentum behind the move.</Rule>
+        <Rule name="3. MACD magnitude">|MACD-hist(12,26,9)| ≥ {cfg.macd_hist_min ?? 5} — enough momentum behind the move. The MACD indicator uses periods {cfg.macd_fast ?? 12}/{cfg.macd_slow ?? 26}/{cfg.macd_signal ?? 9}; <b>macd_hist_min is the threshold</b> applied to that histogram, not the indicator itself.</Rule>
         <Rule name="4. ATR volatility regime">ATR(14) ≥ {cfg.atr_regime_ratio ?? 0.5} × SMA50(ATR) — volatility must be alive.</Rule>
         <Rule name="5. Reversal trigger">Prev candle RSI(14) &lt; {cfg.rsi_oversold ?? 40} (long) / &gt; {cfg.rsi_overbought ?? 60} (short) <b>and</b> current candle closes green (long) / red (short).</Rule>
         <Rule name="6. MACD confirmation">MACD-hist rising vs previous bar (long) / falling (short).</Rule>
@@ -388,12 +389,16 @@ const StrategyTab = ({ profile, champion }) => {
       <DocSection title={`⚙️ Live Champion Config (${profile || 'loading…'})`} color="text-yellow-400">
         <p className="text-xs text-gray-500">This is the exact tuned parameter set currently powering backtests and the signal overlay.</p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs">
-          {interesting.map(k => (
-            <div key={k} className="flex justify-between border-b border-gray-700/50 py-1">
-              <span className="text-gray-500">{k}</span>
-              <span className="text-gray-200 font-bold">{fmt(cfg[k])}</span>
-            </div>
-          ))}
+          {interesting.map(k => {
+            const defaults = { macd_fast: 12, macd_slow: 26, macd_signal: 9, trend_ema_period: 50 };
+            const val = cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : defaults[k];
+            return (
+              <div key={k} className="flex justify-between border-b border-gray-700/50 py-1">
+                <span className="text-gray-500">{k}</span>
+                <span className="text-gray-200 font-bold">{fmt(val)}</span>
+              </div>
+            );
+          })}
         </div>
       </DocSection>
     </div>

@@ -158,6 +158,75 @@ const StrategyExplainedTab = ({ champion }) => {
         </Item>
       </Card>
 
+      {/* ------------------------------------------------------------ MACD -- */}
+      <div className="lg:col-span-2">
+        <Card title="📐 MACD — the indicator vs the histogram threshold" color="text-teal-400">
+          <Note>
+            These are <b>two different things</b> that are easy to confuse. The <b>MACD indicator</b> is a
+            calculated line built from three period settings (<K>macd_fast</K>, <K>macd_slow</K>, <K>macd_signal</K>),
+            and its <b>histogram</b> is the gap between two of those lines. The strategy's tunable
+            <K>macd_hist_min</K> is a <em>separate threshold</em> applied to that histogram — it is a filter
+            value you enter, not the indicator itself. The chart page draws the real MACD line + signal +
+            histogram (12, 26, 9); the backtest uses the same math internally.
+          </Note>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>MACD indicator (the "MACD value")</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                Config keys <K>macd_fast=12</K>, <K>macd_slow=26</K>, <K>macd_signal=9</K>. These are the
+                EMA periods that build the MACD oscillator. They are <b>not shown as inputs</b> on the
+                backtest form — they stay at their defaults (12, 26, 9).
+              </div>
+              <Formula>MACD_line = EMA(fast) − EMA(slow) = EMA(12) − EMA(26)</Formula>
+              <Formula>Signal = EMA(MACD_line, signal) = EMA(MACD_line, 9)</Formula>
+              <Formula>Histogram = MACD_line − Signal</Formula>
+              <div className="text-gray-400 text-xs mt-1">
+                MACD measures <b>momentum</b>: positive line = short-term price moving faster than
+                long-term (bullish); negative = bearish. The histogram shows whether that momentum is
+                <b>growing or shrinking</b>.
+              </div>
+            </div>
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>MACD histogram threshold (the filter value)</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                Config key <K>macd_hist_min</K> (default <K>{c('macd_hist_min', 5)}</K>). This is the
+                <b>input you tune</b> on the backtest form — the minimum size of the histogram required to
+                allow an entry. It is the only MACD knob exposed in the UI.
+              </div>
+              <Formula>Long:   MACD_histogram ≥ macd_hist_min</Formula>
+              <Formula>Short:  MACD_histogram ≤ −macd_hist_min   (or ≤ the negative value when directional)</Formula>
+              <div className="text-gray-400 text-xs mt-1">
+                It is applied to the histogram <em>computed</em> by the MACD indicator above, so the two
+                work together: the indicator generates the momentum number, this value decides how big
+                that number must be to trade.
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 space-y-3">
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>Where MACD is used inside the strategy (3 separate ways)</K>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-2 text-xs text-gray-400">
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">① Magnitude filter (Setup A &amp; B)</div>
+                  Uses <K>macd_hist_min</K>: only trade when the histogram is big enough — the move has real
+                  momentum, not just a flicker.
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">② MACD confirmation (Setup A)</div>
+                  Long: histogram <em>rising</em> vs previous bar; short: <em>falling</em>. Momentum must be
+                  accelerating in the trade direction.
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">③ Zero-cross (Setup B)</div>
+                  Long: histogram crosses <em>above 0</em>; short: crosses <em>below 0</em>. A fresh momentum
+                  burst triggering a trend-continuation entry.
+                </div>
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+
       {/* ------------------------------------------------------------ Entries -- */}
       <Card title="🎯 Entries (v3) — Setup A: RSI Reversal" color="text-green-400">
         <p className="text-xs text-gray-500">All five filters must pass on the same 1h candle; entry fills on the <b>next candle's open</b>.</p>
@@ -171,9 +240,12 @@ const StrategyExplainedTab = ({ champion }) => {
           Skips choppy, directionless markets. Only entries where trend strength
           <K>ADX ≥ adx_min</K> (default {c('adx_min', 10)}). Higher = only strong trends, fewer trades.
         </Item>
-        <Item name="MACD hist min (momentum size)" formula="hist = MACD_line − Signal_line,  MACD_line = EMA(12) − EMA(26)">
-          Longs need <K>hist ≥ macd_hist_min</K>; shorts <K>hist ≤ −macd_hist_min</K> (signed when direction
-          conditions are ON). Ensures enough momentum. Uses <K>macd_hist_min</K>.
+        <Item name="MACD hist min (momentum size threshold)"
+          formula="hist = MACD_line − Signal,  MACD_line = EMA(12) − EMA(26),  Signal = EMA(MACD_line, 9)   →   Long: hist ≥ macd_hist_min   Short: hist ≤ −macd_hist_min">
+          This is the <b>threshold on the MACD histogram</b> (not the MACD indicator itself — the indicator is
+          built from <K>macd_fast/slow/signal = 12/26/9</K>; this is the filter value you tune). Longs need
+          <K>hist ≥ macd_hist_min</K>; shorts <K>hist ≤ −macd_hist_min</K> (signed when direction conditions
+          are ON). Ensures enough momentum. Uses <K>macd_hist_min</K>. See the full MACD card below.
         </Item>
         <Item name="MACD confirmation" formula="Long: hist_t > hist_{t−1}   ·   Short: hist_t < hist_{t−1}">
           The histogram must be <em>expanding</em> in the trade direction on the signal candle.
@@ -276,9 +348,9 @@ const StrategyExplainedTab = ({ champion }) => {
               <div className="text-gray-400 text-xs mt-1">Reversal trigger and momentum agreement.</div>
             </div>
             <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
-              <K>MACD (12, 26, 9)</K>
-              <Formula>MACD = EMA(12) − EMA(26) &nbsp; Signal = EMA(MACD,9) &nbsp; Hist = MACD − Signal</Formula>
-              <div className="text-gray-400 text-xs mt-1">Momentum magnitude filter + zero-cross confirmation.</div>
+              <K>MACD (indicator: fast 12 · slow 26 · signal 9)</K>
+              <Formula>MACD_line = EMA(12) − EMA(26) &nbsp; Signal = EMA(MACD_line, 9) &nbsp; Hist = MACD_line − Signal</Formula>
+              <div className="text-gray-400 text-xs mt-1">The indicator (periods 12/26/9) is distinct from the <K>macd_hist_min</K> threshold applied to its histogram — see the MACD card above.</div>
             </div>
             <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
               <K>ADX &amp; DI (14)</K>
