@@ -21,7 +21,8 @@ class BranchConditions(BaseModel):
     """
     macd_hist_min: Optional[float] = None   # signed: long hist >= val, short hist <= val
     stop_loss_atr: Optional[float] = None   # SL distance expressed in ATR units
-    atr_regime_ratio: Optional[float] = None  # ATR >= ratio * SMA(ATR, 50)
+    atr_regime_ratio: Optional[float] = None  # ATR >= ratio * SMA(ATR, 50) (legacy floor)
+    atr_regime_max: Optional[float] = None  # optional max-ATR cap (multiple of SMA); None = disabled
     rsi_oversold: Optional[int] = None
     rsi_overbought: Optional[int] = None
     adx_min: Optional[float] = None
@@ -136,6 +137,11 @@ class PhantomV2Config(BaseModel):
     def atr_regime_ratio_for(self, direction: int) -> float:
         return self._pick(direction, 'atr_regime_ratio', 'atr_regime_ratio')
 
+    def atr_regime_max_for(self, direction: int) -> Optional[float]:
+        # Optional directional max-ATR cap; None in shared mode or when unset.
+        branch = self._branch(direction)
+        return getattr(branch, 'atr_regime_max', None)
+
     def adx_min_for(self, direction: int) -> float:
         return self._pick(direction, 'adx_min', 'adx_min')
 
@@ -172,13 +178,24 @@ class StrategyService:
         close = df_1h['close'].values.astype(np.float64)
         trend_col = np.where(close > ema50_4h_map, 1, -1)
 
-        # 2. ATR Regime Filter (optionally per-direction)
+        # 2. ATR Regime Filter (optionally per-direction).
+        # `atr_regime_ratio` keeps the legacy lower-bound semantics
+        # (atr >= ratio * SMA) in BOTH modes so the shared pre-fill is
+        # behaviour-identical when the toggle is first turned on. An
+        # additional optional per-direction MAX-ATR cap (`atr_regime_max`,
+        # a multiple of SMA, None = disabled) lets shorts exclude the
+        # high-volatility regime where the data shows REVERSAL-SHORT
+        # underperforms (a lower cap = tighter = excludes more high-vol).
         atr_v = ind_1h['atr14']
         atr_sma = sma(atr_v, 50)
         use_dir = cfg.entry_conditions.use_direction_conditions
         if use_dir:
-            regime_ok_l = atr_v >= (cfg.atr_regime_ratio_for(1) * atr_sma)
-            regime_ok_s = atr_v >= (cfg.atr_regime_ratio_for(-1) * atr_sma)
+            reg_ratio_l = cfg.atr_regime_ratio_for(1)
+            reg_ratio_s = cfg.atr_regime_ratio_for(-1)
+            max_l = cfg.atr_regime_max_for(1)
+            max_s = cfg.atr_regime_max_for(-1)
+            regime_ok_l = (atr_v >= reg_ratio_l * atr_sma) if max_l is None else ((atr_v >= reg_ratio_l * atr_sma) & (atr_v <= max_l * atr_sma))
+            regime_ok_s = (atr_v >= reg_ratio_s * atr_sma) if max_s is None else ((atr_v >= reg_ratio_s * atr_sma) & (atr_v <= max_s * atr_sma))
         else:
             regime_ok_shared = atr_v >= (cfg.atr_regime_ratio * atr_sma)
             regime_ok_l = regime_ok_s = regime_ok_shared

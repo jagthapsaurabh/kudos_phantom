@@ -144,6 +144,12 @@ other.
   clearly present** for shorts (a negative threshold) while longs keep a positive
   threshold. The shared (OFF) field still uses the legacy `|hist| >= min`
   magnitude filter.
+- **ATR regime — optional max-ATR cap for shorts**: `atr_regime_ratio` keeps the
+  legacy **lower-bound floor** (`ATR >= ratio × SMA`) in both modes, so the
+  shared pre-fill is behaviour-identical when the toggle is first switched on.
+  To exclude the high-volatility regime where REVERSAL-SHORT underperforms, use
+  the optional per-direction **`atr_regime_max`** cap (`ATR <= value × SMA`); a
+  lower cap is tighter. `null`/blank disables it.
 - **Stop-loss ATR per direction** is applied in `services/order_manager.py` via
   `stop_loss_atr_for(direction)`, so shorts can use a wider/narrower hard stop
   than longs (backtest flagged 84% of losing-day trades exiting via hard SL).

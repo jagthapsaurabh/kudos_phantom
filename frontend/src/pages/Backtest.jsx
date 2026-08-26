@@ -32,8 +32,8 @@ const Backtest = () => {
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
     entry_conditions: {
       use_direction_conditions: false,
-      long: { macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
-      short: { macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      long: { macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      short: { macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
     },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
@@ -63,7 +63,7 @@ const Backtest = () => {
 
   // Fields that the backtest shows live per-direction with the toggle ON.
   const directionalFields = [
-    'macd_hist_min', 'stop_loss_atr', 'atr_regime_ratio',
+    'macd_hist_min', 'stop_loss_atr', 'atr_regime_ratio', 'atr_regime_max',
     'rsi_oversold', 'rsi_overbought', 'adx_min',
   ];
   // Shared groups shown always (they stay single regardless of the toggle).
@@ -103,12 +103,14 @@ const Backtest = () => {
     long.macd_hist_min = prev.macd_hist_min ?? long.macd_hist_min ?? 5;
     long.stop_loss_atr = prev.stop_loss_atr ?? long.stop_loss_atr ?? 1.2;
     long.atr_regime_ratio = prev.atr_regime_ratio ?? long.atr_regime_ratio ?? 0.5;
+    long.atr_regime_max = (long.atr_regime_max === undefined ? null : long.atr_regime_max);
     long.rsi_oversold = prev.rsi_oversold ?? long.rsi_oversold ?? 40;
     long.rsi_overbought = prev.rsi_overbought ?? long.rsi_overbought ?? 60;
     long.adx_min = prev.adx_min ?? long.adx_min ?? 10;
     short.macd_hist_min = -(prev.macd_hist_min ?? Math.abs(short.macd_hist_min ?? 5));
     short.stop_loss_atr = prev.stop_loss_atr ?? short.stop_loss_atr ?? 1.2;
     short.atr_regime_ratio = prev.atr_regime_ratio ?? short.atr_regime_ratio ?? 0.5;
+    short.atr_regime_max = (short.atr_regime_max === undefined ? null : short.atr_regime_max);
     short.rsi_oversold = prev.rsi_oversold ?? short.rsi_oversold ?? 40;
     short.rsi_overbought = prev.rsi_overbought ?? short.rsi_overbought ?? 60;
     short.adx_min = prev.adx_min ?? short.adx_min ?? 10;
@@ -518,7 +520,7 @@ const Backtest = () => {
                 <div>
                   <div className="font-bold text-white">Use separate conditions for Long / Short</div>
                   <div className="text-[11px] text-gray-500 mt-0.5">
-                    When ON, tune MACD-hist min, stop-loss ATR, ATR regime ratio and RSI/ADX independently for LONG and SHORT.
+                    When ON, tune MACD-hist min, stop-loss ATR, ATR regime floor + max-ATR cap and RSI/ADX independently for LONG and SHORT.
                     Off = shared conditions (current v2.5 behaviour).
                   </div>
                 </div>
@@ -582,9 +584,22 @@ const Backtest = () => {
                           {field.replace(/_/g, ' ')} <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
                         </label>
                         <input type="number" step="0.01"
-                          value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? 0}
-                          onChange={e => setDirField(activeDirTab, field, parseFloat(e.target.value))}
+                          value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
+                          onChange={e => {
+                            const val = e.target.value;
+                            // Optional field (atr_regime_max): blank => null (disabled).
+                            setDirField(activeDirTab, field, val === '' ? null : parseFloat(val));
+                          }}
                           className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
+                        {field === 'atr_regime_max' && (
+                          <span className="text-[9px] text-gray-600 mt-0.5">max-ATR cap (multiples of SMA; blank = off)</span>
+                        )}
+                        {field === 'atr_regime_ratio' && (
+                          <span className="text-[9px] text-gray-600 mt-0.5">min-ATR floor (lower = more trades)</span>
+                        )}
+                        {field === 'macd_hist_min' && (
+                          <span className="text-[9px] text-gray-600 mt-0.5">{activeDirTab === 'long' ? 'require hist ≥ this' : 'require hist ≤ this (use negative for bearish)'}</span>
+                        )}
                       </div>
                     ))}
                   </div>

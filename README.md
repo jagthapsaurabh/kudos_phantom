@@ -85,6 +85,7 @@ When the two sides behave differently (REVERSAL-SHORT quality collapses at high 
 histogram), use the **"Use separate conditions for Long / Short"** toggle on the backtest page.
 With it ON, the LONG and SHORT branches each carry their own `macd_hist_min` (signed — shorts can
 be negative, e.g. `-8`, to require bearish momentum), `stop_loss_atr`, `atr_regime_ratio`,
+the optional `atr_regime_max` max-ATR cap (to exclude high-volatility for shorts),
 `rsi_oversold`/`rsi_overbought` and `adx_min`. Persisted as `entry_conditions.long.*` /
 `entry_conditions.short.*`; any unset value falls back to the shared field. Use the
 **Preview Filters** button (or `POST /backtest/filter-preview`) to see per-bucket win rate /

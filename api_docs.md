@@ -63,9 +63,18 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 carry an `entry_conditions` block. When `use_direction_conditions` is `False` (default) the engine
 uses the legacy shared conditions. When `True`, the LONG and SHORT branches each supply their own
 `macd_hist_min`, `stop_loss_atr`, `atr_regime_ratio`, `rsi_oversold`, `rsi_overbought` and `adx_min`
-(any field left `null` falls back to the shared value). Directional `macd_hist_min` uses a **signed**
-interpretation — longs require the histogram to be at/above the value (e.g. `5`), shorts require it
-to be at/below the value (e.g. `-8`), so a negative short threshold means "bearish momentum clearly present".
+(any field left `null` falls back to the shared value). Two directional fields are interpreted
+**per side**:
+
+- `macd_hist_min` is **signed** — longs require `hist >= value` (e.g. `5`), shorts require
+  `hist <= value` (e.g. `-8`), so a negative short threshold means "bearish momentum clearly present".
+- `atr_regime_ratio` keeps the legacy **lower-bound floor** semantics
+  (`ATR >= ratio × SMA`) in both modes.
+- `atr_regime_max` (optional on each side) adds a **max-ATR cap**
+  (`ATR <= value × SMA(ATR, 50)`); when blank/`null` it is disabled. A lower
+  cap is tighter and excludes the high-volatility regimes where shorts
+  underperform. This is the field to use to exclude the top volatility quartile
+  for shorts.
 
 ```json
 {
