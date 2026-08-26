@@ -43,6 +43,9 @@ pip install python-dotenv
 Create `/var/www/kudos_phantom/backend/.env` with the following (replace `your_server_ip`):
 ```env
 DATABASE_URL=sqlite:///./trading_system.db
+# To use PostgreSQL instead, point DATABASE_URL at your instance (requires the
+# psycopg2 driver — already in requirements.txt):
+# DATABASE_URL=postgresql://user:pass@host:5432/dbname
 SECRET_KEY=phantom_secret_key_2026_xyz
 CORS_ORIGINS=http://your_server_ip:5173,http://your_server_ip
 CONVERSION_RATE=85.0
