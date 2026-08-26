@@ -106,10 +106,10 @@ const CustomStrategyBuilder = () => {
   };
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
-      <div className="flex justify-between items-center mb-8">
+    <div className="page-shell">
+      <div className="flex flex-col lg:flex-row lg:justify-between lg:items-center gap-4 mb-8">
         <div>
-          <h1 className="text-3xl font-bold text-blue-400">Custom Strategy Builder</h1>
+          <h1 className="text-2xl sm:text-3xl font-bold text-blue-400">Custom Strategy Builder</h1>
           <p className="text-gray-400">Create complex entry conditions using Chartink-style logic</p>
         </div>
         <div className="bg-blue-900/30 border border-blue-500/50 p-3 rounded-lg text-xs text-blue-300 max-w-xs">

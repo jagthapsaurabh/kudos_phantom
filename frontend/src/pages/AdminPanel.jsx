@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
 import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet, Percent, Plug, Database, Upload, Save } from 'lucide-react';
+import DateInput from '../components/DateInput';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -229,7 +230,8 @@ const ClientsTab = ({ onConfirm }) => {
           <h3 className="font-bold text-gray-200">Client Accounts ({clients.length})</h3>
           <button onClick={load} className="text-gray-400 hover:text-white"><RefreshCw size={16} /></button>
         </div>
-        <table className="w-full text-left text-xs">
+        <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs min-w-[860px]">
           <thead className="bg-gray-900 text-gray-500 uppercase">
             <tr>
               <th className="p-3">Client</th><th className="p-3">Capital</th><th className="p-3">Margin</th>
@@ -241,6 +243,7 @@ const ClientsTab = ({ onConfirm }) => {
             {clients.map(c => <ClientRow key={c.id} client={c} onChanged={load} onConfirm={onConfirm} />)}
           </tbody>
         </table>
+        </div>
       </div>
     </div>
   );
@@ -591,7 +594,7 @@ const SeedDataTab = () => {
   useEffect(() => { load(); }, []);
   const seed = async e => { e.preventDefault(); setBusy(true); setMsg(null); const res = await fetch(`${API_URL}/admin/market-data/seed`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ source, symbol: symbol.toUpperCase(), intervals, start_date: start || null, end_date: end || null, limit: Number(limit), fetch_all: fetchAll }) }); const data = await res.json(); setBusy(false); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Seed failed' }); else { setMsg({ ok: true, text: `Seeded ${data.summary?.reduce((n, x) => n + (x.fetched || 0), 0) || 0} OHLCV candles.` }); load(); } };
   const upload = async e => { e.preventDefault(); if (!file) return; setBusy(true); const body = new FormData(); body.append('file', file); body.append('source', source); body.append('symbol', symbol.toUpperCase()); body.append('interval', csvInterval); const res = await fetch(`${API_URL}/admin/market-data/seed-csv`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }, body }); const data = await res.json(); setBusy(false); setMsg(res.ok ? { ok: true, text: `Imported ${data.summary?.fetched || 0} candles with volume.` } : { ok: false, text: data.detail || 'CSV import failed' }); if (res.ok) load(); };
-  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><input type="date" className={f} value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><input type="date" className={f} value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Seeding…' : 'Fetch & Seed OHLCV'}</button></form></div>
+  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><DateInput value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><DateInput value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Seeding…' : 'Fetch & Seed OHLCV'}</button></form></div>
     <form onSubmit={upload} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex flex-wrap items-end gap-4"><div><label className="text-[10px] text-gray-500 uppercase block">CSV file (event_time, open, high, low, close, volume)</label><input type="file" accept=".csv" onChange={e => setFile(e.target.files?.[0])} className="text-sm text-gray-400 mt-2" /></div><div><label className="text-[10px] text-gray-500 uppercase block">CSV interval</label><select className={f} value={csvInterval} onChange={e => setCsvInterval(e.target.value)}>{['1m','5m','15m','1h','4h','1d'].map(i => <option key={i}>{i}</option>)}</select></div><button disabled={!file || busy} className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm flex items-center gap-2"><Upload size={14} /> Import CSV</button></form>
     {msg && <div className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
     <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="p-4 border-b border-gray-700 flex justify-between"><h3 className="font-bold text-gray-300">Seeded datasets</h3><button onClick={load} className="text-gray-400 hover:text-white"><RefreshCw size={15} /></button></div><div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 text-blue-300 font-bold">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{row.count}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>{status.length === 0 && <div className="p-8 text-center text-gray-500">No seeded data yet.</div>}</div>
@@ -646,7 +649,7 @@ const AdminPanel = () => {
   ];
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen font-sans">
+    <div className="page-shell font-sans">
       <ConfirmModal
         open={!!confirm}
         title={
@@ -687,10 +690,10 @@ const AdminPanel = () => {
         </div>
       </header>
 
-      <div className="flex gap-2 mb-6 border-b border-gray-800 pb-3">
+      <div className="flex gap-2 mb-6 border-b border-gray-800 pb-3 overflow-x-auto">
         {tabs.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}>
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition shrink-0 ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}>
             {t.icon} {t.label}
           </button>
         ))}

@@ -12,6 +12,7 @@ import {
   Maximize2, Minimize2, Activity, BarChart3, ChevronDown,
 } from 'lucide-react';
 import { API_URL } from '../api';
+import DateInput from '../components/DateInput';
 import { computeAll } from '../utils/indicators';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
@@ -399,12 +400,12 @@ const ChartPage = () => {
   const o = legend || {};
 
   return (
-    <div className={`${fullscreen ? 'fixed inset-0 z-50 bg-gray-950 p-2' : 'ml-64 p-8'} bg-gray-900 text-white min-h-screen font-sans`}>
+    <div className={`${fullscreen ? 'fixed inset-0 z-50 bg-gray-950 p-2' : 'page-shell'} text-white min-h-screen font-sans`}>
       {/* Header */}
       <div className="flex flex-wrap justify-between items-center gap-4 mb-4">
         <div>
-          <h1 className="text-3xl font-bold flex items-center gap-3 text-blue-400">
-            <TrendingUp size={32} /> Market Chart
+          <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-3 text-blue-400">
+            <TrendingUp size={28} /> Market Chart
           </h1>
           <p className="text-gray-400 text-sm mt-1">Candlesticks, volume, indicators & strategy signal overlay</p>
         </div>
@@ -479,12 +480,10 @@ const ChartPage = () => {
             {strategies.map(s => <option key={s.id} value={s.id}>Custom: {s.name}</option>)}
           </select>
         </div>
-        <div className="flex items-center gap-2 text-xs text-gray-400">
-          <input type="date" value={signalRange.start} onChange={e => setSignalRange({ ...signalRange, start: e.target.value })}
-            className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white" />
+        <div className="flex items-center gap-2 text-xs text-gray-400 w-full sm:w-auto">
+          <div className="w-[9.5rem]"><DateInput value={signalRange.start} onChange={e => setSignalRange({ ...signalRange, start: e.target.value })} /></div>
           <span>→</span>
-          <input type="date" value={signalRange.end} onChange={e => setSignalRange({ ...signalRange, end: e.target.value })}
-            className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white" />
+          <div className="w-[9.5rem]"><DateInput value={signalRange.end} onChange={e => setSignalRange({ ...signalRange, end: e.target.value })} /></div>
         </div>
         <span className="text-xs font-bold text-green-400">{signalCount} markers</span>
         {loading && <span className="text-xs text-gray-500 animate-pulse">Loading…</span>}

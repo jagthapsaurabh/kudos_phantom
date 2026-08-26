@@ -117,7 +117,7 @@ const LiveTrade = () => {
   const marginUsed = activeTrades.reduce((sum, t) => sum + t.margin, 0);
 
   return (
-    <div className="ml-64 p-8 bg-gray-900 text-white min-h-screen">
+    <div className="page-shell">
       <ConfirmModal
         open={!!confirm}
         title="Stop Live Trade Instance?"
@@ -127,14 +127,14 @@ const LiveTrade = () => {
         onCancel={() => setConfirm(null)}
         onConfirm={stopTrade}
       />
-      <div className="flex justify-between items-center mb-8">
+      <div className="flex flex-col xl:flex-row xl:justify-between xl:items-start gap-4 mb-8">
         <div>
-          <h1 className="text-3xl font-bold flex items-center gap-3 text-green-400">
-            <ShieldCheck size={32} /> Live Trading
+          <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-3 text-green-400">
+            <ShieldCheck size={28} /> Live Trading
           </h1>
           <p className="text-gray-400 text-sm mt-1">Executing real trades on your broker account</p>
         </div>
-        <div className="flex gap-4 items-center flex-wrap">
+        <div className="flex gap-3 items-end flex-wrap">
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Broker / Data</label>
             <select value={dataSource} onChange={e => { setDataSource(e.target.value); setConnectionId(''); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
