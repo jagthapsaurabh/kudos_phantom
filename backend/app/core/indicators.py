@@ -52,13 +52,15 @@ def macd(close: np.ndarray, fast=12, slow=26, signal_period=9):
     signal_line = ema(macd_line, signal_period)
     return macd_line, signal_line, macd_line - signal_line
 
-def compute_indicators(df: pd.DataFrame) -> dict[str, np.ndarray]:
+def compute_indicators(df: pd.DataFrame, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9) -> dict[str, np.ndarray]:
     o, h, l, c, v = (df[col].values.astype(np.float64) for col in ("open", "high", "low", "close", "volume"))
     ind = {"o": o, "h": h, "l": l, "c": c, "v": v, "n": len(c)}
     ind["atr14"] = atr(h, l, c, 14)
     ind["rsi14"] = rsi(c, 14)
     ind["ema50"] = ema(c, 50)
     ind["adx"], ind["pdi"], ind["mdi"] = adx_di(h, l, c, 14)
-    ind["macd_line"], ind["macd_signal"], ind["macd_hist"] = macd(c)
+    # MACD periods are user-configurable (config.macd_fast/slow/signal); pass
+    # them through so the backtest/paper/live runs honour the chosen values.
+    ind["macd_line"], ind["macd_signal"], ind["macd_hist"] = macd(c, fast=macd_fast, slow=macd_slow, signal_period=macd_signal)
     ind["is_green"], ind["is_red"] = c > o, c < o
     return ind

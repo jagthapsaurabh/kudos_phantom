@@ -2,6 +2,18 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle } from 'lucide-react';
 import { API_URL } from '../api';
 
+// Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
+// explicitly in India Standard Time (UTC+5:30). Guarantees the user always
+// sees India time regardless of the browser's own timezone.
+const fmtIST = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  const ist = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+  const p = (x) => String(x).padStart(2, '0');
+  return `${p(ist.getUTCHours())}:${p(ist.getUTCMinutes())}:${p(ist.getUTCSeconds())} ${p(ist.getUTCDate())}/${p(ist.getUTCMonth() + 1)}/${ist.getUTCFullYear()} IST`;
+};
+
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
   if (!open) return null;
@@ -36,11 +48,16 @@ const TradeCard = ({ trade, onClose }) => (
         </div>
       </div>
     </div>
-    <div className="grid grid-cols-2 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
+    <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
       <div className="bg-gray-800/50 p-2 rounded">Entry<br /><span className="text-white text-xs">{Number(trade.entry).toFixed(2)}</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Current<br /><span className="text-white text-xs">{Number(trade.current).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Chg<br /><span className={`text-xs ${trade.chg_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{trade.chg_pct >= 0 ? '+' : ''}{Number(trade.chg_pct).toFixed(2)}%</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Margin<br /><span className="text-white text-xs">₹{Number(trade.margin).toFixed(0)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Leverage<br /><span className="text-white text-xs">{trade.leverage ?? '—'}×</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Notional<br /><span className="text-white text-xs">${Number(trade.notional_usd || 0).toFixed(0)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Lots<br /><span className="text-white text-xs">{Number(trade.lots || 0).toFixed(4)} BTC</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Bars Held<br /><span className="text-white text-xs">{trade.bars_held ?? 0}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Entry (IST)<br /><span className="text-white text-xs">{fmtIST(trade.entry_time)}</span></div>
     </div>
     {onClose && (
       <button onClick={onClose} className="mt-3 w-full text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 py-1 rounded border border-red-900/40 hover:bg-red-900/20 transition">
@@ -71,6 +88,8 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Exit</th>
               <th className="p-2">Net PnL</th>
               <th className="p-2">Fees</th>
+              <th className="p-2">Entry (IST)</th>
+              <th className="p-2">Exit (IST)</th>
               <th className="p-2">Reason</th>
               <th className="p-2">Held</th>
             </tr>
@@ -82,6 +101,9 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                 <td className="p-2 font-mono text-gray-300">{Number(t.entry).toFixed(2)}</td>
                 <td className="p-2 font-mono text-gray-300">{Number(t.exit).toFixed(2)}</td>
                 <td className={`p-2 font-mono font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(2)}</td>
+                <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{Number(t.fees || 0).toFixed(2)}</span></td>
+                <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
+                <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
                 <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{t.reason || '—'}</span></td>
                 <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
               </tr>
@@ -146,7 +168,7 @@ const LogPanel = ({ instanceKey }) => {
         {logs.length === 0 && <div className="text-gray-600 italic text-center py-8">Waiting for logs…</div>}
         {logs.map((l, i) => (
           <div key={i} className="flex gap-2">
-            <span className="text-gray-600 shrink-0">{l.ts?.split('T')[1] || ''}</span>
+            <span className="text-gray-600 shrink-0">{l.ts ? fmtIST(l.ts).split(' ')[0] + ' ' + fmtIST(l.ts).split(' ')[1] : ''}</span>
             <span className={`shrink-0 font-bold ${levelColor(l.level)}`}>{l.level.toUpperCase().padEnd(5)}</span>
             <span className="text-gray-300 break-all">{l.msg}</span>
           </div>
@@ -159,7 +181,7 @@ const LogPanel = ({ instanceKey }) => {
 // ---------- Instance Card ----------
 const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
   const activeTrades = inst.active_trades || [];
-  const lastChecked = inst.last_checked ? new Date(inst.last_checked).toLocaleTimeString() : '—';
+  const lastChecked = fmtIST(inst.last_checked);
   return (
     <div onClick={() => onSelect(inst.instance_key)}
          className={`p-4 rounded-xl border cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
@@ -174,7 +196,12 @@ const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
         </span>
       </div>
       <div className="text-xl font-mono text-yellow-400 mb-1">₹{(inst.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
-      <div className="text-[10px] text-gray-500 font-mono mb-2">Last: {inst.last_price ? Number(inst.last_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'} · {lastChecked}</div>
+      <div className="grid grid-cols-3 gap-2 text-center text-[10px] font-medium text-gray-400 mb-2">
+        <div className="bg-gray-900/50 p-1.5 rounded">Current<br /><span className="text-white text-xs">{inst.last_price ? Number(inst.last_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'}</span></div>
+        <div className="bg-gray-900/50 p-1.5 rounded">Leverage<br /><span className="text-white text-xs">{inst.leverage ?? '—'}×</span></div>
+        <div className="bg-gray-900/50 p-1.5 rounded">Margin<br /><span className="text-white text-xs">{inst.margin_pct ?? '—'}%</span></div>
+      </div>
+      <div className="text-[10px] text-gray-500 font-mono mb-2">Updated: {lastChecked}</div>
       <div className="flex justify-between items-center text-xs text-gray-500">
         <span>{activeTrades.length} open · {(inst.closed_trades || []).length} closed</span>
         <span className="font-mono text-gray-600">{inst.instance_key.split('_').pop()}</span>

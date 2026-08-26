@@ -9,7 +9,7 @@ import os
 from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
-from .services.paper_trader import PaperTradeService
+from .services.paper_trader import PaperTradeService, _to_ist
 from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
 from .database.models import (
@@ -1216,24 +1216,33 @@ def get_paper_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
-                current = getattr(trade, 'current_price', None) or trade.peak_price
+                # Prefer the freshest tick price so the "current" value is live.
+                current = getattr(service, 'last_price', None) or getattr(trade, 'current_price', None) or trade.peak_price
                 pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * service.conversion_rate
+                leverage = getattr(service.config, 'leverage', 1)
+                # Percent change of the live price vs entry (direction-aware).
+                chg_pct = ((current - trade.entry_price) / trade.entry_price * 100) * trade.direction if trade.entry_price else 0.0
+                entry_time_ist = _to_ist(trade.entry_time)
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": current, "pnl": pnl_inr,
-                    "entry_time": str(trade.entry_time), "bars_held": trade.bars_held,
-                    "margin": trade.margin_inr
+                    "current": current, "pnl": pnl_inr, "chg_pct": chg_pct,
+                    "entry_time": entry_time_ist, "bars_held": trade.bars_held,
+                    "margin": trade.margin_inr, "notional_usd": getattr(trade, 'notional_usd', 0),
+                    "lots": getattr(trade, 'lots', 0), "leverage": leverage,
+                    "sl": getattr(trade, 'sl', None), "tp": getattr(trade, 'tp', None),
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
                 "data_source": service.market_source, "broker_name": service.broker_name,
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
+                "leverage": getattr(service.config, 'leverage', 1),
+                "margin_pct": getattr(service, 'margin_pct', 0),
+                "conversion_rate": service.conversion_rate,
                 "is_running": service.is_running, "active_trades": active_trades,
                 "open_trade_count": len(service.oms.active_trades),
                 "closed_trades": service.closed_trades[-50:],
                 "last_price": service.last_price, "last_checked": service.last_checked,
-                "conversion_rate": service.conversion_rate,
             })
     return status_list
 
@@ -1312,15 +1321,23 @@ def get_live_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
+                current = getattr(service, 'last_price', None) or getattr(trade, 'current_price', None) or trade.peak_price
+                pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * getattr(service, 'conversion_rate', 85.0)
+                leverage = getattr(service.config, 'leverage', 1)
+                chg_pct = ((current - trade.entry_price) / trade.entry_price * 100) * trade.direction if trade.entry_price else 0.0
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": trade.peak_price, "pnl": (trade.peak_price - trade.entry_price) * trade.direction * trade.lots * 85.0,
-                    "margin": trade.margin_inr
+                    "current": current, "pnl": pnl_inr, "chg_pct": chg_pct,
+                    "margin": trade.margin_inr, "notional_usd": getattr(trade, 'notional_usd', 0),
+                    "lots": getattr(trade, 'lots', 0), "leverage": leverage,
+                    "entry_time": _to_ist(trade.entry_time),
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
                 "broker_name": service.broker_name, "data_source": service.market_source,
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
+                "leverage": getattr(service.config, 'leverage', 1),
+                "margin_pct": getattr(service, 'margin_pct', 0),
                 "last_price": service.last_price, "last_checked": service.last_checked,
                 "is_running": service.is_running, "active_trades": active_trades
             })

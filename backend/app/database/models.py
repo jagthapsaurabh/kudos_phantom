@@ -6,6 +6,13 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import datetime
 import os
+from dotenv import load_dotenv
+
+# Load .env BEFORE reading DATABASE_URL so the engine is built against the
+# configured backend (e.g. PostgreSQL). This must happen at import time: it is
+# the single shared entry point for the API server (main.py), all scripts and
+# the seeder. load_dotenv() does not override already-set real env vars.
+load_dotenv()
 
 Base = declarative_base()
 

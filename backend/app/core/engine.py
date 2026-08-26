@@ -115,7 +115,7 @@ class BacktestEngine:
         df_4h = df_4h.sort_index()
 
         from .indicators import compute_indicators
-        ind_1h = compute_indicators(df_1h)
+        ind_1h = compute_indicators(df_1h, macd_fast=self.config.macd_fast, macd_slow=self.config.macd_slow, macd_signal=self.config.macd_signal)
         for col, values in ind_1h.items(): df_1h[col] = values
 
         # StrategyServices built for Phantom expose metadata; third-party

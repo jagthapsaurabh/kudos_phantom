@@ -40,7 +40,22 @@ class DataSyncService:
 
     @classmethod
     def _delta_resolution(cls, interval):
-        return {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1D"}.get(interval, interval)
+        # Delta Exchange expects the *string label* of the timeframe, not a
+        # seconds value (e.g. "15m", "1h", "4h", "1d"). Sending "15"/"60"/"240"
+        # returns HTTP 400 Bad Request because the resolution enum is rejected.
+        # The app's own interval names (1m,5m,15m,1h,4h,1d) are already the
+        # labels Delta uses, so we pass them through.
+        label = str(interval).lower()
+        alias = {"60m": "1h", "240m": "4h", "2h": "2h", "6h": "6h"}
+        if label in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "1d", "1w"):
+            return label
+        return alias.get(label, label)
+
+    @staticmethod
+    def _interval_seconds(interval):
+        return {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+                "1d": 86400, "1w": 604800}.get(interval, 3600)
 
     @classmethod
     def fetch_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
@@ -69,10 +84,14 @@ class DataSyncService:
         if source == "Delta":
             url = "https://api.india.delta.exchange/v2/history/candles"
             params = {"symbol": cls._delta_symbol(symbol), "resolution": cls._delta_resolution(interval), "limit": min(limit, 2000)}
-            if start_time:
-                params["start"] = int(cls._as_datetime(start_time).replace(tzinfo=timezone.utc).timestamp())
-            if end_time:
-                params["end"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp())
+            # Delta requires BOTH `start` and `end` on every request (they are
+            # mandatory query params). When the caller does not supply them we
+            # derive a sane window (now .. now - limit*interval) instead of
+            # omitting them, which would trigger a 400 Bad Request.
+            now = int(datetime.now(timezone.utc).timestamp())
+            params["start"] = int(cls._as_datetime(start_time).replace(tzinfo=timezone.utc).timestamp()) if start_time else \
+                now - int(cls._interval_seconds(interval)) * min(limit, 2000)
+            params["end"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp()) if end_time else now
             try:
                 response = requests.get(url, params=params, timeout=20)
                 response.raise_for_status()
