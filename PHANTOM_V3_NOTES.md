@@ -121,6 +121,54 @@ DD-throttle thresholds and picked the shipped low-DD champion
 - `main.py`: trade persistence filters to real table columns (previously broke
   on legacy DB schema; schema drift now auto-migrated for **all** tables).
 
+## Addon: direction-specific Long / Short conditions (v3.2)
+
+Data showed the two sides don't behave the same way — REVERSAL-SHORT's quality
+collapses at high ATR14 and high MACD-histogram values, a pattern absent on the
+long side. A single shared parameter set can't express "tighter filter for
+shorts only". This addon exposes an optional per-direction override so the
+admin can tune the two sides independently without loosening one to help the
+other.
+
+- **Toggle** (`entry_conditions.use_direction_conditions`, UI: *"Use separate
+  conditions for Long / Short"*). OFF = exactly the legacy shared engine. ON =
+  the LONG and SHORT branches each carry their own copy of the directional
+  fields.
+- **Directional fields** (`entry_conditions.long.*` / `.short.*`):
+  `macd_hist_min`, `stop_loss_atr`, `atr_regime_ratio`, `rsi_oversold`,
+  `rsi_overbought`, `adx_min`. Any value left `null` falls back to the shared
+  config field, so existing saved configs keep working unchanged.
+- **Signed MACD for shorts**: the directional `macd_hist_min` is interpreted per
+  side — longs require `hist >= value` (e.g. `5`), shorts require
+  `hist <= value` (e.g. `-8`). This lets an admin require **bearish momentum
+  clearly present** for shorts (a negative threshold) while longs keep a positive
+  threshold. The shared (OFF) field still uses the legacy `|hist| >= min`
+  magnitude filter.
+- **ATR regime — optional max-ATR cap for shorts**: `atr_regime_ratio` keeps the
+  legacy **lower-bound floor** (`ATR >= ratio × SMA`) in both modes, so the
+  shared pre-fill is behaviour-identical when the toggle is first switched on.
+  To exclude the high-volatility regime where REVERSAL-SHORT underperforms, use
+  the optional per-direction **`atr_regime_max`** cap (`ATR <= value × SMA`); a
+  lower cap is tighter. `null`/blank disables it.
+- **Stop-loss ATR per direction** is applied in `services/order_manager.py` via
+  `stop_loss_atr_for(direction)`, so shorts can use a wider/narrower hard stop
+  than longs (backtest flagged 84% of losing-day trades exiting via hard SL).
+- **Config + lifecycle**: the override is part of `PhantomV2Config` / the
+  backtest `params`, saved by *"Save as New Strategy"* on the backtest page,
+  and honoured by backtest, Paper and Live trading (a saved `params` strategy is
+  auto-detected and run with `StrategyService` rather than the rule builder).
+- **Filter preview** (`POST /backtest/filter-preview` + *"Preview Filters"* button):
+  before running the full backtest, show the historical trades in each
+  LONG/SHORT × REVERSAL/MOMENTUM bucket under the conditions currently set,
+  with win rate, profit factor and avg/net PnL. For `champion_lowdd_config.json`
+  (shared) the pre-preview bucket breakdown makes MACD/ATR threshold tuning
+  directly available in the UI instead of an offline script.
+
+Suggested starting values observed during tuning (exposed as defaults in the UI,
+not hardcoded): SHORT `macd_hist_min` ≈ negative (e.g. `-8`) to require bearish
+momentum, SHORT `atr_regime_ratio` below the shared `0.5` to exclude the top
+volatility quartile where REVERSAL-SHORT's win rate drops to ~52%.
+
 ## Reproduce
 ```bash
 python -m backend.app.scripts.run_baseline        # v2.5 parity numbers

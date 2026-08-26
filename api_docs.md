@@ -53,10 +53,39 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode` | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
+| `POST` | `/backtest/filter-preview` | `params`, `start_date`, `end_date`, `symbol`, `data_source`, `fee_mode` | Synchronous per-bucket peek at the current conditions (`LONG/SHORT x REVERSAL/MOMENTUM`) with win rate, profit factor and avg/net PnL — handy while tuning the direction-specific thresholds before a full run. |
 | `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `initial_capital`) |
 | `GET` | `/backtest/results/{id}` | None | Get detailed trades and equity curve for a run (incl. `initial_capital`) |
 | `DELETE` | `/backtest/{id}` | None | Delete a single backtest run and its trades |
 | `DELETE` | `/backtest/clear` | None | Delete all of the user's backtest runs |
+
+**Direction-specific conditions (`params.entry_conditions`).** Every `params` object may optionally
+carry an `entry_conditions` block. When `use_direction_conditions` is `False` (default) the engine
+uses the legacy shared conditions. When `True`, the LONG and SHORT branches each supply their own
+`macd_hist_min`, `stop_loss_atr`, `atr_regime_ratio`, `rsi_oversold`, `rsi_overbought` and `adx_min`
+(any field left `null` falls back to the shared value). Two directional fields are interpreted
+**per side**:
+
+- `macd_hist_min` is **signed** — longs require `hist >= value` (e.g. `5`), shorts require
+  `hist <= value` (e.g. `-8`), so a negative short threshold means "bearish momentum clearly present".
+- `atr_regime_ratio` keeps the legacy **lower-bound floor** semantics
+  (`ATR >= ratio × SMA`) in both modes.
+- `atr_regime_max` (optional on each side) adds a **max-ATR cap**
+  (`ATR <= value × SMA(ATR, 50)`); when blank/`null` it is disabled. A lower
+  cap is tighter and excludes the high-volatility regimes where shorts
+  underperform. This is the field to use to exclude the top volatility quartile
+  for shorts.
+
+```json
+{
+  "macd_hist_min": 5.0,
+  "entry_conditions": {
+    "use_direction_conditions": true,
+    "long":  { "macd_hist_min": 5.0,  "stop_loss_atr": 1.2, "atr_regime_ratio": 0.5, "rsi_oversold": 40, "rsi_overbought": 60, "adx_min": 10.0 },
+    "short": { "macd_hist_min": -8.0, "stop_loss_atr": 1.6, "atr_regime_ratio": 0.3, "rsi_oversold": 40, "rsi_overbought": 60, "adx_min": 10.0 }
+  }
+}
+```
 
 ---
 
@@ -80,5 +109,5 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | `GET` | `/` | None | System health check |
 | `GET` | `/klines` | `symbol`, `interval`, `limit` | Fetch raw market data for charts |
 | `GET` | `/strategies` | None | List available custom strategies |
-| `POST` | `/strategies/create` | `name`, `rules` | Create a new custom strategy |
+| `POST` | `/strategies/create` | `name`, `rules` or `params` | Create a new custom strategy. `rules` stores a Chartink-style rule list (dynamic builder), `params` stores a Phantom `PhantomV2Config` dict (can include `entry_conditions`). A saved `params` strategy can be re-run or Paper / Live traded directly. |
 | `POST` | `/strategies/scan` | `rules`, `symbol`, `interval`, `start_date`, `end_date`, `limit` | Chartink-style scan: returns the latest candles that match an unsaved rule set (for the strategy builder live preview) |

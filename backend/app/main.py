@@ -134,6 +134,41 @@ def _fee_config(config, fees):
                                    'maker_fee_bps': float(fees.maker_fee_bps)})
 
 
+_PHANTOM_PARAM_KEYS = (
+    'entry_conditions', 'use_direction_conditions', 'rsi_oversold',
+    'rsi_overbought', 'stop_loss_atr', 'macd_hist_min', 'atr_regime_ratio',
+    'adx_min', 'trend_ema_period',
+)
+
+
+def _resolve_strategy_payload(db, strategy_id, user_id, fees):
+    """Resolve a saved custom strategy into a runnable payload.
+
+    A strategy created by the Phantom parameter form (or the backtest page's
+    "Save as new strategy") stores a :class:`PhantomV2Config` params dict under
+    the `rules` JSON column. A strategy created by the Chartink-style rule
+    builder stores a list of rule nodes. This helper detects which and returns
+    ``(kind, payload, strat)`` where kind is ``'phantom'`` or ``'dynamic'``.
+
+    Returns ``None`` when the strategy does not exist / is not owned by user.
+    """
+    try:
+        strategy_id = int(strategy_id)
+    except (ValueError, TypeError):
+        return None
+    strat = db.query(CustomStrategy).filter(
+        CustomStrategy.id == strategy_id, CustomStrategy.user_id == user_id).first()
+    if not strat:
+        return None
+    data = strat.rules
+    if isinstance(data, dict) and any(k in data for k in _PHANTOM_PARAM_KEYS):
+        cfg = PhantomV2Config(**{k: v for k, v in data.items() if k in PhantomV2Config.model_fields})
+        if fees is not None:
+            cfg = _fee_config(cfg, fees)
+        return ('phantom', cfg, strat)
+    return ('dynamic', data, strat)
+
+
 async def daily_sync_task():
     while True:
         DataSyncService.sync_market_data()
@@ -749,12 +784,20 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
             raise HTTPException(status_code=400, detail="Invalid strategy id")
         if not strat:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
-        from .core.dynamic_strategy import DynamicStrategyService
-        cfg = PhantomV2Config()
-        engine = BacktestEngine(cfg)
-        strategy_service = DynamicStrategyService(strat.rules)
-        wants_metadata = False
-        label = strat.name
+        resolved = _resolve_strategy_payload(db, strategy_id, user.id, None)
+        if resolved and resolved[0] == 'phantom':
+            cfg = resolved[1]
+            engine = BacktestEngine(cfg)
+            strategy_service = engine.strategy_service
+            wants_metadata = True
+            label = strat.name
+        else:
+            from .core.dynamic_strategy import DynamicStrategyService
+            cfg = PhantomV2Config()
+            engine = BacktestEngine(cfg)
+            strategy_service = DynamicStrategyService(strat.rules)
+            wants_metadata = False
+            label = strat.name
 
     df_1h = engine._get_data_from_db(symbol, "1h", start_date, end_date, normalize_source(source))
     df_4h = engine._get_data_from_db(symbol, "4h", start_date, end_date, normalize_source(source))
@@ -813,24 +856,29 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         if req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         else:
-            strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(req.strategy_id), CustomStrategy.user_id == user_id).first()
-            if not strat: return
-            from .core.dynamic_strategy import DynamicStrategyService
-            class DynamicBacktestEngine:
-                def __init__(self, rules):
-                    self.config = _fee_config(PhantomV2Config(), fees)
-                    self.strategy_service = DynamicStrategyService(rules)
-                    from .core.strategy import ValidatorService
-                    self.validator_service = ValidatorService()
-                    from .services.order_manager import OrderManager
-                    self.oms = OrderManager(self.config)
-                def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
-                    original_engine = BacktestEngine(self.config, fee_schedule=fees, data_source=source)
-                    original_engine.strategy_service = self.strategy_service
-                    # NOTE: pass by keyword - the engine signature is
-                    # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
-                    return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, start_date=start_date, end_date=end_date)
-            engine = DynamicBacktestEngine(strat.rules)
+            resolved = _resolve_strategy_payload(db, req.strategy_id, user_id, fees)
+            if not resolved: return
+            kind, payload, strat = resolved
+            if kind == 'phantom':
+                # A saved Phantom params config (may include entry_conditions).
+                engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source)
+            else:
+                from .core.dynamic_strategy import DynamicStrategyService
+                class DynamicBacktestEngine:
+                    def __init__(self, rules):
+                        self.config = _fee_config(PhantomV2Config(), fees)
+                        self.strategy_service = DynamicStrategyService(rules)
+                        from .core.strategy import ValidatorService
+                        self.validator_service = ValidatorService()
+                        from .services.order_manager import OrderManager
+                        self.oms = OrderManager(self.config)
+                    def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
+                        original_engine = BacktestEngine(self.config, fee_schedule=fees, data_source=source)
+                        original_engine.strategy_service = self.strategy_service
+                        # NOTE: pass by keyword - the engine signature is
+                        # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
+                        return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, start_date=start_date, end_date=end_date)
+                engine = DynamicBacktestEngine(payload)
 
         results = engine.run(symbol="BTCUSDT", initial_capital_inr=capital, start_date=start_date_str, end_date=end_date_str)
         
@@ -886,7 +934,7 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
             name=req.strategy_name,
             start_date=start_date_dt,
             end_date=end_date_dt,
-            config_json=json.dumps(req.params.dict()),
+            config_json=json.dumps(req.params.model_dump()),
             initial_capital=capital,
             data_source=normalize_source(req.data_source),
             fee_mode=req.fee_mode,
@@ -976,6 +1024,88 @@ def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error deleting run: {str(e)}")
 
+# --- FILTER PREVIEW (per bucket, before the full run) --------------------
+class FilterPreviewRequest(BaseModel):
+    params: StrategyParams
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    symbol: str = "BTCUSDT"
+    data_source: str = 'Binance'
+    fee_mode: str = 'backtest'
+
+@app.post("/backtest/filter-preview")
+def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Quick per-bucket peek at the conditions currently in the form.
+
+    Runs a lightweight backtest with the given params (shipping the
+    direction-specific overrides when the toggle is ON) and buckets the
+    resulting trades by LONG/SHORT x REVERSAL/MOMENTUM with win rate,
+    profit factor and average net PnL for each bucket. This lets an admin
+    tune the MACD / ATR-regime thresholds and see the bucket-level
+    trade-off without a separate offline script.
+    """
+    try:
+        source = normalize_source(req.data_source)
+        fees = resolve_fees(db, source, req.fee_mode, req.params)
+        config = _fee_config(req.params, fees)
+        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        start = req.start_date or "2020-07-04"
+        end = req.end_date or "2026-07-04"
+        results = engine.run(symbol=req.symbol, initial_capital_inr=20000,
+                             start_date=start, end_date=end)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Filter preview error: {str(e)}")
+
+    buckets = {}
+    for t in results['trades']:
+        side = 'LONG' if t['direction'] == 1 else 'SHORT'
+        setup = (t.get('setup') or 'UNKNOWN').upper()
+        key = f"{side}_{setup}"
+        b = buckets.setdefault(key, {
+            'count': 0, 'wins': 0, 'net': 0.0,
+            'wins_sum': 0.0, 'loss_sum': 0.0,
+        })
+        pnl = float(t['net_pnl'])
+        b['count'] += 1
+        b['net'] += pnl
+        if pnl > 0:
+            b['wins'] += 1
+            b['wins_sum'] += pnl
+        else:
+            b['loss_sum'] += abs(pnl)
+
+    out = {}
+    for key, b in buckets.items():
+        pf = (b['wins_sum'] / b['loss_sum']) if b['loss_sum'] > 0 else (99.0 if b['wins_sum'] > 0 else 0.0)
+        out[key] = {
+            'count': b['count'],
+            'win_rate': round(b['wins'] / b['count'] * 100, 2) if b['count'] else 0.0,
+            'profit_factor': round(pf, 2),
+            'avg_pnl': round(b['net'] / b['count'], 2) if b['count'] else 0.0,
+            'net_pnl': round(b['net'], 2),
+        }
+    # Provide a per-direction roll-up too (LONG / SHORT).
+    sides = {}
+    for key, b in buckets.items():
+        side = key.split('_')[0]
+        s = sides.setdefault(side, {'count': 0, 'wins': 0, 'net': 0.0})
+        s['count'] += b['count']
+        s['wins'] += b['wins']
+        s['net'] += b['net']
+    for side, s in sides.items():
+        s['win_rate'] = round(s['wins'] / s['count'] * 100, 2) if s['count'] else 0.0
+        s['avg_pnl'] = round(s['net'] / s['count'], 2) if s['count'] else 0.0
+
+    return {
+        'total_trades': len(results['trades']),
+        'total_win_rate': round(results['win_rate'], 2),
+        'total_profit_factor': round(results['profit_factor'], 2),
+        'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
+        'buckets': out,
+        'by_side': {k: v for k, v in sides.items()},
+        'setup_dist': results.get('setup_dist', {}),
+    }
+
 # --- PAPER TRADING ---
 class TradeStartRequest(BaseModel):
     strategy_id: str
@@ -1039,13 +1169,16 @@ def start_paper_trade(
                                     market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
-        try:
-            strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(strategy_id), CustomStrategy.user_id == user.id).first()
-            if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = PaperTradeService(strategy_id, strat.rules, initial_capital=capital, margin_pct=margin_pct,
+        resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Custom strategy not found")
+        kind, payload, strat = resolved
+        if kind == 'phantom':
+            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=False, broker_definition=definition)
+        else:
+            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees, is_custom=True, broker_definition=definition)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
@@ -1129,14 +1262,18 @@ def start_live_trade(
                                    testnet=testnet, fee_schedule=fees, definition=definition)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
-        try:
-            strat = db.query(CustomStrategy).filter(CustomStrategy.id == int(strategy_id), CustomStrategy.user_id == user.id).first()
-            if not strat: raise HTTPException(status_code=404, detail="Custom strategy not found")
-            service = LiveTradeService(strategy_id, strat.rules, api_key, api_secret, initial_capital=capital,
+        resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Custom strategy not found")
+        kind, payload, strat = resolved
+        if kind == 'phantom':
+            service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
+                                       margin_pct=margin_pct, is_custom=False, broker_name=source,
+                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition)
+        else:
+            service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid strategy ID format")
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,

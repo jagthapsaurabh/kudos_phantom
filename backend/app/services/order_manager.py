@@ -48,8 +48,12 @@ class OrderManager:
         notional_usd = lots * price_usd
         margin_inr = (notional_usd / self.config.leverage) * conversion_rate
         
-        # SL / TP / Trail Distances
-        sl_dist = self.config.stop_loss_atr * atr_usd
+        # SL / TP / Trail Distances. `stop_loss_atr_for` honours the
+        # direction-specific override when the master toggle is ON, otherwise
+        # it returns the shared `stop_loss_atr`.
+        sl_atr = getattr(self.config, 'stop_loss_atr_for', None)
+        sl_atr_val = sl_atr(direction) if callable(sl_atr) else self.config.stop_loss_atr
+        sl_dist = sl_atr_val * atr_usd
         # SL Floor: max(2.0xATR, 1.6% * entry)
         min_sl = self.config.sl_floor_pct * price_usd
         if sl_dist < min_sl:

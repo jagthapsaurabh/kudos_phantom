@@ -80,6 +80,18 @@ returned by `GET /backtest/results/{run_id}`.
 All v3 behaviours are config-driven (`PhantomV2Config`); every new flag defaults to the exact
 v2.5 behaviour, so the API, paper trader and live trader remain fully backward compatible.
 
+### v3.2 addon: Direction-specific Long / Short conditions
+When the two sides behave differently (REVERSAL-SHORT quality collapses at high ATR/high MACD
+histogram), use the **"Use separate conditions for Long / Short"** toggle on the backtest page.
+With it ON, the LONG and SHORT branches each carry their own `macd_hist_min` (signed — shorts can
+be negative, e.g. `-8`, to require bearish momentum), `stop_loss_atr`, `atr_regime_ratio`,
+the optional `atr_regime_max` max-ATR cap (to exclude high-volatility for shorts),
+`rsi_oversold`/`rsi_overbought` and `adx_min`. Persisted as `entry_conditions.long.*` /
+`entry_conditions.short.*`; any unset value falls back to the shared field. Use the
+**Preview Filters** button (or `POST /backtest/filter-preview`) to see per-bucket win rate /
+profit factor before running the full backtest, and **Save as New Strategy** to keep a tuned
+configuration under a new name for re-running or Paper / Live trading.
+
 ---
 
 ## 🔌 Exchanges, fees & seeded market data
