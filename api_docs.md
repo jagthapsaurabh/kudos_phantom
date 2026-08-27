@@ -37,11 +37,20 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 ### 4. Paper Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. |
-| `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance |
-| `DELETE` | `/paper-trade/{instance_key}` | None | Stops and removes a paper-trade session from the user's workspace |
-| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name |
+| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. Returns the `instance_key` and the `session_id` of its saved history row. |
+| `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance. The result is **saved** to History (`saved_to_history`, `session_id` in the response). |
+| `DELETE` | `/paper-trade/{instance_key}` | None | Stops a session and permanently removes it, including its saved history row (`history_removed`) |
+| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name, `session_id` and the live equity curve |
 | `GET` | `/paper-trade/logs` | `instance_key` | Live log buffer for an instance |
+| `GET` | `/paper-trade/history` | None | **Every** paper session the user has run (newest first) with status, equity, ROI, win rate, profit factor, max drawdown and trade count. Survives stop and server restart. |
+| `GET` | `/paper-trade/history/{session_id}` | None | Full saved result of one session: closed trades, equity curve, saved logs, positions still open at stop and the parameter snapshot |
+| `DELETE` | `/paper-trade/history/{session_id}` | None | Delete one saved session from History |
+
+Paper sessions are mirrored into the `paper_sessions` table while they run (on every fill and every
+few quiet ticks) and finalised when they stop, so stopping an instance no longer loses its trades,
+equity curve or logs. Status is `running`, `stopped`, or `interrupted` (the server restarted while it
+was live). Only an explicit delete — the workspace delete on a live card or History → Delete — removes
+a saved result.
 
 ### 5. Live Trading
 | Method | Endpoint | Request Body | Description |
@@ -71,22 +80,30 @@ supported for older configs and enables all of the original directional override
 
 - `macd_hist_min` is **signed** — longs require `hist >= value` (e.g. `5`), shorts require
   `hist <= value` (e.g. `-8`), so a negative short threshold means "bearish momentum clearly present".
-- `atr_regime_ratio` keeps the legacy **lower-bound floor** semantics
-  (`ATR >= ratio × SMA`) in both modes.
+- `atr_regime_ratio` is compared with `SMA(ATR, 50)` using the side's `atr_regime_op`.
+- `atr_regime_op` (optional, per side) chooses the comparison: `">="`, `"<="`, `">"` or `"<"`.
+  It defaults to `">="` — the original lower-bound floor — and is only read when
+  `use_direction_atr_floor` (or the legacy master switch) is on, so existing runs and saved
+  strategies are unchanged. Unknown operators are rejected with a validation error; the unicode
+  forms `≥` / `≤` and `=>` / `=<` are accepted and normalised.
 - `atr_regime_max` (optional on each side) adds a **max-ATR cap**
-  (`ATR <= value × SMA(ATR, 50)`); when blank/`null` it is disabled. A lower
-  cap is tighter and excludes the high-volatility regimes where shorts
-  underperform. This is the field to use to exclude the top volatility quartile
-  for shorts.
+  (`ATR <= value × SMA(ATR, 50)`); when blank/`null` it is disabled. It is ANDed with the
+  operator test above. A lower cap is tighter and excludes the high-volatility regimes where
+  shorts underperform.
+
+`POST /backtest/filter-preview` echoes the resolved rule per side in `atr_regime_rules`
+(e.g. `{"long": "ATR ≥ 0.5 x SMA50(ATR)", "short": "ATR < 1.2 x SMA50(ATR)", "operators": {...}}`),
+and each trade's expanded log row shows the test that filtered it.
 
 ```json
 {
   "macd_hist_min": 5.0,
+  "atr_regime_ratio": 0.5,
   "entry_conditions": {
     "use_direction_macd_hist": true,
     "use_direction_atr_floor": true,
-    "long":  { "macd_hist_min": 5.0, "atr_regime_ratio": 0.5 },
-    "short": { "macd_hist_min": -8.0, "atr_regime_ratio": 0.3 }
+    "long":  { "macd_hist_min": 5.0,  "atr_regime_ratio": 0.5, "atr_regime_op": ">=" },
+    "short": { "macd_hist_min": -8.0, "atr_regime_ratio": 1.2, "atr_regime_op": "<" }
   }
 }
 ```

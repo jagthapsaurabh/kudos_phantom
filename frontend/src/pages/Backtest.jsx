@@ -14,7 +14,7 @@ const PARAM_META = {
   macd_slow: { label: 'MACD slow (EMA)', hint: 'Long MACD period. Must be greater than fast.' },
   macd_signal: { label: 'MACD signal', hint: 'Signal-line period: Signal = EMA(MACD_line, signal). Histogram = MACD_line − Signal.' },
   macd_hist_min: { label: 'MACD hist min', hint: 'Minimum momentum size. Longs: hist ≥ this. Shorts: hist ≤ this (use a negative).' },
-  atr_regime_ratio: { label: 'Min ATR floor', hint: 'Require ATR ≥ this × its 50-bar average. Lower = more trades.' },
+  atr_regime_ratio: { label: 'Min ATR floor', hint: 'Require ATR ≥ this × its 50-bar average. Lower = more trades. Turn on the switch below to pick the comparison (>, <, ≥, ≤) and value separately for Long and Short.' },
   atr_regime_max: { label: 'Max ATR cap', hint: 'Optional: skip high-volatility. Blank = off.' },
   enable_momentum_entry: { label: 'Momentum entries', hint: 'Also take trend-continuation trades, not just reversals.' },
   cooldown_bars: { label: 'Cooldown bars', hint: 'Wait this many candles after a close before a new entry.' },
@@ -28,6 +28,32 @@ const PARAM_META = {
   dd_soft_pct: { label: 'Soft drawdown %', hint: 'Past this equity drawdown, position size is reduced.' },
   dd_halt_pct: { label: 'Halt drawdown %', hint: 'Past this, new entries stop. 100 = guard off.' },
   dd_resume_pct: { label: 'Resume drawdown %', hint: 'Start entries again once drawdown falls below this.' },
+};
+
+// Comparison operators the client can choose for the per-side ATR regime rule.
+// '>=' (ATR ≥ ratio × 50-bar average) is the original Phantom behaviour and is
+// what each side starts from when the Long/Short switch is turned on, so the
+// default condition never changes unless the client edits it.
+const ATR_REGIME_OPS = [
+  { value: '>=', label: '≥ (greater than or equal)', short: 'ATR ≥' },
+  { value: '<=', label: '≤ (less than or equal)', short: 'ATR ≤' },
+  { value: '>', label: '> (greater than)', short: 'ATR >' },
+  { value: '<', label: '< (less than)', short: 'ATR <' },
+];
+const DEFAULT_ATR_OP = '>=';
+const atrOpShort = (op) => (ATR_REGIME_OPS.find(o => o.value === op) || ATR_REGIME_OPS[0]).short;
+
+// Mirrors the backend resolver (PhantomV2Config.atr_regime_rule_for) so a
+// restored run can show the exact ATR test each side was filtered with.
+const atrRegimeRuleFor = (params, direction) => {
+  const side = direction === 1 ? 'long' : 'short';
+  const ec = params?.entry_conditions || {};
+  const perSide = !!(ec.use_direction_conditions || ec.use_direction_atr_floor);
+  const branch = perSide ? (ec[side] || {}) : {};
+  const op = branch.atr_regime_op || DEFAULT_ATR_OP;
+  const ratio = branch.atr_regime_ratio ?? params?.atr_regime_ratio ?? 0;
+  const symbol = { '>=': '≥', '<=': '≤', '>': '>', '<': '<' }[op] || op;
+  return `ATR ${symbol} ${ratio} × SMA50(ATR)`;
 };
 
 const isBacktestComplete = (runDetails) => Boolean(
@@ -123,8 +149,8 @@ const Backtest = () => {
       use_direction_conditions: false,
       use_direction_macd_hist: false,
       use_direction_atr_floor: false,
-      long: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
-      short: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
+      long: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
+      short: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
     },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
@@ -213,6 +239,10 @@ const Backtest = () => {
     if (value && field === 'use_direction_atr_floor') {
       long.atr_regime_ratio = long.atr_regime_ratio ?? prev.atr_regime_ratio ?? 0;
       short.atr_regime_ratio = short.atr_regime_ratio ?? prev.atr_regime_ratio ?? 0;
+      // Seed both sides with the engine's default comparison so switching the
+      // toggle on never changes the rule until the client edits it.
+      long.atr_regime_op = long.atr_regime_op ?? DEFAULT_ATR_OP;
+      short.atr_regime_op = short.atr_regime_op ?? DEFAULT_ATR_OP;
     }
     return {
       ...prev,
@@ -778,7 +808,8 @@ const Backtest = () => {
         >
           <div className="mb-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
             Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
-            <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds.
+            <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds — the ATR switch
+            also lets each side pick its own comparison (<b className="text-white">&gt;, &lt;, ≥, ≤</b>) against the 50-bar ATR average.
           </div>
 
           <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
@@ -808,23 +839,47 @@ const Backtest = () => {
                             <span className="mt-0.5 block text-gray-500">
                               {isHist
                                 ? 'Long uses hist ≥ value; Short uses hist ≤ value.'
-                                : 'Long and Short use ATR ≥ their floor × 50-bar ATR average.'}
+                                : 'Pick the comparison (>, <, ≥, ≤) and value for each side. Both start on the default ATR ≥ rule.'}
                             </span>
                           </span>
                         </label>
                         {enabled && (
-                          <div className="grid grid-cols-2 gap-2 rounded-lg border border-gray-700 bg-gray-900 p-2">
-                            {['long', 'short'].map(side => {
-                              const sideValue = params.entry_conditions?.[side]?.[field];
-                              return <div key={side}>
-                                <label className={`mb-1 block text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>
-                                  {side} · {isHist ? (side === 'long' ? 'hist ≥' : 'hist ≤') : 'ATR ≥'}
-                                </label>
-                                <input type="number" step="0.01" value={sideValue ?? ''}
-                                  onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
-                                  className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
-                              </div>;
-                            })}
+                          <div className="space-y-2 rounded-lg border border-gray-700 bg-gray-900 p-2">
+                            <div className="grid grid-cols-2 gap-2">
+                              {['long', 'short'].map(side => {
+                                const sideValue = params.entry_conditions?.[side]?.[field];
+                                const sideOp = params.entry_conditions?.[side]?.atr_regime_op ?? DEFAULT_ATR_OP;
+                                return <div key={side}>
+                                  <label className={`mb-1 block text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                                    {side} · {isHist ? (side === 'long' ? 'hist ≥' : 'hist ≤') : atrOpShort(sideOp)}
+                                  </label>
+                                  {isHist ? (
+                                    <input type="number" step="0.01" value={sideValue ?? ''}
+                                      onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
+                                      className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
+                                  ) : (
+                                    <div className="flex gap-1">
+                                      <select value={sideOp}
+                                        onChange={e => setDirectionalValue(side, 'atr_regime_op', e.target.value)}
+                                        title="How ATR is compared with its 50-bar average"
+                                        className="w-16 shrink-0 rounded border border-gray-700 bg-gray-800 p-1.5 text-xs font-mono text-white outline-none focus:border-blue-500">
+                                        {ATR_REGIME_OPS.map(o => <option key={o.value} value={o.value}>{o.value}</option>)}
+                                      </select>
+                                      <input type="number" step="0.01" value={sideValue ?? ''}
+                                        onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
+                                        className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
+                                    </div>
+                                  )}
+                                </div>;
+                              })}
+                            </div>
+                            {!isHist && (
+                              <p className="text-[9px] leading-snug text-gray-500">
+                                Applied as <span className="font-mono text-gray-300">ATR {atrOpShort(params.entry_conditions?.long?.atr_regime_op ?? DEFAULT_ATR_OP).replace('ATR ', '')} {params.entry_conditions?.long?.atr_regime_ratio ?? params[field] ?? 0} × SMA50(ATR)</span> for
+                                longs and <span className="font-mono text-gray-300">ATR {atrOpShort(params.entry_conditions?.short?.atr_regime_op ?? DEFAULT_ATR_OP).replace('ATR ', '')} {params.entry_conditions?.short?.atr_regime_ratio ?? params[field] ?? 0} × SMA50(ATR)</span> for
+                                shorts. Use <span className="font-mono text-gray-300">&lt;</span> to trade only when volatility is calm.
+                              </p>
+                            )}
                           </div>
                         )}
                       </div>;
@@ -900,6 +955,16 @@ const Backtest = () => {
           <p className="mb-4 text-xs text-gray-500">
             Buckets reflect the conditions currently set in the configuration form.
           </p>
+          {preview.atr_regime_rules && (
+            <div className="mb-4 flex flex-wrap gap-2 text-[10px]">
+              {['long', 'short'].map(side => (
+                <span key={side}
+                  className={`rounded border px-2 py-1 font-mono ${side === 'long' ? 'border-green-800/40 bg-green-900/10 text-green-300' : 'border-red-800/40 bg-red-900/10 text-red-300'}`}>
+                  {side.toUpperCase()}: {preview.atr_regime_rules[side]}
+                </span>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
             {Object.entries(preview.buckets || {}).map(([key, b]) => {
               const side = key.split('_')[0];
@@ -1085,6 +1150,9 @@ const Backtest = () => {
                                   <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
                                   <CondChip ok={t.conditions?.rsi_ok} label="RSI trigger" />
                                   <CondChip ok={t.conditions?.macd_confirm_ok} label="MACD confirm" />
+                                </div>
+                                <div className="mt-1.5 text-[9px] text-gray-500">
+                                  ATR test: <span className="font-mono text-gray-300">{atrRegimeRuleFor(results.params, t.direction)}</span>
                                 </div>
                               </div>
                               <div>

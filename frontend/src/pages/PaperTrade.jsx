@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2 } from 'lucide-react';
+import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2, History, Download, RefreshCw, Eye, ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { API_URL } from '../api';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
@@ -13,6 +14,28 @@ const fmtIST = (iso) => {
   const p = (x) => String(x).padStart(2, '0');
   return `${p(ist.getUTCHours())}:${p(ist.getUTCMinutes())}:${p(ist.getUTCSeconds())} ${p(ist.getUTCDate())}/${p(ist.getUTCMonth() + 1)}/${ist.getUTCFullYear()} IST`;
 };
+
+// Saved history timestamps come from the database as naive UTC (no offset),
+// so the browser would otherwise read them as local time. Tag them with Z
+// first, then reuse the IST renderer above.
+const fmtUTC = (iso) => {
+  if (!iso) return '—';
+  const s = String(iso);
+  return fmtIST(/(Z|[+-]\d{2}:?\d{2})$/.test(s) ? s : `${s}Z`);
+};
+
+const inr = (v, digits = 0) => (
+  v === null || v === undefined || Number.isNaN(Number(v))
+    ? '—'
+    : `₹${Number(v).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`
+);
+
+const SESSION_STATUS = {
+  running: { label: 'Running', cls: 'text-green-400 border-green-800 bg-green-900/20' },
+  stopped: { label: 'Stopped', cls: 'text-gray-300 border-gray-700 bg-gray-900' },
+  interrupted: { label: 'Interrupted', cls: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
+};
+const statusMeta = (s) => SESSION_STATUS[s] || { label: s || '—', cls: 'text-gray-400 border-gray-700 bg-gray-900' };
 
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -278,6 +301,252 @@ const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) 
   );
 };
 
+// ---------- History Panel (persisted sessions) ----------
+// Stopping a paper instance used to discard its trades, logs and equity. Every
+// session is now saved server-side, so this panel lists past runs and opens the
+// full saved detail (trades, equity curve, logs, parameters).
+const HistoryRowDetail = ({ session }) => {
+  const curve = (session.equity_curve || []).map((p, i) => ({
+    i,
+    equity: Number(p.equity),
+    ts: fmtIST(p.ts),
+  }));
+  return (
+    <div className="space-y-4 border-t border-gray-700 bg-gray-900/60 p-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
+        {[
+          ['Initial capital', inr(session.initial_capital)],
+          ['Final equity', inr(session.final_equity, 2)],
+          ['Net PnL', inr(session.net_pnl, 2)],
+          ['ROI', session.roi != null ? `${Number(session.roi).toFixed(2)}%` : '—'],
+          ['Max drawdown', session.max_drawdown_pct != null ? `${Number(session.max_drawdown_pct).toFixed(2)}%` : '—'],
+          ['Win rate', session.win_rate != null ? `${Number(session.win_rate).toFixed(2)}%` : '—'],
+          ['Profit factor', session.profit_factor != null ? Number(session.profit_factor).toFixed(2) : '—'],
+          ['Fees paid', inr(session.total_fees, 2)],
+          ['Closed trades', session.closed_trade_count ?? 0],
+          ['Margin %', session.margin_pct != null ? `${Number(session.margin_pct).toFixed(0)}%` : '—'],
+          ['Leverage', session.leverage != null ? `${session.leverage}×` : '—'],
+          ['Fees (bps)', `${session.taker_fee_bps ?? '—'}/${session.maker_fee_bps ?? '—'}`],
+          ['Started', fmtUTC(session.started_at)],
+          ['Stopped', fmtUTC(session.stopped_at)],
+          ['Last tick', fmtUTC(session.last_checked)],
+        ].map(([label, value], i) => (
+          <div key={i} className="rounded-lg border border-gray-800 bg-gray-800/60 p-2">
+            <div className="text-[9px] font-bold uppercase text-gray-500">{label}</div>
+            <div className="truncate text-xs font-mono text-gray-200" title={String(value)}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {curve.length > 1 && (
+        <div className="rounded-xl border border-gray-700 bg-gray-800 p-3">
+          <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase text-gray-400">
+            <TrendingUp size={12} className="text-blue-400" /> Saved equity curve ({curve.length} samples)
+          </div>
+          <ResponsiveContainer width="100%" height={180}>
+            <LineChart data={curve} margin={{ top: 5, right: 10, bottom: 0, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+              <XAxis dataKey="i" stroke="#6b7280" tick={{ fontSize: 9 }} />
+              <YAxis stroke="#6b7280" tick={{ fontSize: 9 }} domain={['auto', 'auto']}
+                     tickFormatter={v => `₹${Number(v).toLocaleString()}`} width={80} />
+              <Tooltip contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', fontSize: 11 }}
+                       labelFormatter={(i, payload) => payload?.[0]?.payload?.ts || ''}
+                       formatter={v => [inr(v, 2), 'Equity']} />
+              <Line type="monotone" dataKey="equity" stroke="#60a5fa" strokeWidth={1.5} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {(session.open_positions || []).length > 0 && (
+        <div className="rounded-xl border border-yellow-900/40 bg-yellow-900/10 p-3 text-[11px] text-yellow-200">
+          <b>{session.open_positions.length}</b> position(s) were still open when the session ended —
+          their PnL is unrealised and is not included in the closed-trade stats.
+        </div>
+      )}
+
+      <ClosedTradesPanel closedTrades={session.closed_trades} />
+
+      {(session.logs || []).length > 0 && (
+        <div className="rounded-xl border border-gray-700 bg-gray-900 p-3">
+          <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase text-gray-400">
+            <Terminal size={12} className="text-blue-400" /> Saved logs ({session.logs.length})
+          </div>
+          <div className="max-h-64 space-y-0.5 overflow-y-auto font-mono text-[10px]">
+            {session.logs.slice().reverse().map((l, i) => (
+              <div key={i} className="flex gap-2">
+                <span className="shrink-0 text-gray-600">{fmtIST(l.ts)}</span>
+                <span className={`shrink-0 font-bold ${l.level === 'error' ? 'text-red-400' : l.level === 'warn' ? 'text-yellow-400' : l.level === 'trade' ? 'text-green-400' : 'text-gray-400'}`}>
+                  {String(l.level || 'info').toUpperCase().padEnd(5)}
+                </span>
+                <span className="break-all text-gray-300">{l.msg}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const exportSessionCSV = (session) => {
+  const trades = session.closed_trades || [];
+  if (!trades.length) { alert('This session has no closed trades to export.'); return; }
+  const cols = ['entry_time', 'exit_time', 'direction', 'symbol', 'entry', 'exit', 'lots', 'margin_inr',
+                'notional_usd', 'sl', 'sl_final', 'tp', 'trail_stop', 'atr_at_entry', 'peak_price',
+                'bars_held', 'reason', 'exit_detail', 'gross_pnl', 'fees', 'pnl'];
+  const lines = [cols.join(',')];
+  trades.forEach(t => {
+    lines.push(cols.map(c => {
+      const v = t[c];
+      const s = v === null || v === undefined ? '' : String(v);
+      return `"${s.replace(/"/g, '""')}"`;
+    }).join(','));
+  });
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `paper_session_${session.id}_${session.strategy_name || 'kudos'}.csv`.replace(/[^a-z0-9_.-]/gi, '_');
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {
+  const [openId, setOpenId] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const toggle = async (row) => {
+    if (openId === row.id) { setOpenId(null); setDetail(null); return; }
+    setOpenId(row.id);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/paper-trade/history/${row.id}`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      if (res.ok) setDetail(await res.json());
+    } catch (e) { /* keep the row open with the summary only */ }
+    setDetailLoading(false);
+  };
+
+  return (
+    <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-lg font-bold flex items-center gap-2">
+            <History size={20} className="text-blue-400" /> Paper Trade History ({history.length})
+          </h3>
+          <p className="mt-1 text-[11px] text-gray-500">
+            Every session is saved while it runs, so stopping or deleting a live instance never loses its
+            trades, equity curve or logs.
+          </p>
+        </div>
+        <button onClick={onRefresh}
+                className="flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-xs font-semibold text-gray-300 transition hover:border-blue-500 hover:text-white disabled:opacity-50"
+                disabled={loading}>
+          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+
+      {history.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-gray-700 bg-gray-800/50 p-6 text-center text-sm text-gray-600">
+          No saved sessions yet. Start an instance above — it appears here automatically and stays after you stop it.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-gray-900 uppercase text-gray-500">
+              <tr>
+                <th className="p-2">Strategy</th>
+                <th className="p-2">Source</th>
+                <th className="p-2">Status</th>
+                <th className="p-2">Started</th>
+                <th className="p-2">Stopped</th>
+                <th className="p-2">Capital</th>
+                <th className="p-2">Final Equity</th>
+                <th className="p-2">Net PnL</th>
+                <th className="p-2">ROI</th>
+                <th className="p-2">Trades</th>
+                <th className="p-2">WR</th>
+                <th className="p-2">Max DD</th>
+                <th className="p-2 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.map(row => {
+                const st = statusMeta(row.status);
+                const isOpen = openId === row.id;
+                const netPositive = (row.net_pnl || 0) >= 0;
+                return (
+                  <React.Fragment key={row.id}>
+                    <tr className={`border-b border-gray-700/60 align-top transition hover:bg-gray-700/20 ${isOpen ? 'bg-gray-900/40' : ''}`}>
+                      <td className="max-w-[180px] p-2">
+                        <div className="truncate font-bold text-gray-200" title={row.strategy_name}>{row.strategy_name || row.strategy_id}</div>
+                        <div className="text-[9px] text-gray-600">#{String(row.instance_key || '').split('_').pop()}</div>
+                      </td>
+                      <td className="p-2 text-gray-400">{row.data_source || '—'}</td>
+                      <td className="p-2">
+                        <span className={`rounded border px-2 py-0.5 text-[10px] font-bold ${st.cls}`}>{st.label}</span>
+                      </td>
+                      <td className="p-2 font-mono text-[10px] text-gray-400">{fmtUTC(row.started_at)}</td>
+                      <td className="p-2 font-mono text-[10px] text-gray-400">{fmtUTC(row.stopped_at)}</td>
+                      <td className="p-2 font-mono text-gray-300">{inr(row.initial_capital)}</td>
+                      <td className="p-2 font-mono text-gray-200">{inr(row.final_equity, 2)}</td>
+                      <td className={`p-2 font-mono font-bold ${netPositive ? 'text-green-400' : 'text-red-400'}`}>{inr(row.net_pnl, 2)}</td>
+                      <td className={`p-2 font-mono ${(row.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {row.roi != null ? `${Number(row.roi).toFixed(2)}%` : '—'}
+                      </td>
+                      <td className="p-2 font-mono text-gray-300">{row.closed_trade_count ?? 0}</td>
+                      <td className="p-2 font-mono text-gray-300">{row.win_rate != null ? `${Number(row.win_rate).toFixed(1)}%` : '—'}</td>
+                      <td className="p-2 font-mono text-gray-300">{row.max_drawdown_pct != null ? `${Number(row.max_drawdown_pct).toFixed(2)}%` : '—'}</td>
+                      <td className="p-2">
+                        <div className="flex items-center justify-end gap-1">
+                          <button onClick={() => toggle(row)} title={isOpen ? 'Hide result' : 'View saved result'}
+                                  className="flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+                            {isOpen ? <ChevronUp size={11} /> : <Eye size={11} />} {isOpen ? 'Hide' : 'View'}
+                          </button>
+                          <button onClick={async () => {
+                                    const res = await fetch(`${API_URL}/paper-trade/history/${row.id}`, {
+                                      headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } });
+                                    if (res.ok) exportSessionCSV(await res.json());
+                                  }}
+                                  title="Export closed trades to CSV"
+                                  className="rounded border border-gray-700 p-1.5 text-gray-400 transition hover:border-blue-500 hover:text-white">
+                            <Download size={11} />
+                          </button>
+                          <button onClick={() => onDelete(row.id, row.strategy_name)} title="Delete this saved session"
+                                  className="rounded border border-gray-700 p-1.5 text-gray-500 transition hover:border-red-700 hover:text-red-300">
+                            <Trash2 size={11} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr className="border-b border-gray-700/60">
+                        <td colSpan={13} className="p-0">
+                          {detailLoading && !detail ? (
+                            <div className="p-6 text-center text-xs text-gray-500">Loading saved result…</div>
+                          ) : detail ? (
+                            <HistoryRowDetail session={detail} />
+                          ) : (
+                            <div className="p-6 text-center text-xs text-gray-500">Saved result unavailable.</div>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ---------- Main Page ----------
 const PaperTrade = () => {
   const [status, setStatus] = useState([]);
@@ -290,6 +559,27 @@ const PaperTrade = () => {
   const [marginPct, setMarginPct] = useState(25);
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  // Saved sessions (survive stop / server restart) shown in Paper Trade History.
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const fetchHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/paper-trade/history`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      const data = await res.json();
+      setHistory(Array.isArray(data) ? data : []);
+    } catch (e) { /* history is a read-only extra; never block the live view */ }
+    setHistoryLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchHistory();
+    const interval = setInterval(fetchHistory, 30000);
+    return () => clearInterval(interval);
+  }, [fetchHistory]);
 
   useEffect(() => {
     fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
@@ -354,6 +644,8 @@ const PaperTrade = () => {
           fetchStatus();
           setSelectedInstance(data.instance_key);
         }, 500);
+        // The new session is saved immediately, so refresh the History list.
+        fetchHistory();
       } else {
         const err = await res.json().catch(() => ({}));
         alert(err.detail || 'Could not start paper trade');
@@ -370,22 +662,30 @@ const PaperTrade = () => {
     setConfirm({ type: 'delete', key: instanceKey, name });
   };
 
+  const requestHistoryDelete = (sessionId, name) => {
+    setConfirm({ type: 'history', key: sessionId, name });
+  };
+
   const doInstanceAction = async () => {
     if (!confirm) return;
     try {
       const isDelete = confirm.type === 'delete';
-      const url = isDelete
-        ? `${API_URL}/paper-trade/${encodeURIComponent(confirm.key)}`
-        : `${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`;
+      const isHistory = confirm.type === 'history';
+      const url = isHistory
+        ? `${API_URL}/paper-trade/history/${encodeURIComponent(confirm.key)}`
+        : isDelete
+          ? `${API_URL}/paper-trade/${encodeURIComponent(confirm.key)}`
+          : `${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`;
       const res = await fetch(url, {
-        method: isDelete ? 'DELETE' : 'POST',
+        method: (isDelete || isHistory) ? 'DELETE' : 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Could not ${isDelete ? 'delete' : 'stop'} paper trade`);
+        throw new Error(data.detail || `Could not ${isHistory ? 'delete the saved session' : isDelete ? 'delete' : 'stop'} paper trade`);
       }
-      await fetchStatus();
+      if (!isHistory) await fetchStatus();
+      await fetchHistory();
     } catch (e) {
       console.error(e);
       alert(e.message);
@@ -404,13 +704,19 @@ const PaperTrade = () => {
     <div className="page-shell">
       <ConfirmModal
         open={!!confirm}
-        title={confirm?.type === 'delete' ? 'Delete Paper Trade Session?' : confirm?.type === 'stop' ? 'Stop Paper Trade Instance?' : 'Confirm'}
+        title={confirm?.type === 'delete'
+          ? 'Delete Paper Trade Session?'
+          : confirm?.type === 'history'
+            ? 'Delete Saved Paper Trade Result?'
+            : confirm?.type === 'stop' ? 'Stop Paper Trade Instance?' : 'Confirm'}
         message={confirm?.type === 'delete'
-          ? `Delete "${confirm?.name || confirm?.key?.split('_').pop()}"? Its session, logs and in-memory trade history will be removed.`
-          : confirm?.type === 'stop'
-            ? `Stop "${confirm?.name || confirm?.key?.split('_').pop()}" and close this monitoring session? You can start a new instance later.`
-            : ''}
-        confirmLabel={confirm?.type === 'delete' ? 'Yes, Delete' : 'Yes, Stop'}
+          ? `Delete "${confirm?.name || confirm?.key?.split('_').pop()}"? The live instance stops AND its saved result is removed from History permanently. Use Stop instead if you want to keep the result.`
+          : confirm?.type === 'history'
+            ? `Permanently delete the saved result of "${confirm?.name || 'this session'}" (trades, equity curve and logs)?`
+            : confirm?.type === 'stop'
+              ? `Stop "${confirm?.name || confirm?.key?.split('_').pop()}"? Its trades, equity curve and logs are saved — you can review the result in Paper Trade History below.`
+              : ''}
+        confirmLabel={confirm?.type === 'stop' ? 'Yes, Stop' : 'Yes, Delete'}
         confirmColor="bg-red-600 hover:bg-red-500"
         onCancel={() => setConfirm(null)}
         onConfirm={doInstanceAction}
@@ -538,8 +844,16 @@ const PaperTrade = () => {
           <LogPanel instanceKey={selectedInstance} />
         </div>
       </div>
+
+      {/* Saved results — survives stop, delete of the live card and restarts */}
+      <div className="mt-6">
+        <HistoryPanel history={history} loading={historyLoading}
+                      onRefresh={fetchHistory} onDelete={requestHistoryDelete} />
+      </div>
     </div>
   );
 };
 
 export default PaperTrade;
+// Exported so the saved-result view can be render-tested on its own.
+export { HistoryPanel, HistoryRowDetail, exportSessionCSV };

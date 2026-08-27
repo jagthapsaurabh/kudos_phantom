@@ -85,12 +85,18 @@ When the two sides behave differently, the Backtest page keeps the shared values
 places two independent switches below them: **Use separate Long / Short MACD hist** and
 **Use separate Long / Short Min ATR floor**. With the MACD switch on, LONG uses `hist >=` its value
 and SHORT uses `hist <=` its signed value (for example `-8` requires bearish momentum). With the ATR
-switch on, each side uses `ATR >= floor × SMA(ATR, 50)`. Values are persisted as
-`entry_conditions.long.*` / `entry_conditions.short.*`; an unset side falls back to the shared field.
-The legacy `use_direction_conditions` master switch remains supported for existing configurations.
+switch on, each side picks **both** the comparison and the value: an operator dropdown
+(`>=`, `<=`, `>`, `<`) next to its ratio, so LONG can require `ATR ≥ 0.5 × SMA(ATR, 50)` while SHORT
+only trades when volatility is calm (`ATR < 1.2 × SMA(ATR, 50)`). Both sides start on the original
+`>=` rule, so switching the toggle on never changes behaviour until the client edits it; an unset
+side falls back to the shared field. Values are persisted as
+`entry_conditions.long.*` / `entry_conditions.short.*` (`atr_regime_ratio`, `atr_regime_op`,
+`atr_regime_max`). The legacy `use_direction_conditions` master switch remains supported for existing
+configurations.
 Use **Preview Filters** (or `POST /backtest/filter-preview`) to see the per-bucket trade-off before
-running the full backtest, and **Save as strategy** to keep a tuned configuration under a name for
-re-running or Paper / Live trading.
+running the full backtest — the response echoes the exact rule per side in `atr_regime_rules`, and each
+trade's expanded log row shows the ATR test that filtered it. **Save as strategy** keeps a tuned
+configuration under a name for re-running or Paper / Live trading.
 
 Opening any saved Backtest history card now restores its saved dates, exchange, strategy, capital,
 and complete parameter snapshot before showing the result.
@@ -108,8 +114,9 @@ The admin panel now includes separate **Fees**, **Broker Integrations**, and **S
 - **Daily refresh:** after startup and every 24 hours, the API incrementally refreshes all supported candle intervals for Binance and every enabled Binance-compatible or Delta-compatible broker integration. Delta daily refresh also omits `1m`/`5m`; generic integrations are reported as skipped until a compatible adapter is configured. **Run daily refresh now** in the Seed Data tab runs the same cycle immediately.
 - **Paper trade details:** every simulated position shows its **Stop / Exit Plan** (current stop loss with the original entry SL and breakeven state, take profit, trailing stop and activation level, active stop, ATR at entry, peak price). Closed trades show the **exit condition** (Take Profit / Trailing Stop / Stop Loss / Max Hold Time) with the exact rule that fired (e.g. "price fell to 67,099 ≤ trail 67,150.00"), exit value, SL (initial → final), TP, trail stop and ATR at entry. The live log prints the same detail on entry and exit.
 - Users choose Binance or Delta for each backtest, chart, paper instance, and live instance. Broker Settings supports multiple credential connections, and the existing instance workers allow multiple exchange/strategy sessions to run concurrently.
+- **Paper trade history (results survive a stop):** every paper instance is mirrored into the `paper_sessions` table while it runs — equity curve, closed trades, log buffer, fees, sizing and the parameter snapshot. **Stopping** an instance keeps its result; the new **Paper Trade History** panel lists every session with status, final equity, net PnL, ROI, win rate, profit factor, max drawdown and trade count, and expands to the full saved result (stats, equity-curve chart, closed-trade table, saved logs and any positions still open at stop) with CSV export. Status is `running`, `stopped` or `interrupted` (the server restarted mid-session, so the row explains itself instead of vanishing). Only an explicit delete — the workspace delete on a live card, or History → Delete — removes a saved result.
 
-Useful API endpoints include `GET /broker-definitions`, `GET /broker-connections`, `GET /fee-settings`, `POST /admin/fee-settings`, `POST /admin/market-data/seed`, `GET /admin/market-data/progress`, `POST /admin/market-data/sync-now`, and `POST /admin/market-data/seed-csv`.
+Useful API endpoints include `GET /broker-definitions`, `GET /broker-connections`, `GET /fee-settings`, `POST /admin/fee-settings`, `POST /admin/market-data/seed`, `GET /admin/market-data/progress`, `POST /admin/market-data/sync-now`, `POST /admin/market-data/seed-csv`, `GET /paper-trade/history`, `GET /paper-trade/history/{session_id}`, and `DELETE /paper-trade/history/{session_id}`.
 
 ## ⚙️ Configuration
 All critical variables are managed in `backend/.env`:

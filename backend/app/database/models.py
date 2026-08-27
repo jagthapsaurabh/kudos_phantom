@@ -248,6 +248,64 @@ class Trade(Base):
     run = relationship('BacktestRun', back_populates='trades')
 
 
+class PaperSession(Base):
+    """Persistent record of one paper-trading instance.
+
+    The live worker (``PaperTradeService``) exists only in process memory, so
+    stopping an instance — or restarting the server — used to throw its result
+    away. Every instance now writes a row here while it runs: the parameters it
+    started with, its equity curve, closed trades and log buffer. Stopping a
+    session keeps the row so the client can review the outcome afterwards;
+    only an explicit delete from the History list removes it.
+
+    ``status`` is one of:
+      * ``running``     — worker is live in this process
+      * ``stopped``     — the user stopped or deleted the live session
+      * ``interrupted`` — the server restarted while it was running
+    """
+    __tablename__ = 'paper_sessions'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    instance_key = Column(String, unique=True, nullable=False, index=True)
+    strategy_id = Column(String, nullable=True)
+    strategy_name = Column(String, nullable=True)
+    symbol = Column(String, default='BTCUSDT')
+    data_source = Column(String, default='Binance')
+    broker_name = Column(String, nullable=True)
+    status = Column(String, default='running', index=True)
+    # Run parameters, snapshotted at start so the result can be reproduced.
+    config_json = Column(String, nullable=True)
+    initial_capital = Column(Float, nullable=True)
+    final_equity = Column(Float, nullable=True)
+    net_pnl = Column(Float, nullable=True)
+    roi = Column(Float, nullable=True)
+    peak_equity = Column(Float, nullable=True)
+    max_drawdown_pct = Column(Float, nullable=True)
+    margin_pct = Column(Float, nullable=True)
+    leverage = Column(Integer, nullable=True)
+    taker_fee_bps = Column(Float, nullable=True)
+    maker_fee_bps = Column(Float, nullable=True)
+    conversion_rate = Column(Float, nullable=True)
+    # Result roll-up over the closed trades.
+    closed_trade_count = Column(Integer, default=0)
+    win_rate = Column(Float, nullable=True)
+    profit_factor = Column(Float, nullable=True)
+    total_fees = Column(Float, nullable=True)
+    last_price = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    stopped_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                       onupdate=datetime.datetime.utcnow)
+    last_checked = Column(DateTime, nullable=True)
+    # Payloads: [{"ts": ISO-IST, "equity": float}], closed-trade dicts, log
+    # lines and the open positions still held when the session ended.
+    equity_curve = Column(JSON, nullable=True)
+    closed_trades = Column(JSON, nullable=True)
+    open_positions = Column(JSON, nullable=True)
+    logs = Column(JSON, nullable=True)
+
+
 def _seed_reference_data():
     """Create built-in providers and .env-compatible initial fee rows once."""
     db = SessionLocal()
