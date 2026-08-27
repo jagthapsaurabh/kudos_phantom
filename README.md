@@ -44,7 +44,7 @@ npm run dev
 | Stops | ATR SL + trailing | **+ breakeven stop** once trade is `breakeven_atr` x ATR in profit |
 | Cooldown | configured but unused | **enforced** after every closed trade |
 | Overlapping trades | silently overwritten | guarded; optional close-&-reverse (`allow_reverse`) |
-| Trade log | 14 fields | **42 exported columns**: which candle signalled, which candle the entry filled on and its colour, every entry condition (value vs threshold, pass/fail), the exit rule that fired and the stop plan |
+| Trade log | 14 fields | **45 exported columns**: which candle signalled, which candle the entry filled on and its colour, every entry condition (value vs threshold, pass/fail), the exit rule that fired and the stop plan |
 | Optimizer | none | `optimize_phantom.py` + `optimize_sizing.py`: staged grid + greedy risk tuning with Calmar-style objective and out-of-sample validation |
 | Users | single user | **roles:** admin manages client accounts (paper/live permissions); admin panel documents every strategy condition; chart overlays the exact signal candles |
 
@@ -115,7 +115,7 @@ Conditions that the firing setup never applies show **`N/A`**, not `FAIL` — a 
 enters on the MACD zero-cross, so the MACD-histogram magnitude test is not used for it. That keeps a
 trade that legitimately fired from looking like it broke its own rules.
 
-**Excel / CSV Export** writes one row per trade with 42 columns: signal/entry/exit candle times (UTC,
+**Excel / CSV Export** writes one row per trade with 45 columns: signal/entry/exit candle times (UTC,
 to the second) and colours, one column per entry condition (`PASS` / `FAIL` / `N/A`), the full
 condition breakdown, the exit condition and its detail, the stop plan and the PnL fields. The file is
 UTF-8 with a BOM and CRLF line endings, so Excel opens it without turning `₹` and `≥` into mojibake.
@@ -129,10 +129,10 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 # backend (offline; no exchange or DB seed required)
 cd backend && ../.venv/bin/python test_trade_log_detail.py   # 50 checks: candles, colours, conditions, export columns
 cd backend && ../.venv/bin/python test_atr_regime_op.py      # 32 checks: per-side ATR operator
-cd backend && ../.venv/bin/python test_paper_history.py      # 54 checks: paper history persistence
+cd backend && ../.venv/bin/python test_paper_history.py      # 56 checks: paper history persistence
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test                                      # 69 checks: trade-log table + CSV export
+cd frontend && npm test                                      # 72 checks: trade-log table + CSV export
 ```
 `test_delta_and_paper.py` now points `DATABASE_URL` at a temporary SQLite file before importing the
 app, so running the suite no longer clears the seeded candles in `backend/trading_system.db`.

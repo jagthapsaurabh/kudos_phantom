@@ -127,7 +127,7 @@ new columns are nullable and are added to existing `trades` tables by `migrate_d
 older runs simply return `null` for them.
 
 **Excel / CSV export.** The Backtest page's *Excel / CSV Export* button writes one row per trade
-with 42 columns — signal/entry/exit candle times (UTC) and colours, one column per entry condition
+with 45 columns — signal/entry/exit candle times (UTC) and colours, one column per entry condition
 (`PASS` / `FAIL` / `N/A`), the full condition breakdown, the exit condition and its detail, the stop
 plan and the PnL fields. It is UTF-8 with a BOM and CRLF line endings so Excel opens it cleanly.
 

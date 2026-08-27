@@ -166,6 +166,11 @@ const col = (name) => cells[header.indexOf(name)];
 
 check('CSV uses CRLF line endings', csv.includes('\r\n'));
 check('CSV has one row per trade plus the header', rows.length === 3);
+// Pinned so the documented column count cannot drift from the code.
+check('CSV has exactly 45 columns', header.length === 45, `got ${header.length}`);
+check('CSV has no duplicate column names',
+  new Set(header).size === header.length);
+check('CSV has no empty column name', header.every(h => h.trim().length > 0));
 check('CSV has the signal candle columns',
   header.includes('Signal Candle Time') && header.includes('Signal Candle Colour'));
 check('CSV has the entry candle columns',
