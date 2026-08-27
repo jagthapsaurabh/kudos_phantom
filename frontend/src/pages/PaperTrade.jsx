@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target } from 'lucide-react';
+import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2 } from 'lucide-react';
 import { API_URL } from '../api';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
@@ -231,36 +231,46 @@ const LogPanel = ({ instanceKey }) => {
 };
 
 // ---------- Instance Card ----------
-const InstanceCard = ({ inst, onStop, onSelect, selected }) => {
+const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) => {
   const activeTrades = inst.active_trades || [];
   const lastChecked = fmtIST(inst.last_checked);
+  const strategyName = inst.strategy_name || (inst.strategy_id === 'PhantomV2' ? 'Kudos V2.5 (Default)' : inst.strategy_id);
   return (
     <div onClick={() => onSelect(inst.instance_key)}
-         className={`p-4 rounded-xl border cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
-      <div className="flex justify-between items-center mb-2">
-        <div className="flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full ${inst.is_running ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-          <span className="font-bold text-sm text-gray-200">{inst.strategy_id}</span>
-          <span className="text-[10px] text-blue-300 ml-2">{inst.data_source || 'Binance'} · {inst.taker_fee_bps ?? '—'}/{inst.maker_fee_bps ?? '—'} bps</span>
+         className={`min-w-0 rounded-xl border p-4 cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20 shadow-lg shadow-blue-950/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center gap-2 text-[9px] font-bold uppercase tracking-wider text-gray-500">
+            <span>Session {position}</span>
+            <span className={`h-1.5 w-1.5 rounded-full ${inst.is_running ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></span>
+            <span className={inst.is_running ? 'text-green-400' : 'text-red-400'}>{inst.is_running ? 'Running' : 'Stopped'}</span>
+          </div>
+          <div className="truncate font-bold text-sm text-gray-100" title={strategyName}>{strategyName}</div>
+          <div className="mt-1 truncate text-[10px] text-blue-300">{inst.data_source || 'Binance'} · {inst.taker_fee_bps ?? '—'}/{inst.maker_fee_bps ?? '—'} bps</div>
         </div>
-        <span className={`text-[10px] font-bold uppercase ${inst.is_running ? 'text-green-400' : 'text-red-400'}`}>
-          {inst.is_running ? 'Running' : 'Stopped'}
-        </span>
+        <button onClick={(e) => { e.stopPropagation(); onDelete(inst.instance_key, strategyName); }}
+                className="shrink-0 rounded-lg p-1.5 text-gray-500 transition hover:bg-red-900/30 hover:text-red-300"
+                title="Delete paper trade session" aria-label={`Delete ${strategyName}`}>
+          <Trash2 size={15} />
+        </button>
       </div>
-      <div className="text-xl font-mono text-yellow-400 mb-1">₹{(inst.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+      <div className="mb-1 text-xl font-mono text-yellow-400">₹{(inst.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
       <div className="grid grid-cols-3 gap-2 text-center text-[10px] font-medium text-gray-400 mb-2">
         <div className="bg-gray-900/50 p-1.5 rounded">Current<br /><span className="text-white text-xs">{inst.last_price ? Number(inst.last_price).toLocaleString(undefined, {maximumFractionDigits: 2}) : '—'}</span></div>
         <div className="bg-gray-900/50 p-1.5 rounded">Leverage<br /><span className="text-white text-xs">{inst.leverage ?? '—'}×</span></div>
         <div className="bg-gray-900/50 p-1.5 rounded">Margin<br /><span className="text-white text-xs">{inst.margin_pct ?? '—'}%</span></div>
       </div>
-      <div className="text-[10px] text-gray-500 font-mono mb-2">Updated: {lastChecked}</div>
-      <div className="flex justify-between items-center text-xs text-gray-500">
+      <div className="mb-2 flex items-center justify-between gap-2 text-[10px] text-gray-500">
         <span>{activeTrades.length} open · {(inst.closed_trades || []).length} closed</span>
-        <span className="font-mono text-gray-600">{inst.instance_key.split('_').pop()}</span>
+        <span className="font-mono text-gray-600" title={inst.instance_key}>{inst.instance_key.split('_').pop()}</span>
+      </div>
+      <div className="flex flex-wrap justify-between gap-x-3 text-[10px] text-gray-600 font-mono">
+        <span>Started: {fmtIST(inst.created_at)}</span>
+        <span>Updated: {lastChecked}</span>
       </div>
       {inst.is_running && (
-        <button onClick={(e) => { e.stopPropagation(); onStop(inst.instance_key); }}
-                className="mt-3 w-full bg-red-900/30 hover:bg-red-900/50 text-red-300 px-3 py-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1 transition">
+        <button onClick={(e) => { e.stopPropagation(); onStop(inst.instance_key, strategyName); }}
+                className="mt-3 w-full rounded-lg border border-red-900/50 bg-red-900/20 px-3 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/50 flex items-center justify-center gap-1">
           <StopCircle size={14} /> Stop Instance
         </button>
       )}
@@ -352,19 +362,34 @@ const PaperTrade = () => {
     setLoading(false);
   };
 
-  const requestStop = (instanceKey) => {
-    setConfirm({ type: 'stop', key: instanceKey });
+  const requestStop = (instanceKey, name) => {
+    setConfirm({ type: 'stop', key: instanceKey, name });
   };
 
-  const doStop = async () => {
+  const requestDelete = (instanceKey, name) => {
+    setConfirm({ type: 'delete', key: instanceKey, name });
+  };
+
+  const doInstanceAction = async () => {
     if (!confirm) return;
     try {
-      await fetch(`${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`, {
-        method: 'POST',
+      const isDelete = confirm.type === 'delete';
+      const url = isDelete
+        ? `${API_URL}/paper-trade/${encodeURIComponent(confirm.key)}`
+        : `${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`;
+      const res = await fetch(url, {
+        method: isDelete ? 'DELETE' : 'POST',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
       });
-      fetchStatus();
-    } catch (e) { console.error(e); }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `Could not ${isDelete ? 'delete' : 'stop'} paper trade`);
+      }
+      await fetchStatus();
+    } catch (e) {
+      console.error(e);
+      alert(e.message);
+    }
     setConfirm(null);
   };
 
@@ -379,12 +404,16 @@ const PaperTrade = () => {
     <div className="page-shell">
       <ConfirmModal
         open={!!confirm}
-        title={confirm?.type === 'stop' ? 'Stop Paper Trade Instance?' : 'Confirm'}
-        message={confirm?.type === 'stop' ? `This will stop instance "${confirm?.key?.split('_').pop()}" and close any open positions. This action cannot be undone.` : ''}
-        confirmLabel="Yes, Stop"
+        title={confirm?.type === 'delete' ? 'Delete Paper Trade Session?' : confirm?.type === 'stop' ? 'Stop Paper Trade Instance?' : 'Confirm'}
+        message={confirm?.type === 'delete'
+          ? `Delete "${confirm?.name || confirm?.key?.split('_').pop()}"? Its session, logs and in-memory trade history will be removed.`
+          : confirm?.type === 'stop'
+            ? `Stop "${confirm?.name || confirm?.key?.split('_').pop()}" and close this monitoring session? You can start a new instance later.`
+            : ''}
+        confirmLabel={confirm?.type === 'delete' ? 'Yes, Delete' : 'Yes, Stop'}
         confirmColor="bg-red-600 hover:bg-red-500"
         onCancel={() => setConfirm(null)}
-        onConfirm={doStop}
+        onConfirm={doInstanceAction}
       />
 
       {/* Header */}
@@ -451,13 +480,18 @@ const PaperTrade = () => {
         <div className="lg:col-span-2 space-y-6">
           {/* Instances */}
           <div>
-            <h3 className="text-sm font-bold text-gray-400 uppercase mb-3 flex items-center gap-2">
-              <AlertCircle size={16} /> Instances
-            </h3>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-bold text-gray-400 uppercase flex items-center gap-2">
+                <AlertCircle size={16} /> Paper sessions ({status.length})
+              </h3>
+              {status.length > 1 && <span className="text-[10px] text-gray-600">Select a session to view its positions and logs</span>}
+            </div>
             {status.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {status.map(inst => (
-                  <InstanceCard key={inst.instance_key} inst={inst} onStop={requestStop} onSelect={setSelectedInstance} selected={inst.instance_key === selectedInstance} />
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {status.map((inst, index) => (
+                  <InstanceCard key={inst.instance_key} inst={inst} position={index + 1}
+                    onStop={requestStop} onDelete={requestDelete} onSelect={setSelectedInstance}
+                    selected={inst.instance_key === selectedInstance} />
                 ))}
               </div>
             ) : (
@@ -474,9 +508,12 @@ const PaperTrade = () => {
                 <Activity size={20} className="text-blue-400" /> Simulated Positions
               </h3>
               {currentInstance && (
-                <div className="flex items-center gap-3 text-xs">
+                <div className="flex min-w-0 items-center gap-3 text-xs">
+                  <span className="max-w-[220px] truncate font-semibold text-blue-300" title={currentInstance.strategy_name || currentInstance.strategy_id}>
+                    {currentInstance.strategy_name || currentInstance.strategy_id}
+                  </span>
                   <span className="text-gray-500">Equity <span className="text-yellow-400 font-mono">₹{(currentInstance.equity_inr || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</span></span>
-                  <span className="text-gray-500 font-mono">{currentInstance.instance_key.split('_').pop()}</span>
+                  <span className="text-gray-600 font-mono">#{currentInstance.instance_key.split('_').pop()}</span>
                 </div>
               )}
             </div>

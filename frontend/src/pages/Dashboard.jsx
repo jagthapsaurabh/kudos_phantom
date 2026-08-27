@@ -155,7 +155,7 @@ const Dashboard = () => {
             {paperStatus.map(s => (
               <div key={s.instance_key} className="bg-gray-800 p-5 rounded-xl border border-gray-700 hover:border-purple-500/30 transition-all">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="font-bold text-gray-200 text-sm truncate">{s.strategy_id}</span>
+                  <span className="font-bold text-gray-200 text-sm truncate" title={s.strategy_name || s.strategy_id}>{s.strategy_name || s.strategy_id}</span>
                   <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${s.is_running ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'}`}>
                     {s.is_running ? 'Running' : 'Stopped'}
                   </span>

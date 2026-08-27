@@ -4,6 +4,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from app.database.models import init_db, SessionLocal, Klines
+from app.services.data_sync import DataSyncService
 
 def fetch_binance_klines(symbol, interval, start_time, end_time=None):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -107,33 +108,9 @@ def seed_from_csv(csv_path, interval, symbol="BTCUSDT"):
     print(f"Successfully seeded {len(df)} candles for {interval} from CSV.")
     return True
 
-def update_daily_data(symbol="BTCUSDT", intervals=["1h", "4h"]):
-    """Updates the DB with the most recent candles."""
-    init_db()
-    db = SessionLocal()
-    
-    for interval in intervals:
-        last_candle = db.query(Klines).filter_by(source="Binance", symbol=symbol, interval=interval).order_by(Klines.event_time.desc()).first()
-        
-        start_time = last_candle.event_time if last_candle else (datetime.utcnow() - timedelta(days=365*6))
-        end_time = datetime.utcnow()
-        
-        print(f"Updating {interval} data from {start_time}...")
-        klines = fetch_binance_klines(symbol, interval, start_time, end_time)
-        
-        if klines:
-            records = [
-                Klines(
-                    symbol=symbol, interval=interval,
-                    event_time=pd.to_datetime(k[0], unit='ms'),
-                    open=float(k[1]), high=float(k[2]), low=float(k[3]),
-                    close=float(k[4]), volume=float(k[5])
-                ) for k in klines[1:]
-            ]
-            db.bulk_save_objects(records)
-            db.commit()
-    
-    db.close()
+def update_daily_data(symbol="BTCUSDT", intervals=None):
+    """Run the same configured multi-source daily refresh as the API."""
+    return DataSyncService.sync_all_configured_sources_daily(symbol, intervals)
 
 if __name__ == "__main__":
     # Default behavior: Try CSV first, then API

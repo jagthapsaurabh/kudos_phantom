@@ -13,11 +13,11 @@ load_dotenv()
 class BranchConditions(BaseModel):
     """Per-direction overrides for a single trade side (LONG / SHORT).
 
-    Every field is optional: when ``None`` (or when the master
-    ``use_direction_conditions`` toggle is OFF) the value falls back to the
-    corresponding shared ``PhantomV2Config`` field, so old saved configs keep
-    working unchanged. This is the ``entry_conditions.long.*`` /
-    ``entry_conditions.short.*`` section persisted in the run/strategy JSON.
+    Every field is optional. When ``None`` (or when the switch governing that
+    field is OFF) the value falls back to the corresponding shared
+    ``PhantomV2Config`` field, so old saved configs keep working unchanged.
+    This is the ``entry_conditions.long.*`` / ``entry_conditions.short.*``
+    section persisted in the run/strategy JSON.
     """
     macd_fast: Optional[int] = None         # per-direction MACD EMA fast period
     macd_slow: Optional[int] = None         # per-direction MACD EMA slow period
@@ -34,13 +34,20 @@ class BranchConditions(BaseModel):
 class EntryConditions(BaseModel):
     """Long / Short override container (``entry_conditions`` in the run JSON).
 
-    When ``use_direction_conditions`` is False the engine behaves exactly as the
-    pre-existing shared-condition engine. When True the LONG and SHORT branches
-    each supply their own copy of the directional fields that data shows matter
-    for the two sides (MACD hist min, stop-loss ATR, ATR regime ratio, RSI
-    bounds, ADX min).
+    ``use_direction_conditions`` is retained for backwards compatibility with
+    the original v3.2 configuration, where every directional filter could be
+    overridden at once. New configurations can opt into the two client-facing
+    controls independently: ``use_direction_macd_hist`` and
+    ``use_direction_atr_floor``. This keeps MACD histogram and ATR-floor
+    tuning side-specific without unexpectedly changing RSI, ADX, MACD periods,
+    or stop-loss behaviour.
     """
+    # Legacy master switch. Existing saved configs with this set to true keep
+    # their full long/short overrides and continue to work unchanged.
     use_direction_conditions: bool = False
+    # Independent switches used by the Backtest form.
+    use_direction_macd_hist: bool = False
+    use_direction_atr_floor: bool = False
     long: BranchConditions = Field(default_factory=BranchConditions)
     short: BranchConditions = Field(default_factory=BranchConditions)
 
@@ -132,6 +139,16 @@ class PhantomV2Config(BaseModel):
             return ec.long if direction == 1 else ec.short
         return BranchConditions()
 
+    def uses_direction_macd_hist(self) -> bool:
+        """Whether MACD histogram thresholds are selected per trade side."""
+        ec = self.entry_conditions
+        return bool(ec.use_direction_conditions or ec.use_direction_macd_hist)
+
+    def uses_direction_atr_floor(self) -> bool:
+        """Whether the minimum ATR floor is selected per trade side."""
+        ec = self.entry_conditions
+        return bool(ec.use_direction_conditions or ec.use_direction_atr_floor)
+
     def _pick(self, direction: int, shared_name: str, dir_attr: str):
         branch = self._branch(direction)
         val = getattr(branch, dir_attr, None)
@@ -155,12 +172,13 @@ class PhantomV2Config(BaseModel):
         return self.macd_fast, self.macd_slow, self.macd_signal
 
     def macd_hist_min_for(self, direction: int) -> float:
-        # Directional MACD-hist uses a SIGNED threshold. When the direction
-        # hasn't set an override we fall back to the shared magnitude applied
-        # to the correct side (long => histogram clearly positive, short =>
-        # clearly negative) so the legacy absolute-value filter is preserved.
+        # Directional MACD-hist uses a SIGNED threshold. Longs compare with >=
+        # and shorts with <=, so a negative short value requires bearish
+        # momentum. When no directional override is active, preserve the old
+        # absolute-magnitude filter by applying the shared value to the proper
+        # side of zero.
         ec = self.entry_conditions
-        if ec.use_direction_conditions:
+        if self.uses_direction_macd_hist():
             b = ec.long if direction == 1 else ec.short
             if b.macd_hist_min is not None:
                 return b.macd_hist_min
@@ -171,11 +189,17 @@ class PhantomV2Config(BaseModel):
         return self._pick(direction, 'stop_loss_atr', 'stop_loss_atr')
 
     def atr_regime_ratio_for(self, direction: int) -> float:
-        return self._pick(direction, 'atr_regime_ratio', 'atr_regime_ratio')
+        if self.uses_direction_atr_floor():
+            branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
+            if branch.atr_regime_ratio is not None:
+                return branch.atr_regime_ratio
+        return self.atr_regime_ratio
 
     def atr_regime_max_for(self, direction: int) -> Optional[float]:
         # Optional directional max-ATR cap; None in shared mode or when unset.
-        branch = self._branch(direction)
+        if not self.uses_direction_atr_floor():
+            return None
+        branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
         return getattr(branch, 'atr_regime_max', None)
 
     def adx_min_for(self, direction: int) -> float:
@@ -215,17 +239,16 @@ class StrategyService:
         trend_col = np.where(close > ema50_4h_map, 1, -1)
 
         # 2. ATR Regime Filter (optionally per-direction).
-        # `atr_regime_ratio` keeps the legacy lower-bound semantics
-        # (atr >= ratio * SMA) in BOTH modes so the shared pre-fill is
-        # behaviour-identical when the toggle is first turned on. An
-        # additional optional per-direction MAX-ATR cap (`atr_regime_max`,
-        # a multiple of SMA, None = disabled) lets shorts exclude the
-        # high-volatility regime where the data shows REVERSAL-SHORT
-        # underperforms (a lower cap = tighter = excludes more high-vol).
+        # `atr_regime_ratio` is a minimum floor: ATR must be greater than or
+        # equal to `floor × SMA(ATR, 50)`. The independent ATR toggle changes
+        # the floor used by LONG and SHORT without changing any other filter.
+        # The legacy master switch and optional max-ATR cap remain supported for
+        # old saved configurations.
         atr_v = ind_1h['atr14']
         atr_sma = sma(atr_v, 50)
         use_dir = cfg.entry_conditions.use_direction_conditions
-        if use_dir:
+        use_dir_atr = cfg.uses_direction_atr_floor()
+        if use_dir_atr:
             reg_ratio_l = cfg.atr_regime_ratio_for(1)
             reg_ratio_s = cfg.atr_regime_ratio_for(-1)
             max_l = cfg.atr_regime_max_for(1)
@@ -243,9 +266,9 @@ class StrategyService:
         is_green = ind_1h['is_green'].astype(bool)
         is_red = ind_1h['is_red'].astype(bool)
 
-        # Per-direction MACD periods: when the toggle is ON and a side supplies
-        # its own macd_fast/slow/signal, recompute the histogram for that side
-        # (the shared `hist` stays as the logged/base value).
+        # Per-direction MACD periods are part of the legacy master switch.
+        # The new MACD-hist-only switch keeps the shared indicator periods and
+        # only changes the signed threshold for each side.
         if use_dir:
             l_f, l_s, l_sig = cfg.macd_periods_for(1)
             s_f, s_s, s_sig = cfg.macd_periods_for(-1)
@@ -255,25 +278,26 @@ class StrategyService:
             hist_long = hist
             hist_short = hist
 
+        use_dir_hist = cfg.uses_direction_macd_hist()
         if use_dir:
             adx_ok_l = adx_v >= cfg.adx_min_for(1)
             adx_ok_s = adx_v >= cfg.adx_min_for(-1)
-            # Directional MACD-hist filter uses SIGNED comparisons so shorts
-            # can require the histogram to sit clearly below the zero line
-            # (negative value) while longs require it to be clearly positive.
-            # The histogram itself is the per-direction one when a side overrides
-            # the MACD periods.
-            hist_ok_l = hist_long >= cfg.macd_hist_min_for(1)
-            hist_ok_s = hist_short <= cfg.macd_hist_min_for(-1)
             rsi_oversold_l = cfg.rsi_oversold_for(1)
             rsi_overbought_s = cfg.rsi_overbought_for(-1)
         else:
             adx_ok_shared = adx_v >= cfg.adx_min
             adx_ok_l = adx_ok_s = adx_ok_shared
-            hist_ok_shared = np.abs(hist) >= cfg.macd_hist_min
-            hist_ok_l = hist_ok_s = hist_ok_shared
             rsi_oversold_l = cfg.rsi_oversold
             rsi_overbought_s = cfg.rsi_overbought
+
+        if use_dir_hist:
+            # Directional MACD-hist is signed: LONG uses >= and SHORT uses <=.
+            hist_ok_l = hist_long >= cfg.macd_hist_min_for(1)
+            hist_ok_s = hist_short <= cfg.macd_hist_min_for(-1)
+        else:
+            # Legacy shared mode retains its absolute-magnitude comparison.
+            hist_ok_shared = np.abs(hist) >= cfg.macd_hist_min
+            hist_ok_l = hist_ok_s = hist_ok_shared
 
         rsi_prev = np.roll(rsi_v, 1)
         hist_prev = np.roll(hist, 1)

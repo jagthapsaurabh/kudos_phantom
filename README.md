@@ -80,17 +80,20 @@ returned by `GET /backtest/results/{run_id}`.
 All v3 behaviours are config-driven (`PhantomV2Config`); every new flag defaults to the exact
 v2.5 behaviour, so the API, paper trader and live trader remain fully backward compatible.
 
-### v3.2 addon: Direction-specific Long / Short conditions
-When the two sides behave differently (REVERSAL-SHORT quality collapses at high ATR/high MACD
-histogram), use the **"Use separate conditions for Long / Short"** toggle on the backtest page.
-With it ON, the LONG and SHORT branches each carry their own `macd_hist_min` (signed — shorts can
-be negative, e.g. `-8`, to require bearish momentum), `stop_loss_atr`, `atr_regime_ratio`,
-the optional `atr_regime_max` max-ATR cap (to exclude high-volatility for shorts),
-`rsi_oversold`/`rsi_overbought` and `adx_min`. Persisted as `entry_conditions.long.*` /
-`entry_conditions.short.*`; any unset value falls back to the shared field. Use the
-**Preview Filters** button (or `POST /backtest/filter-preview`) to see per-bucket win rate /
-profit factor before running the full backtest, and **Save as New Strategy** to keep a tuned
-configuration under a new name for re-running or Paper / Live trading.
+### v3.2 addon: Direction-specific Long / Short thresholds
+When the two sides behave differently, the Backtest page keeps the shared values as the default and
+places two independent switches below them: **Use separate Long / Short MACD hist** and
+**Use separate Long / Short Min ATR floor**. With the MACD switch on, LONG uses `hist >=` its value
+and SHORT uses `hist <=` its signed value (for example `-8` requires bearish momentum). With the ATR
+switch on, each side uses `ATR >= floor × SMA(ATR, 50)`. Values are persisted as
+`entry_conditions.long.*` / `entry_conditions.short.*`; an unset side falls back to the shared field.
+The legacy `use_direction_conditions` master switch remains supported for existing configurations.
+Use **Preview Filters** (or `POST /backtest/filter-preview`) to see the per-bucket trade-off before
+running the full backtest, and **Save as strategy** to keep a tuned configuration under a name for
+re-running or Paper / Live trading.
+
+Opening any saved Backtest history card now restores its saved dates, exchange, strategy, capital,
+and complete parameter snapshot before showing the result.
 
 ---
 
@@ -100,12 +103,13 @@ The admin panel now includes separate **Fees**, **Broker Integrations**, and **S
 - Admins manage taker and maker fees in basis points independently for **backtest**, **paper**, and **live** modes and per exchange. New runs snapshot the selected schedule, so changing fees never rewrites historical results. `.env` values remain the first-install fallback only.
 - Binance Futures and Delta Exchange are built-in market-data and live-order adapters. Admins can register additional named integrations (a compatible runtime adapter is required before live orders are enabled).
 - Seed data is stored as `source + symbol + interval + event_time` and always includes OHLCV volume. The Seed Data tab supports exchange API seeding and CSV import with the required columns `event_time,open,high,low,close,volume`.
-- **Delta Exchange seeding:** Delta's `/v2/history/candles` endpoint requires the `resolution` to be a **string label** (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`) and **both** `start` and `end` (Unix seconds) on every request. The adapter (a) maps `BTCUSDT → BTCUSD`, (b) passes the timeframe label through unchanged (numeric/seconds values such as `15`, `60`, `240` return HTTP 400 Bad Request), and (c) derives a `start`/`end` window from the requested `limit` when the caller doesn't supply dates. Seeding from the **Admin → Seed Data** tab (or `POST /admin/market-data/seed` with `"source": "Delta"`) uses this adapter.
-- **Delta diagnostics (a seed that fetches 0 candles is no longer silent):** the adapter parses every response shape Delta has used (bare array of dicts, bare array of arrays, `{"result": [...]}`, `{"candles": [...], "result": null}`), falls back from `api.india.delta.exchange` to the CDN host `cdn.india.deltaex.org`, and reports the exact HTTP status / exchange error for each host. Failed intervals appear in the seed response as per-interval `error` entries (status becomes `Seed completed with errors` / `Seed failed`) instead of a bare `fetched: 0`. The **Test connection** button in the Seed Data tab (or `GET /admin/market-data/test?source=Delta&interval=1h`) probes the source with 3 candles and shows what the exchange actually answers.
+- **Delta Exchange seeding:** Delta API `/v2/history/candles` requires the `resolution` to be a **string label** (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`) and both `start` and `end` Unix timestamps. Delta returns at most **2,000 candles per request** and charges three rate-limit units for OHLC requests. The Seed Data tab **Delta 2020 → today** preset therefore requests only `15m`, `1h`, `4h` and `1d`, splits 1 Jan 2020 → today into safe windows, paces requests and retries HTTP 429 responses. `1m` and `5m` are intentionally excluded from this full-history plan. Each committed window stores a durable cursor in `market_data_seed_progress`, so an interrupted range resumes without re-fetching committed windows; repeating a completed range is a no-op.
+- **Delta diagnostics (a seed that fetches 0 candles is no longer silent):** the adapter maps `BTCUSDT → BTCUSD`, parses every response shape Delta has used (bare array of dicts, bare array of arrays, `{"result": [...]}`, `{"candles": [...], "result": null}`), falls back from `api.india.delta.exchange` to the CDN host `cdn.india.deltaex.org`, and reports the exact HTTP status / exchange error for each host. Failed intervals appear in the seed response as per-interval `error` entries. The **Test connection** button (or `GET /admin/market-data/test?source=Delta&interval=1h`) probes the source with a safe request before a long seed.
+- **Daily refresh:** after startup and every 24 hours, the API incrementally refreshes all supported candle intervals for Binance and every enabled Binance-compatible or Delta-compatible broker integration. Delta daily refresh also omits `1m`/`5m`; generic integrations are reported as skipped until a compatible adapter is configured. **Run daily refresh now** in the Seed Data tab runs the same cycle immediately.
 - **Paper trade details:** every simulated position shows its **Stop / Exit Plan** (current stop loss with the original entry SL and breakeven state, take profit, trailing stop and activation level, active stop, ATR at entry, peak price). Closed trades show the **exit condition** (Take Profit / Trailing Stop / Stop Loss / Max Hold Time) with the exact rule that fired (e.g. "price fell to 67,099 ≤ trail 67,150.00"), exit value, SL (initial → final), TP, trail stop and ATR at entry. The live log prints the same detail on entry and exit.
 - Users choose Binance or Delta for each backtest, chart, paper instance, and live instance. Broker Settings supports multiple credential connections, and the existing instance workers allow multiple exchange/strategy sessions to run concurrently.
 
-Useful API endpoints include `GET /broker-definitions`, `GET /broker-connections`, `GET /fee-settings`, `POST /admin/fee-settings`, `POST /admin/market-data/seed`, and `POST /admin/market-data/seed-csv`.
+Useful API endpoints include `GET /broker-definitions`, `GET /broker-connections`, `GET /fee-settings`, `POST /admin/fee-settings`, `POST /admin/market-data/seed`, `GET /admin/market-data/progress`, `POST /admin/market-data/sync-now`, and `POST /admin/market-data/seed-csv`.
 
 ## ⚙️ Configuration
 All critical variables are managed in `backend/.env`:

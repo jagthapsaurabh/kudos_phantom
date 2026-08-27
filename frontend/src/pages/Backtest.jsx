@@ -118,19 +118,23 @@ const Backtest = () => {
     leverage: 2, margin_pct: 0.15,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
     entry_conditions: {
+      // The two direction toggles are intentionally independent. The legacy
+      // use_direction_conditions flag is still accepted for older saved runs.
       use_direction_conditions: false,
-      long: { macd_fast: 12, macd_slow: 26, macd_signal: 9, macd_hist_min: 5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
-      short: { macd_fast: 12, macd_slow: 26, macd_signal: 9, macd_hist_min: -5, stop_loss_atr: 1.2, atr_regime_ratio: 0.5, atr_regime_max: null, rsi_oversold: 40, rsi_overbought: 60, adx_min: 10 },
+      use_direction_macd_hist: false,
+      use_direction_atr_floor: false,
+      long: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
+      short: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
     },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
   const [params, setParams] = useState({ ...DEFAULT_PARAMS });
-  const [activeDirTab, setActiveDirTab] = useState('long');
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [results, setResults] = useState(null);
+  const [restoredRun, setRestoredRun] = useState(false);
   const [loading, setLoading] = useState(false);
   const [dates, setDates] = useState({ start: '2020-07-04', end: '2026-07-04' });
   const [history, setHistory] = useState([]);
@@ -179,21 +183,8 @@ const Backtest = () => {
   const pollIntervalRef = useRef(null);
   const resultsSectionRef = useRef(null);
 
-  // Fields that the backtest shows live per-direction with the toggle ON.
-  const directionalFields = [
-    'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min', 'stop_loss_atr',
-    'atr_regime_ratio', 'atr_regime_max',
-    'rsi_oversold', 'rsi_overbought', 'adx_min',
-  ];
-  // Shared groups shown always (they stay single regardless of the toggle).
-  const sharedGroups = {
-    "Trend & Regime": ["trend_ema_period", "cooldown_bars"],
-    "MACD Indicator": ["macd_fast", "macd_slow", "macd_signal"],
-    "Entries (v3)": ["enable_momentum_entry"],
-    "Risk & Exit Model": ["take_profit_atr", "trail_activation_atr", "trail_distance_atr", "breakeven_atr"],
-    "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
-  };
-  // Param groups when the toggle is OFF (all fields shared, legacy layout).
+  // All fields are shared by default. The two threshold switches below add
+  // only the Long / Short values the client needs to tune independently.
   const sharedParamGroups = {
     "Trend & Regime": ["trend_ema_period", "atr_regime_ratio", "cooldown_bars"],
     "MACD Indicator": ["macd_fast", "macd_slow", "macd_signal"],
@@ -202,51 +193,48 @@ const Backtest = () => {
     "Sizing & Drawdown Guard": ["leverage", "margin_pct", "dd_soft_pct", "dd_halt_pct", "dd_resume_pct"],
   };
   const useDirection = !!(params.entry_conditions && params.entry_conditions.use_direction_conditions);
+  const useDirMacdHist = useDirection || !!(params.entry_conditions && params.entry_conditions.use_direction_macd_hist);
+  const useDirAtrFloor = useDirection || !!(params.entry_conditions && params.entry_conditions.use_direction_atr_floor);
 
   const toggleSection = (key) => setSectionVisibility(prev => ({ ...prev, [key]: !prev[key] }));
   const setSharedField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
 
-  const setDirField = (side, field, value) => setParams(prev => ({
+  // The client-facing switches are deliberately independent. Enabling one
+  // copies the current shared value into each side only when that side does
+  // not already have a saved override.
+  const setDirectionalToggle = (field, value) => setParams(prev => {
+    const ec = prev.entry_conditions || {};
+    const long = { ...(ec.long || {}) };
+    const short = { ...(ec.short || {}) };
+    if (value && field === 'use_direction_macd_hist') {
+      long.macd_hist_min = long.macd_hist_min ?? prev.macd_hist_min ?? 0;
+      short.macd_hist_min = short.macd_hist_min ?? -(Math.abs(prev.macd_hist_min ?? 0));
+    }
+    if (value && field === 'use_direction_atr_floor') {
+      long.atr_regime_ratio = long.atr_regime_ratio ?? prev.atr_regime_ratio ?? 0;
+      short.atr_regime_ratio = short.atr_regime_ratio ?? prev.atr_regime_ratio ?? 0;
+    }
+    return {
+      ...prev,
+      entry_conditions: {
+        ...ec,
+        [field]: value,
+        long,
+        short,
+      },
+    };
+  });
+
+  const setDirectionalValue = (side, field, value) => setParams(prev => ({
     ...prev,
     entry_conditions: {
-      ...prev.entry_conditions,
-      [side]: { ...prev.entry_conditions[side], [field]: value },
+      ...(prev.entry_conditions || {}),
+      [side]: {
+        ...((prev.entry_conditions || {})[side] || {}),
+        [field]: value,
+      },
     },
   }));
-
-  const setUseDirection = (val) => setParams(prev => {
-    const p = { ...prev };
-    const ec = prev.entry_conditions || DEFAULT_PARAMS.entry_conditions;
-    // Pre-fill long/short from the current shared values so nothing breaks
-    // for existing configs; SHORT MACD defaults to the negative of the shared
-    // magnitude so bearish momentum is required (suggested starting value).
-    const long = { ...ec.long };
-    const short = { ...ec.short };
-    // Per-direction MACD periods default to the shared indicator periods so a
-    // freshly-enabled toggle is behaviour-identical until the user tunes them.
-    long.macd_fast = long.macd_fast ?? prev.macd_fast ?? 12;
-    long.macd_slow = long.macd_slow ?? prev.macd_slow ?? 26;
-    long.macd_signal = long.macd_signal ?? prev.macd_signal ?? 9;
-    short.macd_fast = short.macd_fast ?? prev.macd_fast ?? 12;
-    short.macd_slow = short.macd_slow ?? prev.macd_slow ?? 26;
-    short.macd_signal = short.macd_signal ?? prev.macd_signal ?? 9;
-    long.macd_hist_min = prev.macd_hist_min ?? long.macd_hist_min ?? 5;
-    long.stop_loss_atr = prev.stop_loss_atr ?? long.stop_loss_atr ?? 1.2;
-    long.atr_regime_ratio = prev.atr_regime_ratio ?? long.atr_regime_ratio ?? 0.5;
-    long.atr_regime_max = (long.atr_regime_max === undefined ? null : long.atr_regime_max);
-    long.rsi_oversold = prev.rsi_oversold ?? long.rsi_oversold ?? 40;
-    long.rsi_overbought = prev.rsi_overbought ?? long.rsi_overbought ?? 60;
-    long.adx_min = prev.adx_min ?? long.adx_min ?? 10;
-    short.macd_hist_min = -(prev.macd_hist_min ?? Math.abs(short.macd_hist_min ?? 5));
-    short.stop_loss_atr = prev.stop_loss_atr ?? short.stop_loss_atr ?? 1.2;
-    short.atr_regime_ratio = prev.atr_regime_ratio ?? short.atr_regime_ratio ?? 0.5;
-    short.atr_regime_max = (short.atr_regime_max === undefined ? null : short.atr_regime_max);
-    short.rsi_oversold = prev.rsi_oversold ?? short.rsi_oversold ?? 40;
-    short.rsi_overbought = prev.rsi_overbought ?? short.rsi_overbought ?? 60;
-    short.adx_min = prev.adx_min ?? short.adx_min ?? 10;
-    p.entry_conditions = { use_direction_conditions: val, long, short };
-    return p;
-  });
 
   // The parameter form applies to PhantomV2 and to saved Kudos-style
   // strategies (params stored as an object, not Chartink rule arrays).
@@ -343,12 +331,13 @@ const Backtest = () => {
       setSectionVisibility(prev => ({
         ...prev,
         ...completedRunSectionVisibility,
+        ...(restoredRun ? { setup: true, config: true } : {}),
       }));
       window.requestAnimationFrame(() => {
         resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
     }
-  }, [results]);
+  }, [results, restoredRun]);
 
   useEffect(() => {
     if (results && results.equity_curve && sectionVisibility.equity) {
@@ -444,6 +433,7 @@ const Backtest = () => {
           const resultData = await res.json();
           if (!isBacktestComplete(resultData.run_details)) return false;
 
+          setRestoredRun(false);
           setResults(normalizeBacktestResults({ id: runId, ...resultData.run_details }, resultData.trades));
           setLoading(false);
           if (pollIntervalRef.current) {
@@ -520,6 +510,45 @@ const Backtest = () => {
     setPreviewLoading(false);
   };
 
+  const mergeSavedParams = (savedParams) => {
+    const saved = savedParams && typeof savedParams === 'object' ? savedParams : {};
+    const base = JSON.parse(JSON.stringify(DEFAULT_PARAMS));
+    const savedConditions = saved.entry_conditions && typeof saved.entry_conditions === 'object'
+      ? saved.entry_conditions : {};
+    const merged = {
+      ...base,
+      ...saved,
+      entry_conditions: {
+        ...base.entry_conditions,
+        ...savedConditions,
+        long: { ...base.entry_conditions.long, ...(savedConditions.long || {}) },
+        short: { ...base.entry_conditions.short, ...(savedConditions.short || {}) },
+      },
+    };
+    // Runs saved before the independent switches were introduced used the
+    // legacy master switch. Surface that state in the new controls as well.
+    if (savedConditions.use_direction_conditions) {
+      if (savedConditions.use_direction_macd_hist === undefined) merged.entry_conditions.use_direction_macd_hist = true;
+      if (savedConditions.use_direction_atr_floor === undefined) merged.entry_conditions.use_direction_atr_floor = true;
+    }
+    return merged;
+  };
+
+  const dateInputValue = value => value ? String(value).slice(0, 10) : null;
+
+  const applyRunParameters = (runDetails) => {
+    const savedParams = runDetails?.params && typeof runDetails.params === 'object'
+      ? runDetails.params : {};
+    if (Object.keys(savedParams).length > 0) setParams(mergeSavedParams(savedParams));
+    if (runDetails?.strategy_id) setSelectedStrategyId(String(runDetails.strategy_id));
+    const start = dateInputValue(runDetails?.start_date);
+    const end = dateInputValue(runDetails?.end_date);
+    if (start && end) setDates({ start, end });
+    if (runDetails?.initial_capital != null) setCapital(runDetails.initial_capital);
+    if (runDetails?.data_source) setDataSource(runDetails.data_source);
+    if (runDetails?.name) setRunName(runDetails.name);
+  };
+
   const handleStrategySelect = (sid) => {
     setSelectedStrategyId(sid);
     // When a saved Kudos-style strategy is chosen, load its params into the
@@ -527,8 +556,7 @@ const Backtest = () => {
     const found = strategies.find(s => String(s.id) === String(sid));
     if (found && found.rules && typeof found.rules === 'object' && !Array.isArray(found.rules) &&
         (found.rules.entry_conditions || 'rsi_oversold' in found.rules)) {
-      const merged = { ...DEFAULT_PARAMS, ...found.rules };
-      setParams(JSON.parse(JSON.stringify(merged)));
+      setParams(mergeSavedParams(found.rules));
       setRunName(found.name || '');
     }
   };
@@ -563,6 +591,11 @@ const Backtest = () => {
       if (!res.ok) throw new Error((await res.json()).detail || "Run not found");
       const data = await res.json();
       if (!data.run_details) throw new Error("Run details missing");
+      // A historical run is both a result and a reusable configuration. Load
+      // its exact parameter snapshot before showing the result so rerunning it
+      // cannot accidentally use values from a different run.
+      applyRunParameters(data.run_details);
+      setRestoredRun(true);
       setResults(normalizeBacktestResults({ id: runId, ...data.run_details }, data.trades));
       setShowHistory(false);
     } catch (e) { alert(`Error loading run: ${e.message}`); }
@@ -663,8 +696,8 @@ const Backtest = () => {
         >
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             {history.map(run => (
-              <div key={run.id} className="group relative rounded-xl border border-gray-700 bg-gray-900 p-4 transition hover:border-blue-500">
-                <div className="cursor-pointer" onClick={() => loadRun(run.id)}>
+              <div key={run.id} onClick={() => loadRun(run.id)} className="group relative cursor-pointer rounded-xl border border-gray-700 bg-gray-900 p-4 transition hover:border-blue-500">
+                <div>
                   <div className="font-bold text-gray-200 transition group-hover:text-blue-400">{run.name || 'Unnamed Run'}</div>
                   <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Binance'}</div>
                   <div className={`mt-2 text-sm font-mono ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
@@ -743,101 +776,74 @@ const Backtest = () => {
           onToggle={() => toggleSection('config')}
           className="mb-8"
         >
-          <div className="mb-6">
-            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-700 bg-gray-900 p-3 text-sm text-gray-300">
-              <input type="checkbox" checked={useDirection}
-                onChange={e => setUseDirection(e.target.checked)}
-                className="mt-0.5 h-4 w-4 accent-blue-500" />
-              <div>
-                <div className="font-bold text-white">Use separate conditions for Long / Short</div>
-                <div className="mt-0.5 text-[11px] text-gray-500">
-                  When ON, tune MACD-hist min, stop-loss ATR, ATR regime floor + max-ATR cap and RSI/ADX independently for LONG and SHORT.
-                  Off = shared conditions (current v2.5 behaviour).
-                </div>
-              </div>
-            </label>
+          <div className="mb-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
+            Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
+            <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds.
           </div>
 
-          {!useDirection && (
-            <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
-              {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
-                <div key={groupName} className="space-y-3">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
-                  <div className="space-y-3">
-                    {fields.map(field => field === 'enable_momentum_entry'
-                      ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
-                      : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
-                  </div>
+          <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
+            {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
+              <div key={groupName} className="space-y-3">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
+                <div className="space-y-3">
+                  {fields.map(field => {
+                    if (field === 'enable_momentum_entry') {
+                      return <React.Fragment key={field}>
+                        {renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))}
+                      </React.Fragment>;
+                    }
+                    if (field === 'macd_hist_min' || field === 'atr_regime_ratio') {
+                      const isHist = field === 'macd_hist_min';
+                      const enabled = isHist ? useDirMacdHist : useDirAtrFloor;
+                      const toggleKey = isHist ? 'use_direction_macd_hist' : 'use_direction_atr_floor';
+                      const label = isHist ? 'Use separate Long / Short MACD hist' : 'Use separate Long / Short Min ATR floor';
+                      return <div key={field} className="space-y-2">
+                        {renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value)))}
+                        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                          <input type="checkbox" checked={enabled}
+                            onChange={e => setDirectionalToggle(toggleKey, e.target.checked)}
+                            className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                          <span>
+                            <span className="block font-bold text-white">{label}</span>
+                            <span className="mt-0.5 block text-gray-500">
+                              {isHist
+                                ? 'Long uses hist ≥ value; Short uses hist ≤ value.'
+                                : 'Long and Short use ATR ≥ their floor × 50-bar ATR average.'}
+                            </span>
+                          </span>
+                        </label>
+                        {enabled && (
+                          <div className="grid grid-cols-2 gap-2 rounded-lg border border-gray-700 bg-gray-900 p-2">
+                            {['long', 'short'].map(side => {
+                              const sideValue = params.entry_conditions?.[side]?.[field];
+                              return <div key={side}>
+                                <label className={`mb-1 block text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                                  {side} · {isHist ? (side === 'long' ? 'hist ≥' : 'hist ≤') : 'ATR ≥'}
+                                </label>
+                                <input type="number" step="0.01" value={sideValue ?? ''}
+                                  onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
+                                  className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
+                              </div>;
+                            })}
+                          </div>
+                        )}
+                      </div>;
+                    }
+                    return <React.Fragment key={field}>
+                      {renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value)))}
+                    </React.Fragment>;
+                  })}
                 </div>
-              ))}
-            </div>
-          )}
+              </div>
+            ))}
+          </div>
 
           {useDirection && (
-            <>
-              <div className="mb-6 grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-4">
-                {Object.entries(sharedGroups).map(([groupName, fields]) => (
-                  <div key={groupName} className="space-y-3">
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
-                    <div className="space-y-3">
-                      {fields.map(field => field === 'enable_momentum_entry'
-                        ? renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))
-                        : renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value))))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="border-t border-gray-700 pt-5">
-                <div className="mb-4 flex gap-2">
-                  {['long', 'short'].map(side => (
-                    <button key={side} onClick={() => setActiveDirTab(side)}
-                      className={`rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-wider transition ${
-                        activeDirTab === side
-                          ? side === 'long'
-                            ? 'bg-green-600 text-white shadow-lg shadow-green-900/20'
-                            : 'bg-red-600 text-white shadow-lg shadow-red-900/20'
-                          : 'border border-gray-700 bg-gray-900 text-gray-400 hover:text-white'}`}>
-                      {side === 'long' ? 'Long' : 'Short'}
-                      <span className="ml-1 opacity-80">{side === 'long' ? '▲' : '▼'}</span>
-                    </button>
-                  ))}
-                  <span className="ml-auto self-center text-[10px] text-gray-500">
-                    Editing: <b className={activeDirTab === 'long' ? 'text-green-400' : 'text-red-400'}>{activeDirTab}</b> conditions
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
-                  {directionalFields.map(field => (
-                    <div key={field} className="flex flex-col">
-                      <label className="mb-1 flex items-center gap-1 text-[10px] font-semibold text-gray-400">
-                        {(PARAM_META[field]?.label) || field.replace(/_/g, ' ')}
-                        <span className={activeDirTab === 'long' ? 'text-green-500' : 'text-red-500'}>({activeDirTab})</span>
-                        {PARAM_META[field]?.hint && <span title={PARAM_META[field].hint} className="cursor-help text-gray-600"><HelpCircle size={11} /></span>}
-                      </label>
-                      <input type="number" step={['macd_fast','macd_slow','macd_signal','rsi_oversold','rsi_overbought'].includes(field) ? 1 : 0.01}
-                        value={(params.entry_conditions && params.entry_conditions[activeDirTab] && params.entry_conditions[activeDirTab][field]) ?? (field === 'atr_regime_max' ? '' : 0) }
-                        onChange={e => {
-                          const val = e.target.value;
-                          setDirField(activeDirTab, field, val === '' ? null : parseFloat(val));
-                        }}
-                        className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none transition focus:border-blue-500" />
-                      {field === 'atr_regime_max' && (
-                        <span className="mt-0.5 text-[9px] text-gray-600">max-ATR cap (multiples of SMA; blank = off)</span>
-                      )}
-                      {['macd_fast','macd_slow','macd_signal'].includes(field) && (
-                        <span className="mt-0.5 text-[9px] text-gray-600">{field === 'macd_fast' ? 'EMA fast period for this side' : field === 'macd_slow' ? 'EMA slow period (must be > fast)' : 'signal period for this side'}</span>
-                      )}
-                      {field === 'atr_regime_ratio' && (
-                        <span className="mt-0.5 text-[9px] text-gray-600">min-ATR floor (lower = more trades)</span>
-                      )}
-                      {field === 'macd_hist_min' && (
-                        <span className="mt-0.5 text-[9px] text-gray-600">{activeDirTab === 'long' ? 'require hist ≥ this' : 'require hist ≤ this (use negative for bearish)'}</span>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </>
+            <div className="mt-5 rounded-lg border border-yellow-900/50 bg-yellow-900/10 p-3 text-[10px] text-yellow-300">
+              This run contains the legacy full Long / Short override switch. Its additional RSI, ADX, MACD-period,
+              stop-loss and max-ATR overrides are still honoured by the engine; the two switches above control the
+              editable MACD histogram and minimum ATR floor values.
+            </div>
           )}
         </SectionCard>
       )}
@@ -881,7 +887,11 @@ const Backtest = () => {
           onToggle={() => toggleSection('preview')}
           actions={
             <>
-              {preview.use_direction_conditions && <span className="rounded border border-purple-800/40 bg-purple-900/40 px-2 py-0.5 text-[10px] text-purple-300">direction-specific ON</span>}
+              {(preview.use_direction_conditions || preview.use_direction_macd_hist || preview.use_direction_atr_floor) && (
+                <span className="rounded border border-purple-800/40 bg-purple-900/40 px-2 py-0.5 text-[10px] text-purple-300">
+                  {preview.use_direction_conditions ? 'direction-specific ON' : 'side thresholds ON'}
+                </span>
+              )}
               <button onClick={() => setPreview(null)} className="text-xs text-gray-500 transition hover:text-white">Close</button>
             </>
           }

@@ -14,7 +14,7 @@ from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
-    BrokerDefinition, BrokerConnection, FeeSetting,
+    MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
 )
 import bcrypt
 from passlib.context import CryptContext
@@ -141,6 +141,22 @@ _PHANTOM_PARAM_KEYS = (
 )
 
 
+def _parse_run_params(config_json):
+    """Decode a historical run's parameter snapshot safely.
+
+    Older databases may contain an empty or malformed snapshot. Returning an
+    empty object keeps the results endpoint usable for those runs while newer
+    runs still restore the exact nested ``entry_conditions`` block.
+    """
+    if not config_json:
+        return {}
+    try:
+        value = json.loads(config_json) if isinstance(config_json, str) else config_json
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _resolve_strategy_payload(db, strategy_id, user_id, fees):
     """Resolve a saved custom strategy into a runnable payload.
 
@@ -170,9 +186,19 @@ def _resolve_strategy_payload(db, strategy_id, user_id, fees):
 
 
 async def daily_sync_task():
+    """Refresh Binance and every enabled compatible broker once per day.
+
+    The synchronous exchange adapters run in a worker thread so a long or
+    rate-limited seed/refresh never blocks FastAPI's event loop. Delta uses its
+    supported 15m/1h/4h/1d set here; the 1m/5m history is deliberately omitted.
+    """
     while True:
-        DataSyncService.sync_market_data()
-        # Sleep for 24 hours (86400 seconds)
+        try:
+            await asyncio.to_thread(DataSyncService.sync_all_configured_sources_daily)
+        except Exception as exc:
+            # A single unavailable exchange must not kill the 24-hour loop.
+            print(f"Daily market-data sync failed: {exc}")
+        # Sleep for 24 hours (86400 seconds).
         await asyncio.sleep(86400)
 
 @app.on_event("startup")
@@ -472,10 +498,12 @@ def deactivate_client(client_id: int, admin=Depends(require_admin), db=Depends(g
 def client_activity(client_id: int, admin=Depends(require_admin), db=Depends(get_db)):
     user = db.query(User).filter(User.id == client_id).first()
     if not user: raise HTTPException(status_code=404, detail="Client not found")
-    paper = [{"instance_key": k, "strategy_id": s.strategy_id, "equity_inr": s.equity_inr,
+    paper = [{"instance_key": k, "strategy_id": s.strategy_id,
+              "strategy_name": getattr(s, 'strategy_name', s.strategy_id), "equity_inr": s.equity_inr,
               "is_running": s.is_running, "open_trades": len(s.oms.active_trades)}
              for k, s in paper_trade_instances.items() if f"_{user.username}_" in k]
-    live = [{"instance_key": k, "strategy_id": s.strategy_id, "equity_inr": s.equity_inr,
+    live = [{"instance_key": k, "strategy_id": s.strategy_id,
+             "strategy_name": getattr(s, 'strategy_name', s.strategy_id), "equity_inr": s.equity_inr,
              "is_running": s.is_running, "open_trades": len(s.oms.active_trades)}
             for k, s in live_trade_instances.items() if f"_{user.username}_" in k]
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id)\
@@ -670,11 +698,24 @@ def delete_broker_connection(connection_id: int, user=Depends(get_current_user),
 class MarketSeedPayload(BaseModel):
     source: str = 'Binance'
     symbol: str = 'BTCUSDT'
-    intervals: List[str] = ['1m', '5m', '15m', '1h', '4h', '1d']
+    # None lets the adapter choose its safe default. Delta defaults to the
+    # full-history-compatible 15m/1h/4h/1d set; Binance keeps all app candles.
+    intervals: Optional[List[str]] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     limit: int = 1000
     fetch_all: bool = False
+
+
+def _market_definition(db, source):
+    """Resolve an enabled broker definition for API seeding/syncing."""
+    normalized = normalize_source(source)
+    row = db.query(BrokerDefinition).filter(BrokerDefinition.code == normalized).first()
+    if row is not None and not row.enabled:
+        raise HTTPException(status_code=400, detail=f"Market-data source '{normalized}' is disabled")
+    if row is None and normalized not in ('Binance', 'Delta'):
+        raise HTTPException(status_code=404, detail=f"Broker integration '{normalized}' not found")
+    return normalized, row
 
 
 @app.get('/admin/market-data/status')
@@ -691,33 +732,87 @@ def market_data_status(admin=Depends(require_admin), db=Depends(get_db)):
 
 
 @app.post('/admin/market-data/seed')
-def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin)):
+def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), db=Depends(get_db)):
     try:
-        from .services.data_sync import DataSyncService
-        intervals = [i for i in payload.intervals if i in DataSyncService.TIMEFRAMES]
-        if not intervals: raise HTTPException(status_code=400, detail='Select at least one valid interval')
+        source, definition = _market_definition(db, payload.source)
+        kind = DataSyncService._adapter_kind(source, definition)
+        intervals = payload.intervals
+        if intervals is not None:
+            intervals = [str(interval).lower() for interval in intervals if str(interval).lower() in DataSyncService.TIMEFRAMES]
+            if not intervals:
+                raise HTTPException(status_code=400, detail='Select at least one valid interval')
+        if kind == 'delta' and intervals:
+            excluded = sorted(set(intervals) & DataSyncService.DELTA_EXCLUDED_INTERVALS)
+            if excluded:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"Delta Exchange full-history seeding excludes {', '.join(excluded)}. "
+                            f"Select only {', '.join(DataSyncService.DELTA_HISTORY_INTERVALS)}."),
+                )
         summary = DataSyncService.seed_market_data(
-            normalize_source(payload.source), payload.symbol.upper(), intervals,
-            payload.start_date, payload.end_date, max(1, min(payload.limit, 2000)))
+            source=source,
+            symbol=payload.symbol.upper(),
+            intervals=intervals,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            limit=max(1, min(payload.limit, DataSyncService.DELTA_MAX_CANDLES)),
+            fetch_all=payload.fetch_all,
+            definition=definition,
+        )
         # Per-interval failures are reported in the summary instead of 502 so
         # the admin can see exactly which interval failed and why.
-        ok = sum(1 for s in summary if not s.get('error'))
+        ok = sum(1 for item in summary if not item.get('error'))
         status = 'Seed completed' if ok == len(summary) else ('Seed failed' if ok == 0 else 'Seed completed with errors')
-        return {'status': status, 'summary': summary}
-    except HTTPException: raise
+        return {'status': status, 'source': source, 'symbol': payload.symbol.upper(),
+                'fetch_all': payload.fetch_all, 'summary': summary}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.get('/admin/market-data/progress')
+def market_data_seed_progress(admin=Depends(require_admin), db=Depends(get_db)):
+    """Show durable historical-seed cursors for restart/resume diagnostics."""
+    rows = db.query(MarketDataSeedProgress).order_by(
+        MarketDataSeedProgress.updated_at.desc(), MarketDataSeedProgress.id.desc(),
+    ).limit(100).all()
+    return [{
+        'source': row.source, 'definition': row.definition_key,
+        'symbol': row.symbol, 'interval': row.interval,
+        'requested_start': row.requested_start, 'requested_end': row.requested_end,
+        'next_start': row.next_start, 'status': row.status,
+        'pages': row.pages, 'empty_pages': row.empty_pages,
+        'fetched': row.fetched, 'inserted': row.inserted, 'updated': row.updated,
+        'last_error': row.last_error, 'updated_at': row.updated_at,
+        'completed_at': row.completed_at,
+    } for row in rows]
+
+
 @app.get('/admin/market-data/test')
 def test_market_data_source(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
-                            admin=Depends(require_admin)):
+                            admin=Depends(require_admin), db=Depends(get_db)):
     """Round-trip probe: shows exactly what the exchange answers for a tiny
     request, so an empty seed (0 candles) can be diagnosed from the UI."""
-    from .services.data_sync import DataSyncService
+    source, definition = _market_definition(db, source)
+    interval = str(interval).lower()
     if interval not in DataSyncService.TIMEFRAMES:
         raise HTTPException(status_code=400, detail='Invalid interval')
-    return DataSyncService.test_source(normalize_source(source), symbol.upper(), interval)
+    if DataSyncService._adapter_kind(source, definition) == 'delta' and interval in DataSyncService.DELTA_EXCLUDED_INTERVALS:
+        raise HTTPException(status_code=400, detail='Delta connection tests exclude 1m and 5m; use 15m, 1h, 4h, or 1d')
+    return DataSyncService.test_source(source, symbol.upper(), interval, definition=definition)
+
+
+@app.post('/admin/market-data/sync-now')
+def sync_market_data_now(admin=Depends(require_admin)):
+    """Run the same incremental multi-source cycle used by the daily task."""
+    try:
+        summary = DataSyncService.sync_all_configured_sources_daily()
+        ok = sum(1 for item in summary if not item.get('error'))
+        status = 'Daily refresh completed' if ok == len(summary) else ('Daily refresh failed' if ok == 0 else 'Daily refresh completed with errors')
+        return {'status': status, 'summary': summary}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.post('/admin/market-data/seed-csv')
@@ -948,6 +1043,7 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
         run = BacktestRun(
             user_id=user.id,
             name=req.strategy_name,
+            strategy_id=req.strategy_id,
             start_date=start_date_dt,
             end_date=end_date_dt,
             config_json=json.dumps(req.params.model_dump()),
@@ -969,7 +1065,8 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
 @app.get("/backtest/history")
 def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).order_by(BacktestRun.timestamp.desc()).all()
-    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date,
+    return [{"id": r.id, "name": r.name, "strategy_id": r.strategy_id or 'PhantomV2',
+             "start_date": r.start_date, "end_date": r.end_date,
              "roi": r.roi, "initial_capital": r.initial_capital or 20000,
              "data_source": r.data_source or 'Binance', "taker_fee_bps": r.taker_fee_bps,
              "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp} for r in runs]
@@ -997,6 +1094,10 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
         "run_details": {
             "id": run.id,
             "name": run.name,
+            "strategy_id": run.strategy_id or 'PhantomV2',
+            # The exact parameter snapshot is returned with a run so the UI can
+            # restore the form when a historical card is opened.
+            "params": _parse_run_params(run.config_json),
             "start_date": run.start_date,
             "end_date": run.end_date,
             "initial_capital": run.initial_capital or 20000,
@@ -1129,6 +1230,8 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'total_win_rate': round(results['win_rate'], 2),
         'total_profit_factor': round(results['profit_factor'], 2),
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
+        'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
+        'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
         'buckets': out,
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
@@ -1187,32 +1290,39 @@ def start_paper_trade(
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
-    strategy_id = payload.strategy_id
+    strategy_id = str(payload.strategy_id)
+    strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
         from .core.strategy import FastTestStrategyService
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
-                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
-        kind, payload, strat = resolved
+        kind, strategy_payload, strat = resolved
+        strategy_name = strat.name
         if kind == 'phantom':
-            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
-                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=False, broker_definition=definition)
+            service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees,
+                                        is_custom=False, broker_definition=definition, strategy_name=strategy_name)
         else:
-            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
-                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=True, broker_definition=definition)
+            service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees,
+                                        is_custom=True, broker_definition=definition, strategy_name=strategy_name)
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
-                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name)
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
-    return {"status": "Paper trade started", "instance_key": instance_key, "data_source": source,
+    return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
+            "strategy_name": service.strategy_name, "data_source": source,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
@@ -1224,6 +1334,19 @@ async def stop_paper_trade(instance_key: str, user=Depends(get_current_user)):
         del paper_trade_instances[instance_key]
         return {"status": "Paper trade stopped"}
     raise HTTPException(status_code=404, detail="Instance not found")
+
+@app.delete("/paper-trade/{instance_key}")
+async def delete_paper_trade(instance_key: str, user=Depends(get_current_user)):
+    """Stop and remove one paper-trade session from the user's workspace."""
+    if f"_{user.username}_" not in instance_key:
+        raise HTTPException(status_code=403, detail="Not your instance")
+    service = paper_trade_instances.get(instance_key)
+    if not service:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    await service.stop()
+    del paper_trade_instances[instance_key]
+    return {"status": "Paper trade deleted", "instance_key": instance_key}
+
 
 @app.get("/paper-trade/status")
 def get_paper_status(user=Depends(get_current_user)):
@@ -1267,6 +1390,8 @@ def get_paper_status(user=Depends(get_current_user)):
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
+                "strategy_name": getattr(service, 'strategy_name', service.strategy_id),
+                "created_at": getattr(service, 'created_at', None),
                 "data_source": service.market_source, "broker_name": service.broker_name,
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
