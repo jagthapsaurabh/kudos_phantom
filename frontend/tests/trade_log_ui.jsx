@@ -10,7 +10,7 @@ import React from 'react';
 import { renderToString } from 'react-dom/server';
 import {
   buildTradesCSV, condLabel, fmtCandleTime, TradeLogTable,
-  CandleChip, CondChip, atrRegimeRuleForProbe,
+  CandleChip, CondChip, atrRegimeRuleFor,
 } from '../src/pages/Backtest.jsx';
 
 let pass = 0, fail = 0;
@@ -80,17 +80,17 @@ const trades = [momTrade, revTrade];
 
 // ---------- 1. the per-side ATR rule text (Feature 1, shown in the log) ------
 check('rule text: long uses its own operator/ratio',
-  atrRegimeRuleForProbe(params, 1) === 'ATR ≥ 0.5 × SMA50(ATR)',
-  atrRegimeRuleForProbe(params, 1));
+  atrRegimeRuleFor(params, 1) === 'ATR ≥ 0.5 × SMA50(ATR)',
+  atrRegimeRuleFor(params, 1));
 check('rule text: short uses its own operator/ratio',
-  atrRegimeRuleForProbe(params, -1) === 'ATR < 1.2 × SMA50(ATR)',
-  atrRegimeRuleForProbe(params, -1));
+  atrRegimeRuleFor(params, -1) === 'ATR < 1.2 × SMA50(ATR)',
+  atrRegimeRuleFor(params, -1));
 const offParams = { atr_regime_ratio: 0.5,
   entry_conditions: { use_direction_atr_floor: false, long: { atr_regime_op: '<', atr_regime_ratio: 9 },
                       short: { atr_regime_op: '<', atr_regime_ratio: 9 } } };
 check('rule text: toggle off falls back to the legacy rule for both sides',
-  atrRegimeRuleForProbe(offParams, 1) === 'ATR ≥ 0.5 × SMA50(ATR)'
-  && atrRegimeRuleForProbe(offParams, -1) === 'ATR ≥ 0.5 × SMA50(ATR)');
+  atrRegimeRuleFor(offParams, 1) === 'ATR ≥ 0.5 × SMA50(ATR)'
+  && atrRegimeRuleFor(offParams, -1) === 'ATR ≥ 0.5 × SMA50(ATR)');
 
 // ---------- 2. UTC candle time formatting -----------------------------------
 check('fmtCandleTime renders UTC to the minute',

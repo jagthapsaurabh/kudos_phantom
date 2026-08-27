@@ -1373,6 +1373,9 @@ const CondChip = ({ ok, label }) => (
   </span>
 );
 
-export { buildTradesCSV, condLabel, fmtCandleTime, TradeLogTable, CandleChip, CondChip, atrRegimeRuleFor as atrRegimeRuleForProbe };
+// Exported for tests: the pure helpers and the trade-log table behind the
+// Backtest page's trade log and Excel/CSV export.
+export { buildTradesCSV, condLabel, fmtCandleTime, atrRegimeRuleFor,
+         TradeLogTable, CandleChip, CondChip };
 
 export default Backtest;
