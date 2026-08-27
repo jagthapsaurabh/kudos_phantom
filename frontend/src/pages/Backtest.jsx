@@ -99,7 +99,7 @@ const buildTradesCSV = (trades) => {
     'Exit Condition', 'Exit Condition Detail',
     'SL at Entry', 'SL at Exit', 'Take Profit', 'Trail Stop', 'ATR at Entry', 'Peak Price',
     'Lots', 'Margin', 'Notional', 'Margin % Used', 'Drawdown at Entry %',
-    'Gross PnL', 'Fees', 'Net PnL', 'Equity After', 'Drawdown %', 'Bars Held',
+    'PnL (Gross)', 'Fees', 'Booked PnL (Net)', 'Equity After', 'Drawdown %', 'Bars Held',
   ];
   // UTC, to the second, so a row in the sheet matches the on-screen log exactly.
   const fmtTime = (v) => fmtCandleTime(v, { seconds: true });
@@ -236,7 +236,9 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
           <th className="p-3 font-semibold">4H Trend</th>
           <th className="p-3 font-semibold">RSI</th>
           <th className="p-3 font-semibold">ADX</th>
-          <th className="p-3 font-semibold">Net PnL</th>
+          <th className="p-3 font-semibold" title="Gross PnL before fees">PnL</th>
+          <th className="p-3 font-semibold" title="Entry + exit fees charged on this trade">Fees</th>
+          <th className="p-3 font-semibold" title="Booked = net PnL (gross PnL − fees) added to equity">Booked</th>
           <th className="p-3 font-semibold">Reason</th>
           <th className="p-3 font-semibold">Cond.</th>
         </tr>
@@ -264,13 +266,15 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
               <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
               <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
               <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
-              <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
+              <td className={`p-3 font-mono font-bold ${(t.gross_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.gross_pnl || 0).toFixed(2)}</td>
+              <td className="p-3 font-mono text-gray-400">₹{(t.fees || 0).toFixed(2)}</td>
+              <td className={`p-3 font-mono font-bold ${(t.net_pnl || 0) > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
               <td className="p-3"><span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span></td>
               <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
             </tr>
             {expandedTrade === i && (
               <tr className="border-b border-gray-700 bg-gray-900/60">
-                <td colSpan={12} className="p-4">
+                <td colSpan={14} className="p-4">
                   {/* Every entry condition spelled out: measured value vs the
                       threshold applied, and PASS/FAIL. Built by the engine so it
                       always matches what was actually evaluated. */}
@@ -344,8 +348,8 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                     <div>
                       <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Result</div>
                       <div className="space-y-0.5 font-mono text-gray-300">
-                        <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
-                        <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
+                        <div>PnL (Gross): ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
+                        <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Booked (Net): ₹{(t.net_pnl || 0).toFixed(2)}</div>
                         <div>Exit: {fmtCandleTime(t.exit_time) || '—'} ({t.hold_bars || 0} bars)</div>
                         <div>Peak: {t.peak_price?.toFixed(2) ?? '—'}</div>
                         <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
