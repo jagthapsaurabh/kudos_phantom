@@ -133,13 +133,20 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 ### Running the tests
 ```bash
 # backend (offline; no exchange or DB seed required)
-cd backend && ../.venv/bin/python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
-cd backend && ../.venv/bin/python test_atr_regime_op.py      # 32 checks: per-side ATR operator
-cd backend && ../.venv/bin/python test_paper_history.py      # 56 checks: paper history persistence
+cd backend
+python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
+python test_atr_regime_op.py      # 32 checks: per-side ATR operator
+python test_paper_history.py      # 56 checks: paper history persistence
+python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
+python test_api_e2e.py            # 47 checks: API end to end
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test                                      # 76 checks: trade-log table + CSV export
+cd frontend && npm test            # 76 checks: trade-log table + CSV export
 ```
+The backend tests are plain scripts (no test runner needed) and require only the packages from
+`requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The
+frontend suite runs the components under a forced `TZ=Asia/Calcutta` so the candle-time assertions
+still catch a local/UTC mix-up on a UTC+0 machine; override it with `TEST_TZ=... npm test`.
 `test_delta_and_paper.py` now points `DATABASE_URL` at a temporary SQLite file before importing the
 app, so running the suite no longer clears the seeded candles in `backend/trading_system.db`.
 
