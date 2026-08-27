@@ -20,6 +20,7 @@ python -m app.scripts.seed_admin
 # 2. Seed Market Data (First time only)
 python -m app.scripts.seeder
 
+
 # 3. Start Server
 python run.py
 ```
