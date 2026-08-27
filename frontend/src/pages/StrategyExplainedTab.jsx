@@ -1,7 +1,7 @@
 import React from 'react';
 
 /* ============================================================================
-   PHANTOM Strategy — Explained
+   Kudos Strategy — Explained
    A plain-language, formula-by-formula breakdown of how the strategy works:
    what each setting means, how the value is calculated, where it is used in
    the pipeline and what happens when you change it.

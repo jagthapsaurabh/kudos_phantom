@@ -97,7 +97,7 @@ const TradingPage = ({ type }) => {
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Select Strategy</label>
             <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                     className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
-              <option value="PhantomV2">Phantom V2.5 (Default)</option>
+              <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <option value="Custom">Custom Strategy</option>
             </select>
           </div>

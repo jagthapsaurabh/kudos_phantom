@@ -373,7 +373,7 @@ const PaperTab = () => {
         onConfirm={doStop}
       />
       <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex items-center gap-4 flex-wrap">
-        <button onClick={() => start('PhantomV2')} className="bg-green-600 hover:bg-green-500 px-6 py-3 rounded-xl font-bold">▶ Start Phantom v3 Paper</button>
+        <button onClick={() => start('PhantomV2')} className="bg-green-600 hover:bg-green-500 px-6 py-3 rounded-xl font-bold">▶ Start Kudos v3 Paper</button>
         <button onClick={() => start('FastTest')} className="bg-gray-600 hover:bg-gray-500 px-6 py-3 rounded-xl font-bold">▶ Start FastTest (debug)</button>
         {msg && <span className="text-xs text-gray-400 font-mono">{msg}</span>}
       </div>
@@ -517,7 +517,7 @@ const AdminPanel = () => {
       <header className="mb-8 flex flex-wrap justify-between items-center gap-3">
         <div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-blue-400 tracking-tight">Admin Panel</h1>
-          <p className="text-gray-500 text-sm mt-1">Client accounts, fees, market data & session control — PHANTOM v3</p>
+          <p className="text-gray-500 text-sm mt-1">Client accounts, fees, market data & session control — Kudos v3</p>
         </div>
         <div className="flex items-center gap-2 text-xs bg-gray-800 border border-gray-700 px-3 py-2 rounded-lg">
           <ShieldCheck size={14} className="text-purple-400" />

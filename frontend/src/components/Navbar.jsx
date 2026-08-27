@@ -64,7 +64,7 @@ const Navbar = () => {
     { name: 'Paper Trade', path: '/paper', icon: Activity },
     ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: Radio }] : []),
     { name: 'Strategies', path: '/strategies', icon: PlayCircle },
-    { name: 'Phantom Strategy', path: '/strategy', icon: BookOpen },
+    { name: 'Kudos Strategy', path: '/strategy', icon: BookOpen },
     { name: 'Broker', path: '/broker', icon: Settings },
     ...(role === 'admin' ? [{ name: 'Admin', path: '/admin', icon: Users }] : []),
   ];
@@ -76,7 +76,7 @@ const Navbar = () => {
     <nav className={`bg-gray-950 border-r border-gray-800 text-gray-400 h-full p-2.5 flex flex-col ${slim ? 'w-[68px]' : 'w-[200px]'}`}>
       <div className={`mb-6 mt-1 flex items-center ${slim ? 'justify-center px-0' : 'gap-2 px-2'}`}>
         <TrendingUp size={22} className="text-blue-500 shrink-0" />
-        {!slim && <div className="text-lg font-bold text-blue-500 leading-tight tracking-tight">PHANTOM</div>}
+        {!slim && <div className="text-lg font-bold text-blue-500 leading-tight tracking-tight">Kudos</div>}
       </div>
       <div className="flex-1 space-y-0.5 overflow-y-auto">
         {navItems.map(item => {
@@ -139,7 +139,7 @@ const Navbar = () => {
           <Menu size={20} />
         </button>
         <TrendingUp size={18} className="text-blue-500" />
-        <span className="text-sm font-bold text-blue-400">PHANTOM</span>
+        <span className="text-sm font-bold text-blue-400">Kudos</span>
       </div>
 
       {/* Desktop / tablet sidebar */}

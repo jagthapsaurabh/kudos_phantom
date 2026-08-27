@@ -92,7 +92,7 @@ const Login = () => {
         </form>
         
         <div className="mt-8 text-center text-gray-500 text-xs">
-          Secure Access Only &bull; PHANTOM v3
+          Secure Access Only &bull; Kudos v3
         </div>
       </div>
     </div>

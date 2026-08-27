@@ -106,9 +106,9 @@ const PhantomStrategy = () => {
       <header className="mb-8 flex flex-wrap justify-between items-center gap-3">
         <div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-blue-400 tracking-tight flex items-center gap-3">
-            <BookOpen size={28} /> Phantom Strategy
+            <BookOpen size={28} /> Kudos Strategy
           </h1>
-          <p className="text-gray-500 text-sm mt-1">How PHANTOM v3 enters, manages and exits positions — plus a formula-by-formula deep dive.</p>
+          <p className="text-gray-500 text-sm mt-1">How Kudos v3 enters, manages and exits positions — plus a formula-by-formula deep dive.</p>
         </div>
       </header>
 

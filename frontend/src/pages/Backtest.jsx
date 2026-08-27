@@ -248,7 +248,7 @@ const Backtest = () => {
     return p;
   });
 
-  // The parameter form applies to PhantomV2 and to saved Phantom-style
+  // The parameter form applies to PhantomV2 and to saved Kudos-style
   // strategies (params stored as an object, not Chartink rule arrays).
   const showParamForm = selectedStrategyId === 'PhantomV2' ||
     strategies.some(s => String(s.id) === String(selectedStrategyId) &&
@@ -400,7 +400,7 @@ const Backtest = () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `phantom_trades_run_${results.name || 'export'}.csv`;
+    a.download = `kudos_trades_run_${results.name || 'export'}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -408,7 +408,7 @@ const Backtest = () => {
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const strategyName = runName.trim() || (selectedStrategyId === 'PhantomV2' ? 'Phantom Optimization' : `Custom Run ${selectedStrategyId}`);
+      const strategyName = runName.trim() || (selectedStrategyId === 'PhantomV2' ? 'Kudos Optimization' : `Custom Run ${selectedStrategyId}`);
       const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -476,7 +476,7 @@ const Backtest = () => {
   // Save the current parameter set as a new named strategy so it can be
   // re-run, paper traded or live traded later.
   const saveAsNewStrategy = async () => {
-    const name = (runName.trim() || `Phantom ${new Date().toLocaleString()}`).slice(0, 60);
+    const name = (runName.trim() || `Kudos ${new Date().toLocaleString()}`).slice(0, 60);
     setSaving(true);
     try {
       const res = await fetch(`${API_URL}/strategies/create`, {
@@ -522,7 +522,7 @@ const Backtest = () => {
 
   const handleStrategySelect = (sid) => {
     setSelectedStrategyId(sid);
-    // When a saved Phantom-style strategy is chosen, load its params into the
+    // When a saved Kudos-style strategy is chosen, load its params into the
     // form so the admin can tweak it before re-running.
     const found = strategies.find(s => String(s.id) === String(sid));
     if (found && found.rules && typeof found.rules === 'object' && !Array.isArray(found.rules) &&
@@ -709,7 +709,7 @@ const Backtest = () => {
             <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Strategy to test</label>
             <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
               className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
-              <option value="PhantomV2">Phantom V2.5 (Default)</option>
+              <option value="PhantomV2">Kudos V2.5 (Default)</option>
               {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
           </div>
@@ -737,7 +737,7 @@ const Backtest = () => {
       {showParamForm && (
         <SectionCard
           title="Strategy Configuration"
-          subtitle="Tune PHANTOM parameters, then hide this section when you want more room for results."
+          subtitle="Tune Kudos parameters, then hide this section when you want more room for results."
           icon={SlidersHorizontal}
           collapsed={!sectionVisibility.config}
           onToggle={() => toggleSection('config')}

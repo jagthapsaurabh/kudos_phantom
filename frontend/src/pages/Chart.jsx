@@ -489,7 +489,7 @@ const ChartPage = () => {
           <Radio size={15} className="text-gray-400" />
           <select value={overlayStrategy} onChange={e => setOverlayStrategy(e.target.value)}
             className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none">
-            <option value="PhantomV2">Phantom V2.5 (Champion)</option>
+            <option value="PhantomV2">Kudos V2.5 (Champion)</option>
             <option value="FastTest">FastTest (debug)</option>
             {strategies.map(s => <option key={s.id} value={s.id}>Custom: {s.name}</option>)}
           </select>
@@ -569,7 +569,7 @@ const ChartPage = () => {
             <div className="p-2 bg-purple-500/20 rounded-lg text-purple-400"><Layers size={20} /></div>
             <h3 className="font-bold">Strategy Overlay</h3>
           </div>
-          <p className="text-sm text-gray-400">Overlay Phantom or any custom strategy's signals on {symbol}.</p>
+          <p className="text-sm text-gray-400">Overlay Kudos or any custom strategy's signals on {symbol}.</p>
         </div>
       </div>
     </div>
