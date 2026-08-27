@@ -133,7 +133,7 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 ### Running the tests
 ```bash
 # backend (offline; no exchange or DB seed required)
-cd backend && ../.venv/bin/python test_trade_log_detail.py   # 50 checks: candles, colours, conditions, export columns
+cd backend && ../.venv/bin/python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 cd backend && ../.venv/bin/python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 cd backend && ../.venv/bin/python test_paper_history.py      # 56 checks: paper history persistence
 

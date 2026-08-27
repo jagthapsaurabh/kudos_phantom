@@ -8,9 +8,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np
 import pandas as pd
 
 from app.core.engine import BacktestEngine
+from app.core.indicators import compute_indicators
 from app.core.strategy import PhantomV2Config
 
 PASS, FAIL = [], []
@@ -57,6 +59,35 @@ for label, t in (('first trade', trades[0]),):
 colours = {t.get('entry_candle_type') for t in trades}
 check("entry colours include green and red across the run",
       {'GREEN', 'RED'}.issubset(colours), str(colours))
+
+# The seeded candles never close exactly on their open, so DOJI is documented
+# and rendered by the UI but never actually produced by this run. Exercise the
+# classification directly so the third colour cannot silently rot.
+print("\n== candle colour classification (incl. DOJI, which this data never hits) ==", flush=True)
+_syn = {'is_green': np.array([True, False, False]),
+        'is_red':   np.array([False, True,  False])}
+for _i, _exp in ((0, 'GREEN'), (1, 'RED'), (2, 'DOJI')):
+    _got = BacktestEngine._candle_color(_syn, _i)
+    check(f"close {'>' if _i == 0 else '<' if _i == 1 else '=='} open -> {_exp}",
+          _got == _exp, str(_got))
+check("colour is None when metadata is missing", BacktestEngine._candle_color(None, 0) is None)
+check("colour is None when the bar index is out of range",
+      BacktestEngine._candle_color(_syn, 99) is None)
+check("colour is None when the metadata lacks the keys",
+      BacktestEngine._candle_color({'other': np.array([True])}, 0) is None)
+# The documented rule is close vs open, computed in indicators.py as
+# is_green = c > o, is_red = c < o — confirm that is what feeds the colour.
+_ind = compute_indicators(pd.DataFrame({
+    'open':   [100.0, 100.0, 100.0],
+    'high':   [101.0, 101.0, 101.0],
+    'low':    [99.0,  99.0,  99.0],
+    'close':  [105.0, 95.0, 100.0],   # green, red, doji
+    'volume': [1.0,   1.0,  1.0],
+}, index=pd.date_range('2020-01-01', periods=3, freq='h')))
+_real_meta = {'is_green': _ind['is_green'], 'is_red': _ind['is_red']}
+check("indicators drive the colour end to end",
+      [BacktestEngine._candle_color(_real_meta, i) for i in range(3)] == ['GREEN', 'RED', 'DOJI'],
+      str([BacktestEngine._candle_color(_real_meta, i) for i in range(3)]))
 differ = [t for t in trades if t.get('signal_candle_type') != t.get('entry_candle_type')]
 check("signal and entry candles can differ in colour", len(differ) > 0, str(len(differ)))
 check("legacy candle_type still present (signal candle)",
