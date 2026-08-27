@@ -890,6 +890,36 @@ const Backtest = () => {
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
   const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6'];
 
+  // Custom tooltip for the Exit Distribution pie chart — Recharts default
+  // renders item text in black which is invisible on a dark background.
+  const PieTooltip = ({ active, payload }) => {
+    if (!active || !payload || !payload.length) return null;
+    const { name, value } = payload[0].payload;
+    const color = payload[0].payload.fill || payload[0].color || '#fff';
+    const total = pieData.reduce((s, d) => s + d.value, 0);
+    const pct = total ? ((value / total) * 100).toFixed(1) : '0.0';
+    return (
+      <div style={{
+        backgroundColor: '#1f2937',
+        border: '1px solid #374151',
+        borderRadius: 8,
+        padding: '8px 12px',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+        minWidth: 140,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+          <span style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: color, display: 'inline-block', flexShrink: 0 }} />
+          <span style={{ color: '#e5e7eb', fontWeight: 700, fontSize: 13 }}>{name}</span>
+        </div>
+        <div style={{ color: '#ffffff', fontSize: 13, paddingLeft: 16 }}>
+          <span style={{ fontWeight: 700 }}>{value}</span>
+          <span style={{ color: '#9ca3af', marginLeft: 4 }}>trades</span>
+          <span style={{ color: '#6b7280', marginLeft: 6 }}>({pct}%)</span>
+        </div>
+      </div>
+    );
+  };
+
   useEffect(() => {
     fetchStrategies(); fetchHistory({ autoOpen: true });
     fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []).then(list => {
@@ -1255,9 +1285,13 @@ const Backtest = () => {
                   <ResponsiveContainer width="100%" height={250}>
                     <PieChart>
                       <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
-                        {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
+                        {pieData.map((entry, index) => {
+                          const fill = COLORS[index % COLORS.length];
+                          entry.fill = fill;   // expose fill to PieTooltip payload
+                          return <Cell key={`cell-${index}`} fill={fill} />;
+                        })}
                       </Pie>
-                      <Tooltip contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', color: '#fff' }} />
+                      <Tooltip content={<PieTooltip />} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
