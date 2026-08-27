@@ -226,7 +226,21 @@ class Trade(Base):
     hold_bars = Column(Integer)
     signal_candle_time = Column(DateTime, nullable=True)
     setup = Column(String, nullable=True)
-    candle_type = Column(String, nullable=True)
+    candle_type = Column(String, nullable=True)  # legacy alias: signal-candle colour
+    # Candle-level detail the client asked for: which candle produced the
+    # signal, which candle the entry actually filled on, and the colour of
+    # each (GREEN / RED / DOJI). The entry fills on the candle AFTER the
+    # signal, so these are deliberately separate columns.
+    signal_candle_type = Column(String, nullable=True)
+    entry_candle_time = Column(DateTime, nullable=True)
+    entry_candle_type = Column(String, nullable=True)
+    exit_candle_type = Column(String, nullable=True)
+    # Every entry condition spelled out (value vs threshold vs PASS/FAIL),
+    # one per line, and the exact rule that closed the trade.
+    entry_conditions_detail = Column(String, nullable=True)
+    exit_detail = Column(String, nullable=True)
+    cond_trend_ok = Column(Integer, nullable=True)
+    cond_di_ok = Column(Integer, nullable=True)
     trend_4h = Column(String, nullable=True)
     rsi14 = Column(Float, nullable=True)
     macd_hist = Column(Float, nullable=True)
@@ -242,6 +256,12 @@ class Trade(Base):
     gross_pnl = Column(Float, nullable=True)
     sl = Column(Float, nullable=True)
     tp = Column(Float, nullable=True)
+    # Stop plan at entry vs the levels in force at exit (shows breakeven /
+    # trailing moves) — mirrors what the paper-trade closed list already keeps.
+    sl_entry = Column(Float, nullable=True)
+    trail_stop = Column(Float, nullable=True)
+    atr_at_entry = Column(Float, nullable=True)
+    peak_price = Column(Float, nullable=True)
     entry_dd_pct = Column(Float, nullable=True)
     margin_pct_used = Column(Float, nullable=True)
     equity_at_entry = Column(Float, nullable=True)

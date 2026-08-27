@@ -108,6 +108,29 @@ and each trade's expanded log row shows the test that filtered it.
 }
 ```
 
+**Trade-log detail (`GET /backtest/results/{id}` → `trades[]`).** Each trade now identifies the
+candles involved and explains why it entered and exited. The strategy fires on the **signal**
+candle *i* and fills at the open of candle *i+1*, so both are recorded:
+
+| Field | Meaning |
+| :--- | :--- |
+| `signal_candle_time`, `signal_candle_type` | The candle that raised the signal, and its colour: `GREEN` (`close > open`), `RED` (`close < open`) or `DOJI` (`close == open`) |
+| `entry_candle_time`, `entry_candle_type` | The candle the entry actually filled on (one bar after the signal) and its colour — "which colour got the entry" |
+| `exit_candle_type` | Colour of the candle the position closed on |
+| `entry_conditions_detail` | Multi-line text: every entry condition with the measured value, the threshold applied and `PASS` / `FAIL` / `N/A`. `N/A` means the setup that fired never applies that filter (Setup B momentum enters on the MACD zero-cross, so the MACD-histogram magnitude test is not used) |
+| `exit_detail` | The exact rule that closed the trade, e.g. `Stop loss hit — price rose to 10,260.25 ≥ SL 10,240.23 (initial SL 10,240.23)` |
+| `conditions` | Machine-readable flags: `trend_ok`, `adx_ok`, `macd_hist_ok`, `atr_regime_ok`, `rsi_ok`, `macd_confirm_ok`, `di_ok`. `null` = not applied by that setup |
+| `sl_entry`, `trail_stop`, `atr_at_entry`, `peak_price` | Stop plan actually in force: the initial stop, the final trailing stop, ATR at entry and the best price reached |
+
+`candle_type` is still returned for older saved runs and equals the signal candle colour. All the
+new columns are nullable and are added to existing `trades` tables by `migrate_db()` at startup, so
+older runs simply return `null` for them.
+
+**Excel / CSV export.** The Backtest page's *Excel / CSV Export* button writes one row per trade
+with 42 columns — signal/entry/exit candle times (UTC) and colours, one column per entry condition
+(`PASS` / `FAIL` / `N/A`), the full condition breakdown, the exit condition and its detail, the stop
+plan and the PnL fields. It is UTF-8 with a BOM and CRLF line endings so Excel opens it cleanly.
+
 ---
 
 ### 7. Admin integrations & seeding

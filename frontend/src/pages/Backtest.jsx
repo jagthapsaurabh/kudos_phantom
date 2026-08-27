@@ -56,6 +56,88 @@ const atrRegimeRuleFor = (params, direction) => {
   return `ATR ${symbol} ${ratio} × SMA50(ATR)`;
 };
 
+// PASS / FAIL / N/A for one entry condition. N/A means the setup that fired
+// never applies that filter (e.g. MACD-hist magnitude on a momentum entry),
+// which is different from the trade failing it.
+const condLabel = (v) => (v === undefined || v === null ? 'N/A' : (v ? 'PASS' : 'FAIL'));
+
+// Candle timestamps are UTC. Render them as UTC 24h so the log always points at
+// the same candle regardless of the viewer's timezone (and matches the export).
+const fmtCandleTime = (v, opts = {}) => {
+  if (!v) return '';
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  const base = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} `
+    + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  return opts.seconds ? `${base}:${p(d.getUTCSeconds())}` : base;
+};
+
+// Build the trade-log spreadsheet: which candle signalled, which candle the
+// entry filled on and the colour of each, every entry condition (individual
+// columns plus the full readable breakdown), and the exit condition.
+// Kept pure (trades in, CSV text out) so it can be asserted in tests.
+const buildTradesCSV = (trades) => {
+  const header = [
+    'Trade #', 'Direction', 'Setup',
+    'Signal Candle Time', 'Signal Candle Colour',
+    'Entry Candle Time', 'Entry Candle Colour',
+    'Entry Price',
+    'Exit Time', 'Exit Candle Colour', 'Exit Price',
+    '4H Trend',
+    'RSI14', 'MACD Hist', 'ADX', 'ATR14', 'EMA50 1h', 'EMA50 4h',
+    // Every entry condition, one column each, so the sheet can be filtered.
+    'Entry Cond 1 - 4H Trend', 'Entry Cond 2 - ADX', 'Entry Cond 3 - MACD Hist',
+    'Entry Cond 4 - ATR Regime', 'Entry Cond 5 - RSI Trigger',
+    'Entry Cond 6 - MACD Confirm', 'Entry Cond 7 - DI Confirm',
+    'All Entry Conditions (detail)',
+    // Exit condition: the reason code plus the exact rule that fired.
+    'Exit Condition', 'Exit Condition Detail',
+    'SL at Entry', 'SL at Exit', 'Take Profit', 'Trail Stop', 'ATR at Entry', 'Peak Price',
+    'Lots', 'Margin', 'Notional', 'Margin % Used', 'Drawdown at Entry %',
+    'Gross PnL', 'Fees', 'Net PnL', 'Equity After', 'Drawdown %', 'Bars Held',
+  ];
+  // UTC, to the second, so a row in the sheet matches the on-screen log exactly.
+  const fmtTime = (v) => fmtCandleTime(v, { seconds: true });
+  const num = (v, d = 2) => (v === null || v === undefined ? '' : Number(v).toFixed(d));
+  const rows = (trades || []).map((t, i) => {
+    const c = t.conditions || {};
+    return [
+      i + 1,
+      t.direction === 1 ? 'LONG' : 'SHORT',
+      t.setup || '',
+      fmtTime(t.signal_candle_time || t.entry_time),
+      t.signal_candle_type || t.candle_type || '',
+      fmtTime(t.entry_candle_time || t.entry_time),
+      t.entry_candle_type || '',
+      num(t.entry_price),
+      fmtTime(t.exit_time),
+      t.exit_candle_type || '',
+      num(t.exit_price),
+      t.trend_4h || '',
+      num(t.rsi14, 1), num(t.macd_hist), num(t.adx, 1), num(t.atr14),
+      num(t.ema50_1h), num(t.ema50_4h),
+      condLabel(c.trend_ok), condLabel(c.adx_ok), condLabel(c.macd_hist_ok),
+      condLabel(c.atr_regime_ok), condLabel(c.rsi_ok), condLabel(c.macd_confirm_ok),
+      condLabel(c.di_ok),
+      (t.entry_conditions_detail || '').replace(/\r?\n/g, ' | '),
+      t.exit_reason || '',
+      t.exit_detail || '',
+      num(t.sl_entry), num(t.sl), num(t.tp), num(t.trail_stop),
+      num(t.atr_at_entry), num(t.peak_price),
+      num(t.lots, 4), num(t.margin, 0), num(t.notional, 2),
+      t.margin_pct_used != null ? `${(t.margin_pct_used * 100).toFixed(1)}%` : '',
+      num(t.entry_dd_pct),
+      num(t.gross_pnl), num(t.fees), num(t.net_pnl), num(t.equity_after),
+      num(t.drawdown), t.hold_bars ?? '',
+    ];
+  });
+  // CRLF so Excel keeps one row per line; the caller prepends the UTF-8 BOM so
+  // the ₹ / ≥ characters survive.
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  return [header, ...rows].map(r => r.map(esc).join(',')).join('\r\n');
+};
+
 const isBacktestComplete = (runDetails) => Boolean(
   runDetails
   && runDetails.total_trades !== null
@@ -130,6 +212,149 @@ const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle,
       </div>
     </div>
     {!collapsed && <div className="px-4 pb-4 sm:px-6 sm:pb-6">{children}</div>}
+  </div>
+);
+
+// Trade-log table: which candle signalled, which candle the entry filled on and
+// its colour, plus a per-trade breakdown of every entry condition and the exit rule.
+// Extracted as a component so the new columns can be rendered and asserted in tests.
+const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
+<div className="overflow-x-auto">
+    <table className="w-full text-left text-xs">
+      <thead className="bg-gray-900 uppercase text-gray-500">
+        <tr>
+          <th className="p-3 font-semibold">Signal Candle</th>
+          <th className="p-3 font-semibold">Entry Candle</th>
+          <th className="p-3 font-semibold">Entry</th>
+          <th className="p-3 font-semibold">Exit</th>
+          <th className="p-3 font-semibold">Dir</th>
+          <th className="p-3 font-semibold">Setup</th>
+          <th className="p-3 font-semibold">4H Trend</th>
+          <th className="p-3 font-semibold">RSI</th>
+          <th className="p-3 font-semibold">ADX</th>
+          <th className="p-3 font-semibold">Net PnL</th>
+          <th className="p-3 font-semibold">Reason</th>
+          <th className="p-3 font-semibold">Cond.</th>
+        </tr>
+      </thead>
+      <tbody>
+        {trades?.map((t, i) => (
+          <React.Fragment key={i}>
+            <tr className="cursor-pointer border-b border-gray-700 transition hover:bg-gray-700/30"
+                onClick={() => onToggleRow(expandedTrade === i ? null : i)}>
+              <td className="p-3">
+                <div className="font-mono text-gray-400">{fmtCandleTime(t.signal_candle_time || t.entry_time) || 'N/A'}</div>
+                <CandleChip color={t.signal_candle_type || t.candle_type} label="signal" />
+              </td>
+              <td className="p-3">
+                <div className="font-mono text-gray-400">{fmtCandleTime(t.entry_candle_time || t.entry_time) || 'N/A'}</div>
+                <CandleChip color={t.entry_candle_type} label="entry" />
+              </td>
+              <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
+              <td className="p-3">
+                <div>{(t.exit_price || 0).toFixed(2)}</div>
+                <CandleChip color={t.exit_candle_type} label="exit" />
+              </td>
+              <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
+              <td className="p-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
+              <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
+              <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
+              <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
+              <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
+              <td className="p-3"><span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span></td>
+              <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
+            </tr>
+            {expandedTrade === i && (
+              <tr className="border-b border-gray-700 bg-gray-900/60">
+                <td colSpan={12} className="p-4">
+                  {/* Every entry condition spelled out: measured value vs the
+                      threshold applied, and PASS/FAIL. Built by the engine so it
+                      always matches what was actually evaluated. */}
+                  {t.entry_conditions_detail && (
+                    <div className="mb-3 rounded-lg border border-gray-700 bg-gray-900 p-3">
+                      <div className="mb-1.5 text-[9px] font-bold uppercase text-gray-500">
+                        Entry Conditions — {t.setup || 'setup'} on the {t.signal_candle_type || t.candle_type || '—'} signal candle,
+                        filled on the {t.entry_candle_type || '—'} entry candle
+                      </div>
+                      <div className="space-y-0.5 font-mono text-[10px]">
+                        {String(t.entry_conditions_detail).split('\n').map((line, li) => (
+                          <div key={li}
+                               className={line.endsWith('PASS') ? 'text-green-400'
+                                 : line.endsWith('FAIL') ? 'text-red-400'
+                                 : 'text-gray-400'}>
+                            {line}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {t.exit_detail && (
+                    <div className="mb-3 rounded-lg border border-gray-700 bg-gray-900 p-3">
+                      <div className="mb-1.5 text-[9px] font-bold uppercase text-gray-500">
+                        Exit Condition — {t.exit_reason || '—'} on the {t.exit_candle_type || '—'} candle
+                      </div>
+                      <div className="font-mono text-[10px] text-yellow-300">{t.exit_detail}</div>
+                    </div>
+                  )}
+                  <div className="grid grid-cols-2 gap-3 text-[11px] md:grid-cols-4">
+                    <div>
+                      <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Condition Flags</div>
+                      <div className="flex flex-wrap gap-1">
+                        <CondChip ok={t.conditions?.trend_ok} label={`4h trend (${t.trend_4h || '?'})`} />
+                        <CondChip ok={t.conditions?.adx_ok} label={`ADX≥min (${t.adx?.toFixed(1) ?? '?'})`} />
+                        <CondChip ok={t.conditions?.macd_hist_ok} label="MACD-hist mag" />
+                        <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
+                        <CondChip ok={t.conditions?.rsi_ok} label={t.setup === 'MOMENTUM' ? 'RSI agreement' : 'RSI trigger'} />
+                        <CondChip ok={t.conditions?.macd_confirm_ok} label={t.setup === 'MOMENTUM' ? 'MACD zero-cross' : 'MACD confirm'} />
+                        <CondChip ok={t.conditions?.di_ok} label="DI confirm" />
+                      </div>
+                      <div className="mt-1.5 text-[9px] text-gray-500">
+                        ATR test: <span className="font-mono text-gray-300">{atrRegimeRuleFor(params, t.direction)}</span>
+                        <span className="ml-2 text-gray-600">·  '·' means the setup that fired never applies that filter</span>
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        <CandleChip color={t.signal_candle_type || t.candle_type} label="signal" />
+                        <CandleChip color={t.entry_candle_type} label="entry" />
+                        <CandleChip color={t.exit_candle_type} label="exit" />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Indicators @ Signal</div>
+                      <div className="space-y-0.5 font-mono text-gray-300">
+                        <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
+                        <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
+                        <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
+                        <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Risk Model</div>
+                      <div className="space-y-0.5 font-mono text-gray-300">
+                        <div>SL: {t.sl?.toFixed(2) ?? '—'}{t.sl_entry != null && Math.abs(t.sl - t.sl_entry) > 0.005 ? ` (entry ${t.sl_entry.toFixed(2)})` : ''}</div>
+                        <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
+                        <div>Trail stop: {t.trail_stop?.toFixed(2) ?? '—'} • ATR@entry: {t.atr_at_entry?.toFixed(2) ?? '—'}</div>
+                        <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
+                        <div>Lots: {(t.lots || 0).toFixed(4)} • DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Result</div>
+                      <div className="space-y-0.5 font-mono text-gray-300">
+                        <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
+                        <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
+                        <div>Exit: {fmtCandleTime(t.exit_time) || '—'} ({t.hold_bars || 0} bars)</div>
+                        <div>Peak: {t.peak_price?.toFixed(2) ?? '—'}</div>
+                        <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
+                      </div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            )}
+          </React.Fragment>
+        ))}
+      </tbody>
+    </table>
   </div>
 );
 
@@ -399,23 +624,8 @@ const Backtest = () => {
 
   const exportTradesCSV = () => {
     if (!results?.trades?.length) return;
-    const cols = [
-      'signal_candle_time', 'entry_time', 'exit_time', 'direction', 'setup',
-      'candle_type', 'trend_4h', 'rsi14', 'macd_hist', 'adx', 'atr14', 'ema50_1h', 'ema50_4h',
-      'entry_price', 'sl', 'tp', 'exit_price', 'exit_reason', 'lots', 'margin', 'notional',
-      'gross_pnl', 'fees', 'net_pnl', 'equity_after', 'drawdown', 'hold_bars',
-    ];
-    const condCols = ['cond_adx_ok', 'cond_macd_hist_ok', 'cond_atr_regime_ok', 'cond_rsi_ok', 'cond_macd_confirm_ok'];
-    const header = [...cols, ...condCols];
-    const rows = results.trades.map(t => {
-      const conds = t.conditions || {};
-      const mapped = cols.map(c => t[c] ?? '');
-      const mappedConds = [conds.adx_ok, conds.macd_hist_ok, conds.atr_regime_ok, conds.rsi_ok, conds.macd_confirm_ok]
-        .map(v => v === undefined || v === null ? '' : (v ? 'TRUE' : 'FALSE'));
-      return [...mapped, ...mappedConds];
-    });
-    const csv = [header.join(','), ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const csv = buildTradesCSV(results.trades);
+    const blob = new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -998,8 +1208,9 @@ const Backtest = () => {
             onToggle={() => toggleSection('summary')}
             actions={
               <>
-                <button onClick={exportTradesCSV} className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold transition hover:bg-blue-500">
-                  <Download size={14} /> CSV Export
+                <button onClick={exportTradesCSV} title="Opens directly in Excel — includes every entry condition, the exit condition and the candle colours"
+                        className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold transition hover:bg-blue-500">
+                  <Download size={14} /> Excel / CSV Export
                 </button>
                 <button onClick={() => requestDeleteRun(results.id, results.name)} className="flex items-center gap-2 rounded-lg bg-red-900/30 px-4 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/50">
                   <Trash2 size={14} /> Delete
@@ -1091,106 +1302,20 @@ const Backtest = () => {
 
           <SectionCard
             title={`Detailed Trade Logs (${results.trades?.length || 0})`}
-            subtitle="Entry conditions per candle. Expand a row for deeper inspection."
+            subtitle="Which candle signalled, which candle the entry filled on and its colour. Expand a row for every entry condition and the exact exit rule."
             icon={Activity}
             collapsed={!sectionVisibility.trades}
             onToggle={() => toggleSection('trades')}
             actions={
-              <button onClick={exportTradesCSV} className="rounded bg-blue-600 px-3 py-1 text-[10px] font-bold transition hover:bg-blue-500">
-                ⬇ CSV Export
+              <button onClick={exportTradesCSV} title="Opens directly in Excel — includes every entry condition, the exit condition and the candle colours"
+                      className="rounded bg-blue-600 px-3 py-1 text-[10px] font-bold transition hover:bg-blue-500">
+                ⬇ Excel / CSV Export
               </button>
             }
             className="overflow-hidden"
           >
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-gray-900 uppercase text-gray-500">
-                  <tr>
-                    <th className="p-3 font-semibold">Signal Candle</th>
-                    <th className="p-3 font-semibold">Entry</th>
-                    <th className="p-3 font-semibold">Exit</th>
-                    <th className="p-3 font-semibold">Dir</th>
-                    <th className="p-3 font-semibold">Setup</th>
-                    <th className="p-3 font-semibold">Candle</th>
-                    <th className="p-3 font-semibold">4H Trend</th>
-                    <th className="p-3 font-semibold">RSI</th>
-                    <th className="p-3 font-semibold">ADX</th>
-                    <th className="p-3 font-semibold">Net PnL</th>
-                    <th className="p-3 font-semibold">Reason</th>
-                    <th className="p-3 font-semibold">Cond.</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.trades?.map((t, i) => (
-                    <React.Fragment key={i}>
-                      <tr className="cursor-pointer border-b border-gray-700 transition hover:bg-gray-700/30"
-                          onClick={() => setExpandedTrade(expandedTrade === i ? null : i)}>
-                        <td className="p-3 font-mono text-gray-400">{t.signal_candle_time ? new Date(t.signal_candle_time).toLocaleString() : (t.entry_time ? new Date(t.entry_time).toLocaleString() : 'N/A')}</td>
-                        <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
-                        <td className="p-3">{(t.exit_price || 0).toFixed(2)}</td>
-                        <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
-                        <td className="p-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
-                        <td className={`p-3 ${t.candle_type === 'GREEN' ? 'text-green-400' : t.candle_type === 'RED' ? 'text-red-400' : 'text-gray-400'}`}>{t.candle_type || '—'}</td>
-                        <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
-                        <td className="p-3">{t.rsi14 != null ? t.rsi14.toFixed(1) : '—'}</td>
-                        <td className="p-3">{t.adx != null ? t.adx.toFixed(1) : '—'}</td>
-                        <td className={`p-3 font-bold ${t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
-                        <td className="p-3"><span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span></td>
-                        <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
-                      </tr>
-                      {expandedTrade === i && (
-                        <tr className="border-b border-gray-700 bg-gray-900/60">
-                          <td colSpan={12} className="p-4">
-                            <div className="grid grid-cols-2 gap-3 text-[11px] md:grid-cols-4">
-                              <div>
-                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Entry Conditions</div>
-                                <div className="flex flex-wrap gap-1">
-                                  <CondChip ok={t.conditions?.adx_ok} label={`ADX≥min (${t.adx?.toFixed(1) ?? '?'})`} />
-                                  <CondChip ok={t.conditions?.macd_hist_ok} label="MACD-hist mag" />
-                                  <CondChip ok={t.conditions?.atr_regime_ok} label="ATR regime" />
-                                  <CondChip ok={t.conditions?.rsi_ok} label="RSI trigger" />
-                                  <CondChip ok={t.conditions?.macd_confirm_ok} label="MACD confirm" />
-                                </div>
-                                <div className="mt-1.5 text-[9px] text-gray-500">
-                                  ATR test: <span className="font-mono text-gray-300">{atrRegimeRuleFor(results.params, t.direction)}</span>
-                                </div>
-                              </div>
-                              <div>
-                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Indicators @ Signal</div>
-                                <div className="space-y-0.5 font-mono text-gray-300">
-                                  <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
-                                  <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
-                                  <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
-                                  <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
-                                </div>
-                              </div>
-                              <div>
-                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Risk Model</div>
-                                <div className="space-y-0.5 font-mono text-gray-300">
-                                  <div>SL: {t.sl?.toFixed(2) ?? '—'}</div>
-                                  <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
-                                  <div>Margin: ₹{(t.margin || 0).toFixed(0)} ({((t.margin_pct_used || 0) * 100).toFixed(1)}%)</div>
-                                  <div>Lots: {(t.lots || 0).toFixed(4)} • DD@entry: {(t.entry_dd_pct || 0).toFixed(1)}%</div>
-                                </div>
-                              </div>
-                              <div>
-                                <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Result</div>
-                                <div className="space-y-0.5 font-mono text-gray-300">
-                                  <div>Gross: ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
-                                  <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Net: ₹{(t.net_pnl || 0).toFixed(2)}</div>
-                                  <div>Exit: {t.exit_time ? new Date(t.exit_time).toLocaleString() : '—'} ({t.hold_bars || 0} bars)</div>
-                                  <div>Equity: ₹{(t.equity_after || 0).toFixed(0)} • DD: {(t.drawdown || 0).toFixed(2)}%</div>
-                                </div>
-                              </div>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </React.Fragment>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <TradeLogTable trades={results.trades} params={results.params}
+                expandedTrade={expandedTrade} onToggleRow={setExpandedTrade} />
           </SectionCard>
         </div>
       ) : (
@@ -1220,6 +1345,24 @@ const MetricRow = ({ label, value, color = "text-gray-200" }) => (
   </div>
 );
 
+// Colour of a single candle (GREEN / RED / DOJI). The `label` says which
+// candle it belongs to — signal, entry or exit — because the entry fills on the
+// candle after the signal and the two colours are often different.
+const CandleChip = ({ color, label }) => {
+  if (!color) return null;
+  const cls = color === 'GREEN'
+    ? 'bg-green-900/30 text-green-400 border-green-800/40'
+    : color === 'RED'
+      ? 'bg-red-900/30 text-red-400 border-red-800/40'
+      : 'bg-gray-800 text-gray-500 border-gray-700';
+  return (
+    <span className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${cls}`}
+          title={`${label} candle colour: ${color}`}>
+      {color === 'GREEN' ? '▲' : color === 'RED' ? '▼' : '●'} {color}
+    </span>
+  );
+};
+
 const CondChip = ({ ok, label }) => (
   <span className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
     ok ? 'bg-green-900/30 text-green-400 border-green-800/40'
@@ -1229,5 +1372,7 @@ const CondChip = ({ ok, label }) => (
     {ok ? '✓' : (ok === false || ok === 0 ? '✗' : '·')} {label}
   </span>
 );
+
+export { buildTradesCSV, condLabel, fmtCandleTime, TradeLogTable, CandleChip, CondChip, atrRegimeRuleFor as atrRegimeRuleForProbe };
 
 export default Backtest;

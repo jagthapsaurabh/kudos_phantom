@@ -109,6 +109,8 @@ row = hist[0] if hist else {}
 check("history row is 'running'", row.get("status") == "running", str(row)[:200])
 check("history row carries strategy + capital",
       row.get("strategy_name") == "Kudos V2.5 (Default)" and row.get("initial_capital") == 20000, str(row)[:200])
+check("history row carries the traded symbol",
+      row.get("symbol") == "BTCUSDT", str(row.get("symbol")))
 check("status endpoint exposes session_id",
       client.get("/paper-trade/status", headers=H).json()[0].get("session_id") == svc.session_id)
 

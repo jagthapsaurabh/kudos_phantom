@@ -418,6 +418,19 @@ class StrategyService:
             'ema50_1h': ind_1h['ema50'], 'ema50_4h': ema50_4h_map,
             'pdi': pdi, 'mdi': mdi,
             'trend': trend_col, 'is_green': is_green, 'is_red': is_red,
+            # Reference values the trade log needs to spell out every entry
+            # condition (actual value vs the threshold that was applied).
+            'atr_sma50': atr_sma,
+            'rsi_prev': rsi_prev,
+            'macd_hist_long': hist_long, 'macd_hist_short': hist_short,
+            'macd_hist_long_prev': hist_long_prev, 'macd_hist_short_prev': hist_short_prev,
+            'close': close,
+            # Setup B (momentum) masks, kept separate from the reversal masks so
+            # a MOMENTUM trade's log shows the filters that actually fired.
+            'cond_di_long': pdi > mdi, 'cond_di_short': mdi > pdi,
+            'cond_mom_cross_long': cross_up, 'cond_mom_cross_short': cross_dn,
+            'cond_mom_rsi_long': rsi_v >= cfg.momentum_rsi_min,
+            'cond_mom_rsi_short': rsi_v <= 100.0 - cfg.momentum_rsi_min,
             # Per-direction condition masks (used by the engine snapshot to
             # log which filter passed for the side a trade actually fired on).
             'cond_adx_ok_long': adx_ok_l, 'cond_adx_ok_short': adx_ok_s,

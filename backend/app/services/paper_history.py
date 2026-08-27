@@ -147,6 +147,7 @@ def _payload(service, status=None):
         config_json = None
     values = {
         'status': status or getattr(service, 'history_status', STATUS_RUNNING),
+        'symbol': getattr(service, 'symbol', None) or 'BTCUSDT',
         'strategy_id': str(getattr(service, 'strategy_id', '') or ''),
         'strategy_name': getattr(service, 'strategy_name', None) or str(getattr(service, 'strategy_id', '')),
         'data_source': getattr(service, 'market_source', None) or 'Binance',

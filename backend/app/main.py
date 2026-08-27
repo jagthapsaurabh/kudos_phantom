@@ -1089,14 +1089,28 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                     # PHANTOM v3: entry-condition snapshot (candle, setup, indicators)
                     "signal_candle_time": t.signal_candle_time, "setup": t.setup,
                     "candle_type": t.candle_type, "trend_4h": t.trend_4h,
+                    # Which candle signalled vs which candle the entry filled on,
+                    # and the colour of each — plus the colour of the exit candle.
+                    "signal_candle_type": t.signal_candle_type or t.candle_type,
+                    "entry_candle_time": t.entry_candle_time,
+                    "entry_candle_type": t.entry_candle_type,
+                    "exit_candle_type": t.exit_candle_type,
+                    # Full readable entry/exit condition breakdown for the
+                    # trade log and the Excel/CSV export.
+                    "entry_conditions_detail": t.entry_conditions_detail,
+                    "exit_detail": t.exit_detail,
                     "rsi14": t.rsi14, "macd_hist": t.macd_hist, "adx": t.adx,
                     "atr14": t.atr14, "ema50_1h": t.ema50_1h, "ema50_4h": t.ema50_4h,
                     "conditions": {
+                        "trend_ok": t.cond_trend_ok,
                         "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
                         "atr_regime_ok": t.cond_atr_regime_ok, "rsi_ok": t.cond_rsi_ok,
                         "macd_confirm_ok": t.cond_macd_confirm_ok,
+                        "di_ok": t.cond_di_ok,
                     },
                     "gross_pnl": t.gross_pnl, "sl": t.sl, "tp": t.tp,
+                    "sl_entry": t.sl_entry, "trail_stop": t.trail_stop,
+                    "atr_at_entry": t.atr_at_entry, "peak_price": t.peak_price,
                     "entry_dd_pct": t.entry_dd_pct, "margin_pct_used": t.margin_pct_used,
                     "equity_at_entry": t.equity_at_entry } for t in trades]
     return {
