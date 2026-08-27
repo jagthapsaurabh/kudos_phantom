@@ -138,7 +138,7 @@ cd backend && ../.venv/bin/python test_atr_regime_op.py      # 32 checks: per-si
 cd backend && ../.venv/bin/python test_paper_history.py      # 56 checks: paper history persistence
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test                                      # 72 checks: trade-log table + CSV export
+cd frontend && npm test                                      # 76 checks: trade-log table + CSV export
 ```
 `test_delta_and_paper.py` now points `DATABASE_URL` at a temporary SQLite file before importing the
 app, so running the suite no longer clears the seeded candles in `backend/trading_system.db`.

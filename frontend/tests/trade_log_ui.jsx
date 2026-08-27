@@ -102,6 +102,23 @@ check('fmtCandleTime ignores the viewer timezone (UTC only)',
   fmtCandleTime('2020-12-31T23:30:00.000000') === '2020-12-31 23:30');
 check('fmtCandleTime empty on missing input', fmtCandleTime(null) === '' && fmtCandleTime('') === '');
 check('fmtCandleTime empty on garbage', fmtCandleTime('not-a-date') === '');
+// Regression: the API returns naive UTC strings with no "Z". JS parses a
+// datetime with no timezone designator as LOCAL time, so without appending "Z"
+// every candle time shifted by the viewer's offset (this suite runs at
+// Asia/Calcutta, so the shift would be -05:30).
+check('naive UTC timestamp is read as UTC, not local time',
+  fmtCandleTime('2020-06-26T13:41:59.523330') === '2020-06-26 13:41'
+  && fmtCandleTime('2020-06-26T13:41:59.523330', { seconds: true }) === '2020-06-26 13:41:59',
+  fmtCandleTime('2020-06-26T13:41:59.523330'));
+check('timestamp already carrying Z is left alone',
+  fmtCandleTime('2020-06-26T13:41:59.000Z') === '2020-06-26 13:41');
+check('timestamp with an explicit offset is honoured',
+  fmtCandleTime('2020-06-26T13:41:59+05:30') === '2020-06-26 08:11',
+  fmtCandleTime('2020-06-26T13:41:59+05:30'));
+check('naive timestamp near midnight does not roll to another date',
+  fmtCandleTime('2020-06-26T00:30:00.000000') === '2020-06-26 00:30'
+  && fmtCandleTime('2020-12-31T23:59:59.000000') === '2020-12-31 23:59',
+  `${fmtCandleTime('2020-06-26T00:30:00.000000')} / ${fmtCandleTime('2020-12-31T23:59:59.000000')}`);
 
 // ---------- 3. the table renders, showing candle + colour per trade ----------
 const html = render(React.createElement(TradeLogTable, {

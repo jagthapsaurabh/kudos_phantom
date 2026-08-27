@@ -38,7 +38,14 @@ for (const file of files) {
     continue;
   }
   try {
-    execFileSync(process.execPath, [out], { stdio: 'inherit' });
+    // Run under a non-UTC zone on purpose. Candle timestamps come back from the
+    // API as naive UTC strings, and JS parses those as local time — so a test
+    // suite run at UTC+0 would pass even if the code shifted every time by the
+    // viewer's offset. Asia/Calcutta is the real deployment zone.
+    execFileSync(process.execPath, [out], {
+      stdio: 'inherit',
+      env: { ...process.env, TZ: process.env.TEST_TZ || 'Asia/Calcutta' },
+    });
   } catch {
     failed = 1;
   }

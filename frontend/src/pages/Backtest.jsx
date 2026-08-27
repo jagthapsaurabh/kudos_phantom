@@ -65,7 +65,11 @@ const condLabel = (v) => (v === undefined || v === null ? 'N/A' : (v ? 'PASS' : 
 // the same candle regardless of the viewer's timezone (and matches the export).
 const fmtCandleTime = (v, opts = {}) => {
   if (!v) return '';
-  const d = new Date(v);
+  // The API returns naive UTC strings ("2020-06-26T13:41:59.523330"). JS parses
+  // a datetime with no timezone designator as LOCAL time, so without the "Z" a
+  // viewer in Asia/Calcutta would see every candle time shifted by -05:30.
+  const s = String(v);
+  const d = new Date(/(Z|[+-]\d{2}:?\d{2})$/.test(s) ? s : `${s}Z`);
   if (Number.isNaN(d.getTime())) return '';
   const p = (n) => String(n).padStart(2, '0');
   const base = `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} `
