@@ -120,6 +120,12 @@ to the second) and colours, one column per entry condition (`PASS` / `FAIL` / `N
 condition breakdown, the exit condition and its detail, the stop plan and the PnL fields. The file is
 UTF-8 with a BOM and CRLF line endings, so Excel opens it without turning `₹` and `≥` into mojibake.
 
+That button is separate from the raw engine dump described above
+(`backend/logs/phantom_v3_trades.csv`, 47 machine-readable columns written by
+`BacktestEngine.export_trade_log`). The engine file keeps the raw values — `cond_*_ok` as
+`True`/`False`/blank, snake_case headers — for scripting; the UI export is the human-readable sheet,
+rendering those same flags as `PASS` / `FAIL` / `N/A` and adding the candle colours and times.
+
 Paper sessions export the same per-trade fields (`entry_time, exit_time, direction, symbol, entry,
 exit, lots, margin_inr, notional_usd, sl, sl_final, tp, trail_stop, atr_at_entry, peak_price,
 bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
