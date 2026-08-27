@@ -125,6 +125,48 @@ class Klines(Base):
     __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
 
 
+class MarketDataSeedProgress(Base):
+    """Durable cursor for a bounded historical market-data seed.
+
+    A row is one requested source/definition, symbol, interval and date
+    range. The cursor is advanced in the same database transaction as the
+    candles from the completed window, so a restart repeats at most the
+    in-flight request rather than the already committed history.
+    """
+    __tablename__ = 'market_data_seed_progress'
+    id = Column(Integer, primary_key=True)
+    source = Column(String, nullable=False, index=True)
+    definition_key = Column(String, nullable=False, default='', index=True)
+    symbol = Column(String, nullable=False, index=True)
+    interval = Column(String, nullable=False, index=True)
+    requested_start = Column(DateTime, nullable=False)
+    requested_end = Column(DateTime, nullable=False)
+    next_start = Column(DateTime, nullable=False)
+    page_limit = Column(Integer, nullable=False)
+    interval_seconds = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default='running', index=True)  # running | failed | completed
+    pages = Column(Integer, nullable=False, default=0)
+    empty_pages = Column(Integer, nullable=False, default=0)
+    fetched = Column(Integer, nullable=False, default=0)
+    inserted = Column(Integer, nullable=False, default=0)
+    updated = Column(Integer, nullable=False, default=0)
+    last_error = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    __table_args__ = (
+        UniqueConstraint(
+            'source', 'definition_key', 'symbol', 'interval',
+            'requested_start', 'requested_end',
+            name='uq_market_data_seed_progress_range',
+        ),
+        Index(
+            'ix_market_data_seed_progress_lookup',
+            'source', 'definition_key', 'symbol', 'interval',
+        ),
+    )
+
+
 class CustomStrategy(Base):
     __tablename__ = 'custom_strategies'
     id = Column(Integer, primary_key=True)

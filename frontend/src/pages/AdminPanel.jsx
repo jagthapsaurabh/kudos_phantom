@@ -533,25 +533,300 @@ const FeeSettingsTab = () => {
 
 // --------------------------------------------------------------- Seed data --
 const SeedDataTab = () => {
-  const [defs, setDefs] = useState([]); const [fetchAll, setFetchAll] = useState(false); const [source, setSource] = useState('Binance'); const [symbol, setSymbol] = useState('BTCUSDT'); const [intervals, setIntervals] = useState(['1m', '5m', '15m', '1h', '4h', '1d']); const [start, setStart] = useState(''); const [end, setEnd] = useState(''); const [limit, setLimit] = useState(1000); const [status, setStatus] = useState([]); const [busy, setBusy] = useState(false); const [msg, setMsg] = useState(null); const [file, setFile] = useState(null); const [csvInterval, setCsvInterval] = useState('1h'); const [testResult, setTestResult] = useState(null);
-  const f = 'bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
-  const load = async () => { const [d, s] = await Promise.all([fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.json()), fetch(`${API_URL}/admin/market-data/status`, { headers: authHeaders() }).then(r => r.json())]); setDefs(d || []); setStatus(s || []); };
+  const ALL_INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+  const DELTA_INTERVALS = ['15m', '1h', '4h', '1d'];
+  const builtInDefs = [
+    { code: 'Binance', name: 'Binance Futures', kind: 'binance' },
+    { code: 'Delta', name: 'Delta Exchange', kind: 'delta' },
+  ];
+  const today = () => {
+    const now = new Date();
+    const pad = value => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  };
+
+  const [defs, setDefs] = useState([]);
+  const [fetchAll, setFetchAll] = useState(false);
+  const [source, setSource] = useState('Binance');
+  const [symbol, setSymbol] = useState('BTCUSDT');
+  const [intervals, setIntervals] = useState(ALL_INTERVALS);
+  const [start, setStart] = useState('');
+  const [end, setEnd] = useState('');
+  const [limit, setLimit] = useState(1000);
+  const [status, setStatus] = useState([]);
+  const [progress, setProgress] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [file, setFile] = useState(null);
+  const [csvInterval, setCsvInterval] = useState('1h');
+  const [testResult, setTestResult] = useState(null);
+  const f = 'w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none focus:border-blue-500';
+  const sourceOptions = defs.length ? defs : builtInDefs;
+  const selectedDef = sourceOptions.find(item => item.code === source);
+  const isDeltaSource = source === 'Delta' || selectedDef?.kind === 'delta';
+  const availableIntervals = isDeltaSource ? DELTA_INTERVALS : ALL_INTERVALS;
+
+  const load = async () => {
+    try {
+      const [definitions, datasets, seedProgress] = await Promise.all([
+        fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.json()),
+        fetch(`${API_URL}/admin/market-data/status`, { headers: authHeaders() }).then(r => r.json()),
+        fetch(`${API_URL}/admin/market-data/progress`, { headers: authHeaders() }).then(r => r.json()),
+      ]);
+      setDefs(Array.isArray(definitions) ? definitions : []);
+      setStatus(Array.isArray(datasets) ? datasets : []);
+      setProgress(Array.isArray(seedProgress) ? seedProgress : []);
+    } catch (error) {
+      setMsg({ ok: false, text: `Could not load seed status: ${error.message}` });
+    }
+  };
   useEffect(() => { load(); }, []);
-  const seed = async e => { e.preventDefault(); setBusy(true); setMsg(null); setTestResult(null); const res = await fetch(`${API_URL}/admin/market-data/seed`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ source, symbol: symbol.toUpperCase(), intervals, start_date: start || null, end_date: end || null, limit: Number(limit), fetch_all: fetchAll }) }); const data = await res.json(); setBusy(false); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Seed failed' }); else { const summary = data.summary || []; const seeded = summary.reduce((n, x) => n + (x.fetched || 0), 0); const failed = summary.filter(x => x.error).map(x => `${x.interval}: ${x.error}`); if (failed.length) setMsg({ ok: false, text: `${data.status} — seeded ${seeded} candles. ${failed.join(' | ')}` }); else setMsg({ ok: true, text: `Seeded ${seeded} OHLCV candles.` }); load(); } };
-  const testSource = async () => { setBusy(true); setMsg(null); setTestResult(null); try { const res = await fetch(`${API_URL}/admin/market-data/test?source=${encodeURIComponent(source)}&symbol=${encodeURIComponent(symbol.toUpperCase())}&interval=1h`, { headers: authHeaders() }); const data = await res.json(); setTestResult(res.ok ? data : { ok: false, detail: data.detail || 'Test failed' }); } catch (err) { setTestResult({ ok: false, detail: err.message }); } setBusy(false); };
-  const upload = async e => { e.preventDefault(); if (!file) return; setBusy(true); const body = new FormData(); body.append('file', file); body.append('source', source); body.append('symbol', symbol.toUpperCase()); body.append('interval', csvInterval); const res = await fetch(`${API_URL}/admin/market-data/seed-csv`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }, body }); const data = await res.json(); setBusy(false); setMsg(res.ok ? { ok: true, text: `Imported ${data.summary?.fetched || 0} candles with volume.` } : { ok: false, text: data.detail || 'CSV import failed' }); if (res.ok) load(); };
-  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><DateInput value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><DateInput value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Working…' : 'Fetch & Seed OHLCV'}</button><button type="button" disabled={busy} onClick={testSource} className="bg-gray-700 hover:bg-gray-600 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm" title="Fetch 3 candles from this source to verify connectivity — run this if a seed returns 0 candles">Test connection</button></form></div>
-    {testResult && (
-      <div className={`mt-4 p-3 rounded-xl border text-xs font-mono ${testResult.ok ? 'border-green-800 bg-green-900/20 text-green-300' : 'border-red-800 bg-red-900/20 text-red-300'}`}>
-        <div className="font-bold mb-1">{testResult.ok ? '✓ Connection OK' : '✗ Connection problem'}</div>
-        <div>{testResult.detail}</div>
-        {testResult.ok && testResult.rows > 0 && <div className="mt-1 opacity-80">rows={testResult.rows} · first={testResult.first} · last={testResult.last}</div>}
+
+  const applyDeltaPreset = () => {
+    const delta = sourceOptions.find(item => item.kind === 'delta' || item.code === 'Delta');
+    setSource(delta?.code || 'Delta');
+    setSymbol('BTCUSDT');
+    setIntervals(DELTA_INTERVALS);
+    setStart('2020-01-01');
+    setEnd(today());
+    setLimit(2000);
+    setFetchAll(true);
+    setMsg({ ok: true, text: 'Delta full-history preset ready: 15m, 1h, 4h and 1d through today.' });
+  };
+
+  const handleSourceChange = nextSource => {
+    const nextDef = sourceOptions.find(item => item.code === nextSource);
+    const nextIsDelta = nextSource === 'Delta' || nextDef?.kind === 'delta';
+    setSource(nextSource);
+    setTestResult(null);
+    if (nextIsDelta) {
+      setIntervals(DELTA_INTERVALS);
+      setStart('2020-01-01');
+      setEnd(today());
+      setLimit(2000);
+      setFetchAll(true);
+      if (csvInterval === '1m' || csvInterval === '5m') setCsvInterval('1h');
+    } else {
+      setIntervals(ALL_INTERVALS);
+      setStart('');
+      setEnd('');
+      setLimit(1000);
+      setFetchAll(false);
+    }
+  };
+
+  const formatSummary = (data, verb) => {
+    const summary = Array.isArray(data.summary) ? data.summary : [];
+    const fetched = summary.reduce((total, row) => total + (row.fetched || 0), 0);
+    const failures = summary
+      .filter(row => row.error)
+      .map(row => `${row.source || ''}${row.interval ? ` ${row.interval}` : ''}: ${row.error}`);
+    if (failures.length) return { ok: false, text: `${data.status || verb} — ${fetched.toLocaleString()} candles. ${failures.join(' | ')}` };
+    return { ok: true, text: `${data.status || verb} — ${fetched.toLocaleString()} candles processed.` };
+  };
+
+  const seed = async event => {
+    event.preventDefault();
+    if (!intervals.length) {
+      setMsg({ ok: false, text: 'Select at least one candle interval.' });
+      return;
+    }
+    setBusy(true);
+    setMsg(null);
+    setTestResult(null);
+    const requestIntervals = isDeltaSource ? DELTA_INTERVALS : intervals;
+    try {
+      const res = await fetch(`${API_URL}/admin/market-data/seed`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          source,
+          symbol: symbol.toUpperCase(),
+          intervals: requestIntervals,
+          start_date: isDeltaSource ? (start || '2020-01-01') : (start || null),
+          end_date: isDeltaSource ? (end || today()) : (end || null),
+          limit: Number(limit),
+          fetch_all: isDeltaSource || fetchAll,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Seed failed');
+      setMsg(formatSummary(data, 'Seed completed'));
+      await load();
+    } catch (error) {
+      setMsg({ ok: false, text: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const syncNow = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await fetch(`${API_URL}/admin/market-data/sync-now`, {
+        method: 'POST', headers: authHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Daily refresh failed');
+      setMsg(formatSummary(data, 'Daily refresh completed'));
+      await load();
+    } catch (error) {
+      setMsg({ ok: false, text: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testSource = async () => {
+    setBusy(true);
+    setMsg(null);
+    setTestResult(null);
+    try {
+      const probeInterval = isDeltaSource ? '1h' : (intervals[0] || '1h');
+      const res = await fetch(`${API_URL}/admin/market-data/test?source=${encodeURIComponent(source)}&symbol=${encodeURIComponent(symbol.toUpperCase())}&interval=${probeInterval}`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      setTestResult(res.ok ? data : { ok: false, detail: data.detail || 'Test failed' });
+    } catch (error) {
+      setTestResult({ ok: false, detail: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const upload = async event => {
+    event.preventDefault();
+    if (!file) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      body.append('source', source);
+      body.append('symbol', symbol.toUpperCase());
+      body.append('interval', csvInterval);
+      const res = await fetch(`${API_URL}/admin/market-data/seed-csv`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+        body,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'CSV import failed');
+      setMsg({ ok: true, text: `Imported ${(data.summary?.fetched || 0).toLocaleString()} candles with volume.` });
+      setFile(null);
+      await load();
+    } catch (error) {
+      setMsg({ ok: false, text: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="max-w-7xl space-y-5">
+      <div className="rounded-2xl border border-gray-700 bg-gray-800 p-6">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h3 className="flex items-center gap-2 text-sm font-bold uppercase text-gray-200"><Database size={16} className="text-blue-400" /> Seed market data</h3>
+            <p className="mt-2 max-w-4xl text-xs text-gray-500">Seed OHLCV candles separately for each exchange. Existing candles are upserted by source, symbol, interval and timestamp. Volume is required for every candle.</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={applyDeltaPreset} disabled={busy} className="rounded-lg border border-orange-800/60 bg-orange-900/20 px-3 py-2 text-xs font-bold text-orange-300 transition hover:bg-orange-900/40 disabled:opacity-50">Delta 2020 → today</button>
+            <button type="button" onClick={syncNow} disabled={busy} className="flex items-center gap-2 rounded-lg border border-blue-800/60 bg-blue-900/20 px-3 py-2 text-xs font-bold text-blue-300 transition hover:bg-blue-900/40 disabled:opacity-50"><RefreshCw size={13} /> Run daily refresh now</button>
+          </div>
+        </div>
+
+        {isDeltaSource ? (
+          <div className="mt-5 rounded-xl border border-orange-800/50 bg-orange-900/15 p-4 text-xs text-orange-200">
+            <div className="font-bold">Delta Exchange history mode</div>
+            <p className="mt-1 text-orange-300/80">Delta returns a maximum of 2,000 candles per request. The backend splits 1 Jan 2020 → today into safe date windows, retries rate limits, and continues through empty pre-listing windows. 1m and 5m are intentionally excluded; this screen will seed 15m, 1h, 4h and 1d only.</p>
+          </div>
+        ) : (
+          <div className="mt-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
+            <span className="font-bold text-blue-300">Daily refresh:</span> the API automatically refreshes Binance and every enabled Binance-compatible or Delta-compatible broker once per day. Generic integrations need a compatible adapter before they can be fetched.
+          </div>
+        )}
+
+        <form onSubmit={seed} className="mt-5 grid grid-cols-1 items-end gap-4 md:grid-cols-4">
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Source</label>
+            <select className={f} value={source} onChange={event => handleSourceChange(event.target.value)}>
+              {sourceOptions.map(item => <option key={item.code} value={item.code}>{item.name || item.code}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Symbol</label>
+            <input className={f} value={symbol} onChange={event => setSymbol(event.target.value)} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">From</label>
+            <DateInput value={start} onChange={event => setStart(event.target.value)} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">To</label>
+            <DateInput value={end} onChange={event => setEnd(event.target.value)} />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 md:col-span-3">
+            <span className="text-[10px] font-bold uppercase text-gray-500">Intervals</span>
+            {availableIntervals.map(interval => (
+              <label key={interval} className="flex items-center gap-1 text-xs text-gray-300">
+                <input type="checkbox" checked={intervals.includes(interval)} onChange={event => setIntervals(event.target.checked ? [...new Set([...intervals, interval])] : intervals.filter(item => item !== interval))} className="accent-blue-500" /> {interval}
+              </label>
+            ))}
+            {isDeltaSource && <span className="text-[10px] font-semibold text-orange-400">1m / 5m excluded by Delta history plan</span>}
+            {!isDeltaSource && <label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={fetchAll} onChange={event => setFetchAll(event.target.checked)} className="accent-blue-500" /> Fetch all date windows</label>}
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Candles per API request</label>
+            <input type="number" min="10" max="2000" className={f} value={limit} onChange={event => setLimit(event.target.value)} />
+          </div>
+
+          <div className="flex flex-wrap gap-2 md:col-span-4">
+            <button disabled={busy} className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-bold transition hover:bg-blue-500 disabled:opacity-50">{busy ? 'Working…' : isDeltaSource ? 'Seed Delta history' : 'Fetch & seed OHLCV'}</button>
+            <button type="button" disabled={busy} onClick={testSource} className="rounded-lg bg-gray-700 px-5 py-2.5 text-sm font-bold transition hover:bg-gray-600 disabled:opacity-50" title="Probe one safe 1h request before a long seed">Test connection</button>
+          </div>
+        </form>
       </div>
-    )}
-    <form onSubmit={upload} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex flex-wrap items-end gap-4"><div><label className="text-[10px] text-gray-500 uppercase block">CSV file (event_time, open, high, low, close, volume)</label><input type="file" accept=".csv" onChange={e => setFile(e.target.files?.[0])} className="text-sm text-gray-400 mt-2" /></div><div><label className="text-[10px] text-gray-500 uppercase block">CSV interval</label><select className={f} value={csvInterval} onChange={e => setCsvInterval(e.target.value)}>{['1m','5m','15m','1h','4h','1d'].map(i => <option key={i}>{i}</option>)}</select></div><button disabled={!file || busy} className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm flex items-center gap-2"><Upload size={14} /> Import CSV</button></form>
-    {msg && <div className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
-    <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="p-4 border-b border-gray-700 flex justify-between"><h3 className="font-bold text-gray-300">Seeded datasets</h3><button onClick={load} className="text-gray-400 hover:text-white"><RefreshCw size={15} /></button></div><div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 text-blue-300 font-bold">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{row.count}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>{status.length === 0 && <div className="p-8 text-center text-gray-500">No seeded data yet.</div>}</div>
-  </div>;
+
+      {testResult && (
+        <div className={`rounded-xl border p-3 text-xs font-mono ${testResult.ok ? 'border-green-800 bg-green-900/20 text-green-300' : 'border-red-800 bg-red-900/20 text-red-300'}`}>
+          <div className="mb-1 font-bold">{testResult.ok ? '✓ Connection OK' : '✗ Connection problem'}</div>
+          <div>{testResult.detail}</div>
+          {testResult.ok && testResult.rows > 0 && <div className="mt-1 opacity-80">rows={testResult.rows} · first={testResult.first} · last={testResult.last}</div>}
+        </div>
+      )}
+
+      <form onSubmit={upload} className="flex flex-wrap items-end gap-4 rounded-2xl border border-gray-700 bg-gray-800 p-6">
+        <div>
+          <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">CSV file (event_time, open, high, low, close, volume)</label>
+          <input type="file" accept=".csv" onChange={event => setFile(event.target.files?.[0] || null)} className="mt-2 text-sm text-gray-400" />
+        </div>
+        <div>
+          <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">CSV interval</label>
+          <select className={f} value={csvInterval} onChange={event => setCsvInterval(event.target.value)}>
+            {(isDeltaSource ? DELTA_INTERVALS : ALL_INTERVALS).map(interval => <option key={interval}>{interval}</option>)}
+          </select>
+        </div>
+        <button disabled={!file || busy} className="flex items-center gap-2 rounded-lg bg-gray-600 px-5 py-2.5 text-sm font-bold transition hover:bg-gray-500 disabled:opacity-50"><Upload size={14} /> Import CSV</button>
+      </form>
+
+      {msg && <div className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
+
+      {progress.length > 0 && (
+        <div className="overflow-hidden rounded-2xl border border-gray-700 bg-gray-800">
+          <div className="border-b border-gray-700 p-4"><h3 className="font-bold text-gray-300">Historical seed progress</h3><p className="mt-1 text-[10px] text-gray-600">Each committed window advances a durable cursor. Re-running the same range resumes at the next uncommitted window and completed ranges are skipped.</p></div>
+          <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Interval</th><th className="p-3">Status</th><th className="p-3">Windows</th><th className="p-3">Cursor</th><th className="p-3">Error</th></tr></thead><tbody>{progress.slice(0, 20).map(row => <tr key={`${row.source}-${row.definition}-${row.symbol}-${row.interval}-${row.requested_start}-${row.requested_end}`} className="border-t border-gray-700"><td className="p-3 font-bold text-blue-300">{row.source}</td><td className="p-3">{row.interval}</td><td className={`p-3 font-bold ${row.status === 'completed' ? 'text-green-400' : row.status === 'failed' ? 'text-red-400' : 'text-orange-300'}`}>{row.status}</td><td className="p-3 font-mono">{row.pages} <span className="text-gray-600">({row.fetched?.toLocaleString?.() || 0} candles)</span></td><td className="p-3 text-gray-500">{row.next_start?.split('T')[0]} / {row.requested_end?.split('T')[0]}</td><td className="max-w-md truncate p-3 text-red-300" title={row.last_error || ''}>{row.last_error || '—'}</td></tr>)}</tbody></table></div>
+        </div>
+      )}
+
+      <div className="overflow-hidden rounded-2xl border border-gray-700 bg-gray-800">
+        <div className="flex items-center justify-between border-b border-gray-700 p-4"><div><h3 className="font-bold text-gray-300">Seeded datasets</h3><p className="mt-1 text-[10px] text-gray-600">Daily refresh runs automatically after the API starts, then every 24 hours.</p></div><button onClick={load} className="text-gray-400 transition hover:text-white" title="Refresh dataset status"><RefreshCw size={15} /></button></div>
+        <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 font-bold text-blue-300">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{Number(row.count || 0).toLocaleString()}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>
+        {status.length === 0 && <div className="p-8 text-center text-sm text-gray-500">No seeded data yet.</div>}
+      </div>
+    </div>
+  );
 };
 
 // ------------------------------------------------------------------- Main --

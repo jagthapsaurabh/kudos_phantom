@@ -14,7 +14,7 @@ from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
-    BrokerDefinition, BrokerConnection, FeeSetting,
+    MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
 )
 import bcrypt
 from passlib.context import CryptContext
@@ -186,9 +186,19 @@ def _resolve_strategy_payload(db, strategy_id, user_id, fees):
 
 
 async def daily_sync_task():
+    """Refresh Binance and every enabled compatible broker once per day.
+
+    The synchronous exchange adapters run in a worker thread so a long or
+    rate-limited seed/refresh never blocks FastAPI's event loop. Delta uses its
+    supported 15m/1h/4h/1d set here; the 1m/5m history is deliberately omitted.
+    """
     while True:
-        DataSyncService.sync_market_data()
-        # Sleep for 24 hours (86400 seconds)
+        try:
+            await asyncio.to_thread(DataSyncService.sync_all_configured_sources_daily)
+        except Exception as exc:
+            # A single unavailable exchange must not kill the 24-hour loop.
+            print(f"Daily market-data sync failed: {exc}")
+        # Sleep for 24 hours (86400 seconds).
         await asyncio.sleep(86400)
 
 @app.on_event("startup")
@@ -688,11 +698,24 @@ def delete_broker_connection(connection_id: int, user=Depends(get_current_user),
 class MarketSeedPayload(BaseModel):
     source: str = 'Binance'
     symbol: str = 'BTCUSDT'
-    intervals: List[str] = ['1m', '5m', '15m', '1h', '4h', '1d']
+    # None lets the adapter choose its safe default. Delta defaults to the
+    # full-history-compatible 15m/1h/4h/1d set; Binance keeps all app candles.
+    intervals: Optional[List[str]] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     limit: int = 1000
     fetch_all: bool = False
+
+
+def _market_definition(db, source):
+    """Resolve an enabled broker definition for API seeding/syncing."""
+    normalized = normalize_source(source)
+    row = db.query(BrokerDefinition).filter(BrokerDefinition.code == normalized).first()
+    if row is not None and not row.enabled:
+        raise HTTPException(status_code=400, detail=f"Market-data source '{normalized}' is disabled")
+    if row is None and normalized not in ('Binance', 'Delta'):
+        raise HTTPException(status_code=404, detail=f"Broker integration '{normalized}' not found")
+    return normalized, row
 
 
 @app.get('/admin/market-data/status')
@@ -709,33 +732,87 @@ def market_data_status(admin=Depends(require_admin), db=Depends(get_db)):
 
 
 @app.post('/admin/market-data/seed')
-def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin)):
+def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), db=Depends(get_db)):
     try:
-        from .services.data_sync import DataSyncService
-        intervals = [i for i in payload.intervals if i in DataSyncService.TIMEFRAMES]
-        if not intervals: raise HTTPException(status_code=400, detail='Select at least one valid interval')
+        source, definition = _market_definition(db, payload.source)
+        kind = DataSyncService._adapter_kind(source, definition)
+        intervals = payload.intervals
+        if intervals is not None:
+            intervals = [str(interval).lower() for interval in intervals if str(interval).lower() in DataSyncService.TIMEFRAMES]
+            if not intervals:
+                raise HTTPException(status_code=400, detail='Select at least one valid interval')
+        if kind == 'delta' and intervals:
+            excluded = sorted(set(intervals) & DataSyncService.DELTA_EXCLUDED_INTERVALS)
+            if excluded:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"Delta Exchange full-history seeding excludes {', '.join(excluded)}. "
+                            f"Select only {', '.join(DataSyncService.DELTA_HISTORY_INTERVALS)}."),
+                )
         summary = DataSyncService.seed_market_data(
-            normalize_source(payload.source), payload.symbol.upper(), intervals,
-            payload.start_date, payload.end_date, max(1, min(payload.limit, 2000)))
+            source=source,
+            symbol=payload.symbol.upper(),
+            intervals=intervals,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            limit=max(1, min(payload.limit, DataSyncService.DELTA_MAX_CANDLES)),
+            fetch_all=payload.fetch_all,
+            definition=definition,
+        )
         # Per-interval failures are reported in the summary instead of 502 so
         # the admin can see exactly which interval failed and why.
-        ok = sum(1 for s in summary if not s.get('error'))
+        ok = sum(1 for item in summary if not item.get('error'))
         status = 'Seed completed' if ok == len(summary) else ('Seed failed' if ok == 0 else 'Seed completed with errors')
-        return {'status': status, 'summary': summary}
-    except HTTPException: raise
+        return {'status': status, 'source': source, 'symbol': payload.symbol.upper(),
+                'fetch_all': payload.fetch_all, 'summary': summary}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.get('/admin/market-data/progress')
+def market_data_seed_progress(admin=Depends(require_admin), db=Depends(get_db)):
+    """Show durable historical-seed cursors for restart/resume diagnostics."""
+    rows = db.query(MarketDataSeedProgress).order_by(
+        MarketDataSeedProgress.updated_at.desc(), MarketDataSeedProgress.id.desc(),
+    ).limit(100).all()
+    return [{
+        'source': row.source, 'definition': row.definition_key,
+        'symbol': row.symbol, 'interval': row.interval,
+        'requested_start': row.requested_start, 'requested_end': row.requested_end,
+        'next_start': row.next_start, 'status': row.status,
+        'pages': row.pages, 'empty_pages': row.empty_pages,
+        'fetched': row.fetched, 'inserted': row.inserted, 'updated': row.updated,
+        'last_error': row.last_error, 'updated_at': row.updated_at,
+        'completed_at': row.completed_at,
+    } for row in rows]
+
+
 @app.get('/admin/market-data/test')
 def test_market_data_source(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
-                            admin=Depends(require_admin)):
+                            admin=Depends(require_admin), db=Depends(get_db)):
     """Round-trip probe: shows exactly what the exchange answers for a tiny
     request, so an empty seed (0 candles) can be diagnosed from the UI."""
-    from .services.data_sync import DataSyncService
+    source, definition = _market_definition(db, source)
+    interval = str(interval).lower()
     if interval not in DataSyncService.TIMEFRAMES:
         raise HTTPException(status_code=400, detail='Invalid interval')
-    return DataSyncService.test_source(normalize_source(source), symbol.upper(), interval)
+    if DataSyncService._adapter_kind(source, definition) == 'delta' and interval in DataSyncService.DELTA_EXCLUDED_INTERVALS:
+        raise HTTPException(status_code=400, detail='Delta connection tests exclude 1m and 5m; use 15m, 1h, 4h, or 1d')
+    return DataSyncService.test_source(source, symbol.upper(), interval, definition=definition)
+
+
+@app.post('/admin/market-data/sync-now')
+def sync_market_data_now(admin=Depends(require_admin)):
+    """Run the same incremental multi-source cycle used by the daily task."""
+    try:
+        summary = DataSyncService.sync_all_configured_sources_daily()
+        ok = sum(1 for item in summary if not item.get('error'))
+        status = 'Daily refresh completed' if ok == len(summary) else ('Daily refresh failed' if ok == 0 else 'Daily refresh completed with errors')
+        return {'status': status, 'summary': summary}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.post('/admin/market-data/seed-csv')

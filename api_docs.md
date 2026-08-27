@@ -100,9 +100,13 @@ supported for older configs and enables all of the original directional override
 | `POST` | `/admin/fee-settings` | `broker_code`, `mode`, `taker_fee_bps`, `maker_fee_bps`, `enabled` | Add/update a fee schedule |
 | `GET` | `/admin/brokers` | None | List configured integrations |
 | `POST` | `/admin/brokers` | `code`, `name`, `kind`, endpoint URLs | Register another broker/data adapter |
-| `POST` | `/admin/market-data/seed` | `source`, `symbol`, `intervals`, dates, `limit`, `fetch_all` | Fetch and upsert OHLCV data with volume |
+| `POST` | `/admin/market-data/seed` | `source`, `symbol`, `intervals`, dates, `limit`, `fetch_all` | Fetch and upsert OHLCV data with volume. Delta full-history requests are split into API-safe windows and exclude `1m`/`5m`. |
+| `POST` | `/admin/market-data/sync-now` | None | Run the same incremental multi-source refresh used by the daily scheduler |
 | `POST` | `/admin/market-data/seed-csv` | Multipart CSV + `source`, `symbol`, `interval` | Import `event_time,open,high,low,close,volume` data |
 | `GET` | `/admin/market-data/status` | None | Dataset counts, ranges and volume coverage |
+| `GET` | `/admin/market-data/progress` | None | Durable full-history seed cursors, status, counts and last error |
+
+For the requested Delta backfill, send `source: "Delta"`, `intervals: ["15m", "1h", "4h", "1d"]`, `start_date: "2020-01-01"`, `end_date` as today, `limit: 2000`, and `fetch_all: true`. The server makes one bounded request per window because Delta returns at most 2,000 OHLC candles and charges three rate-limit units per request. `1m` and `5m` are rejected for this Delta seed plan. Every completed window and its next cursor are committed atomically with the candles in `market_data_seed_progress`; a restart resumes the saved cursor and an already-completed request is not fetched again. `GET /admin/market-data/progress` exposes this state. The daily scheduler refreshes all supported intervals for Binance and enabled Binance-compatible / Delta-compatible broker definitions; Delta daily refresh also excludes `1m` and `5m`. Generic broker definitions are reported as skipped until an adapter is configured.
 
 ## 🛠️ Utility
 | Method | Endpoint | Request Body | Description |

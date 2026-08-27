@@ -44,7 +44,9 @@ const ExchangeRegistry = () => {
       </div>
       <p className="text-xs text-gray-500 mb-4 max-w-3xl">
         Binance Futures and Delta Exchange are ready-to-use adapters. Register another provider here so it is
-        available as a named source for every client; a runtime adapter is required before live orders can be sent to a custom source.
+        available as a named source for every client. Choose <b className="text-gray-300">Binance-compatible</b> or
+        <b className="text-gray-300"> Delta-compatible</b> for automatic daily OHLC refresh; Generic / custom
+        sources remain disabled for market-data sync until a runtime adapter is added.
       </p>
 
       <form onSubmit={add} className={`${card} mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 items-end`}>
