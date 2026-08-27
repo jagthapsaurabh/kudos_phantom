@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
 from .services.paper_trader import PaperTradeService, _to_ist
+from .services import paper_history
 from .services.live_trader import LiveTradeService
 from .services.data_sync import DataSyncService
 from .database.models import (
@@ -204,6 +205,11 @@ async def daily_sync_task():
 @app.on_event("startup")
 def startup():
     init_db()
+    # Sessions saved as 'running' belong to a process that no longer exists
+    # (the server restarted). Flag them so History shows why they stopped.
+    interrupted = paper_history.mark_interrupted_sessions()
+    if interrupted:
+        print(f"[paper-history] marked {interrupted} paper session(s) as interrupted")
     # Start the background sync task
     asyncio.create_task(daily_sync_task())
 
@@ -466,10 +472,13 @@ def update_client(client_id: int, payload: ClientUpdate, admin=Depends(require_a
                 raise HTTPException(status_code=400, detail="Admin accounts cannot be deactivated")
             user.is_active = int(payload.is_active)
             if not payload.is_active:
-                # Stop the client's running sessions
+                # Stop the client's running sessions. The saved history rows
+                # are finalised (not deleted) so the results stay reviewable.
                 for key in list(paper_trade_instances.keys()):
                     if f"_{user.username}_" in key:
-                        paper_trade_instances[key].is_running = False
+                        svc = paper_trade_instances[key]
+                        svc.is_running = False
+                        paper_history.finalize_session(key, svc)
                         del paper_trade_instances[key]
                 for key in list(live_trade_instances.keys()):
                     if f"_{user.username}_" in key:
@@ -1080,14 +1089,28 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                     # PHANTOM v3: entry-condition snapshot (candle, setup, indicators)
                     "signal_candle_time": t.signal_candle_time, "setup": t.setup,
                     "candle_type": t.candle_type, "trend_4h": t.trend_4h,
+                    # Which candle signalled vs which candle the entry filled on,
+                    # and the colour of each — plus the colour of the exit candle.
+                    "signal_candle_type": t.signal_candle_type or t.candle_type,
+                    "entry_candle_time": t.entry_candle_time,
+                    "entry_candle_type": t.entry_candle_type,
+                    "exit_candle_type": t.exit_candle_type,
+                    # Full readable entry/exit condition breakdown for the
+                    # trade log and the Excel/CSV export.
+                    "entry_conditions_detail": t.entry_conditions_detail,
+                    "exit_detail": t.exit_detail,
                     "rsi14": t.rsi14, "macd_hist": t.macd_hist, "adx": t.adx,
                     "atr14": t.atr14, "ema50_1h": t.ema50_1h, "ema50_4h": t.ema50_4h,
                     "conditions": {
+                        "trend_ok": t.cond_trend_ok,
                         "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
                         "atr_regime_ok": t.cond_atr_regime_ok, "rsi_ok": t.cond_rsi_ok,
                         "macd_confirm_ok": t.cond_macd_confirm_ok,
+                        "di_ok": t.cond_di_ok,
                     },
                     "gross_pnl": t.gross_pnl, "sl": t.sl, "tp": t.tp,
+                    "sl_entry": t.sl_entry, "trail_stop": t.trail_stop,
+                    "atr_at_entry": t.atr_at_entry, "peak_price": t.peak_price,
                     "entry_dd_pct": t.entry_dd_pct, "margin_pct_used": t.margin_pct_used,
                     "equity_at_entry": t.equity_at_entry } for t in trades]
     return {
@@ -1232,6 +1255,17 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
         'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
         'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
+        # The exact ATR regime test applied to each side, including the
+        # operator (>=, <=, >, <) the client picked. Shared mode reports the
+        # same rule twice.
+        'atr_regime_rules': {
+            'long': config.atr_regime_rule_for(1),
+            'short': config.atr_regime_rule_for(-1),
+            'operators': {
+                'long': config.atr_regime_op_for(1),
+                'short': config.atr_regime_op_for(-1),
+            },
+        },
         'buckets': out,
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
@@ -1319,10 +1353,16 @@ def start_paper_trade(
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name)
+    # Every instance is mirrored into paper_sessions so stopping it (or a
+    # server restart) no longer throws the result away.
+    service.instance_key = instance_key
+    service.user_id = user.id
+    session_id = paper_history.start_session(user.id, instance_key, service)
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
             "strategy_name": service.strategy_name, "data_source": source,
+            "session_id": session_id,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
@@ -1330,14 +1370,22 @@ async def stop_paper_trade(instance_key: str, user=Depends(get_current_user)):
     if f"_{user.username}_" not in instance_key:
         raise HTTPException(status_code=403, detail="Not your instance")
     if instance_key in paper_trade_instances:
-        await paper_trade_instances[instance_key].stop()
+        service = paper_trade_instances[instance_key]
+        await service.stop()
+        # Keep the saved row: the client reviews the result in History.
+        session_id = paper_history.finalize_session(instance_key, service)
         del paper_trade_instances[instance_key]
-        return {"status": "Paper trade stopped"}
+        return {"status": "Paper trade stopped", "saved_to_history": session_id is not None,
+                "session_id": session_id}
     raise HTTPException(status_code=404, detail="Instance not found")
 
 @app.delete("/paper-trade/{instance_key}")
 async def delete_paper_trade(instance_key: str, user=Depends(get_current_user)):
-    """Stop and remove one paper-trade session from the user's workspace."""
+    """Stop a session and permanently remove it, including its saved history.
+
+    Stopping keeps the result in History; this is the destructive action, so
+    the UI asks for confirmation before calling it.
+    """
     if f"_{user.username}_" not in instance_key:
         raise HTTPException(status_code=403, detail="Not your instance")
     service = paper_trade_instances.get(instance_key)
@@ -1345,7 +1393,44 @@ async def delete_paper_trade(instance_key: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Instance not found")
     await service.stop()
     del paper_trade_instances[instance_key]
-    return {"status": "Paper trade deleted", "instance_key": instance_key}
+    purged = paper_history.delete_record(instance_key)
+    return {"status": "Paper trade deleted", "instance_key": instance_key,
+            "history_removed": purged}
+
+
+# --- PAPER TRADE HISTORY (persisted, survives stop / restart) ------------
+@app.get("/paper-trade/history")
+def get_paper_history(user=Depends(get_current_user), db=Depends(get_db)):
+    """Every paper session this user has run, newest first.
+
+    Rows are written while the instance runs and finalised when it stops, so
+    the client can review trades, equity curve and logs of a stopped session.
+    """
+    try:
+        return paper_history.list_sessions(user.id, db)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load paper history: {str(exc)}")
+
+
+@app.get("/paper-trade/history/{session_id}")
+def get_paper_history_detail(session_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Full saved detail for one session: trades, equity curve, logs, params."""
+    detail = paper_history.get_session(session_id, user.id, db)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Paper session not found")
+    return detail
+
+
+@app.delete("/paper-trade/history/{session_id}")
+def delete_paper_history(session_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Delete one saved paper session from History."""
+    found, instance_key = paper_history.delete_session(session_id, user.id, db)
+    if not found:
+        raise HTTPException(status_code=404, detail="Paper session not found")
+    # If the worker is somehow still alive, drop it from the workspace too.
+    if instance_key and instance_key in paper_trade_instances:
+        paper_trade_instances.pop(instance_key, None)
+    return {"status": "Paper session deleted", "id": session_id}
 
 
 @app.get("/paper-trade/status")
@@ -1392,6 +1477,9 @@ def get_paper_status(user=Depends(get_current_user)):
                 "instance_key": key, "strategy_id": service.strategy_id,
                 "strategy_name": getattr(service, 'strategy_name', service.strategy_id),
                 "created_at": getattr(service, 'created_at', None),
+                # Saved paper_sessions row for this worker (History deep link).
+                "session_id": getattr(service, 'session_id', None),
+                "equity_curve": list(getattr(service, 'equity_history', []) or [])[-200:],
                 "data_source": service.market_source, "broker_name": service.broker_name,
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,

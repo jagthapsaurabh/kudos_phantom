@@ -4,6 +4,7 @@ Runs a local mock 'exchange' (HTTP server) and points DataSyncService at it,
 so no real network access is needed.
 """
 import json
+import os
 import sys
 import threading
 from datetime import datetime, timezone
@@ -11,6 +12,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, '.')
+
+# Isolate the database BEFORE any app import: this test clears the klines table
+# to check the seeder, which used to wipe the developer's real seeded market
+# data (backend/trading_system.db) and leave every backtest failing with
+# "Insufficient data in DB for the selected date range".
+TESTDB = "/tmp/delta_paper_test.db"
+if os.path.exists(TESTDB):
+    os.unlink(TESTDB)
+os.environ["DATABASE_URL"] = f"sqlite:///{TESTDB}"
 
 from app.services.data_sync import DataSyncService, MarketDataError
 from app.services.order_manager import OrderManager

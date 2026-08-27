@@ -151,6 +151,13 @@ const StrategyExplainedTab = ({ champion }) => {
           average; lower ratio = more trades (includes quiet markets); higher = only volatile,
           fast-moving regimes. Directional caps can also exclude the top-volatility quartile.
           Uses <K>atr_regime_ratio</K> (and optional <K>atr_regime_max</K>).
+          <br /><br />
+          <b>Per-side comparison:</b> turning on <i>Use separate Long / Short Min ATR floor</i> in the
+          Backtest form lets each side pick its own operator — <K>&gt;</K>, <K>&lt;</K>, <K>≥</K> or
+          <K>≤</K> — plus its own ratio, via <K>entry_conditions.long.atr_regime_op</K> /
+          <K>entry_conditions.short.atr_regime_op</K>. Both sides default to <K>≥</K>, so the rule is
+          unchanged until it is edited. Example: longs with <K>ATR ≥ 0.5 × SMA</K> and shorts with
+          <K>ATR &lt; 1.2 × SMA</K> to avoid shorting volatility spikes.
         </Item>
         <Item name="Cooldown bars" formula="Skip new entries for cooldown_bars candles after a trade closes">
           After a closed trade the engine refuses new entries until this many candles have passed —

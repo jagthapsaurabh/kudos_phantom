@@ -38,7 +38,23 @@ const StrategyRulesTab = ({ profile, champion }) => {
         <Rule name="1. Trend alignment (4h)">Close(1h) &gt; EMA50(4h) — longs only with the macro uptrend. Shorts require Close &lt; EMA50(4h).</Rule>
         <Rule name="2. ADX filter">ADX(14) ≥ {cfg.adx_min ?? 10} — market must be trending, not chopping.</Rule>
         <Rule name="3. MACD magnitude">|MACD-hist(12,26,9)| ≥ {cfg.macd_hist_min ?? 5} — enough momentum behind the move. The MACD indicator uses periods {cfg.macd_fast ?? 12}/{cfg.macd_slow ?? 26}/{cfg.macd_signal ?? 9}; <b>macd_hist_min is the threshold</b> applied to that histogram, not the indicator itself.</Rule>
-        <Rule name="4. ATR volatility regime">ATR(14) ≥ {cfg.atr_regime_ratio ?? 0.5} × SMA50(ATR) — volatility must be alive.</Rule>
+        <Rule name="4. ATR volatility regime">
+          {(() => {
+            const ec = cfg.entry_conditions || {};
+            const perSide = !!(ec.use_direction_conditions || ec.use_direction_atr_floor);
+            const sym = { '>=': '≥', '<=': '≤', '>': '>', '<': '<' };
+            const ruleFor = (side) => {
+              const b = (perSide && ec[side]) || {};
+              const op = b.atr_regime_op || '>=';
+              return `ATR(14) ${sym[op] || op} ${b.atr_regime_ratio ?? cfg.atr_regime_ratio ?? 0.5} × SMA50(ATR)`;
+            };
+            return perSide ? (
+              <>Long: <b className="text-green-300">{ruleFor('long')}</b> · Short: <b className="text-red-300">{ruleFor('short')}</b> — the comparison and ratio are set per side.</>
+            ) : (
+              <>ATR(14) ≥ {cfg.atr_regime_ratio ?? 0.5} × SMA50(ATR) — volatility must be alive.</>
+            );
+          })()}
+        </Rule>
         <Rule name="5. Reversal trigger">Prev candle RSI(14) &lt; {cfg.rsi_oversold ?? 40} (long) / &gt; {cfg.rsi_overbought ?? 60} (short) <b>and</b> current candle closes green (long) / red (short).</Rule>
         <Rule name="6. MACD confirmation">MACD-hist rising vs previous bar (long) / falling (short).</Rule>
       </DocSection>

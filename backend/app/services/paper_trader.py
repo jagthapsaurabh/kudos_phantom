@@ -30,10 +30,12 @@ def _to_ist(value) -> str:
 class PaperTradeService:
     MAX_LOG_LINES = 200  # keep last N log entries per instance
     MAX_CLOSED_TRADES = 100  # keep last N closed trades per instance
+    MAX_EQUITY_POINTS = 5000  # equity-curve resolution kept in memory/DB
+    PERSIST_EVERY_TICKS = 5  # quiet ticks between database snapshots (minutes)
 
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
                  is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
-                 broker_definition=None, strategy_name=None):
+                 broker_definition=None, strategy_name=None, user_id=None):
         self.strategy_id = str(strategy_id)
         # Custom strategies are identified by a numeric id internally. Keep a
         # human-readable name on the worker so every status/list view can show
@@ -41,6 +43,8 @@ class PaperTradeService:
         self.strategy_name = strategy_name or self.strategy_id
         self.is_custom = is_custom
         self.created_at = _ist_now()
+        self.symbol = "BTCUSDT"
+        self.user_id = user_id
         self.market_source = market_source or "Binance"
         self.broker_name = broker_name or self.market_source
         self.broker_definition = broker_definition
@@ -73,6 +77,16 @@ class PaperTradeService:
         self.logs: list = []
         # Closed-trade history: list of trade dicts
         self.closed_trades: list = []
+        # Equity curve: list of {"ts": ISO-IST, "equity": float}. Sampled once
+        # per tick and on every fill so the saved session can be reviewed (and
+        # charted) after the instance is stopped.
+        self.equity_history: list = [{"ts": self.created_at, "equity": float(initial_capital)}]
+        # Persistence bookkeeping (see app.services.paper_history). The API
+        # fills both in when the instance is registered.
+        self.instance_key = None
+        self.session_id = None
+        self.history_status = "running"
+        self._tick_count = 0
         self._log("info", f"Instance initialised — strategy={self.strategy_name}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
 
     def _log(self, level: str, msg: str):
@@ -119,6 +133,29 @@ class PaperTradeService:
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
             self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
 
+    def _record_equity_point(self):
+        """Append one equity-curve sample (IST timestamp, equity in ₹)."""
+        self.equity_history.append({"ts": _ist_now(), "equity": float(self.equity_inr)})
+        if len(self.equity_history) > self.MAX_EQUITY_POINTS:
+            self.equity_history = self.equity_history[-self.MAX_EQUITY_POINTS:]
+
+    def _persist_history(self, force=False):
+        """Mirror the session into the paper_sessions table.
+
+        Writes on every trade event and every ``PERSIST_EVERY_TICKS`` quiet
+        ticks, so the History view is current without hammering the database
+        once a minute. Never raises — bookkeeping must not kill the loop.
+        """
+        if not self.session_id:
+            return
+        if not (force or self._tick_count % self.PERSIST_EVERY_TICKS == 0):
+            return
+        try:
+            from app.services.paper_history import persist_snapshot
+            persist_snapshot(self.instance_key, self)
+        except Exception as exc:
+            print(f"[{self.strategy_id}] History snapshot failed: {exc}")
+
     async def start(self):
         self.is_running = True
         self._log("info", f"🟢 Paper trading started — strategy={self.strategy_id}")
@@ -133,8 +170,11 @@ class PaperTradeService:
 
     async def stop(self):
         self.is_running = False
-        self._log("info", "🔴 Paper trading stopped by user")
+        self._log("info", "🔴 Paper trading stopped by user — results saved to History")
         print(f"🔴 Paper Trading Stopped for Strategy: {self.strategy_id}")
+        # Final snapshot so the saved session holds the closing equity, the
+        # closed trades and the positions that were still open.
+        self._persist_history(force=True)
 
     async def tick(self):
         df_1h = self._fetch_candles("1h", 100)
@@ -158,11 +198,13 @@ class PaperTradeService:
         self.last_checked = _ist_now()
         current_atr = ind_1h['atr14'][-1]
         current_time = df_1h.index[-1]
+        trade_event = False  # a fill this tick forces an immediate DB snapshot
 
         # ---- Manage open positions ----------------------------------
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, current_price, current_atr, current_time)
             if result:
+                trade_event = True
                 price_diff = (result.exit_price - result.entry_price) * result.direction
                 gross_pnl = (result.lots * price_diff) * self.conversion_rate
                 taker = float(getattr(self.config, "taker_fee_bps", 0.0))
@@ -191,6 +233,7 @@ class PaperTradeService:
                 if new_trade is None:
                     self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
                 else:
+                    trade_event = True
                     side = "LONG" if last_sig == 1 else "SHORT"
                     self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | SL {new_trade.sl:,.2f} | "
                                         f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
@@ -202,6 +245,13 @@ class PaperTradeService:
         else:
             self._log("info", f"Scanning… BTCUSDT {current_price:,.2f} — no signal")
             print(f"🔍 [{self.strategy_id}] Scanning... Current Price: {current_price:.2f}, No signal.")
+
+        # ---- History --------------------------------------------------
+        # One equity sample per tick; the row is rewritten on every fill and
+        # every few quiet ticks so History always has a usable result.
+        self._record_equity_point()
+        self._tick_count += 1
+        self._persist_history(force=trade_event)
 
     def _fetch_candles(self, interval, limit):
         """Use candles seeded for this source, then the source public API."""

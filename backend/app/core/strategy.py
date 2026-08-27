@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
@@ -8,6 +8,43 @@ from dotenv import load_dotenv
 from .indicators import compute_indicators, sma, macd as _macd
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# ATR volatility-regime comparison
+# ---------------------------------------------------------------------------
+# The client can choose how each side compares ATR with its 50-bar average:
+# greater than (">"), less than ("<"), greater-or-equal (">=") or
+# less-or-equal ("<="). ">=" is the original Phantom behaviour and stays the
+# default whenever no operator is configured, so existing runs and saved
+# strategies keep producing exactly the same signals.
+ATR_REGIME_OPS = ('>=', '<=', '>', '<')
+DEFAULT_ATR_REGIME_OP = '>='
+_ATR_OP_FUNCS = {
+    '>=': np.greater_equal,
+    '<=': np.less_equal,
+    '>': np.greater,
+    '<': np.less,
+}
+# Friendly labels used by the UI / preview so the rule reads like maths.
+ATR_REGIME_OP_LABELS = {'>=': '≥', '<=': '≤', '>': '>', '<': '<'}
+
+
+def normalize_atr_regime_op(value):
+    """Validate/normalise an ATR comparison operator.
+
+    ``None``/blank means "not configured" and resolves to the default ">=".
+    Accepts the unicode forms (≥ / ≤) too, because those are what the UI shows.
+    """
+    if value is None:
+        return DEFAULT_ATR_REGIME_OP
+    op = str(value).strip()
+    if not op:
+        return DEFAULT_ATR_REGIME_OP
+    op = op.replace('=>', '>=').replace('=<', '<=').replace('≥', '>=').replace('≤', '<=')
+    if op not in ATR_REGIME_OPS:
+        raise ValueError(
+            f"atr_regime_op must be one of {', '.join(ATR_REGIME_OPS)} (got '{value}')")
+    return op
 
 
 class BranchConditions(BaseModel):
@@ -24,11 +61,21 @@ class BranchConditions(BaseModel):
     macd_signal: Optional[int] = None       # per-direction MACD signal period
     macd_hist_min: Optional[float] = None   # signed: long hist >= val, short hist <= val
     stop_loss_atr: Optional[float] = None   # SL distance expressed in ATR units
-    atr_regime_ratio: Optional[float] = None  # ATR >= ratio * SMA(ATR, 50) (legacy floor)
+    atr_regime_ratio: Optional[float] = None  # ATR compared with ratio * SMA(ATR, 50)
+    # Comparison used for the rule above. None = default '>=' (legacy floor).
+    atr_regime_op: Optional[str] = None
     atr_regime_max: Optional[float] = None  # optional max-ATR cap (multiple of SMA); None = disabled
     rsi_oversold: Optional[int] = None
     rsi_overbought: Optional[int] = None
     adx_min: Optional[float] = None
+
+    @field_validator('atr_regime_op')
+    @classmethod
+    def _validate_atr_regime_op(cls, value):
+        """Reject an unknown operator instead of silently trading with '>='."""
+        if value is None:
+            return None
+        return normalize_atr_regime_op(value)
 
 
 class EntryConditions(BaseModel):
@@ -202,6 +249,34 @@ class PhantomV2Config(BaseModel):
         branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
         return getattr(branch, 'atr_regime_max', None)
 
+    def atr_regime_op_for(self, direction: int) -> str:
+        """Comparison operator this side uses for its ATR regime rule.
+
+        Only the per-direction ATR toggle can change it; with the toggle OFF
+        (or no operator chosen) the legacy ``'>='`` floor is used, which keeps
+        every existing run/strategy bit-for-bit identical.
+        """
+        if self.uses_direction_atr_floor():
+            branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
+            op = getattr(branch, 'atr_regime_op', None)
+            if op:
+                return normalize_atr_regime_op(op)
+        return DEFAULT_ATR_REGIME_OP
+
+    def atr_regime_rule_for(self, direction: int) -> str:
+        """Human-readable rule, e.g. ``ATR < 1.20 x SMA50(ATR)``.
+
+        Used by the filter preview and the trade log so the client can see the
+        exact test each side was filtered with.
+        """
+        op = self.atr_regime_op_for(direction)
+        label = ATR_REGIME_OP_LABELS.get(op, op)
+        rule = f"ATR {label} {self.atr_regime_ratio_for(direction):g} x SMA50(ATR)"
+        cap = self.atr_regime_max_for(direction)
+        if cap is not None:
+            rule += f" and ATR <= {cap:g} x SMA50(ATR)"
+        return rule
+
     def adx_min_for(self, direction: int) -> float:
         return self._pick(direction, 'adx_min', 'adx_min')
 
@@ -239,9 +314,10 @@ class StrategyService:
         trend_col = np.where(close > ema50_4h_map, 1, -1)
 
         # 2. ATR Regime Filter (optionally per-direction).
-        # `atr_regime_ratio` is a minimum floor: ATR must be greater than or
-        # equal to `floor × SMA(ATR, 50)`. The independent ATR toggle changes
-        # the floor used by LONG and SHORT without changing any other filter.
+        # Each side compares ATR against `ratio x SMA(ATR, 50)` using its own
+        # operator: '>=' (default, the legacy floor), '<=', '>' or '<'. The
+        # independent ATR toggle changes the ratio AND the comparison used by
+        # LONG and SHORT without touching any other filter.
         # The legacy master switch and optional max-ATR cap remain supported for
         # old saved configurations.
         atr_v = ind_1h['atr14']
@@ -251,10 +327,14 @@ class StrategyService:
         if use_dir_atr:
             reg_ratio_l = cfg.atr_regime_ratio_for(1)
             reg_ratio_s = cfg.atr_regime_ratio_for(-1)
+            op_l = _ATR_OP_FUNCS[cfg.atr_regime_op_for(1)]
+            op_s = _ATR_OP_FUNCS[cfg.atr_regime_op_for(-1)]
             max_l = cfg.atr_regime_max_for(1)
             max_s = cfg.atr_regime_max_for(-1)
-            regime_ok_l = (atr_v >= reg_ratio_l * atr_sma) if max_l is None else ((atr_v >= reg_ratio_l * atr_sma) & (atr_v <= max_l * atr_sma))
-            regime_ok_s = (atr_v >= reg_ratio_s * atr_sma) if max_s is None else ((atr_v >= reg_ratio_s * atr_sma) & (atr_v <= max_s * atr_sma))
+            floor_l = op_l(atr_v, reg_ratio_l * atr_sma)
+            floor_s = op_s(atr_v, reg_ratio_s * atr_sma)
+            regime_ok_l = floor_l if max_l is None else (floor_l & (atr_v <= max_l * atr_sma))
+            regime_ok_s = floor_s if max_s is None else (floor_s & (atr_v <= max_s * atr_sma))
         else:
             regime_ok_shared = atr_v >= (cfg.atr_regime_ratio * atr_sma)
             regime_ok_l = regime_ok_s = regime_ok_shared
@@ -338,6 +418,19 @@ class StrategyService:
             'ema50_1h': ind_1h['ema50'], 'ema50_4h': ema50_4h_map,
             'pdi': pdi, 'mdi': mdi,
             'trend': trend_col, 'is_green': is_green, 'is_red': is_red,
+            # Reference values the trade log needs to spell out every entry
+            # condition (actual value vs the threshold that was applied).
+            'atr_sma50': atr_sma,
+            'rsi_prev': rsi_prev,
+            'macd_hist_long': hist_long, 'macd_hist_short': hist_short,
+            'macd_hist_long_prev': hist_long_prev, 'macd_hist_short_prev': hist_short_prev,
+            'close': close,
+            # Setup B (momentum) masks, kept separate from the reversal masks so
+            # a MOMENTUM trade's log shows the filters that actually fired.
+            'cond_di_long': pdi > mdi, 'cond_di_short': mdi > pdi,
+            'cond_mom_cross_long': cross_up, 'cond_mom_cross_short': cross_dn,
+            'cond_mom_rsi_long': rsi_v >= cfg.momentum_rsi_min,
+            'cond_mom_rsi_short': rsi_v <= 100.0 - cfg.momentum_rsi_min,
             # Per-direction condition masks (used by the engine snapshot to
             # log which filter passed for the side a trade actually fired on).
             'cond_adx_ok_long': adx_ok_l, 'cond_adx_ok_short': adx_ok_s,
@@ -349,6 +442,10 @@ class StrategyService:
             'cond_atr_regime_ok': regime_ok_l,
             'cond_long_rsi': long_rsi_A, 'cond_short_rsi': short_rsi_A,
             'cond_long_macd': long_macd_A, 'cond_short_macd': short_macd_A,
+            # Human-readable ATR rule actually applied to each side (scalars,
+            # not per-bar arrays) — surfaced in the trade log and preview.
+            'atr_regime_rule_long': cfg.atr_regime_rule_for(1),
+            'atr_regime_rule_short': cfg.atr_regime_rule_for(-1),
             'setup': setup,
             'long_A': long_A, 'short_A': short_A, 'long_B': long_B, 'short_B': short_B,
         }
