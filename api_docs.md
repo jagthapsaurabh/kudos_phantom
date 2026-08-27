@@ -39,7 +39,8 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | :--- | :--- | :--- | :--- |
 | `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. |
 | `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance |
-| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history |
+| `DELETE` | `/paper-trade/{instance_key}` | None | Stops and removes a paper-trade session from the user's workspace |
+| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name |
 | `GET` | `/paper-trade/logs` | `instance_key` | Live log buffer for an instance |
 
 ### 5. Live Trading
@@ -54,17 +55,19 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | :--- | :--- | :--- | :--- |
 | `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode` | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
 | `POST` | `/backtest/filter-preview` | `params`, `start_date`, `end_date`, `symbol`, `data_source`, `fee_mode` | Synchronous per-bucket peek at the current conditions (`LONG/SHORT x REVERSAL/MOMENTUM`) with win rate, profit factor and avg/net PnL — handy while tuning the direction-specific thresholds before a full run. |
-| `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `initial_capital`) |
-| `GET` | `/backtest/results/{id}` | None | Get detailed trades and equity curve for a run (incl. `initial_capital`) |
+| `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `strategy_id` and `initial_capital`) |
+| `GET` | `/backtest/results/{id}` | None | Get detailed trades, equity curve and the exact saved `params` snapshot for a run (incl. `strategy_id` and `initial_capital`) |
 | `DELETE` | `/backtest/{id}` | None | Delete a single backtest run and its trades |
 | `DELETE` | `/backtest/clear` | None | Delete all of the user's backtest runs |
 
 **Direction-specific conditions (`params.entry_conditions`).** Every `params` object may optionally
-carry an `entry_conditions` block. When `use_direction_conditions` is `False` (default) the engine
-uses the legacy shared conditions. When `True`, the LONG and SHORT branches each supply their own
-`macd_hist_min`, `stop_loss_atr`, `atr_regime_ratio`, `rsi_oversold`, `rsi_overbought` and `adx_min`
-(any field left `null` falls back to the shared value). Two directional fields are interpreted
-**per side**:
+carry an `entry_conditions` block. The new Backtest controls are independent:
+`use_direction_macd_hist` enables separate Long/Short `macd_hist_min` values and
+`use_direction_atr_floor` enables separate Long/Short `atr_regime_ratio` values. When either is
+false, that field uses the shared value. The legacy `use_direction_conditions` master switch remains
+supported for older configs and enables all of the original directional overrides
+(`macd_hist_min`, `stop_loss_atr`, `atr_regime_ratio`, RSI bounds and `adx_min`). Any field left
+`null` falls back to the shared value. The two client-facing fields are interpreted **per side**:
 
 - `macd_hist_min` is **signed** — longs require `hist >= value` (e.g. `5`), shorts require
   `hist <= value` (e.g. `-8`), so a negative short threshold means "bearish momentum clearly present".
@@ -80,9 +83,10 @@ uses the legacy shared conditions. When `True`, the LONG and SHORT branches each
 {
   "macd_hist_min": 5.0,
   "entry_conditions": {
-    "use_direction_conditions": true,
-    "long":  { "macd_hist_min": 5.0,  "stop_loss_atr": 1.2, "atr_regime_ratio": 0.5, "rsi_oversold": 40, "rsi_overbought": 60, "adx_min": 10.0 },
-    "short": { "macd_hist_min": -8.0, "stop_loss_atr": 1.6, "atr_regime_ratio": 0.3, "rsi_oversold": 40, "rsi_overbought": 60, "adx_min": 10.0 }
+    "use_direction_macd_hist": true,
+    "use_direction_atr_floor": true,
+    "long":  { "macd_hist_min": 5.0, "atr_regime_ratio": 0.5 },
+    "short": { "macd_hist_min": -8.0, "atr_regime_ratio": 0.3 }
   }
 }
 ```

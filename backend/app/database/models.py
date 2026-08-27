@@ -140,6 +140,9 @@ class BacktestRun(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'))
     name = Column(String)
+    # Keep the selected strategy alongside the parameter snapshot so opening a
+    # historical run can restore both the form values and the strategy choice.
+    strategy_id = Column(String, default='PhantomV2')
     start_date = Column(DateTime)
     end_date = Column(DateTime)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
@@ -256,6 +259,10 @@ def migrate_db():
                 conn.execute(text('UPDATE users SET can_paper=1 WHERE can_paper IS NULL'))
             if 'can_live' in user_cols:
                 conn.execute(text('UPDATE users SET can_live=0 WHERE can_live IS NULL'))
+        if inspector.has_table('backtest_runs'):
+            run_cols = {col['name'] for col in inspect(engine).get_columns('backtest_runs')}
+            if 'strategy_id' in run_cols:
+                conn.execute(text("UPDATE backtest_runs SET strategy_id='PhantomV2' WHERE strategy_id IS NULL OR strategy_id=''"))
         if inspector.has_table('klines'):
             kcols = {col['name'] for col in inspect(engine).get_columns('klines')}
             if 'source' in kcols:

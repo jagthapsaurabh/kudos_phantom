@@ -32,9 +32,15 @@ class PaperTradeService:
     MAX_CLOSED_TRADES = 100  # keep last N closed trades per instance
 
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
-                 is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None, broker_definition=None):
-        self.strategy_id = strategy_id
+                 is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
+                 broker_definition=None, strategy_name=None):
+        self.strategy_id = str(strategy_id)
+        # Custom strategies are identified by a numeric id internally. Keep a
+        # human-readable name on the worker so every status/list view can show
+        # what the user actually selected.
+        self.strategy_name = strategy_name or self.strategy_id
         self.is_custom = is_custom
+        self.created_at = _ist_now()
         self.market_source = market_source or "Binance"
         self.broker_name = broker_name or self.market_source
         self.broker_definition = broker_definition
@@ -67,7 +73,7 @@ class PaperTradeService:
         self.logs: list = []
         # Closed-trade history: list of trade dicts
         self.closed_trades: list = []
-        self._log("info", f"Instance initialised — strategy={strategy_id}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
+        self._log("info", f"Instance initialised — strategy={self.strategy_name}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
 
     def _log(self, level: str, msg: str):
         entry = {"ts": _ist_now(), "level": level, "msg": msg}

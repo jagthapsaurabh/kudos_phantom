@@ -80,17 +80,20 @@ returned by `GET /backtest/results/{run_id}`.
 All v3 behaviours are config-driven (`PhantomV2Config`); every new flag defaults to the exact
 v2.5 behaviour, so the API, paper trader and live trader remain fully backward compatible.
 
-### v3.2 addon: Direction-specific Long / Short conditions
-When the two sides behave differently (REVERSAL-SHORT quality collapses at high ATR/high MACD
-histogram), use the **"Use separate conditions for Long / Short"** toggle on the backtest page.
-With it ON, the LONG and SHORT branches each carry their own `macd_hist_min` (signed — shorts can
-be negative, e.g. `-8`, to require bearish momentum), `stop_loss_atr`, `atr_regime_ratio`,
-the optional `atr_regime_max` max-ATR cap (to exclude high-volatility for shorts),
-`rsi_oversold`/`rsi_overbought` and `adx_min`. Persisted as `entry_conditions.long.*` /
-`entry_conditions.short.*`; any unset value falls back to the shared field. Use the
-**Preview Filters** button (or `POST /backtest/filter-preview`) to see per-bucket win rate /
-profit factor before running the full backtest, and **Save as New Strategy** to keep a tuned
-configuration under a new name for re-running or Paper / Live trading.
+### v3.2 addon: Direction-specific Long / Short thresholds
+When the two sides behave differently, the Backtest page keeps the shared values as the default and
+places two independent switches below them: **Use separate Long / Short MACD hist** and
+**Use separate Long / Short Min ATR floor**. With the MACD switch on, LONG uses `hist >=` its value
+and SHORT uses `hist <=` its signed value (for example `-8` requires bearish momentum). With the ATR
+switch on, each side uses `ATR >= floor × SMA(ATR, 50)`. Values are persisted as
+`entry_conditions.long.*` / `entry_conditions.short.*`; an unset side falls back to the shared field.
+The legacy `use_direction_conditions` master switch remains supported for existing configurations.
+Use **Preview Filters** (or `POST /backtest/filter-preview`) to see the per-bucket trade-off before
+running the full backtest, and **Save as strategy** to keep a tuned configuration under a name for
+re-running or Paper / Live trading.
+
+Opening any saved Backtest history card now restores its saved dates, exchange, strategy, capital,
+and complete parameter snapshot before showing the result.
 
 ---
 

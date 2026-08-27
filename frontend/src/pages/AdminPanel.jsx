@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
-import { Users, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Percent, Database, Upload, Save } from 'lucide-react';
+import { Users, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Percent, Database, Upload, Save, Pencil, X, Trash2, StopCircle } from 'lucide-react';
 import DateInput from '../components/DateInput';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
@@ -104,23 +104,109 @@ const AddClientForm = ({ onCreated }) => {
   );
 };
 
-const ClientRow = ({ client, onChanged, onConfirm }) => {
+const EditClientModal = ({ client, onClose, onSaved }) => {
+  const [form, setForm] = useState({
+    full_name: client.full_name || '',
+    mobile: client.mobile || '',
+    email: client.email || '',
+    company: client.company || '',
+    notes: client.notes || '',
+    initial_capital: client.initial_capital ?? 20000,
+    margin_deployment_pct: client.margin_deployment_pct ?? 25,
+  });
   const [busy, setBusy] = useState(false);
-  const [newPw, setNewPw] = useState('');
+  const [message, setMessage] = useState(null);
+  const field = 'w-full rounded-lg border border-gray-700 bg-gray-900 p-2.5 text-sm text-white outline-none focus:border-blue-500';
+  const update = (key, value) => setForm(previous => ({ ...previous, [key]: value }));
+
+  const submit = async e => {
+    e.preventDefault();
+    setBusy(true);
+    setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/admin/clients/${client.id}`, {
+        method: 'PUT',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          full_name: form.full_name,
+          mobile: form.mobile,
+          email: form.email,
+          company: form.company,
+          notes: form.notes,
+          initial_capital: Number(form.initial_capital),
+          margin_deployment_pct: Number(form.margin_deployment_pct),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Could not update client');
+      onSaved();
+      onClose();
+    } catch (error) {
+      setMessage({ ok: false, text: error.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onClick={onClose}>
+      <form onSubmit={submit} onClick={e => e.stopPropagation()} className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-gray-700 bg-gray-800 p-6 shadow-2xl">
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <div>
+            <h3 className="flex items-center gap-2 text-lg font-bold text-white"><Pencil size={17} className="text-blue-400" /> Edit client details</h3>
+            <p className="mt-1 text-xs text-gray-500">Update the profile and paper-trading defaults for @{client.username}.</p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-gray-500 transition hover:bg-gray-700 hover:text-white" aria-label="Close edit form"><X size={17} /></button>
+        </div>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Username</label>
+            <input value={client.username} disabled className={`${field} cursor-not-allowed opacity-60`} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Full name</label>
+            <input value={form.full_name} onChange={e => update('full_name', e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Mobile</label>
+            <input value={form.mobile} onChange={e => update('mobile', e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Email</label>
+            <input type="email" value={form.email} onChange={e => update('email', e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Company / firm</label>
+            <input value={form.company} onChange={e => update('company', e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Capital (₹)</label>
+            <input type="number" min="0" step="100" value={form.initial_capital} onChange={e => update('initial_capital', e.target.value)} className={field} />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Margin deployment %</label>
+            <input type="number" min="0" max="100" step="0.5" value={form.margin_deployment_pct} onChange={e => update('margin_deployment_pct', e.target.value)} className={field} />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Notes</label>
+            <textarea rows="3" value={form.notes} onChange={e => update('notes', e.target.value)} className={field} />
+          </div>
+        </div>
+        <div className="mt-5 flex flex-wrap items-center justify-end gap-3">
+          {message && <span className="mr-auto text-xs font-semibold text-red-400">{message.text}</span>}
+          <button type="button" onClick={onClose} className="rounded-lg bg-gray-700 px-4 py-2 text-sm font-semibold text-gray-300 transition hover:bg-gray-600 hover:text-white">Cancel</button>
+          <button disabled={busy} className="flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-bold text-white transition hover:bg-blue-500 disabled:opacity-50"><Save size={14} /> {busy ? 'Saving…' : 'Save changes'}</button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+const ClientRow = ({ client, onEdit, onConfirm }) => {
+  const [busy, setBusy] = useState(false);
   const [activity, setActivity] = useState(null);
   const [expanded, setExpanded] = useState(false);
   const isAdmin = client.role === 'admin';
-
-  const patch = async (payload) => {
-    setBusy(true);
-    const res = await fetch(`${API_URL}/admin/clients/${client.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(payload) });
-    const data = await res.json();
-    if (!res.ok) {
-      alert(data.detail || 'Update failed');
-    }
-    setBusy(false);
-    onChanged();
-  };
 
   const loadActivity = async () => {
     if (!expanded) {
@@ -170,12 +256,12 @@ const ClientRow = ({ client, onChanged, onConfirm }) => {
         </td>
         <td className="p-3 text-center">{client.has_api_keys ? <Key size={14} className="text-yellow-400 inline" /> : <span className="text-gray-600">—</span>}</td>
         <td className="p-3">
-          <div className="flex items-center gap-1">
-            <input placeholder="reset pw" value={newPw} onChange={e => setNewPw(e.target.value)}
-              className="w-20 bg-gray-900 border border-gray-700 rounded px-1 py-1 text-[10px] text-white" />
-            <button disabled={busy || !newPw} onClick={() => { patch({ password: newPw }); setNewPw(''); }}
-              className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-[10px] font-bold disabled:opacity-40">Set</button>
-            <button onClick={loadActivity} className="bg-blue-900/40 hover:bg-blue-900/60 text-blue-300 px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
+            <button onClick={() => onEdit(client)}
+              className="flex items-center gap-1 rounded bg-blue-900/40 px-2 py-1 text-[10px] font-bold text-blue-300 transition hover:bg-blue-900/60">
+              <Pencil size={11} /> Edit
+            </button>
+            <button onClick={loadActivity} className="flex items-center gap-1 rounded bg-gray-700 px-2 py-1 text-[10px] font-bold text-gray-300 transition hover:bg-gray-600 hover:text-white">
               {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />} Activity
             </button>
           </div>
@@ -188,14 +274,14 @@ const ClientRow = ({ client, onChanged, onConfirm }) => {
               <div>
                 <div className="text-gray-500 uppercase font-bold text-[9px] mb-1">Paper Sessions ({activity.paper_sessions.length})</div>
                 {activity.paper_sessions.map(s => (
-                  <div key={s.instance_key} className="font-mono text-gray-300">{s.strategy_id} — ₹{(s.equity_inr || 0).toFixed(0)} {s.is_running ? '🟢' : '🔴'} ({s.open_trades} open)</div>
+                  <div key={s.instance_key} className="font-mono text-gray-300">{s.strategy_name || s.strategy_id} — ₹{(s.equity_inr || 0).toFixed(0)} {s.is_running ? '🟢' : '🔴'} ({s.open_trades} open)</div>
                 ))}
                 {activity.paper_sessions.length === 0 && <div className="text-gray-600">No sessions</div>}
               </div>
               <div>
                 <div className="text-gray-500 uppercase font-bold text-[9px] mb-1">Live Sessions ({activity.live_sessions.length})</div>
                 {activity.live_sessions.map(s => (
-                  <div key={s.instance_key} className="font-mono text-gray-300">{s.strategy_id} — ₹{(s.equity_inr || 0).toFixed(0)} {s.is_running ? '🟢' : '🔴'} ({s.open_trades} open)</div>
+                  <div key={s.instance_key} className="font-mono text-gray-300">{s.strategy_name || s.strategy_id} — ₹{(s.equity_inr || 0).toFixed(0)} {s.is_running ? '🟢' : '🔴'} ({s.open_trades} open)</div>
                 ))}
                 {activity.live_sessions.length === 0 && <div className="text-gray-600">No sessions</div>}
               </div>
@@ -216,6 +302,7 @@ const ClientRow = ({ client, onChanged, onConfirm }) => {
 
 const ClientsTab = ({ onConfirm }) => {
   const [clients, setClients] = useState([]);
+  const [editingClient, setEditingClient] = useState(null);
   const load = useCallback(async () => {
     const res = await fetch(`${API_URL}/admin/clients`, { headers: authHeaders() });
     if (res.ok) setClients(await res.json());
@@ -224,6 +311,7 @@ const ClientsTab = ({ onConfirm }) => {
 
   return (
     <div>
+      {editingClient && <EditClientModal client={editingClient} onClose={() => setEditingClient(null)} onSaved={load} />}
       <AddClientForm onCreated={load} />
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="p-4 border-b border-gray-700 flex justify-between items-center">
@@ -240,7 +328,7 @@ const ClientsTab = ({ onConfirm }) => {
             </tr>
           </thead>
           <tbody>
-            {clients.map(c => <ClientRow key={c.id} client={c} onChanged={load} onConfirm={onConfirm} />)}
+            {clients.map(c => <ClientRow key={c.id} client={c} onEdit={setEditingClient} onConfirm={onConfirm} />)}
           </tbody>
         </table>
         </div>
@@ -350,13 +438,21 @@ const PaperTab = () => {
     fetchStatus();
   };
 
-  const requestStop = (instance_key) => {
-    setConfirm({ type: 'stop', key: instance_key });
+  const requestStop = (instance_key, name) => {
+    setConfirm({ type: 'stop', key: instance_key, name });
   };
 
-  const doStop = async () => {
+  const requestDelete = (instance_key, name) => {
+    setConfirm({ type: 'delete', key: instance_key, name });
+  };
+
+  const doPaperAction = async () => {
     if (!confirm) return;
-    await fetch(`${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`, { method: 'POST', headers: authHeaders() });
+    const isDelete = confirm.type === 'delete';
+    const url = isDelete
+      ? `${API_URL}/paper-trade/${encodeURIComponent(confirm.key)}`
+      : `${API_URL}/paper-trade/stop?instance_key=${encodeURIComponent(confirm.key)}`;
+    await fetch(url, { method: isDelete ? 'DELETE' : 'POST', headers: authHeaders() });
     setConfirm(null);
     fetchStatus();
   };
@@ -365,12 +461,14 @@ const PaperTab = () => {
     <div className="space-y-6">
       <ConfirmModal
         open={!!confirm}
-        title="Stop Paper Trade?"
-        message={`This will stop instance "${confirm?.key?.split('_').pop()}" and close any open positions.`}
-        confirmLabel="Yes, Stop"
+        title={confirm?.type === 'delete' ? 'Delete Paper Trade?' : 'Stop Paper Trade?'}
+        message={confirm?.type === 'delete'
+          ? `Delete "${confirm?.name || confirm?.key?.split('_').pop()}" and remove its session history?`
+          : `Stop "${confirm?.name || confirm?.key?.split('_').pop()}" and close any open positions.`}
+        confirmLabel={confirm?.type === 'delete' ? 'Yes, Delete' : 'Yes, Stop'}
         confirmColor="bg-red-600 hover:bg-red-500"
         onCancel={() => setConfirm(null)}
-        onConfirm={doStop}
+        onConfirm={doPaperAction}
       />
       <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex items-center gap-4 flex-wrap">
         <button onClick={() => start('PhantomV2')} className="bg-green-600 hover:bg-green-500 px-6 py-3 rounded-xl font-bold">▶ Start Kudos v3 Paper</button>
@@ -378,19 +476,27 @@ const PaperTab = () => {
         {msg && <span className="text-xs text-gray-400 font-mono">{msg}</span>}
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {paperStatus.map(s => (
-          <div key={s.instance_key} className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
-            <div className="flex justify-between items-center mb-2">
-              <div className="font-bold text-gray-200">{s.strategy_id}</div>
-              <div className={`text-xs font-bold ${s.is_running ? 'text-green-400' : 'text-red-400'}`}>{s.is_running ? 'RUNNING' : 'STOPPED'}</div>
+        {paperStatus.map((s, index) => {
+          const strategyName = s.strategy_name || s.strategy_id;
+          return <div key={s.instance_key} className="bg-gray-800 p-5 rounded-2xl border border-gray-700">
+            <div className="mb-2 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[9px] font-bold uppercase tracking-wider text-gray-500">Session {index + 1}</div>
+                <div className="truncate font-bold text-gray-200" title={strategyName}>{strategyName}</div>
+                <div className="text-[10px] text-blue-300">{s.data_source || 'Binance'}</div>
+              </div>
+              <div className={`shrink-0 text-xs font-bold ${s.is_running ? 'text-green-400' : 'text-red-400'}`}>{s.is_running ? 'RUNNING' : 'STOPPED'}</div>
             </div>
-            <div className="text-2xl font-mono text-yellow-400 mb-3">₹{(s.equity_inr || 0).toLocaleString()}</div>
-            <div className="text-xs text-gray-500 mb-3">{s.active_trades?.length || 0} open trade(s)</div>
-            {s.is_running && (
-              <button onClick={() => requestStop(s.instance_key)} className="bg-red-900/40 hover:bg-red-900/60 text-red-300 px-4 py-2 rounded-lg text-xs font-bold">Stop</button>
-            )}
-          </div>
-        ))}
+            <div className="text-2xl font-mono text-yellow-400 mb-1">₹{(s.equity_inr || 0).toLocaleString()}</div>
+            <div className="mb-3 text-xs text-gray-500">{s.active_trades?.length || 0} open trade(s) · #{s.instance_key.split('_').pop()}</div>
+            <div className="flex gap-2">
+              {s.is_running && (
+                <button onClick={() => requestStop(s.instance_key, strategyName)} className="flex items-center gap-1 rounded-lg bg-red-900/40 px-3 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/60"><StopCircle size={13} /> Stop</button>
+              )}
+              <button onClick={() => requestDelete(s.instance_key, strategyName)} className="flex items-center gap-1 rounded-lg bg-gray-700 px-3 py-2 text-xs font-bold text-gray-300 transition hover:bg-red-900/40 hover:text-red-300"><Trash2 size={13} /> Delete</button>
+            </div>
+          </div>;
+        })}
         {paperStatus.length === 0 && <div className="text-gray-600 text-sm p-6">No paper sessions running for your account.</div>}
       </div>
     </div>

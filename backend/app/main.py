@@ -141,6 +141,22 @@ _PHANTOM_PARAM_KEYS = (
 )
 
 
+def _parse_run_params(config_json):
+    """Decode a historical run's parameter snapshot safely.
+
+    Older databases may contain an empty or malformed snapshot. Returning an
+    empty object keeps the results endpoint usable for those runs while newer
+    runs still restore the exact nested ``entry_conditions`` block.
+    """
+    if not config_json:
+        return {}
+    try:
+        value = json.loads(config_json) if isinstance(config_json, str) else config_json
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _resolve_strategy_payload(db, strategy_id, user_id, fees):
     """Resolve a saved custom strategy into a runnable payload.
 
@@ -472,10 +488,12 @@ def deactivate_client(client_id: int, admin=Depends(require_admin), db=Depends(g
 def client_activity(client_id: int, admin=Depends(require_admin), db=Depends(get_db)):
     user = db.query(User).filter(User.id == client_id).first()
     if not user: raise HTTPException(status_code=404, detail="Client not found")
-    paper = [{"instance_key": k, "strategy_id": s.strategy_id, "equity_inr": s.equity_inr,
+    paper = [{"instance_key": k, "strategy_id": s.strategy_id,
+              "strategy_name": getattr(s, 'strategy_name', s.strategy_id), "equity_inr": s.equity_inr,
               "is_running": s.is_running, "open_trades": len(s.oms.active_trades)}
              for k, s in paper_trade_instances.items() if f"_{user.username}_" in k]
-    live = [{"instance_key": k, "strategy_id": s.strategy_id, "equity_inr": s.equity_inr,
+    live = [{"instance_key": k, "strategy_id": s.strategy_id,
+             "strategy_name": getattr(s, 'strategy_name', s.strategy_id), "equity_inr": s.equity_inr,
              "is_running": s.is_running, "open_trades": len(s.oms.active_trades)}
             for k, s in live_trade_instances.items() if f"_{user.username}_" in k]
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id)\
@@ -948,6 +966,7 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
         run = BacktestRun(
             user_id=user.id,
             name=req.strategy_name,
+            strategy_id=req.strategy_id,
             start_date=start_date_dt,
             end_date=end_date_dt,
             config_json=json.dumps(req.params.model_dump()),
@@ -969,7 +988,8 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
 @app.get("/backtest/history")
 def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     runs = db.query(BacktestRun).filter(BacktestRun.user_id == user.id).order_by(BacktestRun.timestamp.desc()).all()
-    return [{"id": r.id, "name": r.name, "start_date": r.start_date, "end_date": r.end_date,
+    return [{"id": r.id, "name": r.name, "strategy_id": r.strategy_id or 'PhantomV2',
+             "start_date": r.start_date, "end_date": r.end_date,
              "roi": r.roi, "initial_capital": r.initial_capital or 20000,
              "data_source": r.data_source or 'Binance', "taker_fee_bps": r.taker_fee_bps,
              "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp} for r in runs]
@@ -997,6 +1017,10 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
         "run_details": {
             "id": run.id,
             "name": run.name,
+            "strategy_id": run.strategy_id or 'PhantomV2',
+            # The exact parameter snapshot is returned with a run so the UI can
+            # restore the form when a historical card is opened.
+            "params": _parse_run_params(run.config_json),
             "start_date": run.start_date,
             "end_date": run.end_date,
             "initial_capital": run.initial_capital or 20000,
@@ -1129,6 +1153,8 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'total_win_rate': round(results['win_rate'], 2),
         'total_profit_factor': round(results['profit_factor'], 2),
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
+        'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
+        'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
         'buckets': out,
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
@@ -1187,32 +1213,39 @@ def start_paper_trade(
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
-    strategy_id = payload.strategy_id
+    strategy_id = str(payload.strategy_id)
+    strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
         from .core.strategy import FastTestStrategyService
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
-                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
-        kind, payload, strat = resolved
+        kind, strategy_payload, strat = resolved
+        strategy_name = strat.name
         if kind == 'phantom':
-            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
-                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=False, broker_definition=definition)
+            service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees,
+                                        is_custom=False, broker_definition=definition, strategy_name=strategy_name)
         else:
-            service = PaperTradeService(strategy_id, payload, initial_capital=capital, margin_pct=margin_pct,
-                                        market_source=source, broker_name=source, fee_schedule=fees, is_custom=True, broker_definition=definition)
+            service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
+                                        market_source=source, broker_name=source, fee_schedule=fees,
+                                        is_custom=True, broker_definition=definition, strategy_name=strategy_name)
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
-                                    market_source=source, broker_name=source, fee_schedule=fees, broker_definition=definition)
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name)
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
-    return {"status": "Paper trade started", "instance_key": instance_key, "data_source": source,
+    return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
+            "strategy_name": service.strategy_name, "data_source": source,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
@@ -1224,6 +1257,19 @@ async def stop_paper_trade(instance_key: str, user=Depends(get_current_user)):
         del paper_trade_instances[instance_key]
         return {"status": "Paper trade stopped"}
     raise HTTPException(status_code=404, detail="Instance not found")
+
+@app.delete("/paper-trade/{instance_key}")
+async def delete_paper_trade(instance_key: str, user=Depends(get_current_user)):
+    """Stop and remove one paper-trade session from the user's workspace."""
+    if f"_{user.username}_" not in instance_key:
+        raise HTTPException(status_code=403, detail="Not your instance")
+    service = paper_trade_instances.get(instance_key)
+    if not service:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    await service.stop()
+    del paper_trade_instances[instance_key]
+    return {"status": "Paper trade deleted", "instance_key": instance_key}
+
 
 @app.get("/paper-trade/status")
 def get_paper_status(user=Depends(get_current_user)):
@@ -1267,6 +1313,8 @@ def get_paper_status(user=Depends(get_current_user)):
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
+                "strategy_name": getattr(service, 'strategy_name', service.strategy_id),
+                "created_at": getattr(service, 'created_at', None),
                 "data_source": service.market_source, "broker_name": service.broker_name,
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "equity_inr": service.equity_inr, "initial_capital_inr": service.initial_capital_inr,
