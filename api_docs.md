@@ -126,6 +126,13 @@ candle *i* and fills at the open of candle *i+1*, so both are recorded:
 new columns are nullable and are added to existing `trades` tables by `migrate_db()` at startup, so
 older runs simply return `null` for them.
 
+**Timestamps are naive UTC.** Every `*_time` field is serialised without a timezone designator —
+`2020-06-26T13:41:59.523330`, not `...Z`. They are UTC. Parsers that assume local time for an
+undesignated datetime will shift them: JavaScript's `new Date("2020-06-26T13:41:59.523330")` reads it
+as *local* time, so a viewer at UTC+05:30 gets `08:11Z`. Append `Z` before parsing, or parse with an
+explicit UTC assumption. The Backtest UI does this in `fmtCandleTime`, which is why the trade log and
+the export agree regardless of the viewer's timezone.
+
 **Excel / CSV export.** The Backtest page's *Excel / CSV Export* button writes one row per trade
 with 45 columns — signal/entry/exit candle times (UTC) and colours, one column per entry condition
 (`PASS` / `FAIL` / `N/A`), the full condition breakdown, the exit condition and its detail, the stop
