@@ -111,6 +111,21 @@ check("history row carries strategy + capital",
       row.get("strategy_name") == "Kudos V2.5 (Default)" and row.get("initial_capital") == 20000, str(row)[:200])
 check("history row carries the traded symbol",
       row.get("symbol") == "BTCUSDT", str(row.get("symbol")))
+# The column has default='BTCUSDT', so the check above would also pass if
+# _payload() never mentioned the symbol at all. Point the service at a
+# different symbol and re-snapshot: the row must follow the service, not the
+# column default.
+_real_symbol = svc.symbol
+svc.symbol = "ETHUSDT"
+from app.services import paper_history as _ph
+_ph.persist_snapshot(instance_key, svc)
+_row2 = client.get("/paper-trade/history", headers=H).json()[0]
+check("history row tracks the service's symbol, not the column default",
+      _row2.get("symbol") == "ETHUSDT", str(_row2.get("symbol")))
+svc.symbol = _real_symbol
+_ph.persist_snapshot(instance_key, svc)
+check("symbol restored on the next snapshot",
+      client.get("/paper-trade/history", headers=H).json()[0].get("symbol") == _real_symbol)
 check("status endpoint exposes session_id",
       client.get("/paper-trade/status", headers=H).json()[0].get("session_id") == svc.session_id)
 
