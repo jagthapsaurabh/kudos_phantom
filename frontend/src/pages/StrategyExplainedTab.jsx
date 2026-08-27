@@ -1,7 +1,7 @@
 import React from 'react';
 
 /* ============================================================================
-   PHANTOM Strategy — Explained
+   Kudos Strategy — Explained
    A plain-language, formula-by-formula breakdown of how the strategy works:
    what each setting means, how the value is calculated, where it is used in
    the pipeline and what happens when you change it.
@@ -362,7 +362,7 @@ const StrategyExplainedTab = ({ champion }) => {
             <b>Where every value is used:</b> indicators → <K>compute_indicators</K> → <K>StrategyService._compute</K>
             (signal generation) → <K>OrderManager.create_order/update_trade</K> (sizing, SL/TP/trail/breakeven) →
             <K>BacktestEngine.run</K> (drawdown guard, fee &amp; PnL accounting). The exact parameter values of the
-            shipped champion are shown in the <em>Phantom Strategy</em> tab. At ₹{priceRef.toLocaleString()} per BTC
+            shipped champion are shown in the <em>Strategy Rules</em> tab. At ₹{priceRef.toLocaleString()} per BTC
             and {mp * 100}% margin × {lev}× leverage, the example above is what a single position looks like.
           </Note>
         </Card>

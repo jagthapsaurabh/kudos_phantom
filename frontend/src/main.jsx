@@ -8,6 +8,7 @@ import Backtest from './pages/Backtest';
 import PaperTrade from './pages/PaperTrade';
 import LiveTrade from './pages/LiveTrade';
 import Strategies from './pages/Strategies';
+import PhantomStrategy from './pages/PhantomStrategy';
 import BrokerSettings from './pages/BrokerSettings';
 import ChartPage from './pages/Chart';
 import AdminPanel from './pages/AdminPanel';
@@ -36,6 +37,7 @@ root.render(
       <Route path="/live" element={<ProtectedRoute><Navbar /><LiveTrade /></ProtectedRoute>} />
       <Route path="/chart" element={<ProtectedRoute><Navbar /><ChartPage /></ProtectedRoute>} />
       <Route path="/strategies" element={<ProtectedRoute><Navbar /><Strategies /></ProtectedRoute>} />
+      <Route path="/strategy" element={<ProtectedRoute><Navbar /><PhantomStrategy /></ProtectedRoute>} />
       <Route path="/broker" element={<ProtectedRoute><Navbar /><BrokerSettings /></ProtectedRoute>} />
       <Route path="/admin" element={<AdminRoute><Navbar /><AdminPanel /></AdminRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle } from 'lucide-react';
+import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target } from 'lucide-react';
 import { API_URL } from '../api';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
@@ -32,6 +32,33 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
 };
 
 // ---------- Trade Card ----------
+const StopBar = ({ trade }) => {
+  const sl = trade.sl, tp = trade.tp, stopLevel = trade.stop_level, trailActive = !!trade.trail_active;
+  const slMoved = trade.sl_entry != null && sl != null && Math.abs(sl - trade.sl_entry) > 0.005;
+  return (
+    <div className="mt-3">
+      <div className="text-[10px] text-gray-500 uppercase font-bold mb-1.5 flex items-center gap-1">
+        <Target size={11} /> Stop / Exit Plan
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
+        <div className={`p-2 rounded border ${slMoved ? 'border-yellow-500/40 bg-yellow-500/5' : 'bg-gray-800/50'}`}>
+          Stop Loss<br />
+          <span className="text-xs text-red-300 font-mono">{sl != null ? Number(sl).toFixed(2) : '—'}</span>
+          {slMoved && <div className="text-[9px] text-yellow-400 mt-0.5">was {Number(trade.sl_entry).toFixed(2)} · breakeven</div>}
+        </div>
+        <div className="bg-gray-800/50 p-2 rounded">Take Profit<br /><span className="text-xs text-green-300 font-mono">{tp != null ? Number(tp).toFixed(2) : '—'}</span></div>
+        <div className={`p-2 rounded border ${trailActive ? 'border-purple-500/40 bg-purple-500/5' : 'bg-gray-800/50'}`}>
+          {trailActive ? 'Trail Stop (active)' : 'Trailing (armed at)'}<br />
+          <span className="text-xs text-purple-300 font-mono">{trailActive ? (stopLevel != null ? Number(stopLevel).toFixed(2) : '—') : (trade.trail_activation != null ? Number(trade.trail_activation).toFixed(2) : '—')}</span>
+        </div>
+        <div className="bg-gray-800/50 p-2 rounded">Active Stop<br /><span className="text-xs text-white font-mono">{stopLevel != null ? Number(stopLevel).toFixed(2) : '—'}</span></div>
+        <div className="bg-gray-800/50 p-2 rounded">ATR @ Entry<br /><span className="text-white text-xs font-mono">{trade.atr_at_entry != null ? Number(trade.atr_at_entry).toFixed(2) : '—'}</span></div>
+        <div className="bg-gray-800/50 p-2 rounded">Peak Price<br /><span className="text-white text-xs font-mono">{trade.peak_price != null ? Number(trade.peak_price).toFixed(2) : '—'}</span></div>
+      </div>
+    </div>
+  );
+};
+
 const TradeCard = ({ trade, onClose }) => (
   <div className="p-4 rounded-xl border border-blue-500/30 bg-blue-500/5 transition hover:scale-[1.01]">
     <div className="flex justify-between items-start mb-3">
@@ -59,6 +86,7 @@ const TradeCard = ({ trade, onClose }) => (
       <div className="bg-gray-800/50 p-2 rounded">Bars Held<br /><span className="text-white text-xs">{trade.bars_held ?? 0}</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Entry (IST)<br /><span className="text-white text-xs">{fmtIST(trade.entry_time)}</span></div>
     </div>
+    <StopBar trade={trade} />
     {onClose && (
       <button onClick={onClose} className="mt-3 w-full text-xs text-red-400 hover:text-red-300 flex items-center justify-center gap-1 py-1 rounded border border-red-900/40 hover:bg-red-900/20 transition">
         <XCircle size={12} /> Close Position
@@ -68,6 +96,15 @@ const TradeCard = ({ trade, onClose }) => (
 );
 
 // ---------- Closed Trades Panel ----------
+const EXIT_REASONS = {
+  TP: { label: 'Take Profit', color: 'text-green-400 border-green-800 bg-green-900/20' },
+  TSL: { label: 'Trailing Stop', color: 'text-purple-400 border-purple-800 bg-purple-900/20' },
+  SL: { label: 'Stop Loss', color: 'text-red-400 border-red-800 bg-red-900/20' },
+  MH: { label: 'Max Hold Time', color: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
+  REV: { label: 'Reversal', color: 'text-blue-400 border-blue-800 bg-blue-900/20' },
+};
+const reasonMeta = (r) => EXIT_REASONS[r] || { label: r || '—', color: 'text-gray-400 border-gray-700 bg-gray-900' };
+
 const ClosedTradesPanel = ({ closedTrades }) => {
   if (!closedTrades || closedTrades.length === 0) {
     return (
@@ -86,28 +123,43 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Dir</th>
               <th className="p-2">Entry</th>
               <th className="p-2">Exit</th>
+              <th className="p-2">Stop Loss</th>
+              <th className="p-2">Take Profit</th>
+              <th className="p-2">Trail Stop</th>
+              <th className="p-2">ATR</th>
+              <th className="p-2">Exit Condition</th>
               <th className="p-2">Net PnL</th>
               <th className="p-2">Fees</th>
               <th className="p-2">Entry (IST)</th>
               <th className="p-2">Exit (IST)</th>
-              <th className="p-2">Reason</th>
               <th className="p-2">Held</th>
             </tr>
           </thead>
           <tbody>
-            {closedTrades.map((t, i) => (
-              <tr key={i} className="border-b border-gray-700/60">
-                <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
-                <td className="p-2 font-mono text-gray-300">{Number(t.entry).toFixed(2)}</td>
-                <td className="p-2 font-mono text-gray-300">{Number(t.exit).toFixed(2)}</td>
-                <td className={`p-2 font-mono font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(2)}</td>
-                <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{Number(t.fees || 0).toFixed(2)}</span></td>
-                <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
-                <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
-                <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{t.reason || '—'}</span></td>
-                <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
-              </tr>
-            ))}
+            {closedTrades.map((t, i) => {
+              const meta = reasonMeta(t.reason);
+              const slMoved = t.sl != null && t.sl_final != null && Math.abs(t.sl_final - t.sl) > 0.005;
+              return (
+                <tr key={i} className="border-b border-gray-700/60 align-top">
+                  <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
+                  <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-red-300">{t.sl != null ? Number(t.sl).toFixed(2) : '—'}{slMoved && <span className="text-[9px] text-yellow-400 ml-1">→ {Number(t.sl_final).toFixed(2)} (BE)</span>}</td>
+                  <td className="p-2 font-mono text-green-300">{t.tp != null ? Number(t.tp).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-purple-300">{t.trail_stop != null ? Number(t.trail_stop).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-gray-400">{t.atr_at_entry != null ? Number(t.atr_at_entry).toFixed(2) : '—'}</td>
+                  <td className="p-2 max-w-[260px]">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${meta.color}`}>{meta.label}</span>
+                    {t.exit_detail && <div className="text-[10px] text-gray-500 mt-1 leading-snug">{t.exit_detail}</div>}
+                  </td>
+                  <td className={`p-2 font-mono font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(2)}</td>
+                  <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{Number(t.fees || 0).toFixed(2)}</span></td>
+                  <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
+                  <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
+                  <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -350,7 +402,7 @@ const PaperTrade = () => {
           </select>
           <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
-            <option value="PhantomV2">Phantom V2.5 (Default)</option>
+            <option value="PhantomV2">Kudos V2.5 (Default)</option>
             <option value="FastTest">Fast Test Strategy</option>
             {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>

@@ -79,7 +79,9 @@ class LiveTradeService:
                 side = "SELL" if result.direction == 1 else "BUY"
                 response = self.broker.place_order(symbol, side, "MARKET", result.lots)
                 if "error" not in response:
-                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {current_price}")
+                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {result.exit_price:,.2f}")
+                    if result.exit_detail:
+                        print(f"   Exit condition: {result.exit_detail}")
                 else:
                     print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
 

@@ -696,12 +696,28 @@ def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin)):
         from .services.data_sync import DataSyncService
         intervals = [i for i in payload.intervals if i in DataSyncService.TIMEFRAMES]
         if not intervals: raise HTTPException(status_code=400, detail='Select at least one valid interval')
-        return {'status': 'Seed completed', 'summary': DataSyncService.seed_market_data(
+        summary = DataSyncService.seed_market_data(
             normalize_source(payload.source), payload.symbol.upper(), intervals,
-            payload.start_date, payload.end_date, max(1, min(payload.limit, 2000)))}
+            payload.start_date, payload.end_date, max(1, min(payload.limit, 2000)))
+        # Per-interval failures are reported in the summary instead of 502 so
+        # the admin can see exactly which interval failed and why.
+        ok = sum(1 for s in summary if not s.get('error'))
+        status = 'Seed completed' if ok == len(summary) else ('Seed failed' if ok == 0 else 'Seed completed with errors')
+        return {'status': status, 'summary': summary}
     except HTTPException: raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get('/admin/market-data/test')
+def test_market_data_source(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
+                            admin=Depends(require_admin)):
+    """Round-trip probe: shows exactly what the exchange answers for a tiny
+    request, so an empty seed (0 candles) can be diagnosed from the UI."""
+    from .services.data_sync import DataSyncService
+    if interval not in DataSyncService.TIMEFRAMES:
+        raise HTTPException(status_code=400, detail='Invalid interval')
+    return DataSyncService.test_source(normalize_source(source), symbol.upper(), interval)
 
 
 @app.post('/admin/market-data/seed-csv')
@@ -1223,13 +1239,31 @@ def get_paper_status(user=Depends(get_current_user)):
                 # Percent change of the live price vs entry (direction-aware).
                 chg_pct = ((current - trade.entry_price) / trade.entry_price * 100) * trade.direction if trade.entry_price else 0.0
                 entry_time_ist = _to_ist(trade.entry_time)
+                # Which stop is in force right now: trailing stop once the
+                # peak crossed the activation level, otherwise the hard SL
+                # (which may already have been moved to breakeven).
+                # Note: values can be numpy scalars (ATR comes from pandas),
+                # so coerce to plain Python types before serializing.
+                trail_active = bool((trade.peak_price >= trade.trail_activation) if trade.direction == 1
+                                    else (trade.peak_price <= trade.trail_activation))
+                stop_level = getattr(trade, 'trail_stop', None) if trail_active else getattr(trade, 'sl', None)
+                breakeven_active = bool((getattr(trade, 'sl', 0) >= trade.entry_price) if trade.direction == 1
+                                        else (getattr(trade, 'sl', float('inf')) <= trade.entry_price))
+                _f = lambda v: None if v is None else float(v)
                 active_trades.append({
-                    "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": current, "pnl": pnl_inr, "chg_pct": chg_pct,
-                    "entry_time": entry_time_ist, "bars_held": trade.bars_held,
-                    "margin": trade.margin_inr, "notional_usd": getattr(trade, 'notional_usd', 0),
-                    "lots": getattr(trade, 'lots', 0), "leverage": leverage,
-                    "sl": getattr(trade, 'sl', None), "tp": getattr(trade, 'tp', None),
+                    "symbol": symbol, "direction": trade.direction, "entry": float(trade.entry_price),
+                    "current": float(current), "pnl": float(pnl_inr), "chg_pct": float(chg_pct),
+                    "entry_time": entry_time_ist, "bars_held": int(trade.bars_held),
+                    "margin": float(trade.margin_inr), "notional_usd": float(getattr(trade, 'notional_usd', 0)),
+                    "lots": float(getattr(trade, 'lots', 0)), "leverage": leverage,
+                    "sl": _f(getattr(trade, 'sl', None)), "sl_entry": _f(getattr(trade, 'sl_entry', None)),
+                    "tp": _f(getattr(trade, 'tp', None)),
+                    "trail_stop": _f(getattr(trade, 'trail_stop', None)),
+                    "trail_activation": _f(getattr(trade, 'trail_activation', None)),
+                    "trail_active": trail_active, "stop_level": _f(stop_level),
+                    "breakeven_active": breakeven_active,
+                    "atr_at_entry": _f(getattr(trade, 'atr_at_entry', None)),
+                    "peak_price": _f(getattr(trade, 'peak_price', None)),
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,

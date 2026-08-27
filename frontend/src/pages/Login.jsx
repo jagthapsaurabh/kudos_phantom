@@ -46,9 +46,8 @@ const Login = () => {
         <div className="text-center mb-8">
           <div className="flex items-center justify-center gap-2 mb-2">
             <TrendingUp size={32} className="text-blue-500" />
-            <h1 className="text-4xl font-extrabold text-blue-500">PHANTOM</h1>
+            <h1 className="text-4xl font-extrabold text-blue-500">Kudos</h1>
           </div>
-          <p className="text-gray-400">Institutional Trading Command Center</p>
         </div>
         
         <form onSubmit={handleSubmit} className="space-y-6">
@@ -93,7 +92,7 @@ const Login = () => {
         </form>
         
         <div className="mt-8 text-center text-gray-500 text-xs">
-          Secure Access Only &bull; PHANTOM v3
+          Secure Access Only &bull; Kudos v3
         </div>
       </div>
     </div>

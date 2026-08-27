@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from app.core.strategy import StrategyService, PhantomV2Config, ValidatorService
 from app.core.dynamic_strategy import DynamicStrategyService
 from app.services.order_manager import OrderManager
+from app.services.broker_client import BrokerClient
 from app.database.models import SessionLocal, Klines
 import requests
 from app.core.indicators import compute_indicators
@@ -80,18 +81,34 @@ class PaperTradeService:
         Entry/exit times are the candle timestamps (naive UTC) which are
         converted to IST so the UI always shows India time.
         """
+        # Coerce to plain Python types: ATR-derived values are numpy scalars
+        # (np.float64 serializes as float, but comparisons yield np.bool_ which
+        # FastAPI cannot encode — keep every numeric field a real float).
+        f = lambda v: None if v is None else float(v)
         self.closed_trades.append({
             "symbol": trade.symbol,
-            "direction": trade.direction,
-            "entry": trade.entry_price,
-            "exit": trade.exit_price,
-            "pnl": pnl_inr,
-            "gross_pnl": gross_pnl if gross_pnl is not None else pnl_inr,
-            "fees": fees_inr,
+            "direction": int(trade.direction),
+            "entry": f(trade.entry_price),
+            "exit": f(trade.exit_price),
+            "pnl": f(pnl_inr),
+            "gross_pnl": f(gross_pnl) if gross_pnl is not None else f(pnl_inr),
+            "fees": f(fees_inr),
             "reason": trade.exit_reason,
+            "exit_detail": getattr(trade, "exit_detail", "") or "",
+            # Stop plan at entry vs the levels actually in force at exit.
+            "sl": f(getattr(trade, "sl_entry", trade.sl)),
+            "sl_final": f(trade.sl),
+            "tp": f(trade.tp),
+            "trail_stop": f(trade.trail_stop),
+            "trail_activation": f(trade.trail_activation),
+            "atr_at_entry": f(trade.atr_at_entry),
+            "peak_price": f(trade.peak_price),
+            "margin_inr": f(trade.margin_inr),
+            "notional_usd": f(trade.notional_usd),
+            "lots": f(trade.lots),
             "entry_time": _to_ist(trade.entry_time),
             "exit_time": _to_ist(trade.exit_time),
-            "bars_held": trade.bars_held,
+            "bars_held": int(trade.bars_held),
         })
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
             self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
@@ -149,8 +166,14 @@ class PaperTradeService:
                 pnl_inr = gross_pnl - entry_fee - exit_fee
                 self.equity_inr += pnl_inr
                 self._record_closed(result, pnl_inr, entry_fee + exit_fee, gross_pnl)
-                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | Equity ₹{self.equity_inr:,.2f}")
-                print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason}, Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
+                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — exit {result.exit_price:,.2f} | "
+                                    f"SL {result.sl_entry:,.2f} → {result.sl:,.2f} | TP {result.tp:,.2f} | "
+                                    f"Trail {result.trail_stop:,.2f} | ATR {result.atr_at_entry:,.2f} | "
+                                    f"Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | "
+                                    f"Equity ₹{self.equity_inr:,.2f}")
+                if result.exit_detail:
+                    self._log("info", f"Exit condition: {result.exit_detail}")
+                print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason} @ {result.exit_price:.2f}, Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
 
         # ---- New entries --------------------------------------------
         if last_sig != 0:
@@ -158,10 +181,15 @@ class PaperTradeService:
             validation = self.validator.validate_signal(last_sig, current_price, current_price, ind_slice)
             if validation.passed:
                 margin_inr = self.equity_inr * (self.margin_pct / 100.0)
-                self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time, margin_inr, self.conversion_rate)
-                side = "LONG" if last_sig == 1 else "SHORT"
-                self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | Margin ₹{margin_inr:,.0f}")
-                print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {'LONG' if last_sig==1 else 'SHORT'} at {current_price}")
+                new_trade = self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time, margin_inr, self.conversion_rate)
+                if new_trade is None:
+                    self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
+                else:
+                    side = "LONG" if last_sig == 1 else "SHORT"
+                    self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | SL {new_trade.sl:,.2f} | "
+                                        f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
+                                        f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
+                    print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {current_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
             else:
                 self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
                 print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
@@ -181,7 +209,10 @@ class PaperTradeService:
                 return df
             df.set_index('event_time', inplace=True)
             return df.sort_index()
-        except Exception:
+        except Exception as exc:
+            # Do not swallow the reason silently — a quiet None here becomes
+            # "Data fetch failed" with no way to diagnose it.
+            print(f"[{self.strategy_id}] Candle fetch failed for {self.market_source} {interval}: {exc}")
             return None
 
     def _get_data_from_db(self, symbol, interval, limit=500):
