@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, Users, LineChart, Radio, Menu, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, Users, LineChart, Radio, Menu, X, ChevronLeft, ChevronRight, BookOpen } from 'lucide-react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -64,11 +64,12 @@ const Navbar = () => {
     { name: 'Paper Trade', path: '/paper', icon: Activity },
     ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: Radio }] : []),
     { name: 'Strategies', path: '/strategies', icon: PlayCircle },
+    { name: 'Phantom Strategy', path: '/strategy', icon: BookOpen },
     { name: 'Broker', path: '/broker', icon: Settings },
     ...(role === 'admin' ? [{ name: 'Admin', path: '/admin', icon: Users }] : []),
   ];
 
-  const isActive = (path) => (path === '/' ? location.pathname === '/' : location.pathname.startsWith(path));
+  const isActive = (path) => (path === '/' ? location.pathname === '/' : (location.pathname === path || location.pathname.startsWith(path + '/')));
   const slim = collapsed && !mobileOpen;
 
   const sidebar = (

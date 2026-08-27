@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
-import { Users, BookOpen, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Trash2, Wallet, Percent, Plug, Database, Upload, Save, Calculator } from 'lucide-react';
+import { Users, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Percent, Database, Upload, Save } from 'lucide-react';
 import DateInput from '../components/DateInput';
-import StrategyExplainedTab from './StrategyExplainedTab';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -326,85 +325,6 @@ const ChangePasswordTab = () => {
   );
 };
 
-// ------------------------------------------------------ Strategy docs tab --
-const DocSection = ({ title, color, children }) => (
-  <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
-    <h3 className={`text-sm font-bold uppercase tracking-wider mb-3 ${color}`}>{title}</h3>
-    <div className="space-y-2 text-sm text-gray-300">{children}</div>
-  </div>
-);
-
-const Rule = ({ name, children }) => (
-  <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
-    <span className="font-mono text-blue-300 text-xs font-bold">{name}</span>
-    <div className="text-gray-400 text-xs mt-1 leading-relaxed">{children}</div>
-  </div>
-);
-
-const StrategyTab = ({ profile, champion }) => {
-  const cfg = champion?.config || {};
-  const fmt = (v) => (typeof v === 'boolean' ? (v ? 'ON' : 'OFF') : v);
-  const interesting = [
-    'adx_min', 'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min',
-    'rsi_oversold', 'rsi_overbought', 'atr_regime_ratio',
-    'enable_momentum_entry', 'trend_ema_period', 'stop_loss_atr', 'take_profit_atr',
-    'trail_activation_atr', 'trail_distance_atr', 'breakeven_atr', 'timeout_bars',
-    'cooldown_bars', 'leverage', 'margin_pct', 'reduced_margin_pct',
-    'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct',
-  ];
-  return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <DocSection title="📈 Entry Conditions — Setup A: RSI Reversal (LONG)" color="text-green-400">
-        <p className="text-xs text-gray-500">All five filters must pass on the same 1h candle; entry executes on the next candle's open.</p>
-        <Rule name="1. Trend alignment (4h)">Close(1h) &gt; EMA50(4h) — longs only with the macro uptrend. Shorts require Close &lt; EMA50(4h).</Rule>
-        <Rule name="2. ADX filter">ADX(14) ≥ {cfg.adx_min ?? 10} — market must be trending, not chopping.</Rule>
-        <Rule name="3. MACD magnitude">|MACD-hist(12,26,9)| ≥ {cfg.macd_hist_min ?? 5} — enough momentum behind the move. The MACD indicator uses periods {cfg.macd_fast ?? 12}/{cfg.macd_slow ?? 26}/{cfg.macd_signal ?? 9}; <b>macd_hist_min is the threshold</b> applied to that histogram, not the indicator itself.</Rule>
-        <Rule name="4. ATR volatility regime">ATR(14) ≥ {cfg.atr_regime_ratio ?? 0.5} × SMA50(ATR) — volatility must be alive.</Rule>
-        <Rule name="5. Reversal trigger">Prev candle RSI(14) &lt; {cfg.rsi_oversold ?? 40} (long) / &gt; {cfg.rsi_overbought ?? 60} (short) <b>and</b> current candle closes green (long) / red (short).</Rule>
-        <Rule name="6. MACD confirmation">MACD-hist rising vs previous bar (long) / falling (short).</Rule>
-      </DocSection>
-
-      <DocSection title="⚡ Entry Conditions — Setup B: Momentum Continuation (v3)" color="text-purple-400">
-        <p className="text-xs text-gray-500">Adds trend-continuation trades so the strategy trades far more often than reversal-only. Currently <b>{fmt(cfg.enable_momentum_entry)}</b>.</p>
-        <Rule name="1. Trend alignment (4h)">Same EMA50(4h) trend filter as Setup A.</Rule>
-        <Rule name="2. ADX filter">ADX(14) ≥ {cfg.adx_min ?? 10}.</Rule>
-        <Rule name="3. ATR regime">Same volatility regime filter as Setup A.</Rule>
-        <Rule name="4. DI confirmation">+DI &gt; −DI (long) / −DI &gt; +DI (short) — directional agreement.</Rule>
-        <Rule name="5. MACD zero-cross">MACD-hist crosses above 0 (long) / below 0 (short) on this candle — fresh momentum burst.</Rule>
-        <Rule name="6. RSI agreement">RSI(14) ≥ {cfg.momentum_rsi_min ?? 50} (long) / ≤ {cfg.momentum_rsi_min ? (100 - cfg.momentum_rsi_min) : 50} (short).</Rule>
-      </DocSection>
-
-      <DocSection title="🛡️ Risk, Exits & Drawdown Guard" color="text-red-400">
-        <Rule name="Stop loss">{cfg.stop_loss_atr ?? 1.2}×ATR from entry, with a hard floor of {(cfg.sl_floor_pct ?? 0.016) * 100}% of price.</Rule>
-        <Rule name="Take profit">{cfg.take_profit_atr ?? 14}×ATR from entry (maker fee on TP fills).</Rule>
-        <Rule name="Trailing stop">Activates after +{cfg.trail_activation_atr ?? 0.8}×ATR; trails the peak at {cfg.trail_distance_atr ?? 0.3}×ATR.</Rule>
-        <Rule name="Breakeven stop (v3)">After +{cfg.breakeven_atr ?? 0.75}×ATR in profit, the stop is ratcheted to the entry price — winners can't become losers.</Rule>
-        <Rule name="Time stop">Positions older than {cfg.timeout_bars ?? 72} bars are closed at market ("MH").</Rule>
-        <Rule name="Cooldown">{cfg.cooldown_bars ?? 0} bar(s) after every close before a new entry is allowed.</Rule>
-        <Rule name="Drawdown guard (v3)">Past {cfg.dd_soft_pct ?? 8}% equity drawdown, position size drops to {(cfg.reduced_margin_pct ?? 0.075) * 100}% margin. At {cfg.dd_halt_pct ?? 100}% DD new entries halt entirely and resume below {cfg.dd_resume_pct ?? 100}% DD (100 = guard off).</Rule>
-        <Rule name="Position sizing">{(cfg.margin_pct ?? 0.15) * 100}% of equity as margin × {cfg.leverage ?? 2} leverage, quantized to 0.001 BTC lots.</Rule>
-        <Rule name="Signal validator">Entries are rejected if price drifts &gt;1% between signal close and next open (gap protection).</Rule>
-      </DocSection>
-
-      <DocSection title={`⚙️ Live Champion Config (${profile || 'loading…'})`} color="text-yellow-400">
-        <p className="text-xs text-gray-500">This is the exact tuned parameter set currently powering backtests and the signal overlay.</p>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs">
-          {interesting.map(k => {
-            const defaults = { macd_fast: 12, macd_slow: 26, macd_signal: 9, trend_ema_period: 50 };
-            const val = cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : defaults[k];
-            return (
-              <div key={k} className="flex justify-between border-b border-gray-700/50 py-1">
-                <span className="text-gray-500">{k}</span>
-                <span className="text-gray-200 font-bold">{fmt(val)}</span>
-              </div>
-            );
-          })}
-        </div>
-      </DocSection>
-    </div>
-  );
-};
-
 // -------------------------------------------------------------- Paper tab --
 const PaperTab = () => {
   const [paperStatus, setPaperStatus] = useState([]);
@@ -477,77 +397,6 @@ const PaperTab = () => {
   );
 };
 
-// ------------------------------------------------------ Capital settings --
-const CapitalTab = () => {
-  const [admins, setAdmins] = useState([]);
-  const [capital, setCapital] = useState(20000);
-  const [margin, setMargin] = useState(25);
-  const [msg, setMsg] = useState(null);
-  const [saving, setSaving] = useState(false);
-
-  const load = useCallback(async () => {
-    const res = await fetch(`${API_URL}/admin/clients`, { headers: authHeaders() });
-    if (res.ok) {
-      const list = await res.json();
-      const admin = list.find(c => c.role === 'admin');
-      if (admin) {
-        setAdmins(list);
-        setCapital(admin.initial_capital || 20000);
-        setMargin(admin.margin_deployment_pct || 25);
-      }
-    }
-  }, []);
-  useEffect(() => { load(); }, [load]);
-
-  const save = async (e) => {
-    e.preventDefault();
-    setSaving(true);
-    setMsg(null);
-    const admin = admins.find(c => c.role === 'admin');
-    if (!admin) { setMsg({ ok: false, text: 'No admin account found' }); setSaving(false); return; }
-    try {
-      const res = await fetch(`${API_URL}/admin/clients/${admin.id}`, {
-        method: 'PUT', headers: authHeaders(),
-        body: JSON.stringify({ initial_capital: parseFloat(capital), margin_deployment_pct: parseFloat(margin) }),
-      });
-      const data = await res.json();
-      if (res.ok) setMsg({ ok: true, text: `Default capital set to ₹${Number(capital).toLocaleString()}. It is used as the default for new backtests & paper-trade instances.` });
-      else setMsg({ ok: false, text: data.detail || 'Failed to save' });
-    } catch (e) { setMsg({ ok: false, text: 'Network error' }); }
-    setSaving(false);
-  };
-
-  return (
-    <div className="max-w-xl">
-      <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
-        <h3 className="text-sm font-bold text-gray-300 uppercase tracking-wider mb-2 flex items-center gap-2"><Wallet size={16} /> Default Trading Capital (Admin)</h3>
-        <p className="text-xs text-gray-500 mb-5">
-          This is the starting capital used by default for new <b>backtests</b> and <b>paper-trade</b> instances. You can still override it per run when you start one.
-        </p>
-        <form onSubmit={save} className="space-y-4">
-          <div>
-            <label className="text-[10px] text-gray-500 uppercase block mb-1">Initial Capital (₹)</label>
-            <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
-              className="w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm" />
-          </div>
-          <div>
-            <label className="text-[10px] text-gray-500 uppercase block mb-1">Margin Deployment (%)</label>
-            <input type="number" min="1" max="100" step="1" value={margin} onChange={e => setMargin(e.target.value)}
-              className="w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm" />
-          </div>
-          <div className="flex items-center gap-4">
-            <button disabled={saving} className="bg-blue-600 hover:bg-blue-500 px-6 py-2.5 rounded-lg font-bold text-sm transition disabled:opacity-50">
-              {saving ? 'Saving…' : 'Save Default Capital'}
-            </button>
-            {msg && <span className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</span>}
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-};
-
-
 // ------------------------------------------------------------- Fee schedules --
 const FeeSettingsTab = () => {
   const [fees, setFees] = useState([]);
@@ -576,31 +425,23 @@ const FeeSettingsTab = () => {
   </div>;
 };
 
-// --------------------------------------------------------- Broker registry --
-const BrokerIntegrationsTab = () => {
-  const blank = { code: '', name: '', kind: 'generic', market_data_url: '', trading_api_url: '', notes: '' };
-  const [form, setForm] = useState(blank); const [rows, setRows] = useState([]); const [msg, setMsg] = useState(null);
-  const load = () => fetch(`${API_URL}/admin/brokers`, { headers: authHeaders() }).then(r => r.json()).then(setRows).catch(() => {});
-  useEffect(() => { load(); }, []);
-  const add = async e => { e.preventDefault(); const res = await fetch(`${API_URL}/admin/brokers`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(form) }); const data = await res.json(); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Could not add integration' }); else { setMsg({ ok: true, text: `${form.name} added.` }); setForm(blank); load(); } };
-  const toggle = async row => { const res = await fetch(`${API_URL}/admin/brokers/${row.id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ ...row, enabled: !row.enabled }) }); if (res.ok) load(); };
-  const f = 'w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
-  return <div className="space-y-5 max-w-6xl">
-    <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Plug size={16} className="text-green-400" /> Broker integrations</h3><p className="text-xs text-gray-500 mt-2">Binance Futures and Delta Exchange are ready-to-use adapters. Register another provider here so it is available as a named source; a runtime adapter is required before live orders can be sent.</p></div>
-    <form onSubmit={add} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 grid grid-cols-1 md:grid-cols-3 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Code *</label><input required placeholder="Bybit" className={f} value={form.code} onChange={e => setForm({ ...form, code: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Display name *</label><input required placeholder="Bybit Futures" className={f} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Adapter kind</label><select className={f} value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value })}><option value="generic">Generic / custom</option><option value="binance">Binance-compatible</option><option value="delta">Delta-compatible</option></select></div><div><label className="text-[10px] text-gray-500 uppercase">Market data URL</label><input className={f} placeholder="https://…" value={form.market_data_url} onChange={e => setForm({ ...form, market_data_url: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Trading API URL</label><input className={f} placeholder="https://…" value={form.trading_api_url} onChange={e => setForm({ ...form, trading_api_url: e.target.value })} /></div><div><label className="text-[10px] text-gray-500 uppercase">Notes</label><input className={f} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></div><button className="bg-blue-600 hover:bg-blue-500 px-5 py-2 rounded-lg font-bold text-sm md:col-span-3 w-fit">Add Integration</button>{msg && <span className="text-xs text-green-400">{msg.text}</span>}</form>
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">{rows.map(row => <div key={row.id} className="bg-gray-800 p-5 rounded-xl border border-gray-700 flex justify-between gap-3"><div><div className="font-bold text-gray-200">{row.name} <span className="text-[10px] text-gray-500 ml-2">{row.code}</span></div><div className="text-xs text-gray-500 mt-1">{row.kind} adapter · {row.is_builtin ? 'built-in' : 'admin configured'}</div><div className="text-[10px] text-gray-600 mt-1">{row.market_data_url || 'No market endpoint configured'}</div></div><button onClick={() => toggle(row)} className={`self-start px-2 py-1 text-[10px] rounded border ${row.enabled ? 'text-green-400 border-green-800' : 'text-gray-500 border-gray-700'}`}>{row.enabled ? 'ENABLED' : 'DISABLED'}</button></div>)}</div>
-  </div>;
-};
-
 // --------------------------------------------------------------- Seed data --
 const SeedDataTab = () => {
-  const [defs, setDefs] = useState([]); const [fetchAll, setFetchAll] = useState(false); const [source, setSource] = useState('Binance'); const [symbol, setSymbol] = useState('BTCUSDT'); const [intervals, setIntervals] = useState(['1m', '5m', '15m', '1h', '4h', '1d']); const [start, setStart] = useState(''); const [end, setEnd] = useState(''); const [limit, setLimit] = useState(1000); const [status, setStatus] = useState([]); const [busy, setBusy] = useState(false); const [msg, setMsg] = useState(null); const [file, setFile] = useState(null); const [csvInterval, setCsvInterval] = useState('1h');
+  const [defs, setDefs] = useState([]); const [fetchAll, setFetchAll] = useState(false); const [source, setSource] = useState('Binance'); const [symbol, setSymbol] = useState('BTCUSDT'); const [intervals, setIntervals] = useState(['1m', '5m', '15m', '1h', '4h', '1d']); const [start, setStart] = useState(''); const [end, setEnd] = useState(''); const [limit, setLimit] = useState(1000); const [status, setStatus] = useState([]); const [busy, setBusy] = useState(false); const [msg, setMsg] = useState(null); const [file, setFile] = useState(null); const [csvInterval, setCsvInterval] = useState('1h'); const [testResult, setTestResult] = useState(null);
   const f = 'bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
   const load = async () => { const [d, s] = await Promise.all([fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.json()), fetch(`${API_URL}/admin/market-data/status`, { headers: authHeaders() }).then(r => r.json())]); setDefs(d || []); setStatus(s || []); };
   useEffect(() => { load(); }, []);
-  const seed = async e => { e.preventDefault(); setBusy(true); setMsg(null); const res = await fetch(`${API_URL}/admin/market-data/seed`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ source, symbol: symbol.toUpperCase(), intervals, start_date: start || null, end_date: end || null, limit: Number(limit), fetch_all: fetchAll }) }); const data = await res.json(); setBusy(false); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Seed failed' }); else { setMsg({ ok: true, text: `Seeded ${data.summary?.reduce((n, x) => n + (x.fetched || 0), 0) || 0} OHLCV candles.` }); load(); } };
+  const seed = async e => { e.preventDefault(); setBusy(true); setMsg(null); setTestResult(null); const res = await fetch(`${API_URL}/admin/market-data/seed`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ source, symbol: symbol.toUpperCase(), intervals, start_date: start || null, end_date: end || null, limit: Number(limit), fetch_all: fetchAll }) }); const data = await res.json(); setBusy(false); if (!res.ok) setMsg({ ok: false, text: data.detail || 'Seed failed' }); else { const summary = data.summary || []; const seeded = summary.reduce((n, x) => n + (x.fetched || 0), 0); const failed = summary.filter(x => x.error).map(x => `${x.interval}: ${x.error}`); if (failed.length) setMsg({ ok: false, text: `${data.status} — seeded ${seeded} candles. ${failed.join(' | ')}` }); else setMsg({ ok: true, text: `Seeded ${seeded} OHLCV candles.` }); load(); } };
+  const testSource = async () => { setBusy(true); setMsg(null); setTestResult(null); try { const res = await fetch(`${API_URL}/admin/market-data/test?source=${encodeURIComponent(source)}&symbol=${encodeURIComponent(symbol.toUpperCase())}&interval=1h`, { headers: authHeaders() }); const data = await res.json(); setTestResult(res.ok ? data : { ok: false, detail: data.detail || 'Test failed' }); } catch (err) { setTestResult({ ok: false, detail: err.message }); } setBusy(false); };
   const upload = async e => { e.preventDefault(); if (!file) return; setBusy(true); const body = new FormData(); body.append('file', file); body.append('source', source); body.append('symbol', symbol.toUpperCase()); body.append('interval', csvInterval); const res = await fetch(`${API_URL}/admin/market-data/seed-csv`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }, body }); const data = await res.json(); setBusy(false); setMsg(res.ok ? { ok: true, text: `Imported ${data.summary?.fetched || 0} candles with volume.` } : { ok: false, text: data.detail || 'CSV import failed' }); if (res.ok) load(); };
-  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><DateInput value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><DateInput value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Seeding…' : 'Fetch & Seed OHLCV'}</button></form></div>
+  return <div className="space-y-5 max-w-7xl"><div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Database size={16} className="text-blue-400" /> Seed market data</h3><p className="text-xs text-gray-500 mt-2">Seed OHLCV candles separately for each exchange. Volume is mandatory and is visible in the chart. Existing candles are upserted by source, symbol, interval and timestamp.</p><form onSubmit={seed} className="mt-5 grid grid-cols-1 md:grid-cols-4 gap-3 items-end"><div><label className="text-[10px] text-gray-500 uppercase">Source</label><select className={f} value={source} onChange={e => setSource(e.target.value)}>{defs.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}</select></div><div><label className="text-[10px] text-gray-500 uppercase">Symbol</label><input className={f} value={symbol} onChange={e => setSymbol(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">From</label><DateInput value={start} onChange={e => setStart(e.target.value)} /></div><div><label className="text-[10px] text-gray-500 uppercase">To</label><DateInput value={end} onChange={e => setEnd(e.target.value)} /></div><div className="md:col-span-3 flex flex-wrap gap-3">{['1m','5m','15m','1h','4h','1d'].map(i => <label key={i} className="flex items-center gap-1 text-xs text-gray-300"><input type="checkbox" checked={intervals.includes(i)} onChange={e => setIntervals(e.target.checked ? [...intervals, i] : intervals.filter(x => x !== i))} className="accent-blue-500" /> {i}</label>)}<label className="text-xs text-gray-400 flex items-center gap-2"><input type="checkbox" checked={fetchAll} onChange={e => setFetchAll(e.target.checked)} className="accent-blue-500" /> Fetch all pages</label><label className="text-xs text-gray-400 flex items-center gap-2">Rows/API page <input type="number" min="10" max="2000" className={`${f} w-24`} value={limit} onChange={e => setLimit(e.target.value)} /></label></div><button disabled={busy} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm">{busy ? 'Working…' : 'Fetch & Seed OHLCV'}</button><button type="button" disabled={busy} onClick={testSource} className="bg-gray-700 hover:bg-gray-600 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm" title="Fetch 3 candles from this source to verify connectivity — run this if a seed returns 0 candles">Test connection</button></form></div>
+    {testResult && (
+      <div className={`mt-4 p-3 rounded-xl border text-xs font-mono ${testResult.ok ? 'border-green-800 bg-green-900/20 text-green-300' : 'border-red-800 bg-red-900/20 text-red-300'}`}>
+        <div className="font-bold mb-1">{testResult.ok ? '✓ Connection OK' : '✗ Connection problem'}</div>
+        <div>{testResult.detail}</div>
+        {testResult.ok && testResult.rows > 0 && <div className="mt-1 opacity-80">rows={testResult.rows} · first={testResult.first} · last={testResult.last}</div>}
+      </div>
+    )}
     <form onSubmit={upload} className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex flex-wrap items-end gap-4"><div><label className="text-[10px] text-gray-500 uppercase block">CSV file (event_time, open, high, low, close, volume)</label><input type="file" accept=".csv" onChange={e => setFile(e.target.files?.[0])} className="text-sm text-gray-400 mt-2" /></div><div><label className="text-[10px] text-gray-500 uppercase block">CSV interval</label><select className={f} value={csvInterval} onChange={e => setCsvInterval(e.target.value)}>{['1m','5m','15m','1h','4h','1d'].map(i => <option key={i}>{i}</option>)}</select></div><button disabled={!file || busy} className="bg-gray-600 hover:bg-gray-500 disabled:opacity-50 px-5 py-2 rounded-lg font-bold text-sm flex items-center gap-2"><Upload size={14} /> Import CSV</button></form>
     {msg && <div className={`text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
     <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="p-4 border-b border-gray-700 flex justify-between"><h3 className="font-bold text-gray-300">Seeded datasets</h3><button onClick={load} className="text-gray-400 hover:text-white"><RefreshCw size={15} /></button></div><div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 text-blue-300 font-bold">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{row.count}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>{status.length === 0 && <div className="p-8 text-center text-gray-500">No seeded data yet.</div>}</div>
@@ -610,15 +451,7 @@ const SeedDataTab = () => {
 // ------------------------------------------------------------------- Main --
 const AdminPanel = () => {
   const [tab, setTab] = useState('clients');
-  const [champion, setChampion] = useState(null);
   const [confirm, setConfirm] = useState(null);
-
-  useEffect(() => {
-    fetch(`${API_URL}/phantom/config`, { headers: authHeaders() })
-      .then(r => r.ok ? r.json() : null)
-      .then(setChampion)
-      .catch(() => {});
-  }, []);
 
   const doConfirm = async () => {
     if (!confirm) return;
@@ -644,15 +477,11 @@ const AdminPanel = () => {
   };
 
   const tabs = [
-    { id: 'clients', label: 'Client Management', icon: <Users size={16} /> },
-    { id: 'capital', label: 'Capital Settings', icon: <Wallet size={16} /> },
-    { id: 'password', label: 'Change Password', icon: <Lock size={16} /> },
-    { id: 'strategy', label: 'Phantom Strategy', icon: <BookOpen size={16} /> },
-    { id: 'explained', label: 'Strategy Explained', icon: <Calculator size={16} /> },
+    { id: 'clients', label: 'Clients', icon: <Users size={16} /> },
     { id: 'paper', label: 'Paper Control', icon: <Activity size={16} /> },
     { id: 'fees', label: 'Fees', icon: <Percent size={16} /> },
-    { id: 'brokers', label: 'Broker Integrations', icon: <Plug size={16} /> },
     { id: 'seed', label: 'Seed Data', icon: <Database size={16} /> },
+    { id: 'password', label: 'Password', icon: <Lock size={16} /> },
   ];
 
   return (
@@ -685,10 +514,10 @@ const AdminPanel = () => {
         onConfirm={doConfirm}
       />
 
-      <header className="mb-8 flex justify-between items-center">
+      <header className="mb-8 flex flex-wrap justify-between items-center gap-3">
         <div>
-          <h1 className="text-3xl font-extrabold text-blue-400 tracking-tight">Admin Panel</h1>
-          <p className="text-gray-500 text-sm">Client accounts, strategy transparency & session control — PHANTOM v3</p>
+          <h1 className="text-2xl sm:text-3xl font-extrabold text-blue-400 tracking-tight">Admin Panel</h1>
+          <p className="text-gray-500 text-sm mt-1">Client accounts, fees, market data & session control — PHANTOM v3</p>
         </div>
         <div className="flex items-center gap-2 text-xs bg-gray-800 border border-gray-700 px-3 py-2 rounded-lg">
           <ShieldCheck size={14} className="text-purple-400" />
@@ -697,24 +526,20 @@ const AdminPanel = () => {
         </div>
       </header>
 
-      <div className="flex gap-2 mb-6 border-b border-gray-800 pb-3 overflow-x-auto">
+      <div className="flex flex-wrap gap-2 mb-6 border-b border-gray-800 pb-4">
         {tabs.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition shrink-0 ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}>
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition ${tab === t.id ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/30' : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'}`}>
             {t.icon} {t.label}
           </button>
         ))}
       </div>
 
       {tab === 'clients' && <ClientsTab onConfirm={setConfirm} />}
-      {tab === 'capital' && <CapitalTab />}
-      {tab === 'password' && <ChangePasswordTab />}
-      {tab === 'strategy' && <StrategyTab profile={champion?.profile} champion={champion} />}
-      {tab === 'explained' && <StrategyExplainedTab champion={champion} />}
       {tab === 'paper' && <PaperTab />}
       {tab === 'fees' && <FeeSettingsTab />}
-      {tab === 'brokers' && <BrokerIntegrationsTab />}
       {tab === 'seed' && <SeedDataTab />}
+      {tab === 'password' && <ChangePasswordTab />}
     </div>
   );
 };

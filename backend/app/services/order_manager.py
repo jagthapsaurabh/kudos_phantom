@@ -26,7 +26,12 @@ class Trade:
     exit_price: float = 0.0
     exit_time: any = None
     exit_reason: str = ""
+    exit_detail: str = ""   # human-readable description of the exit condition
     bars_held: int = 0
+    # Stop levels as originally set at entry. `sl` moves (breakeven/trailing),
+    # so the UI needs the initial value to show "what the plan was".
+    sl_entry: float = 0.0
+    tp_entry: float = 0.0
 
 class OrderManager:
     def __init__(self, config):
@@ -67,10 +72,11 @@ class OrderManager:
         trail_stop = sl
         
         trade = Trade(
-            symbol=symbol, direction=direction, entry_price=price_usd, sl=sl, tp=tp, 
-            trail_activation=trail_act, trail_stop=trail_stop, atr_at_entry=atr_usd, 
+            symbol=symbol, direction=direction, entry_price=price_usd, sl=sl, tp=tp,
+            trail_activation=trail_act, trail_stop=trail_stop, atr_at_entry=atr_usd,
             entry_time=timestamp, margin_inr=margin_inr, notional_usd=notional_usd, lots=lots,
-            peak_price=price_usd, current_price=price_usd
+            peak_price=price_usd, current_price=price_usd,
+            sl_entry=sl, tp_entry=tp
         )
         self.active_trades[symbol] = trade
         return trade
@@ -97,13 +103,21 @@ class OrderManager:
                     trade.trail_stop = max(trade.trail_stop, trade.entry_price)
             
             # 2. Check TSL / SL FIRST
-            stop_level = trade.trail_stop if trade.peak_price >= trade.trail_activation else trade.sl
+            trail_hit = trade.peak_price >= trade.trail_activation
+            stop_level = trade.trail_stop if trail_hit else trade.sl
             if current_price_usd <= stop_level:
-                return self.close_trade(symbol, stop_level, timestamp, "TSL" if trade.peak_price >= trade.trail_activation else "SL")
-            
+                if trail_hit:
+                    detail = (f"Trailing stop hit — price fell to {current_price_usd:,.2f} ≤ trail {stop_level:,.2f} "
+                              f"(peak {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
+                else:
+                    be_note = " (at breakeven)" if trade.sl >= trade.entry_price else ""
+                    detail = f"Stop loss hit — price fell to {current_price_usd:,.2f} ≤ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                return self.close_trade(symbol, stop_level, timestamp, "TSL" if trail_hit else "SL", detail)
+
             # 3. Check TP SECOND
             if current_price_usd >= trade.tp:
-                return self.close_trade(symbol, trade.tp, timestamp, "TP")
+                detail = f"Take profit hit — price rose to {current_price_usd:,.2f} ≥ TP {trade.tp:,.2f}"
+                return self.close_trade(symbol, trade.tp, timestamp, "TP", detail)
                 
         else: # SHORT
             trade.peak_price = min(trade.peak_price, current_price_usd)
@@ -118,21 +132,32 @@ class OrderManager:
                 if trade.peak_price <= trade.trail_activation:
                     trade.trail_stop = min(trade.trail_stop, trade.entry_price)
                 
-            stop_level = trade.trail_stop if trade.peak_price <= trade.trail_activation else trade.sl
+            trail_hit = trade.peak_price <= trade.trail_activation
+            stop_level = trade.trail_stop if trail_hit else trade.sl
             if current_price_usd >= stop_level:
-                return self.close_trade(symbol, stop_level, timestamp, "TSL" if trade.peak_price <= trade.trail_activation else "SL")
-                
+                if trail_hit:
+                    detail = (f"Trailing stop hit — price rose to {current_price_usd:,.2f} ≥ trail {stop_level:,.2f} "
+                              f"(low {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
+                else:
+                    be_note = " (at breakeven)" if trade.sl <= trade.entry_price else ""
+                    detail = f"Stop loss hit — price rose to {current_price_usd:,.2f} ≥ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                return self.close_trade(symbol, stop_level, timestamp, "TSL" if trail_hit else "SL", detail)
+
             if current_price_usd <= trade.tp:
-                return self.close_trade(symbol, trade.tp, timestamp, "TP")
-        
+                detail = f"Take profit hit — price fell to {current_price_usd:,.2f} ≤ TP {trade.tp:,.2f}"
+                return self.close_trade(symbol, trade.tp, timestamp, "TP", detail)
+
         if trade.bars_held >= self.config.timeout_bars:
-            return self.close_trade(symbol, current_price_usd, timestamp, "MH")
+            detail = (f"Max holding time reached — closed at market {current_price_usd:,.2f} "
+                      f"after {trade.bars_held} bars (limit {self.config.timeout_bars})")
+            return self.close_trade(symbol, current_price_usd, timestamp, "MH", detail)
         return None
 
-    def close_trade(self, symbol, price, timestamp, reason):
+    def close_trade(self, symbol, price, timestamp, reason, detail=""):
         trade = self.active_trades.pop(symbol)
         trade.status = OrderStatus.CLOSED
         trade.exit_price = price
         trade.exit_time = timestamp
         trade.exit_reason = reason
+        trade.exit_detail = detail
         return trade

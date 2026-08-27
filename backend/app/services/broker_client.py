@@ -85,18 +85,22 @@ class BrokerClient:
             now = int(time.time())
             params.setdefault("start", now - int(self._interval_seconds(interval)) * min(int(limit), 2000))
             params.setdefault("end", now)
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            payload = response.json()
-            raw = payload.get("result", payload) if isinstance(payload, dict) else payload
-            rows = []
-            for k in raw or []:
-                if isinstance(k, dict):
-                    ts = k.get("time", k.get("timestamp"))
-                    rows.append({"event_time": pd.to_datetime(float(ts), unit="s").to_pydatetime(),
-                                 "open": float(k["open"]), "high": float(k["high"]), "low": float(k["low"]),
-                                 "close": float(k["close"]), "volume": float(k.get("volume", 0) or 0)})
-            return rows
+            try:
+                response = requests.get(url, params=params, timeout=15)
+                if response.status_code != 200:
+                    body = (response.text or "").strip().replace("\n", " ")[:300]
+                    raise RuntimeError(f"Delta data request failed: HTTP {response.status_code} {body}".strip())
+                payload = response.json()
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Delta data request failed: {exc}") from exc
+            # Delta has answered with several wrappers over the years
+            # (bare list, {"result": [...]}, {"candles": [...], "result": null});
+            # use the shared parser so this stays in sync with the seeder.
+            from app.services.data_sync import DataSyncService
+            array, error = DataSyncService._extract_delta_array(payload)
+            if error:
+                raise RuntimeError(f"Delta data request failed: {error}")
+            return DataSyncService._parse_candle_rows(array)
         raise RuntimeError(f"No adapter installed for broker '{self.broker_name}'")
 
     def _binance_request(self, method, endpoint, params):
