@@ -127,6 +127,8 @@ const html = render(React.createElement(TradeLogTable, {
 check('table renders both trades', html.includes('MOMENTUM') && html.includes('REVERSAL'));
 check('header has a Signal Candle column', html.includes('Signal Candle'));
 check('header has an Entry Candle column', html.includes('Entry Candle'));
+check('header shows PnL, Fees and Booked columns',
+  html.includes('>PnL</th>') && html.includes('>Fees</th>') && html.includes('>Booked</th>'));
 check('legacy single "Candle" header is gone', !html.includes('>Candle</th>'));
 check('entry candle colour chip shown', html.includes('▲ GREEN'));
 check('signal/exit candle colour chips shown', html.includes('▼ RED'));
@@ -201,6 +203,8 @@ check('CSV has the readable condition breakdown column',
   header.includes('All Entry Conditions (detail)'));
 check('CSV has both exit condition columns',
   header.includes('Exit Condition') && header.includes('Exit Condition Detail'));
+check('CSV has PnL / Fees / Booked columns',
+  header.includes('PnL (Gross)') && header.includes('Fees') && header.includes('Booked PnL (Net)'));
 
 // The actual values — this is what the client reads in Excel.
 check('CSV: signal candle colour', col('Signal Candle Colour') === 'RED', col('Signal Candle Colour'));
@@ -223,6 +227,9 @@ check('CSV: condition breakdown flattened into one cell',
   && col('All Entry Conditions (detail)').includes('7. RSI agreement')
   && !col('All Entry Conditions (detail)').includes('\n'));
 check('CSV: direction and setup', col('Direction') === 'SHORT' && col('Setup') === 'MOMENTUM');
+check('CSV: per-trade PnL, fees and booked values',
+  col('PnL (Gross)') === '-6.67' && col('Fees') === '1.80' && col('Booked PnL (Net)') === '-8.47',
+  `${col('PnL (Gross)')} / ${col('Fees')} / ${col('Booked PnL (Net)')}`);
 check('CSV: stop plan columns', col('SL at Entry') === '10240.23' && col('ATR at Entry') === '20.00');
 check('CSV: quoting survives embedded commas', rows[1].includes('"Stop loss hit — price rose to 10,260.25'));
 check('CSV: unicode survives', csv.includes('≥'));

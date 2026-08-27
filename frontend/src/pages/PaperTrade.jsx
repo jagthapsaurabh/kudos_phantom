@@ -151,8 +151,9 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Trail Stop</th>
               <th className="p-2">ATR</th>
               <th className="p-2">Exit Condition</th>
-              <th className="p-2">Net PnL</th>
-              <th className="p-2">Fees</th>
+              <th className="p-2" title="Gross PnL before fees">PnL</th>
+              <th className="p-2" title="Entry + exit fees charged on this trade">Fees</th>
+              <th className="p-2" title="Booked = net PnL (gross PnL − fees) credited to equity">Booked</th>
               <th className="p-2">Entry (IST)</th>
               <th className="p-2">Exit (IST)</th>
               <th className="p-2">Held</th>
@@ -175,8 +176,9 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${meta.color}`}>{meta.label}</span>
                     {t.exit_detail && <div className="text-[10px] text-gray-500 mt-1 leading-snug">{t.exit_detail}</div>}
                   </td>
-                  <td className={`p-2 font-mono font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{t.pnl >= 0 ? '+' : ''}{Number(t.pnl).toFixed(2)}</td>
+                  <td className={`p-2 font-mono font-bold ${(t.gross_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(t.gross_pnl || 0) >= 0 ? '+' : ''}{Number(t.gross_pnl || 0).toFixed(2)}</td>
                   <td className="p-2"><span className="bg-gray-900 px-2 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700">{Number(t.fees || 0).toFixed(2)}</span></td>
+                  <td className={`p-2 font-mono font-bold ${(t.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(t.pnl || 0) >= 0 ? '+' : ''}{Number(t.pnl || 0).toFixed(2)}</td>
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
                   <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
@@ -392,13 +394,22 @@ const HistoryRowDetail = ({ session }) => {
 const exportSessionCSV = (session) => {
   const trades = session.closed_trades || [];
   if (!trades.length) { alert('This session has no closed trades to export.'); return; }
-  const cols = ['entry_time', 'exit_time', 'direction', 'symbol', 'entry', 'exit', 'lots', 'margin_inr',
-                'notional_usd', 'sl', 'sl_final', 'tp', 'trail_stop', 'atr_at_entry', 'peak_price',
-                'bars_held', 'reason', 'exit_detail', 'gross_pnl', 'fees', 'pnl'];
-  const lines = [cols.join(',')];
+  // [data key, column header] pairs so the export can use clear names while
+  // still reading each field from the closed-trade object.
+  const cols = [
+    ['entry_time', 'Entry Time (IST)'], ['exit_time', 'Exit Time (IST)'],
+    ['direction', 'Direction'], ['symbol', 'Symbol'],
+    ['entry', 'Entry Price'], ['exit', 'Exit Price'],
+    ['lots', 'Lots'], ['margin_inr', 'Margin (INR)'], ['notional_usd', 'Notional (USD)'],
+    ['sl', 'Stop Loss'], ['sl_final', 'Stop Loss (Final)'], ['tp', 'Take Profit'],
+    ['trail_stop', 'Trail Stop'], ['atr_at_entry', 'ATR @ Entry'], ['peak_price', 'Peak Price'],
+    ['bars_held', 'Bars Held'], ['reason', 'Exit Reason'], ['exit_detail', 'Exit Detail'],
+    ['gross_pnl', 'PnL (Gross)'], ['fees', 'Fees'], ['pnl', 'Booked PnL (Net)'],
+  ];
+  const lines = [cols.map(([, label]) => label).join(',')];
   trades.forEach(t => {
-    lines.push(cols.map(c => {
-      const v = t[c];
+    lines.push(cols.map(([key]) => {
+      const v = t[key];
       const s = v === null || v === undefined ? '' : String(v);
       return `"${s.replace(/"/g, '""')}"`;
     }).join(','));
