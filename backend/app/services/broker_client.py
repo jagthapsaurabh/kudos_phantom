@@ -9,6 +9,8 @@ from urllib.parse import urlencode
 import requests
 import pandas as pd
 
+from app.core.mark_price import MarkPriceQuote, perpetual_symbol
+
 
 class BrokerClient:
     """Small common client for Binance Futures and Delta Exchange.
@@ -48,6 +50,90 @@ class BrokerClient:
         if broker_name == "Delta" and value.endswith("USDT"):
             return value[:-4] + "USD"
         return value
+
+    # ------------------------------------------------------------------
+    # Perpetual contracts & mark price
+    # ------------------------------------------------------------------
+    # The tool trades the BTC *perpetual* on every venue (BTCUSDT on Binance,
+    # BTCUSD on Delta). Dated futures are never substituted: `perpetual_symbol`
+    # is the single resolver used by data sync, paper and live workers.
+    PERPETUAL_SYMBOLS = {"Binance": "BTCUSDT", "Delta": "BTCUSD"}
+
+    def perpetual_symbol(self, symbol: str = "BTCUSDT") -> str:
+        return perpetual_symbol(self.broker_name, symbol)
+
+    def fetch_mark_price(self, symbol: str = "BTCUSDT"):
+        """Current mark price for the perpetual. ``None`` when unavailable.
+
+        Binance: /fapi/v1/premiumIndex · Delta: /v2/tickers/{symbol}
+        The traded (last) price is read alongside it so the fill price and the
+        pricing basis are both known at entry.
+        """
+        perp = self.perpetual_symbol(symbol)
+        quote = MarkPriceQuote(self.broker_name, perp)
+        try:
+            if self.kind == "binance":
+                response = requests.get(f"{self.market_url}/fapi/v1/premiumIndex",
+                                        params={"symbol": perp}, timeout=15)
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, list):
+                    payload = payload[0] if payload else {}
+                quote.mark_price = float(payload.get("markPrice")) if payload.get("markPrice") else None
+                quote.index_price = float(payload.get("indexPrice")) if payload.get("indexPrice") else None
+                quote.raw = payload
+                try:
+                    ticker = requests.get(f"{self.market_url}/fapi/v1/ticker/price",
+                                          params={"symbol": perp}, timeout=15)
+                    if ticker.status_code == 200:
+                        quote.last_price = float(ticker.json().get("price"))
+                except Exception:
+                    pass
+            elif self.kind == "delta":
+                response = requests.get(f"{self.market_url}/v2/tickers/{perp}", timeout=15)
+                response.raise_for_status()
+                payload = response.json()
+                row = payload.get("result") if isinstance(payload, dict) else None
+                if isinstance(row, list):
+                    row = row[0] if row else None
+                if not isinstance(row, dict):
+                    row = payload if isinstance(payload, dict) else {}
+                quote.mark_price = float(row["mark_price"]) if row.get("mark_price") else None
+                quote.last_price = (float(row["close"]) if row.get("close") else
+                                    float(row["last_price"]) if row.get("last_price") else None)
+                quote.index_price = float(row["index_price"]) if row.get("index_price") else None
+                quote.raw = row
+            else:
+                return None
+        except Exception as exc:
+            print(f"[{self.broker_name}] mark price unavailable: {exc}")
+            return None
+        if quote.last_price is None:
+            quote.last_price = quote.mark_price
+        return quote if (quote.mark_price or quote.last_price) else None
+
+    def fetch_mark_price_klines(self, symbol="BTCUSDT", interval="1h", limit=500,
+                                start_time=None, end_time=None):
+        """Historical mark-price candles (used to seed mark prices)."""
+        perp = self.perpetual_symbol(symbol)
+        if self.kind == "binance":
+            params = {"symbol": perp, "interval": interval,
+                      "limit": min(max(1, int(limit)), 1500)}
+            if start_time is not None:
+                params["startTime"] = int(pd.Timestamp(start_time).timestamp() * 1000)
+            if end_time is not None:
+                params["endTime"] = int(pd.Timestamp(end_time).timestamp() * 1000)
+            response = requests.get(f"{self.market_url}/fapi/v1/markPriceKlines",
+                                    params=params, timeout=20)
+            response.raise_for_status()
+            return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
+                     "open": float(k[1]), "high": float(k[2]),
+                     "low": float(k[3]), "close": float(k[4])} for k in response.json()]
+        if self.kind == "delta":
+            from app.services.data_sync import DataSyncService
+            return DataSyncService.fetch_mark_klines(self.broker_name, perp, interval,
+                                                     start_time, end_time, limit)
+        return []
 
     @staticmethod
     def _interval_delta(interval):

@@ -186,7 +186,13 @@ const col = (name) => cells[header.indexOf(name)];
 check('CSV uses CRLF line endings', csv.includes('\r\n'));
 check('CSV has one row per trade plus the header', rows.length === 3);
 // Pinned so the documented column count cannot drift from the code.
-check('CSV has exactly 45 columns', header.length === 45, `got ${header.length}`);
+// 45 original columns + 5 BTC-perpetual pricing columns (basis / mark /
+// traded for entry and exit, plus the "priced on mark" flag).
+check('CSV has exactly 50 columns', header.length === 50, `got ${header.length}`);
+check('CSV has the mark-price / traded-price columns',
+  ['Entry Price (Basis)', 'Entry Price (Mark)', 'Entry Price (Traded)',
+   'Exit Price (Basis)', 'Exit Price (Mark)', 'Exit Price (Traded)',
+   'Priced On Mark'].every(h => header.includes(h)), header.join('|'));
 check('CSV has no duplicate column names',
   new Set(header).size === header.length);
 check('CSV has no empty column name', header.every(h => h.trim().length > 0));

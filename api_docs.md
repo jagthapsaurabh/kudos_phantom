@@ -32,15 +32,19 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | :--- | :--- | :--- | :--- |
 | `GET` | `/klines` | `symbol`, `interval`, `limit`, `source` | Fetch source-specific OHLCV candle data (including volume) for charts |
 | `GET` | `/symbols` | `source` | List symbols available in the selected local market-data source |
+| `GET` | `/market/contract` | `source` | The BTC **perpetual** contract traded on that venue (`BTCUSDT` on Binance, `BTCUSD` on Delta) |
+| `GET` | `/market/mark-price` | `source`, `symbol` | Live mark price, traded (last) price and index price of the perpetual |
+| `GET` | `/trading-windows` | None | The account's default "skip new trades" schedule + whether entries are paused now |
+| `PUT` | `/trading-windows` | `enabled`, `timezone`, `block_exits`, `windows[]` (or `quick_days[]`) | Save the account default used when a start request omits a schedule |
 | `GET` | `/phantom/signals` | `symbol`, `source`, `start_date`, `end_date`, `strategy_id` | Signal candles for the chart overlay. `strategy_id` may be `PhantomV2` (default, tuned champion), `FastTest`, or a custom strategy id created in the Strategies manager. |
 
 ### 4. Paper Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. Returns the `instance_key` and the `session_id` of its saved history row. |
+| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional), `use_mark_price` (optional), `trading_windows` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. Returns the `instance_key`, the `session_id` of its saved history row, and the resolved `contract` / `trading_windows` summary. |
 | `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance. The result is **saved** to History (`saved_to_history`, `session_id` in the response). |
 | `DELETE` | `/paper-trade/{instance_key}` | None | Stops a session and permanently removes it, including its saved history row (`history_removed`) |
-| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name, `session_id` and the live equity curve |
+| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name, `session_id`, the live equity curve, the BTC-perpetual mark/traded prices (`last_mark_price`, `last_trade_price`, `mark_price_basis`), the instance's `trading_windows` schedule, whether `entry_paused` is true right now and how many entries it has `blocked_entries` |
 | `GET` | `/paper-trade/logs` | `instance_key` | Live log buffer for an instance |
 | `GET` | `/paper-trade/history` | None | **Every** paper session the user has run (newest first) with status, equity, ROI, win rate, profit factor, max drawdown and trade count. Survives stop and server restart. |
 | `GET` | `/paper-trade/history/{session_id}` | None | Full saved result of one session: closed trades, equity curve, saved logs, positions still open at stop and the parameter snapshot |
@@ -55,19 +59,57 @@ a saved result.
 ### 5. Live Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/live-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital`, `margin_pct` | Starts a real-money execution instance on the selected broker using the live fee schedule |
+| `POST` | `/live-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital`, `margin_pct`, `use_mark_price` (optional), `trading_windows` (optional) | Starts a real-money execution instance on the selected broker using the live fee schedule. Orders go to the venue's BTC perpetual and risk is managed on the mark price when `use_mark_price` is true. |
 | `POST` | `/live-trade/stop` | `instance_key` | Stops a live execution instance |
-| `GET` | `/live-trade/status` | None | List all live instances and positions |
+| `GET` | `/live-trade/status` | None | List all live instances and positions, plus the perpetual `contract`, mark/traded prices, the `trading_windows` schedule in force, `entry_paused` and `blocked_entries` |
 
 ### 6. Backtesting
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode` | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
+| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode`, `use_mark_price` (optional), `trading_windows` (optional) | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
 | `POST` | `/backtest/filter-preview` | `params`, `start_date`, `end_date`, `symbol`, `data_source`, `fee_mode` | Synchronous per-bucket peek at the current conditions (`LONG/SHORT x REVERSAL/MOMENTUM`) with win rate, profit factor and avg/net PnL — handy while tuning the direction-specific thresholds before a full run. |
 | `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `strategy_id` and `initial_capital`) |
-| `GET` | `/backtest/results/{id}` | None | Get detailed trades, equity curve and the exact saved `params` snapshot for a run (incl. `strategy_id` and `initial_capital`) |
+| `GET` | `/backtest/results/{id}` | None | Get detailed trades, equity curve and the exact saved `params` snapshot for a run (incl. `strategy_id`, `initial_capital`, `use_mark_price`, `trading_windows_enabled`, `blocked_entries` and `contract`) |
 | `DELETE` | `/backtest/{id}` | None | Delete a single backtest run and its trades |
 | `DELETE` | `/backtest/clear` | None | Delete all of the user's backtest runs |
+
+**BTC perpetual, mark price and "skip new trades" windows.** Every run — backtest, paper and live —
+is executed on the venue's BTC **perpetual** (`BTCUSDT` on Binance, `BTCUSD` on Delta; dated futures
+are never substituted) and priced on the exchange **mark price** by default:
+
+* `params.use_mark_price` (default `true`) — stops, targets, trailing, breakeven and PnL are computed
+  on the mark price. The traded price is recorded on every trade next to it, so both are always
+  stored: `entry_price`/`exit_price` hold the pricing basis, `entry_trade_price`/`exit_trade_price`
+  the traded fill, and `entry_mark_price`/`exit_mark_price` the mark price at that instant
+  (`mark_price_basis` = 1 when the maths ran on mark).
+* `params.trading_windows` (or the top-level `trading_windows` field) — a schedule of periods in
+  which **new** entries are refused:
+
+```json
+{
+  "enabled": true,
+  "timezone": "Asia/Kolkata",
+  "block_exits": false,
+  "windows": [
+    { "label": "Weekend gap", "start_day": "sat", "start_time": "18:30",
+      "end_day": "mon", "end_time": "01:00", "all_day": false, "enabled": true },
+    { "label": "Skip Tuesday", "start_day": 1, "end_day": 1, "all_day": true, "enabled": true }
+  ]
+}
+```
+
+  Days are `0=Mon … 6=Sun` (names are accepted too). An `all_day` window covers every minute from
+  the start day through the end day. A timed window whose end precedes its start wraps past Sunday,
+  which is how "Saturday 18:30 → Monday 01:00" is expressed. Any number of windows can be combined.
+  `block_exits` is off by default: **positions that are already open keep their stop, target,
+  breakeven and trailing rules** — only new entries are skipped. Refused entries are counted in
+  `diagnostics.blocked_entries` and reported as the rejection reason `TRADING_WINDOW`.
+* The account default lives in `GET`/`PUT /trading-windows` and on `/broker-settings`
+  (`use_mark_price`, `trading_windows`); a start request may override it per run/instance.
+* Historical mark prices are seeded onto the existing candles (`klines.mark_open/high/low/close`)
+  by passing `include_mark_price: true` to `POST /admin/market-data/seed`, and are refreshed by the
+  daily sync. Where no mark series exists the engine falls back to the traded price and reports
+  `mark_price_basis: false` (and `mark_price_coverage` as a percentage) instead of failing.
 
 **Direction-specific conditions (`params.entry_conditions`).** Every `params` object may optionally
 carry an `entry_conditions` block. The new Backtest controls are independent:

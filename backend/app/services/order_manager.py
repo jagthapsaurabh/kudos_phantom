@@ -10,6 +10,9 @@ class OrderStatus(Enum):
 class Trade:
     symbol: str
     direction: int
+    # `entry_price` is the pricing basis used for the maths. For the BTC
+    # perpetual that is the exchange MARK price when `mark_price_basis` is on;
+    # the price the order actually filled at is kept in `entry_trade_price`.
     entry_price: float  # USD
     sl: float           # USD
     tp: float           # USD
@@ -32,13 +35,31 @@ class Trade:
     # so the UI needs the initial value to show "what the plan was".
     sl_entry: float = 0.0
     tp_entry: float = 0.0
+    # ---- BTC perpetual: traded price vs mark price ------------------
+    entry_trade_price: float = 0.0      # actual fill / traded price
+    entry_mark_price: float = 0.0       # exchange mark price at entry
+    exit_trade_price: float = 0.0       # traded price when the exit fired
+    exit_mark_price: float = 0.0        # mark price the exit was triggered on
+    mark_price_basis: bool = False      # True when entry/exit_price are marks
+    current_mark_price: float = 0.0     # latest mark price while open
 
 class OrderManager:
     def __init__(self, config):
         self.config = config
         self.active_trades = {}
 
-    def create_order(self, symbol, direction, price_usd, atr_usd, timestamp, margin_inr, conversion_rate=85.0):
+    def create_order(self, symbol, direction, price_usd, atr_usd, timestamp, margin_inr,
+                     conversion_rate=85.0, trade_price_usd=None, mark_price_usd=None,
+                     mark_price_basis=None):
+        """Open a position.
+
+        ``price_usd`` is the pricing basis (mark price of the BTC perpetual when
+        mark pricing is on). ``trade_price_usd`` is the price the order would
+        actually fill at and ``mark_price_usd`` the exchange mark price at that
+        instant; both are stored on the trade so the fill and the pricing basis
+        can always be reconciled.
+        """
+        use_mark = bool(mark_price_basis) if mark_price_basis is not None else bool(getattr(self.config, 'use_mark_price', True))
         # 1. Notional Calculation
         notional_usd = (margin_inr * self.config.leverage) / conversion_rate
         
@@ -71,21 +92,46 @@ class OrderManager:
         # Trailing stop level starts at hard SL
         trail_stop = sl
         
+        # Fill price vs pricing basis. When the engine prices on mark, `price`
+        # is already the mark price; otherwise the mark is whatever the caller
+        # read from the mark series (may be None for un-seeded bars).
+        if use_mark:
+            entry_mark = float(price_usd)
+            entry_trade = float(trade_price_usd) if trade_price_usd else float(price_usd)
+            basis_price = float(price_usd)
+        else:
+            entry_mark = float(mark_price_usd) if mark_price_usd else 0.0
+            entry_trade = float(trade_price_usd) if trade_price_usd else float(price_usd)
+            basis_price = float(price_usd)
+
         trade = Trade(
-            symbol=symbol, direction=direction, entry_price=price_usd, sl=sl, tp=tp,
+            symbol=symbol, direction=direction, entry_price=basis_price, sl=sl, tp=tp,
             trail_activation=trail_act, trail_stop=trail_stop, atr_at_entry=atr_usd,
             entry_time=timestamp, margin_inr=margin_inr, notional_usd=notional_usd, lots=lots,
-            peak_price=price_usd, current_price=price_usd,
-            sl_entry=sl, tp_entry=tp
+            peak_price=basis_price, current_price=basis_price,
+            sl_entry=sl, tp_entry=tp,
+            entry_trade_price=entry_trade, entry_mark_price=entry_mark,
+            mark_price_basis=use_mark, current_mark_price=entry_mark,
         )
         self.active_trades[symbol] = trade
         return trade
 
-    def update_trade(self, symbol, current_price_usd, current_atr_usd, timestamp):
+    def update_trade(self, symbol, current_price_usd, current_atr_usd, timestamp,
+                     trade_price_usd=None, mark_price_usd=None):
         if symbol not in self.active_trades: return None
         trade = self.active_trades[symbol]
         trade.bars_held += 1
         trade.current_price = current_price_usd
+        # Keep both prices current: `current_price` is the pricing basis (mark),
+        # `exit_trade_price` records what the market was trading at when the
+        # stop/target level was reached.
+        trade.exit_trade_price = float(trade_price_usd) if trade_price_usd else float(current_price_usd)
+        if mark_price_usd:
+            trade.current_mark_price = float(mark_price_usd)
+            trade.exit_mark_price = float(mark_price_usd)
+        elif trade.mark_price_basis:
+            trade.current_mark_price = float(current_price_usd)
+            trade.exit_mark_price = float(current_price_usd)
         if trade.direction == 1:
             # 1. Update peak and activate trail
             trade.peak_price = max(trade.peak_price, current_price_usd)
@@ -153,11 +199,21 @@ class OrderManager:
             return self.close_trade(symbol, current_price_usd, timestamp, "MH", detail)
         return None
 
-    def close_trade(self, symbol, price, timestamp, reason, detail=""):
+    def close_trade(self, symbol, price, timestamp, reason, detail="", trade_price_usd=None,
+                    mark_price_usd=None):
         trade = self.active_trades.pop(symbol)
         trade.status = OrderStatus.CLOSED
         trade.exit_price = price
         trade.exit_time = timestamp
         trade.exit_reason = reason
         trade.exit_detail = detail
+        # `price` is the level that triggered the exit, expressed on the pricing
+        # basis (mark price when mark pricing is on). Store the traded price
+        # and the mark price of the same moment next to it.
+        if trade.mark_price_basis:
+            trade.exit_mark_price = float(mark_price_usd) if mark_price_usd else float(price)
+            trade.exit_trade_price = float(trade_price_usd) if trade_price_usd else float(trade.exit_trade_price or price)
+        else:
+            trade.exit_trade_price = float(trade_price_usd) if trade_price_usd else float(price)
+            trade.exit_mark_price = float(mark_price_usd) if mark_price_usd else float(trade.exit_mark_price or 0.0)
         return trade

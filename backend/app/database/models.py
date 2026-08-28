@@ -45,6 +45,13 @@ class User(Base):
     is_active = Column(Integer, default=1)
     can_paper = Column(Integer, default=1)
     can_live = Column(Integer, default=0)
+    # Account-level trading defaults.
+    # use_mark_price: risk maths (SL/TP/trail/PnL) runs on the exchange mark
+    # price of the BTC perpetual; the traded price is recorded alongside it.
+    use_mark_price = Column(Integer, default=1)
+    # JSON schedule of "skip new trades" windows shared by Backtest, Paper and
+    # Live (see app.core.trading_windows). Each mode can override it per run.
+    trading_windows_json = Column(String, nullable=True)
     full_name = Column(String, nullable=True)
     mobile = Column(String, nullable=True)
     email = Column(String, nullable=True)
@@ -122,6 +129,13 @@ class Klines(Base):
     low = Column(Float)
     close = Column(Float)
     volume = Column(Float)  # base-asset volume; required for seeded candles
+    # Mark-price OHLC of the same bar (BTC perpetual). NULL until the mark
+    # series is seeded for this source — the engine then falls back to the
+    # traded OHLC above and reports mark_price_basis = 0.
+    mark_open = Column(Float, nullable=True)
+    mark_high = Column(Float, nullable=True)
+    mark_low = Column(Float, nullable=True)
+    mark_close = Column(Float, nullable=True)
     __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
 
 
@@ -194,6 +208,11 @@ class BacktestRun(Base):
     fee_mode = Column(String, default='backtest')
     taker_fee_bps = Column(Float, nullable=True)
     maker_fee_bps = Column(Float, nullable=True)
+    # BTC perpetual pricing: 1 = stops/targets/PnL computed on mark price.
+    use_mark_price = Column(Integer, default=1)
+    # 1 when the run skipped new entries during configured trading windows.
+    trading_windows_enabled = Column(Integer, default=0)
+    blocked_entries = Column(Integer, default=0)
     final_equity = Column(Float)
     total_trades = Column(Integer)
     win_rate = Column(Float)
@@ -215,6 +234,15 @@ class Trade(Base):
     direction = Column(Integer)
     entry_price = Column(Float)
     exit_price = Column(Float)
+    # BTC perpetual: the fill/traded price and the exchange mark price are both
+    # stored. `entry_price`/`exit_price` are the pricing basis actually used for
+    # the PnL maths (mark price when `mark_price_basis` = 1), and the other pair
+    # keeps the real execution price so a trade can always be reconciled.
+    entry_trade_price = Column(Float, nullable=True)
+    exit_trade_price = Column(Float, nullable=True)
+    entry_mark_price = Column(Float, nullable=True)
+    exit_mark_price = Column(Float, nullable=True)
+    mark_price_basis = Column(Integer, nullable=True)
     lots = Column(Float)
     margin = Column(Float)
     notional = Column(Float)
@@ -306,6 +334,11 @@ class PaperSession(Base):
     taker_fee_bps = Column(Float, nullable=True)
     maker_fee_bps = Column(Float, nullable=True)
     conversion_rate = Column(Float, nullable=True)
+    # BTC perpetual pricing: 1 = SL/TP/trail/PnL computed on the mark price.
+    use_mark_price = Column(Integer, nullable=True)
+    # "Skip new trades" schedule in force for this session (JSON).
+    trading_windows_json = Column(String, nullable=True)
+    blocked_entries = Column(Integer, default=0)
     # Result roll-up over the closed trades.
     closed_trade_count = Column(Integer, default=0)
     win_rate = Column(Float, nullable=True)

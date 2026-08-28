@@ -35,6 +35,64 @@ npm run dev
 
 ---
 
+## 🎯 BTC perpetual, mark price & trading windows (v3.3)
+
+**Contract.** Every venue is wired to the BTC **perpetual** — `BTCUSDT` on Binance Futures and
+`BTCUSD` on Delta Exchange. Dated futures are never substituted; `app.core.mark_price.perpetual_symbol`
+is the single resolver used by market-data seeding, the backtest engine, the paper worker and the
+live worker (`GET /market/contract` shows which one a venue resolves to).
+
+**Mark price.** Risk runs on the exchange **mark price**, the same price liquidations are computed
+on: stop-loss, take-profit, trailing, breakeven, drawdown and PnL are all evaluated on it. The price
+an order actually fills at (traded/last price) is recorded beside it, so a trade can always be
+reconciled — the database stores **both**:
+
+| Column | Meaning |
+| :--- | :--- |
+| `entry_price` / `exit_price` | the pricing basis the maths ran on (mark price when mark pricing is on) |
+| `entry_trade_price` / `exit_trade_price` | the traded price the order filled at |
+| `entry_mark_price` / `exit_mark_price` | the exchange mark price at that instant |
+| `mark_price_basis` | `1` when PnL was computed on the mark price |
+
+Mark prices are seeded onto the same candle rows (`klines.mark_open/high/low/close`) — Binance via
+`/fapi/v1/markPriceKlines`, Delta via `/v2/history/candles?symbol=MARK:BTCUSD` — by ticking
+**Include mark price** in the Seed Data tab, and are refreshed by the daily sync. Bars with no mark
+price fall back to the traded price bar-by-bar; the run then reports `mark_price_basis: false` and its
+`mark_price_coverage` percentage instead of silently changing its accounting.
+
+**Trading windows ("skip new trades").** Backtest, Paper Trade and Live Trade all carry the same
+switch: *block new entries during chosen periods*. The classic crypto weekend gap is one preset —
+**Saturday 18:30 → Monday 01:00 IST** — but the model is general and client-configurable:
+
+* any number of windows, each with a **start day/time** and an **end day/time**;
+* a window may cross midnight, and may **wrap past Sunday** (Saturday → Monday);
+* `all_day` blocks a whole day, or a span of days (Saturday → Sunday);
+* the schedule is interpreted in any IANA timezone — **Asia/Kolkata** by default;
+* pick single days too: **Sunday**, **Tuesday**, **Saturday**, or any combination;
+* **only new entries are refused.** A position opened before a window keeps its stop-loss,
+  take-profit, breakeven and trailing rules until it closes on its own (turn on *Also freeze exits*
+  to change that). Skipped entries are logged and counted (`TRADING_WINDOW` rejections,
+  `blocked_entries`).
+
+Presets in the UI: *Weekend (Sat 18:30 → Mon 01:00)*, *Skip Sunday*, *Skip Saturday & Sunday*,
+*Fri 18:30 → Sat 02:00*, *No restrictions*. The schedule is stored with the run / paper session /
+live instance so any result can be reproduced, and `GET`/`PUT /trading-windows` saves an
+account-level default that every Backtest / Paper / Live start inherits.
+
+```jsonc
+// params.trading_windows  — days are 0=Mon … 6=Sun (names are accepted)
+{
+  "enabled": true,
+  "timezone": "Asia/Kolkata",
+  "block_exits": false,
+  "windows": [
+    { "label": "Weekend gap", "start_day": "sat", "start_time": "18:30",
+      "end_day": "mon", "end_time": "01:00", "all_day": false, "enabled": true },
+    { "label": "Skip Tuesday", "start_day": 1, "end_day": 1, "all_day": true, "enabled": true }
+  ]
+}
+```
+
 ## ⚡ PHANTOM v3 — What's New
 
 | Area | v2.5 | v3 |
@@ -139,9 +197,10 @@ python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
+python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 76 checks: trade-log table + CSV export
+cd frontend && npm test            # 160 checks: trade-log table + CSV export, trading windows, page smoke
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

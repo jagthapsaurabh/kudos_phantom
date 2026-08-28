@@ -27,7 +27,11 @@ class BacktestEngine:
 
         if not data: return pd.DataFrame()
         df = pd.DataFrame([
-            {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume}
+            {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume,
+             # Mark price of the BTC perpetual for the same bar (NULL until the
+             # mark series is seeded for this source).
+             'mark_open': getattr(k, 'mark_open', None), 'mark_high': getattr(k, 'mark_high', None),
+             'mark_low': getattr(k, 'mark_low', None), 'mark_close': getattr(k, 'mark_close', None)}
             for k in data
         ])
         df.set_index('event_time', inplace=True)
@@ -60,6 +64,14 @@ class BacktestEngine:
             "entry_time": result.entry_time, "exit_time": result.exit_time,
             "direction": result.direction, "entry_price": result.entry_price,
             "exit_price": result.exit_price, "lots": result.lots,
+            # BTC perpetual: the traded price AND the mark price are both
+            # stored. `entry_price`/`exit_price` are the pricing basis the PnL
+            # was computed on (mark price when `mark_price_basis` is 1).
+            "entry_trade_price": getattr(result, "entry_trade_price", None),
+            "exit_trade_price": getattr(result, "exit_trade_price", None),
+            "entry_mark_price": getattr(result, "entry_mark_price", None),
+            "exit_mark_price": getattr(result, "exit_mark_price", None),
+            "mark_price_basis": bool(getattr(result, "mark_price_basis", False)),
             "margin": result.margin_inr, "notional": result.notional_usd,
             "gross_pnl": pnl_inr, "net_pnl": net_pnl_inr,
             "fees": entry_fee_inr + exit_fee_inr,
@@ -260,6 +272,55 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Main backtest loop
     # ------------------------------------------------------------------
+    def _resolve_price_frame(self, df_1h):
+        """Pick the price series the engine trades on.
+
+        For the BTC perpetual the client prices risk on the exchange MARK price,
+        so when a mark series has been seeded the mark OHLC becomes the pricing
+        basis and the traded OHLC stays the recorded fill price. Bars without a
+        mark price (older history, a source that does not publish one) fall back
+        to the traded price bar-by-bar instead of dropping the whole run.
+        """
+        from .mark_price import decision_series
+
+        use_mark = bool(getattr(self.config, "use_mark_price", True))
+        dec_close, coverage_close, basis_close = decision_series(
+            df_1h, use_mark, fallback_column="close", mark_column="mark_close")
+        dec_open, coverage_open, basis_open = decision_series(
+            df_1h, use_mark, fallback_column="open", mark_column="mark_open")
+        # A run is priced on mark only when BOTH the open and the close series
+        # carry marks — mixing a traded entry with a mark exit (or the other way
+        # round) would make the PnL impossible to reconcile.
+        basis = "mark" if (basis_close == "mark" and basis_open == "mark") else "trade"
+        if basis == "trade":
+            dec_close = pd.to_numeric(df_1h["close"], errors="coerce")
+            dec_open = pd.to_numeric(df_1h["open"], errors="coerce")
+        raw_close = (pd.to_numeric(df_1h["mark_close"], errors="coerce")
+                     if "mark_close" in df_1h.columns else None)
+        raw_open = (pd.to_numeric(df_1h["mark_open"], errors="coerce")
+                    if "mark_open" in df_1h.columns else None)
+        return {
+            "decision_close": dec_close.astype(float).values,
+            "decision_open": dec_open.astype(float).values,
+            "mark_close": raw_close.astype(float).values if raw_close is not None else None,
+            "mark_open": raw_open.astype(float).values if raw_open is not None else None,
+            "basis": basis,
+            "coverage": min(coverage_close, coverage_open) if basis == "mark" else 0.0,
+        }
+
+    @staticmethod
+    def _mark_at(array, index):
+        """Mark price at ``index`` or None (NaN / no series)."""
+        if array is None:
+            return None
+        try:
+            value = float(array[index])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if value != value:  # NaN
+            return None
+        return value
+
     def run(self, symbol="BTCUSDT", initial_capital_inr=20000, conversion_rate=85.0,
             start_date=None, end_date=None, df_1h=None, df_4h=None,
             trade_log_path=None):
@@ -293,13 +354,27 @@ class BacktestEngine:
         skipped_overlap = 0
         halt_bars = 0
         throttled_entries = 0
+        blocked_entries = 0
         halted = False
         last_exit_i = -10**9
         cfg = self.config
 
+        # ---- BTC perpetual pricing + "skip new trades" schedule ---------
+        price_frame = self._resolve_price_frame(df_1h)
+        dec_closes = price_frame["decision_close"]
+        dec_opens = price_frame["decision_open"]
+        mark_closes = price_frame["mark_close"]
+        mark_opens = price_frame["mark_open"]
+        self.mark_price_basis = price_frame["basis"] == "mark"
+        self.mark_price_coverage = price_frame["coverage"]
+        from .trading_windows import TradingWindowGuard, BLOCK_REASON
+        window_guard = TradingWindowGuard.from_any(getattr(cfg, "trading_windows", None))
+        self.window_guard = window_guard
+
         def close_active(sym, price, ts, reason):
             """Force-close helper used for reversals."""
-            trade = self.oms.close_trade(sym, price, ts, reason)
+            trade = self.oms.close_trade(sym, price, ts, reason,
+                                         mark_price_usd=self._mark_at(mark_closes, i))
             if trade.bars_held == 0:
                 trade.bars_held = 1
             net, eq, td = self._book_closed_trade(trade, equity_box[0], conversion_rate)
@@ -320,12 +395,19 @@ class BacktestEngine:
 
         for i in range(1, n):
             current_time = idx[i]
-            current_price_usd = closes[i]
+            # `current_price_usd` is the pricing basis (mark price of the
+            # perpetual when mark pricing is on); `trade_price_usd` is what the
+            # market was actually trading at, and is recorded on the trade.
+            current_price_usd = float(dec_closes[i])
+            trade_price_usd = float(closes[i])
+            current_mark_usd = self._mark_at(mark_closes, i)
             current_atr_usd = atrs[i]
 
             # ---- Manage open positions ----------------------------------
             for sym in list(self.oms.active_trades.keys()):
-                result = self.oms.update_trade(sym, current_price_usd, current_atr_usd, current_time)
+                result = self.oms.update_trade(sym, current_price_usd, current_atr_usd, current_time,
+                                               trade_price_usd=trade_price_usd,
+                                               mark_price_usd=current_mark_usd)
                 if result:
                     net, equity_box[0], td = self._book_closed_trade(result, equity_box[0], conversion_rate)
                     td.update(open_ctx_box.pop(sym, {}))
@@ -351,11 +433,21 @@ class BacktestEngine:
             sig = signals[i]
             if sig != 0 and i + 1 < n:
                 in_cooldown = (i - last_exit_i) <= cfg.cooldown_bars
-                if halted or in_cooldown:
+                # "Skip new trades" schedule. The new position would open at
+                # the next candle, so that candle's timestamp decides whether
+                # the entry is allowed. Open positions are untouched — only a
+                # NEW trade is refused.
+                blocked_window = window_guard.blocking_window(idx[i + 1])
+                if blocked_window:
+                    blocked_entries += 1
+                    rejected_reasons[BLOCK_REASON] = rejected_reasons.get(BLOCK_REASON, 0) + 1
+                if halted or in_cooldown or blocked_window:
                     pass
                 else:
                     open_trade = self.oms.active_trades.get(symbol)
-                    next_open_usd = opens[i + 1]
+                    next_open_usd = float(dec_opens[i + 1])
+                    next_trade_open_usd = float(opens[i + 1])
+                    next_mark_usd = self._mark_at(mark_opens, i + 1)
                     if open_trade is not None and cfg.allow_reverse and open_trade.direction != sig:
                         # Close at next open and reverse direction
                         close_active(symbol, next_open_usd, idx[i + 1], "REV")
@@ -363,7 +455,9 @@ class BacktestEngine:
                         open_trade = None
                     if open_trade is None or cfg.allow_overlap:
                         ind_slice = df_1h.iloc[max(0, i - 50):i + 1]
-                        val = self.validator_service.validate_signal(sig, closes[i], next_open_usd, ind_slice)
+                        # Drift is measured against the price the order fills
+                        # at (traded price), not against the mark-price basis.
+                        val = self.validator_service.validate_signal(sig, closes[i], next_trade_open_usd, ind_slice)
                         if val.passed:
                             margin_inr = equity_box[0] * margin_pct_now
                             if margin_pct_now != cfg.margin_pct:
@@ -389,7 +483,10 @@ class BacktestEngine:
                             ctx["equity_at_entry"] = equity_box[0]
                             new_trade = self.oms.create_order(symbol, int(sig), next_open_usd,
                                                               current_atr_usd, idx[i + 1],
-                                                              margin_inr, conversion_rate)
+                                                              margin_inr, conversion_rate,
+                                                              trade_price_usd=next_trade_open_usd,
+                                                              mark_price_usd=next_mark_usd,
+                                                              mark_price_basis=self.mark_price_basis)
                             if new_trade is not None:
                                 open_ctx_box[symbol] = ctx
                             else:
@@ -465,10 +562,17 @@ class BacktestEngine:
             "exit_dist": dist,
             "setup_dist": setup_dist,
             "rejected_reasons": rejected_reasons,
+            # BTC perpetual: which price the run was priced on, and how much of
+            # the range actually carried a mark price.
+            "mark_price_basis": self.mark_price_basis,
+            "mark_price_coverage": round(float(self.mark_price_coverage or 0.0) * 100.0, 2),
+            # "Skip new trades" schedule actually applied to this run.
+            "trading_windows": window_guard.summary(),
             "diagnostics": {
                 "skipped_overlap": skipped_overlap,
                 "halt_bars": halt_bars,
                 "throttled_entries": throttled_entries,
+                "blocked_entries": blocked_entries,
             }
         }
 
@@ -498,8 +602,11 @@ class BacktestEngine:
             'cond_trend_ok', 'cond_adx_ok', 'cond_macd_hist_ok', 'cond_atr_regime_ok',
             'cond_rsi_ok', 'cond_macd_confirm_ok', 'cond_di_ok',
             'entry_conditions_detail',
-            'entry_price', 'sl', 'sl_entry', 'tp', 'trail_stop',
-            'exit_price', 'exit_reason', 'exit_detail',
+            'entry_price', 'entry_trade_price', 'entry_mark_price',
+            'sl', 'sl_entry', 'tp', 'trail_stop',
+            'exit_price', 'exit_trade_price', 'exit_mark_price',
+            'mark_price_basis',
+            'exit_reason', 'exit_detail',
             'atr_at_entry', 'peak_price',
             'lots', 'margin', 'notional', 'margin_pct_used', 'entry_dd_pct',
             'gross_pnl', 'fees', 'net_pnl', 'equity_at_entry', 'equity_after',

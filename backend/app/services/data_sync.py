@@ -276,6 +276,86 @@ class DataSyncService:
 
         raise MarketDataError(f"No market-data adapter is installed for source '{source}'. Configure a Binance-compatible or Delta-compatible adapter first.")
 
+    # ------------------------------------------------------------------
+    # Mark price history (BTC perpetual)
+    # ------------------------------------------------------------------
+    # Both venues publish a mark-price series for the perpetual that is
+    # separate from the traded OHLCV:
+    #   Binance → /fapi/v1/markPriceKlines?symbol=BTCUSDT
+    #   Delta   → /v2/history/candles?symbol=MARK:BTCUSD
+    # The rows are stored on the matching klines row (mark_open/high/low/close)
+    # so a backtest always has the traded price and the mark price aligned.
+    @classmethod
+    def fetch_mark_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+                          start_time=None, end_time=None, limit=1000, definition=None):
+        from app.core.mark_price import mark_symbol, perpetual_symbol
+
+        source = cls.normalize_source(source)
+        kind = cls._adapter_kind(source, definition)
+        perp = perpetual_symbol(source, symbol)
+        if kind == "binance":
+            base = cls._base_url(definition, "https://fapi.binance.com")
+            params = {"symbol": perp, "interval": interval,
+                      "limit": min(max(1, int(limit)), cls.BINANCE_MAX_CANDLES)}
+            if start_time:
+                params["startTime"] = int(cls._as_datetime(start_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            if end_time:
+                params["endTime"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            response = requests.get(f"{base}/fapi/v1/markPriceKlines", params=params, timeout=20)
+            if response.status_code != 200:
+                body = (response.text or "").strip().replace("\n", " ")[:300]
+                raise MarketDataError(f"Binance mark-price request failed: HTTP {response.status_code} {body}".strip())
+            return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
+                     "open": float(k[1]), "high": float(k[2]),
+                     "low": float(k[3]), "close": float(k[4])} for k in response.json()]
+        if kind == "delta":
+            custom_hosts = None
+            if definition is not None and not getattr(definition, "is_builtin", False):
+                configured_url = getattr(definition, "market_data_url", None)
+                if configured_url:
+                    custom_hosts = [configured_url.rstrip("/")]
+            return cls._delta_fetch(mark_symbol(source, perp), interval, start_time,
+                                    end_time, limit, hosts=custom_hosts)
+        raise MarketDataError(
+            f"No mark-price adapter is installed for source '{source}'. "
+            f"Only Binance-compatible and Delta-compatible sources expose a mark price."
+        )
+
+    @classmethod
+    def sync_mark_prices(cls, source="Binance", symbol="BTCUSDT", intervals=None,
+                         start_time=None, end_time=None, limit=1000, definition=None):
+        """Fetch mark-price candles and write them onto the seeded klines.
+
+        Rows whose candle has not been seeded yet are skipped (the traded
+        OHLCV seed always runs first), so this is safe to call after any seed
+        or daily refresh. Returns a per-interval summary.
+        """
+        from app.core.mark_price import upsert_mark_rows
+
+        source = cls.normalize_source(source)
+        kind = cls._adapter_kind(source, definition)
+        intervals = list(intervals or (cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES))
+        init_db()
+        summary = []
+        db = SessionLocal()
+        try:
+            for interval in intervals:
+                entry = {"source": source, "symbol": symbol, "interval": interval}
+                try:
+                    rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
+                                                 end_time, limit, definition=definition)
+                    result = upsert_mark_rows(db, rows, source, symbol, interval) if rows else {
+                        "inserted": 0, "updated": 0, "total": 0}
+                    db.commit()
+                    entry.update(result, fetched=len(rows))
+                except MarketDataError as exc:
+                    db.rollback()
+                    entry.update(inserted=0, updated=0, total=0, fetched=0, error=str(exc))
+                summary.append(entry)
+        finally:
+            db.close()
+        return summary
+
     @classmethod
     def test_source(cls, source="Binance", symbol="BTCUSDT", interval="1h", limit=3, definition=None):
         """Small round-trip used by the admin UI's 'Test connection' button.
@@ -828,6 +908,17 @@ class DataSyncService:
             summary.extend(cls.sync_market_data(
                 source, symbol, wanted, definition=definition, limit=1000
             ))
+            # Keep the mark-price series of the BTC perpetual current too, so
+            # paper/live risk (and the next backtest) can be priced on mark.
+            # A mark-price failure never fails the candle refresh.
+            try:
+                mark_summary = cls.sync_mark_prices(
+                    source, symbol, wanted, definition=definition, limit=1000)
+                for item in mark_summary:
+                    item["series"] = "mark_price"
+                summary.extend(mark_summary)
+            except Exception as exc:
+                print(f"Mark-price refresh skipped for {source}: {exc}")
         return summary
 
     @classmethod

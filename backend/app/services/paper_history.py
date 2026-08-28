@@ -132,6 +132,24 @@ def _open_positions(service):
     return positions
 
 
+def _windows_json(service, config=None):
+    """Serialize the session's "skip new trades" schedule (best effort)."""
+    import json as _json
+    windows = getattr(service, 'trading_windows', None)
+    if windows is None and config is not None:
+        windows = getattr(config, 'trading_windows', None)
+    if windows is None:
+        return None
+    try:
+        if hasattr(windows, 'model_dump'):
+            return _json.dumps(windows.model_dump())
+        if isinstance(windows, dict):
+            return _json.dumps(windows)
+        return None
+    except Exception:
+        return None
+
+
 def _payload(service, status=None):
     """Build the column values for one session snapshot."""
     closed = list(getattr(service, 'closed_trades', []) or [])
@@ -159,6 +177,9 @@ def _payload(service, status=None):
         'taker_fee_bps': _f(getattr(config, 'taker_fee_bps', None)) if config is not None else None,
         'maker_fee_bps': _f(getattr(config, 'maker_fee_bps', None)) if config is not None else None,
         'conversion_rate': _f(getattr(service, 'conversion_rate', None)),
+        'use_mark_price': int(bool(getattr(config, 'use_mark_price', True))) if config is not None else None,
+        'trading_windows_json': _windows_json(service, config),
+        'blocked_entries': int(getattr(service, 'blocked_entries', 0) or 0),
         'config_json': config_json,
         'last_price': _f(getattr(service, 'last_price', None)),
         'last_checked': _parse_ist(getattr(service, 'last_checked', None)),
@@ -290,6 +311,10 @@ def _summary_dict(row):
         'leverage': row.leverage,
         'taker_fee_bps': row.taker_fee_bps,
         'maker_fee_bps': row.maker_fee_bps,
+        # BTC perpetual pricing + the "skip new trades" schedule in force.
+        'use_mark_price': row.use_mark_price,
+        'trading_windows': _parse_config(row.trading_windows_json) or None,
+        'blocked_entries': row.blocked_entries or 0,
         'last_price': row.last_price,
         'created_at': row.created_at,
         'started_at': row.started_at,
