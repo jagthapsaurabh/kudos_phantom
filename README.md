@@ -37,6 +37,10 @@ npm run dev
 
 ## 🧭 Live order management & the trading terminal (v3.4)
 
+> Design research for this section — venue capability matrix, bracket-order support, sizing,
+> rate limits and citations — lives in **[docs/order_management_research.md](docs/order_management_research.md)**.
+
+
 PHANTOM now trades the full order lifecycle against the real broker and shows the account the way an
 exchange terminal does. Open **Live Terminal** in the sidebar (or `/terminal`).
 
@@ -245,10 +249,10 @@ python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
-python test_live_account.py       # 138 checks: rate limits, order lifecycle, terminal schema, live API
+python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 215 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 216 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

@@ -308,6 +308,9 @@ check("Delta default is a 10 000 weight / 5-minute budget", delta_cfg.weight_per
 check("Binance default tracks order budget separately",
       binance_cfg.orders_per_minute == 1200.0 and binance_cfg.weight_per_5min is None,
       str(binance_cfg))
+check("Binance also caps 300 orders per 10 seconds",
+      binance_cfg.orders_per_10s == 300.0, str(binance_cfg.orders_per_10s))
+check("Delta publishes no order-specific cap", delta_cfg.orders_per_10s is None)
 check("conservative default stays at or under 20 requests/second (the user's figure)",
       delta_cfg.requests_per_second == 20.0 and binance_cfg.requests_per_second == 20.0)
 check("20 req/s sits under Binance's 2 400/min weight budget",
@@ -373,6 +376,25 @@ except RateLimitExceeded:
     raised = True
 check("order budget is enforced (Binance 1 200/min)", raised)
 
+burst = RateLimiter("test-burst", RateLimitConfig(requests_per_second=100,
+                                                  requests_per_minute=100,
+                                                  weight_per_5min=None,
+                                                  orders_per_minute=1000,
+                                                  orders_per_10s=3,
+                                                  acquire_timeout=0.4))
+for _ in range(3):
+    burst.acquire(is_order=True)
+check("10-second order window is counted", burst.snapshot()["orders_last_10s"] == 3)
+raised = False
+try:
+    burst.acquire(is_order=True)
+except RateLimitExceeded:
+    raised = True
+check("a 300-in-10s style burst is blocked even with minute budget left", raised)
+check("an admin override scales the 10s window with the minute budget",
+      binance_cfg.orders_per_minute and
+      default_config_for("Binance", _Def(orders_per_minute=600)).orders_per_10s == 150.0)
+
 weight_limiter = RateLimiter("test-weight", RateLimitConfig(requests_per_second=100,
                                                             requests_per_minute=None,
                                                             weight_per_5min=10,
@@ -413,7 +435,7 @@ paced = RateLimiter("test-pace", RateLimitConfig(requests_per_minute=100, reques
                                                  safe_ratio=0.85, acquire_timeout=0.05))
 paced.note_response({"X-MBX-USED-WEIGHT-1M": "95"})
 check("calls are slowed before the venue says no (safe_ratio)",
-      paced._sleep_for(([], [], [], [])) >= 0.4, str(paced._sleep_for(([], [], [], []))))
+      paced._sleep_for(([], [], [], [], [])) >= 0.4, str(paced._sleep_for(([], [], [], [], []))))
 
 shared_a = get_limiter("shared:key", RateLimitConfig(requests_per_second=50))
 shared_b = get_limiter("shared:key")
@@ -491,9 +513,12 @@ sl = binance.place_order("BTCUSDT", "sell", "stop_market", 0.03, stop_price=6500
                          reduce_only=True, size_in_btc=True)
 check("stop order accepted", isinstance(sl, dict) and "error" not in sl, str(sl)[:200])
 sent = [r for r in STATE["requests"] if r["path"] == "/fapi/v1/order"][-1]
-check("stop uses MARK working type + price protection, reduce-only",
-      sent["query"].get("workingType") == "MARK" and sent["query"].get("reduceOnly") == "true"
+check("stop triggers on the MARK price with price protection, reduce-only",
+      sent["query"].get("workingType") == "MARK_PRICE" and sent["query"].get("reduceOnly") == "true"
       and sent["query"].get("priceProtect") == "TRUE", str(sent["query"]))
+check("the 'MARK' alias is mapped to the documented MARK_PRICE enum",
+      binance.BINANCE_WORKING_TYPES["MARK"] == "MARK_PRICE"
+      and binance.BINANCE_WORKING_TYPES["CONTRACT"] == "CONTRACT_PRICE")
 
 bracket = binance.place_bracket_order("BTCUSDT", "buy", 0.03, stop_loss_price=65000.0,
                                       take_profit_price=70000.0, size_in_btc=True)

@@ -123,6 +123,10 @@ POST /live-account/orders
 
 ### 5c. Broker rate limits
 
+The venue research behind the table below (published limits, weights and the reasoning for the
+conservative defaults) is written up in `docs/order_management_research.md`.
+
+
 Every broker call — market data, orders, the terminal poller — goes through one shared
 `RateLimiter` per broker connection (`app/core/rate_limit.py`), so several workers can never
 outrun the venue together.

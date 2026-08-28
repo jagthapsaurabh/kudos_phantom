@@ -76,7 +76,8 @@ const snapshot = {
     broker: 'Delta', requests_last_second: 2, requests_last_minute: 14,
     orders_last_minute: 3, weight_used_5min: 210, exchange_quota: 6420,
     exchange_reset_ms: 123000, retried_calls: 1, rejected_calls: 0,
-    limits: { requests_per_second: 20, requests_per_minute: 1200, weight_per_5min: 10000, orders_per_minute: null },
+    orders_last_10s: 1,
+    limits: { requests_per_second: 20, requests_per_minute: 1200, weight_per_5min: 10000, orders_per_minute: null, orders_per_10s: 300 },
   },
   fetched_at: '2026-08-28T09:20:00',
 };
@@ -96,6 +97,8 @@ check('risk flags margin utilisation', html.includes('Margin used') && html.incl
 check('rate-limit panel shows the local windows', html.includes('Rate limits') && html.includes('Per second') && html.includes('20'));
 check('rate-limit panel shows the 5-minute weight budget', html.includes('Weight / 5 min') && html.includes('10,000'));
 check('rate-limit panel shows the exchange quota', html.includes('exchange quota 6,420 left'));
+check('rate-limit panel shows the 10-second order cap',
+  html.includes('Orders / 10s') && html.includes('300'));
 check('rate-limit panel reports retried calls', html.includes('1 retried after HTTP 429'));
 
 // ------------------------------------------------------------ order ticket --

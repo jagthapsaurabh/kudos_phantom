@@ -58,8 +58,11 @@ class RateLimitConfig:
     # Delta's fixed 5-minute weight quota. ``None`` disables weight tracking
     # (Binance reports its minute budget through response headers instead).
     weight_per_5min: Optional[float] = 10000.0
-    # Binance caps order placement separately from the general weight budget.
+    # Binance caps order placement twice: 1 200 orders/minute *and* 300 orders
+    # per 10 seconds, per account. Only the minute budget would let a 300-order
+    # burst through inside ten seconds, so both windows are tracked.
     orders_per_minute: Optional[float] = 1200.0
+    orders_per_10s: Optional[float] = 300.0
     # Retry policy for HTTP 429 (and transient 5xx).
     max_retries: int = 4
     backoff_base: float = 0.35
@@ -99,6 +102,7 @@ class RateLimitUsage:
     requests_last_minute: int = 0
     weight_used: float = 0.0
     orders_last_minute: int = 0
+    orders_last_10s: int = 0
     throttled_calls: int = 0
     retried_calls: int = 0
     rejected_calls: int = 0          # gave up after max_retries
@@ -135,6 +139,7 @@ class RateLimiter:
         self._minute: Deque[float] = deque()
         self._weights: Deque[Tuple[float, float]] = deque()   # (ts, weight)
         self._orders: Deque[float] = deque()
+        self._orders_10s: Deque[float] = deque()
         self.usage = RateLimitUsage()
         # Exchange-reported state, updated from response headers.
         self._exchange_weight: Optional[float] = None
@@ -156,13 +161,15 @@ class RateLimiter:
             self._weights.popleft()
         while self._orders and now - self._orders[0] >= 60.0:
             self._orders.popleft()
+        while self._orders_10s and now - self._orders_10s[0] >= 10.0:
+            self._orders_10s.popleft()
 
     def _sleep_for(self, windows) -> float:
         """Smallest wait (seconds) until every window has room."""
         now = time.monotonic()
         waits = []
         cfg = self.config
-        second, minute, weights, orders = windows
+        second, minute, weights, orders, orders_10s = windows
         if cfg.requests_per_second and len(second) >= cfg.requests_per_second:
             waits.append(max(0.0, 1.0 - (now - second[0])) + 0.001)
         if cfg.requests_per_minute and len(minute) >= cfg.requests_per_minute:
@@ -173,6 +180,8 @@ class RateLimiter:
                 waits.append(max(0.0, 300.0 - (now - weights[0][0])) + 0.05)
         if cfg.orders_per_minute and len(orders) >= cfg.orders_per_minute:
             waits.append(max(0.0, 60.0 - (now - orders[0])) + 0.001)
+        if cfg.orders_per_10s and len(orders_10s) >= cfg.orders_per_10s:
+            waits.append(max(0.0, 10.0 - (now - orders_10s[0])) + 0.001)
         # Exchange-reported budget: slow down before the venue says no.
         if self._exchange_quota is not None and self._exchange_quota <= 0:
             waits.append(min(self._exchange_reset_ms or 1000.0, 60_000.0) / 1000.0)
@@ -192,17 +201,20 @@ class RateLimiter:
             with self._lock:
                 now = time.monotonic()
                 self._prune(now)
-                wait = self._sleep_for((self._second, self._minute, self._weights, self._orders))
+                wait = self._sleep_for((self._second, self._minute, self._weights,
+                                        self._orders, self._orders_10s))
                 if wait <= 0:
                     self._second.append(now)
                     self._minute.append(now)
                     self._weights.append((now, float(weight or 0.0)))
                     if is_order:
                         self._orders.append(now)
+                        self._orders_10s.append(now)
                     self.usage.requests_last_second = len(self._second)
                     self.usage.requests_last_minute = len(self._minute)
                     self.usage.weight_used = sum(w for _, w in self._weights)
                     self.usage.orders_last_minute = len(self._orders)
+                    self.usage.orders_last_10s = len(self._orders_10s)
                     return waited
                 self.usage.throttled_calls += 1
                 self.usage.last_throttled_at = time.time()
@@ -287,6 +299,7 @@ class RateLimiter:
                 "requests_last_second": len(self._second),
                 "requests_last_minute": len(self._minute),
                 "orders_last_minute": len(self._orders),
+                "orders_last_10s": len(self._orders_10s),
                 "weight_used_5min": round(sum(w for _, w in self._weights), 2),
                 "exchange_weight": self._exchange_weight,
                 "exchange_quota": self._exchange_quota,
@@ -330,11 +343,14 @@ def all_snapshots() -> Dict[str, dict]:
 # ---------------------------------------------------------------------------
 VENUE_DEFAULTS: Dict[str, RateLimitConfig] = {
     # 10 000 weight per fixed 5-minute window; ~33/s sustained. Stay well under.
+    # Delta publishes no order-specific cap, only the shared weight quota.
     "Delta": RateLimitConfig(requests_per_second=20.0, requests_per_minute=1200.0,
-                             weight_per_5min=10000.0, orders_per_minute=None),
+                             weight_per_5min=10000.0, orders_per_minute=None,
+                             orders_per_10s=None),
     # 2 400 weight/minute, 1 200 orders/minute.
     "Binance": RateLimitConfig(requests_per_second=20.0, requests_per_minute=1200.0,
-                               weight_per_5min=None, orders_per_minute=1200.0),
+                               weight_per_5min=None, orders_per_minute=1200.0,
+                               orders_per_10s=300.0),
 }
 
 
@@ -362,4 +378,8 @@ def default_config_for(broker_code: str, definition=None) -> RateLimitConfig:
                 overrides[field_name] = float(value)
             except (TypeError, ValueError):
                 continue
+    # Both venues keep the 10-second order window at a quarter of the minute
+    # budget (Binance: 300 of 1 200), so scale it with an override.
+    if "orders_per_minute" in overrides and base.orders_per_10s:
+        overrides["orders_per_10s"] = overrides["orders_per_minute"] / 4.0
     return RateLimitConfig.coerce(base.as_dict(), **overrides)

@@ -55,6 +55,13 @@ class BrokerClient:
         "Delta": {"kind": "delta", "market": "https://api.india.delta.exchange", "trading": "https://api.india.delta.exchange"},
     }
 
+    # Accepted aliases for Binance's `workingType` (stop-trigger source).
+    BINANCE_WORKING_TYPES = {
+        "MARK_PRICE": "MARK_PRICE", "MARK": "MARK_PRICE",
+        "CONTRACT_PRICE": "CONTRACT_PRICE", "CONTRACT": "CONTRACT_PRICE",
+        "LAST_TRADED_PRICE": "CONTRACT_PRICE", "LAST": "CONTRACT_PRICE",
+    }
+
     # Binance order types the terminal can send.
     BINANCE_ORDER_TYPES = {
         "market": "MARKET", "limit": "LIMIT",
@@ -453,7 +460,7 @@ class BrokerClient:
                     price: Optional[float] = None, stop_price: Optional[float] = None,
                     reduce_only: bool = False, client_order_id: Optional[str] = None,
                     time_in_force: str = "GTC", post_only: bool = False,
-                    working_type: str = "MARK", stop_side: Optional[str] = None,
+                    working_type: str = "MARK_PRICE", stop_side: Optional[str] = None,
                     trail_amount: Optional[float] = None, size_in_btc: bool = False):
         """Place an order. ``qty`` is in the venue's own units unless
         ``size_in_btc`` is set, in which case it is converted for you.
@@ -492,7 +499,10 @@ class BrokerClient:
             if stop_price is None:
                 return {"error": f"{native} requires a stop_price"}
             params["stopPrice"] = stop_price
-            params["workingType"] = working_type or "MARK_PRICE"
+            # Documented enum is MARK_PRICE / CONTRACT_PRICE; "MARK" and
+            # "CONTRACT" are accepted by callers and mapped here.
+            params["workingType"] = self.BINANCE_WORKING_TYPES.get(
+                str(working_type or "MARK_PRICE").upper(), "MARK_PRICE")
             params["priceProtect"] = "TRUE"
         if native == "TRAILING_STOP_MARKET":
             params["callbackRate"] = trail_amount
@@ -597,11 +607,11 @@ class BrokerClient:
             if stop_loss_price is not None:
                 legs.append(self.place_order(symbol, close_side, "stop_market", size,
                                              stop_price=stop_loss_price, reduce_only=True,
-                                             working_type="MARK"))
+                                             working_type="MARK_PRICE"))
             if take_profit_price is not None:
                 legs.append(self.place_order(symbol, close_side, "take_profit_market", size,
                                              stop_price=take_profit_price, reduce_only=True,
-                                             working_type="MARK"))
+                                             working_type="MARK_PRICE"))
             return {"entry": entry, "legs": legs, "_bracket": True,
                     "note": "Binance has no native bracket order; protection legs placed as reduce-only stops."}
         return {"error": f"No bracket-order adapter installed for '{self.broker_name}'"}

@@ -552,6 +552,8 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
                   hint="local sliding window" />
             <Stat label="Per minute" value={`${fmt(usage.requests_last_minute, 0, '0')} / ${fmt(rate.requests_per_minute, 0)}`} />
             <Stat label="Orders / min" value={`${fmt(usage.orders_last_minute, 0, '0')} / ${fmt(rate.orders_per_minute, 0)}`} />
+            <Stat label="Orders / 10s" value={`${fmt(usage.orders_last_10s, 0, '0')} / ${fmt(rate.orders_per_10s, 0)}`}
+                  hint="Binance second order cap" />
             <Stat label="Weight / 5 min" value={`${fmt(usage.weight_used_5min, 0, '0')} / ${fmt(rate.weight_per_5min, 0)}`}
                   hint={usage.exchange_quota != null ? `exchange quota ${fmt(usage.exchange_quota, 0)} left` : 'Delta fixed window'} />
           </div>
