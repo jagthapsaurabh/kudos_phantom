@@ -35,6 +35,53 @@ npm run dev
 
 ---
 
+## 🧭 Live order management & the trading terminal (v3.4)
+
+PHANTOM now trades the full order lifecycle against the real broker and shows the account the way an
+exchange terminal does. Open **Live Terminal** in the sidebar (or `/terminal`).
+
+**Order lifecycle** — market, limit, stop-market, stop-limit, take-profit and trailing orders; edit
+(Delta), cancel one, cancel all, open orders, order history and fills with fees. Entries can be sent
+as **bracket orders** (entry + stop-loss + take-profit): Delta has a native bracket endpoint, Binance
+does not, so the protection legs are placed as reduce-only `STOP_MARKET` / `TAKE_PROFIT_MARKET`
+orders and are cancelled when the position closes. Stops trigger on the **mark price**
+(`stop_trigger_method: mark_price` on Delta, `workingType: MARK` + `priceProtect` on Binance).
+
+**Terminal panels** — Positions (size in BTC *and* the venue's unit, entry, mark, liquidation,
+margin, leverage, uPnL, ROE, close button), Open Orders, Stop Orders (trigger + trigger method),
+Fills (fee, maker/taker, realised PnL), Order History, plus Wallet & Margin, Risk (margin
+utilisation, effective leverage, long/short/net exposure) and a live Rate-limit panel.
+
+**Sizing** — Delta sizes in whole contracts (1 contract = 0.001 BTC), Binance in BTC lots; the
+ticket accepts either unit and converts using the contract specification read from the venue.
+
+**Local audit trail** — every order (`broker_orders`, tagged with its leg, client id and the strategy
+instance that sent it) and every fill (`broker_fills`) is mirrored locally, deduplicated on the
+exchange trade id, so history survives the exchange's own window.
+
+**Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
+
+| Venue | Documented limit | Enforced |
+| :--- | :--- | :--- |
+| Delta Exchange | 10 000 weight per **fixed** 5-minute window; 500 ops/s per product; 429 → `X-RATE-LIMIT-RESET` (ms) | 20 req/s, 1 200 req/min, weight budget, quota polled from `/v2/rate_limits/quota` |
+| Binance Futures | 2 400 request-weight/min and **1 200 orders/min** per IP | 20 req/s, 1 200 req/min, order slots counted separately, `X-MBX-USED-WEIGHT-1M` tracked |
+
+One limiter is shared per broker connection, 429s are retried (4 attempts, honouring `Retry-After` /
+`X-RATE-LIMIT-RESET`) and a failure is returned as an error object instead of raising, so a trading
+worker survives a rejected order. All limits are editable per broker in **Broker → Exchange
+Registry → Limits** and returned by `GET /live-account/rate-limits`.
+
+Smoke-test the live endpoints without touching a real exchange:
+
+```bash
+cd backend && ../.venv/bin/python tools/mock_exchange.py --port 8099   # fake Binance REST surface
+# then register it in Broker → Exchange Registry (kind: binance, URLs http://127.0.0.1:8099)
+```
+
+**API configuration** — credentials per broker (multiple labelled connections) in
+**Broker & Data Sources**; leverage and margin mode from the terminal or per broker definition;
+contract value and tick size fall back to the venue's instrument endpoint and can be overridden.
+
 ## 🎯 BTC perpetual, mark price & trading windows (v3.3)
 
 **Contract.** Every venue is wired to the BTC **perpetual** — `BTCUSDT` on Binance Futures and
@@ -198,9 +245,10 @@ python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
+python test_live_account.py       # 138 checks: rate limits, order lifecycle, terminal schema, live API
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 160 checks: trade-log table + CSV export, trading windows, page smoke
+cd frontend && npm test            # 215 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

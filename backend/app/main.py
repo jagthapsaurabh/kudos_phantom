@@ -605,12 +605,47 @@ class BrokerDefinitionPayload(BaseModel):
     trading_api_url: Optional[str] = None
     enabled: bool = True
     notes: Optional[str] = None
+    # Rate-limit policy — NULL falls back to the venue default
+    # (Delta 10 000 weight / 5 min, Binance 2 400 weight + 1 200 orders / min).
+    rate_limit_per_second: Optional[float] = None
+    rate_limit_per_minute: Optional[float] = None
+    quota_per_5min: Optional[float] = None
+    orders_per_minute: Optional[float] = None
+    # Trading defaults for the live terminal.
+    default_leverage: Optional[int] = None
+    margin_mode: Optional[str] = None
+    contract_value: Optional[float] = None
+    tick_size: Optional[float] = None
 
 
 def _broker_dict(row):
     return {'id': row.id, 'code': row.code, 'name': row.name, 'kind': row.kind,
             'market_data_url': row.market_data_url, 'trading_api_url': row.trading_api_url,
-            'enabled': bool(row.enabled), 'is_builtin': bool(row.is_builtin), 'notes': row.notes}
+            'enabled': bool(row.enabled), 'is_builtin': bool(row.is_builtin), 'notes': row.notes,
+            'rate_limit_per_second': row.rate_limit_per_second,
+            'rate_limit_per_minute': row.rate_limit_per_minute,
+            'quota_per_5min': row.quota_per_5min,
+            'orders_per_minute': row.orders_per_minute,
+            'default_leverage': row.default_leverage, 'margin_mode': row.margin_mode,
+            'contract_value': row.contract_value, 'tick_size': row.tick_size}
+
+
+def _apply_broker_payload(row, payload):
+    """Copy the editable broker fields (incl. rate limits) onto a row."""
+    row.name = payload.name
+    row.kind = payload.kind.lower()
+    row.market_data_url = payload.market_data_url
+    row.trading_api_url = payload.trading_api_url
+    row.enabled = int(payload.enabled)
+    row.notes = payload.notes
+    row.rate_limit_per_second = payload.rate_limit_per_second
+    row.rate_limit_per_minute = payload.rate_limit_per_minute
+    row.quota_per_5min = payload.quota_per_5min
+    row.orders_per_minute = payload.orders_per_minute
+    row.default_leverage = payload.default_leverage
+    row.margin_mode = (payload.margin_mode or None)
+    row.contract_value = payload.contract_value
+    row.tick_size = payload.tick_size
 
 
 @app.get('/broker-definitions')
@@ -628,9 +663,8 @@ def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin)
     code = normalize_source(payload.code)
     if db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first():
         raise HTTPException(status_code=400, detail='Broker code already exists')
-    row = BrokerDefinition(code=code, name=payload.name, kind=payload.kind.lower(),
-                           market_data_url=payload.market_data_url, trading_api_url=payload.trading_api_url,
-                           enabled=int(payload.enabled), is_builtin=0, notes=payload.notes)
+    row = BrokerDefinition(code=code, is_builtin=0)
+    _apply_broker_payload(row, payload)
     db.add(row)
     db.flush()
     default_taker = float(os.getenv('TAKER_FEE_BPS', '5.9'))
@@ -646,8 +680,7 @@ def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin)
 def update_broker(broker_id: int, payload: BrokerDefinitionPayload, admin=Depends(require_admin), db=Depends(get_db)):
     row = db.query(BrokerDefinition).filter(BrokerDefinition.id == broker_id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker integration not found')
-    row.name = payload.name; row.kind = payload.kind.lower(); row.market_data_url = payload.market_data_url
-    row.trading_api_url = payload.trading_api_url; row.enabled = int(payload.enabled); row.notes = payload.notes
+    _apply_broker_payload(row, payload)
     db.commit(); db.refresh(row)
     return _broker_dict(row)
 
@@ -1787,7 +1820,8 @@ def start_live_trade(
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
-                                   trading_windows=window_config, use_mark_price=use_mark)
+                                   trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -1798,17 +1832,20 @@ def start_live_trade(
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=False, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
-                                       trading_windows=window_config, use_mark_price=use_mark)
+                                       trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
-                                       trading_windows=window_config, use_mark_price=use_mark)
+                                       trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
-                                   trading_windows=window_config, use_mark_price=use_mark)
+                                   trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
@@ -2014,3 +2051,282 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
             "best_roi": 0.0, "avg_roi": 0.0, "total_runs": 0, "completed_runs": 0,
             "avg_win_rate": 0.0, "best_win_rate": 0.0, "last_run": None,
         }
+
+
+# ===========================================================================
+# LIVE ACCOUNT — orders, positions, fills, margin and risk
+#
+# Everything below talks to the real broker through BrokerClient, which
+# throttles each call against that venue's rate limits (Delta: 10 000 weight
+# per fixed 5-minute window; Binance: 2 400 weight/min and 1 200 orders/min —
+# see app/core/rate_limit.py). Broker payloads are normalized by
+# app/services/broker_account.py so both venues render the same way.
+# ===========================================================================
+def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None,
+                 require_credentials: bool = True):
+    """Build a BrokerClient from a broker code + the user's credentials."""
+    from .services.broker_client import BrokerClient
+    code = normalize_source(broker_code)
+    definition = db.query(BrokerDefinition).filter(
+        BrokerDefinition.code == code, BrokerDefinition.enabled == 1).first()
+    if not definition:
+        raise HTTPException(status_code=400, detail=f"Broker '{code}' is not configured or enabled")
+    query = db.query(BrokerConnection).filter(
+        BrokerConnection.user_id == user.id, BrokerConnection.broker_code == code,
+        BrokerConnection.is_active == 1)
+    if connection_id is not None:
+        query = query.filter(BrokerConnection.id == connection_id)
+    connection = query.order_by(BrokerConnection.created_at).first()
+    api_key = (connection.api_key if connection else None) or (user.api_key or '')
+    api_secret = (connection.api_secret if connection else None) or (user.api_secret or '')
+    passphrase = (connection.passphrase if connection else None) or ''
+    testnet = bool(connection.is_testnet) if connection else False
+    if require_credentials and (not api_key or not api_secret):
+        raise HTTPException(status_code=400,
+                            detail=f"API keys not configured for {code}. Add them in Broker Settings.")
+    client = BrokerClient(api_key, api_secret, code, passphrase, testnet, definition)
+    return client, definition, (connection.id if connection else None)
+
+
+class LiveOrderRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    side: str
+    order_type: str = 'market'
+    size: float = 0.0
+    size_in_btc: bool = True
+    price: Optional[float] = None
+    stop_price: Optional[float] = None
+    trail_amount: Optional[float] = None
+    reduce_only: bool = False
+    post_only: bool = False
+    time_in_force: str = 'gtc'
+    working_type: str = 'MARK'
+    client_order_id: Optional[str] = None
+    # Bracket: attach protection legs to the entry.
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    stop_trigger: str = 'mark_price'
+    # 'manual' from the terminal ticket, 'strategy' from a live-trade instance.
+    source: str = 'manual'
+    instance_key: Optional[str] = None
+
+
+class LiveCancelRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    order_id: Optional[str] = None
+    client_order_id: Optional[str] = None
+    symbol: str = 'BTCUSDT'
+
+
+class LiveClosePositionRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    size: Optional[float] = None
+    size_in_btc: bool = True
+    instance_key: Optional[str] = None
+
+
+class LiveLeverageRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    leverage: int = 1
+
+
+class LiveMarginModeRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    mode: str = 'isolated'
+
+
+class LivePositionMarginRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    amount: float = 0.0
+
+
+class LiveSnapshotRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    include_history: bool = True
+    history_limit: int = 50
+
+
+def _record_placed_order(client, user, broker_code, connection_id, response, request, contract_value):
+    """Persist the local mirror of a placed order (plain or bracketed)."""
+    from .services.broker_account import normalize_order, record_order, split_order_response
+    recorded = []
+    parent_id = None
+    for row, leg_name in split_order_response(response, broker_code):
+        order = normalize_order(row, broker_code, contract_value)
+        if order.get('error'):
+            continue
+        order['symbol'] = client.perpetual_symbol(request.symbol)
+        record_order(user.id, broker_code, order, source=request.source,
+                     instance_key=request.instance_key, connection_id=connection_id,
+                     leg=leg_name, parent_order_id=(None if leg_name == 'entry' else parent_id),
+                     raw=row)
+        if leg_name == 'entry':
+            parent_id = order.get('order_id')
+        recorded.append(order)
+    return recorded
+
+
+@app.post('/live-account/snapshot')
+def live_account_snapshot(payload: LiveSnapshotRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Positions / open orders / stop orders / fills / history / margin for one broker."""
+    from .services.broker_account import account_snapshot
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    return account_snapshot(client, payload.symbol, include_history=payload.include_history,
+                            history_limit=payload.history_limit)
+
+
+@app.post('/live-account/orders')
+def live_place_order(payload: LiveOrderRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Place a market / limit / stop / take-profit order, optionally bracketed."""
+    from .services.broker_account import (normalize_order, record_fills, record_order)
+    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+    symbol = payload.symbol or 'BTCUSDT'
+    instrument = client.get_instrument(symbol) or {}
+    contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
+    client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
+    side = str(payload.side or '').lower()
+    if side not in ('buy', 'sell'):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+
+    if payload.stop_loss is not None or payload.take_profit is not None:
+        response = client.place_bracket_order(
+            symbol, side, payload.size, price=payload.price,
+            stop_loss_price=payload.stop_loss, take_profit_price=payload.take_profit,
+            client_order_id=client_order_id, trigger_method=payload.stop_trigger,
+            size_in_btc=payload.size_in_btc)
+    else:
+        response = client.place_order(
+            symbol, side, payload.order_type, payload.size, price=payload.price,
+            stop_price=payload.stop_price, reduce_only=payload.reduce_only,
+            client_order_id=client_order_id, time_in_force=payload.time_in_force,
+            post_only=payload.post_only, working_type=payload.working_type,
+            trail_amount=payload.trail_amount, size_in_btc=payload.size_in_btc)
+
+    orders = _record_placed_order(client, user, definition.code, connection_id, response, payload, contract_value)
+    fills_recorded = 0
+    if orders:
+        # A market order can fill before the exchange answers; capture it.
+        try:
+            fills = client.get_fills(symbol, limit=10)
+            if isinstance(fills, list) and not (isinstance(fills, dict) and fills.get('error')):
+                from .services.broker_account import normalize_fill
+                fills_recorded = record_fills(user.id, definition.code,
+                                              [normalize_fill(f, definition.code, contract_value) for f in fills],
+                                              source=payload.source, instance_key=payload.instance_key)
+        except Exception:
+            fills_recorded = 0
+    return {
+        "status": "rejected" if (isinstance(response, dict) and response.get('error')) else "placed",
+        "broker": definition.code,
+        "symbol": client.perpetual_symbol(symbol),
+        "contract_value": contract_value,
+        "client_order_id": client_order_id,
+        "response": response,
+        "orders": orders,
+        "fills_recorded": fills_recorded,
+        "rate_limits": client.rate_limit_usage(),
+    }
+
+
+@app.post('/live-account/orders/cancel')
+def live_cancel_order(payload: LiveCancelRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Cancel one order by exchange id or by our client order id."""
+    from .services.broker_account import mark_order_cancelled
+    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+    if not payload.order_id and not payload.client_order_id:
+        raise HTTPException(status_code=400, detail="order_id or client_order_id is required")
+    response = client.cancel_order(payload.order_id, payload.symbol, payload.client_order_id)
+    local_row = None
+    if isinstance(response, dict) and not response.get('error'):
+        local_row = mark_order_cancelled(user.id, definition.code,
+                                         order_id=str(payload.order_id or ''),
+                                         client_order_id=payload.client_order_id)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "cancelled",
+            "response": response, "local": local_row,
+            "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/orders/cancel-all')
+def live_cancel_all_orders(payload: LiveCancelRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Cancel every open order on the contract (or the whole account)."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.cancel_all_orders(payload.symbol)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "cancelled",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/positions/close')
+def live_close_position(payload: LiveClosePositionRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Flatten the open position on the contract."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.close_position(payload.symbol, size=payload.size,
+                                     size_in_btc=payload.size_in_btc)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "closed",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/leverage')
+def live_set_leverage(payload: LiveLeverageRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.set_leverage(payload.symbol, int(payload.leverage))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/margin-mode')
+def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.set_margin_mode(payload.symbol, payload.mode)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/position-margin')
+def live_change_position_margin(payload: LivePositionMarginRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.change_position_margin(payload.symbol, float(payload.amount))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.get('/live-account/rate-limits')
+def live_rate_limits(broker: str = 'Binance', connection_id: Optional[int] = None,
+                     user=Depends(get_current_user), db=Depends(get_db)):
+    """Local throttling state, plus the exchange's own quota (Delta)."""
+    from .core.rate_limit import all_snapshots
+    client, definition, _ = _live_client(db, user, broker, connection_id)
+    usage = client.rate_limit_usage()
+    quota = None
+    try:
+        quota = client.fetch_rate_limit_quota()
+    except Exception:
+        quota = None
+    return {"broker": definition.code, "local": usage, "exchange_quota": quota,
+            "all": all_snapshots()}
+
+
+@app.get('/live-account/orders')
+def live_local_orders(broker: str = None, limit: int = 200, user=Depends(get_current_user)):
+    """Orders sent through PHANTOM, from the local audit table."""
+    from .services.broker_account import local_order_history
+    return local_order_history(user.id, broker, limit=limit)
+
+
+@app.get('/live-account/fills')
+def live_local_fills(broker: str = None, limit: int = 200, user=Depends(get_current_user)):
+    """Executions recorded locally (kept after the exchange history window)."""
+    from .services.broker_account import local_fills
+    return local_fills(user.id, broker, limit=limit)

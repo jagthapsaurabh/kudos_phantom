@@ -52,7 +52,8 @@ class LiveTradeService:
     def __init__(self, strategy_id: str, config_or_rules, api_key: str, api_secret: str,
                  initial_capital=20000.0, margin_pct=25.0, is_custom=False,
                  broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
-                 definition=None, trading_windows=None, use_mark_price=None):
+                 definition=None, trading_windows=None, use_mark_price=None,
+                 user_id=None, instance_key=None, bracket_orders=True):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
         self.market_source = broker_name or "Binance"
@@ -106,6 +107,18 @@ class LiveTradeService:
         self.blocked_entries = 0
         self._last_block_notice = None
         self.last_checked = None
+        # ---- Live order lifecycle ---------------------------------------
+        # `user_id` + `instance_key` let every order and fill this instance
+        # sends be mirrored into broker_orders / broker_fills for the terminal.
+        self.user_id = user_id
+        self.instance_key = instance_key
+        # Entries go out as bracket orders (entry + stop-loss + take-profit) so
+        # risk is protected exchange-side even if this worker dies mid-trade.
+        self.bracket_orders = bool(bracket_orders)
+        # Protection legs left over after a close must be cancelled, otherwise
+        # a stale reduce-only stop can reopen the other side of the book.
+        self.cancel_legs_on_exit = True
+        self.last_order_error = None
 
     async def start(self):
         self.is_running = True
@@ -162,7 +175,13 @@ class LiveTradeService:
                                            trade_price_usd=trade_price, mark_price_usd=mark_price)
             if result:
                 side = "SELL" if result.direction == 1 else "BUY"
-                response = self.broker.place_order(self.contract_symbol, side, "MARKET", result.lots)
+                response = self.broker.place_order(self.contract_symbol, side, "MARKET",
+                                                   result.lots, size_in_btc=True)
+                # Drop the stop-loss / take-profit legs the entry created; the
+                # position they protected is already flat.
+                if "error" not in response and self.cancel_legs_on_exit:
+                    self._cancel_protection_legs()
+                self._record_order(response, leg="exit")
                 if "error" not in response:
                     filled = extract_fill_price(response)
                     if filled:
@@ -173,6 +192,7 @@ class LiveTradeService:
                     if result.exit_detail:
                         print(f"   Exit condition: {result.exit_detail}")
                 else:
+                    self.last_order_error = response.get("error")
                     print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
 
         # "Skip new trades" schedule. A position already open keeps being
@@ -200,18 +220,91 @@ class LiveTradeService:
                 if lots <= 0:
                     return
                 side = "BUY" if last_sig == 1 else "SELL"
-                res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots)
+                # Open the OMS trade first so the entry can be bracketed with
+                # the same stop-loss / take-profit levels the strategy uses.
+                planned = self.oms.create_order("BTCUSDT", last_sig, decision_price, current_atr, current_time,
+                                                margin_inr, self.conversion_rate,
+                                                trade_price_usd=trade_price,
+                                                mark_price_usd=mark_price, mark_price_basis=use_mark)
+                if planned is None:
+                    return
+                lots = float(planned.lots)
+                if self.bracket_orders:
+                    res = self.broker.place_bracket_order(
+                        self.contract_symbol, side, lots, price=None,
+                        stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
+                        trigger_method="mark_price" if use_mark else "last_traded_price",
+                        size_in_btc=True)
+                else:
+                    res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots,
+                                                  size_in_btc=True)
+                self._record_order(res, leg="entry")
                 if "error" not in res:
-                    filled = extract_fill_price(res)
-                    self.oms.create_order("BTCUSDT", last_sig, decision_price, current_atr, current_time,
-                                          margin_inr, self.conversion_rate,
-                                          trade_price_usd=filled or trade_price,
-                                          mark_price_usd=mark_price, mark_price_basis=use_mark)
+                    filled = extract_fill_price(res if not res.get("_bracket") else (res.get("entry") or res))
+                    if filled:
+                        planned.entry_trade_price = float(filled)
                     price_note = (f"mark {mark_price:,.2f} (filled {filled:,.2f})" if filled
                                   else (f"mark {mark_price:,.2f}" if use_mark else f"{current_price:,.2f}"))
-                    print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {price_note} ({lots} BTC)")
+                    protection = ""
+                    if self.bracket_orders:
+                        protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}"
+                                      f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
+                    print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {price_note} ({lots} BTC){protection}")
                 else:
+                    # No order left the building: roll the OMS trade back so the
+                    # local book does not drift away from the exchange.
+                    self.oms.active_trades.pop("BTCUSDT", None)
+                    self.last_order_error = res.get("error")
                     print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
+
+    # ------------------------------------------------------------------
+    # Local audit trail + bracket cleanup
+    # ------------------------------------------------------------------
+    def _record_order(self, response, leg="entry"):
+        """Mirror a broker order (and any fills) into the local tables."""
+        if not self.user_id or not isinstance(response, dict) or response.get("error"):
+            return None
+        try:
+            from app.services.broker_account import (normalize_fill, normalize_order,
+                                                     record_fills, record_order,
+                                                     split_order_response)
+            instrument = self.broker.get_instrument(self.symbol) or {}
+            contract_value = float(instrument.get("contract_value") or 1.0) or 1.0
+            code = str(self.broker_name)
+            written = None
+            parent_id = None
+            for row, row_leg in split_order_response(response, code):
+                if not isinstance(row, dict) or row.get("error"):
+                    continue
+                order = normalize_order(row, code, contract_value)
+                if order.get("error"):
+                    continue
+                order["symbol"] = self.contract_symbol
+                written = record_order(self.user_id, code, order, source="strategy",
+                                       instance_key=self.instance_key, leg=row_leg,
+                                       parent_order_id=parent_id, raw=row)
+                if row_leg == "entry":
+                    parent_id = order.get("order_id")
+            try:
+                fills = self.broker.get_fills(self.symbol, limit=10)
+                if isinstance(fills, list):
+                    record_fills(self.user_id, code,
+                                 [normalize_fill(f, code, contract_value) for f in fills],
+                                 source="strategy", instance_key=self.instance_key)
+            except Exception:
+                pass
+            return written
+        except Exception as exc:
+            print(f"[{self.strategy_id}] could not record order: {exc}")
+            return None
+
+    def _cancel_protection_legs(self):
+        """Cancel the reduce-only stop / target legs of a closed bracket."""
+        try:
+            return self.broker.cancel_all_orders(self.symbol)
+        except Exception as exc:
+            print(f"[{self.strategy_id}] could not cancel protection legs: {exc}")
+            return None
 
     def _fetch_mark_price(self):
         """Current mark price of the BTC perpetual; ``None`` when unavailable."""

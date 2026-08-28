@@ -35,6 +35,40 @@ const ExchangeRegistry = () => {
 
   const f = 'w-full bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-sm';
 
+  // ---- Per-broker rate limits + trading defaults --------------------------
+  const [editing, setEditing] = useState(null);
+  const [limitMsg, setLimitMsg] = useState(null);
+  const limitsOf = (row) => ({
+    rate_limit_per_second: row.rate_limit_per_second ?? '',
+    rate_limit_per_minute: row.rate_limit_per_minute ?? '',
+    quota_per_5min: row.quota_per_5min ?? '',
+    orders_per_minute: row.orders_per_minute ?? '',
+    default_leverage: row.default_leverage ?? '',
+    margin_mode: row.margin_mode ?? '',
+    contract_value: row.contract_value ?? '',
+    tick_size: row.tick_size ?? '',
+  });
+  const [limits, setLimits] = useState({});
+  const num = (value) => (value === '' || value === null || value === undefined ? null : Number(value));
+
+  const startEdit = (row) => { setEditing(row.id); setLimits(limitsOf(row)); setLimitMsg(null); };
+  const saveLimits = async (row) => {
+    const body = {
+      ...row,
+      rate_limit_per_second: num(limits.rate_limit_per_second),
+      rate_limit_per_minute: num(limits.rate_limit_per_minute),
+      quota_per_5min: num(limits.quota_per_5min),
+      orders_per_minute: num(limits.orders_per_minute),
+      default_leverage: num(limits.default_leverage),
+      margin_mode: limits.margin_mode || null,
+      contract_value: num(limits.contract_value),
+      tick_size: num(limits.tick_size),
+    };
+    const res = await fetch(`${API_URL}/admin/brokers/${row.id}`, { method: 'PUT', headers: auth(), body: JSON.stringify(body) });
+    if (!res.ok) setLimitMsg({ ok: false, text: (await res.json()).detail || 'Could not save limits' });
+    else { setLimitMsg({ ok: true, text: `${row.name} limits saved.` }); setEditing(null); load(); }
+  };
+
   return (
     <section className="mt-8">
       <div className="flex items-center gap-2 mb-1">
@@ -75,10 +109,65 @@ const ExchangeRegistry = () => {
               </button>
             </div>
             <div className="text-[10px] text-gray-600 break-all">{row.market_data_url || 'No market endpoint configured'}</div>
+
+            <div className="flex items-center justify-between gap-2 text-[10px] text-gray-500">
+              <span>
+                {row.rate_limit_per_second ? `${row.rate_limit_per_second} req/s` : 'default req/s'} ·{' '}
+                {row.quota_per_5min ? `${row.quota_per_5min} / 5min` : (row.orders_per_minute ? `${row.orders_per_minute} orders/min` : 'venue budget')}
+              </span>
+              <button onClick={() => (editing === row.id ? setEditing(null) : startEdit(row))}
+                      className="rounded border border-gray-700 px-2 py-0.5 font-bold text-gray-400 transition hover:border-blue-500 hover:text-white">
+                {editing === row.id ? 'Close' : 'Limits'}
+              </button>
+            </div>
+
+            {editing === row.id && (
+              <div className="mt-1 space-y-2 rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                <div className="text-[10px] text-gray-500">
+                  Blank = venue default (Delta 10 000 weight / 5 min, Binance 2 400 weight + 1 200 orders / min).
+                  Every request the app sends is throttled against these numbers.
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="block text-[10px] uppercase text-gray-500">Req / second
+                    <input type="number" min="0" step="0.5" className={f} value={limits.rate_limit_per_second}
+                           onChange={e => setLimits(l => ({ ...l, rate_limit_per_second: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Req / minute
+                    <input type="number" min="0" step="1" className={f} value={limits.rate_limit_per_minute}
+                           onChange={e => setLimits(l => ({ ...l, rate_limit_per_minute: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Quota / 5 min (Delta)
+                    <input type="number" min="0" step="100" className={f} value={limits.quota_per_5min}
+                           onChange={e => setLimits(l => ({ ...l, quota_per_5min: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Orders / minute
+                    <input type="number" min="0" step="10" className={f} value={limits.orders_per_minute}
+                           onChange={e => setLimits(l => ({ ...l, orders_per_minute: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Default leverage
+                    <input type="number" min="1" max="125" className={f} value={limits.default_leverage}
+                           onChange={e => setLimits(l => ({ ...l, default_leverage: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Margin mode
+                    <select className={f} value={limits.margin_mode}
+                            onChange={e => setLimits(l => ({ ...l, margin_mode: e.target.value }))}>
+                      <option value="">Venue default</option>
+                      <option value="isolated">Isolated</option>
+                      <option value="cross">Cross</option>
+                    </select></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Contract value (BTC)
+                    <input type="number" min="0" step="0.0001" className={f} value={limits.contract_value}
+                           onChange={e => setLimits(l => ({ ...l, contract_value: e.target.value }))} /></label>
+                  <label className="block text-[10px] uppercase text-gray-500">Tick size
+                    <input type="number" min="0" step="0.01" className={f} value={limits.tick_size}
+                           onChange={e => setLimits(l => ({ ...l, tick_size: e.target.value }))} /></label>
+                </div>
+                <button onClick={() => saveLimits(row)}
+                        className="w-full rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-bold text-white transition hover:bg-blue-500">
+                  Save limits &amp; defaults
+                </button>
+              </div>
+            )}
           </div>
         ))}
         {rows.length === 0 && <div className="text-xs text-gray-500">No integrations registered yet.</div>}
       </div>
+      {limitMsg && <div className={`mt-3 text-xs font-semibold ${limitMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{limitMsg.text}</div>}
     </section>
   );
 };

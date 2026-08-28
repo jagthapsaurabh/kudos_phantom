@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle } from 'lucide-react';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import {
@@ -205,6 +205,10 @@ const LiveTrade = () => {
               <span className="text-[10px] opacity-70">{useMarkPrice ? '· MARK' : '· TRADE'}</span>
             </button>
           </div>
+          <a href="/terminal"
+             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
+            <TerminalSquare size={16} /> Terminal
+          </a>
           <button onClick={startTrade} disabled={loading}
                   className="px-6 py-2 rounded-lg font-bold transition bg-green-600 hover:bg-green-500 flex items-center gap-2">
             <Play size={18} /> Start Instance

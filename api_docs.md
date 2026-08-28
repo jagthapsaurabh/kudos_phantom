@@ -24,6 +24,8 @@ All protected endpoints require a Bearer Token in the header:
 | `GET` | `/broker-settings` | None | Get capital defaults and masked legacy settings |
 | `POST` | `/broker-settings` | `api_key`, `api_secret`, `initial_capital`, `margin_pct`, `broker_name` | Update legacy/primary broker keys and capital |
 | `GET` | `/fee-settings` | `broker_code`, `mode` | Read the admin schedule used by a new run |
+| `GET` | `/admin/brokers` | None | Every broker definition **including its rate-limit and trading defaults** |
+| `PUT` | `/admin/brokers/{id}` | `code`, `name`, `kind`, `market_data_url`, `trading_api_url`, `enabled`, `notes`, `rate_limit_per_second`, `rate_limit_per_minute`, `quota_per_5min`, `orders_per_minute`, `default_leverage`, `margin_mode`, `contract_value`, `tick_size` | Edit a broker (admin). Admin-only; blanks fall back to the venue default |
 
 Fees are managed by admins in basis points using `POST /admin/fee-settings` with `broker_code`, `mode` (`backtest`, `paper`, or `live`), `taker_fee_bps`, and `maker_fee_bps`. Schedules are snapshotted on backtest runs; `.env` is only the first-install fallback.
 
@@ -62,6 +64,79 @@ a saved result.
 | `POST` | `/live-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital`, `margin_pct`, `use_mark_price` (optional), `trading_windows` (optional) | Starts a real-money execution instance on the selected broker using the live fee schedule. Orders go to the venue's BTC perpetual and risk is managed on the mark price when `use_mark_price` is true. |
 | `POST` | `/live-trade/stop` | `instance_key` | Stops a live execution instance |
 | `GET` | `/live-trade/status` | None | List all live instances and positions, plus the perpetual `contract`, mark/traded prices, the `trading_windows` schedule in force, `entry_paused` and `blocked_entries` |
+
+Every order a live instance sends is mirrored into `broker_orders` (with its `leg`, `client_order_id`
+and `instance_key`) and every execution into `broker_fills`, so the terminal keeps an audit trail
+after the exchange drops the order from its own history window.
+
+### 5b. Live Account — orders, positions, fills, margin (the terminal)
+
+| Method | Endpoint | Request Body | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/live-account/snapshot` | `broker`, `connection_id`, `symbol`, `include_history`, `history_limit` | Everything the terminal renders in one call: `contract`, `mark_price`, `balance`, `risk`, `positions`, `open_orders`, `stop_orders`, `fills`, `order_history`, `errors`, `rate_limits` |
+| `POST` | `/live-account/orders` | `broker`, `connection_id`, `symbol`, `side`, `order_type`, `size`, `size_in_btc`, `price`, `stop_price`, `trail_amount`, `reduce_only`, `post_only`, `time_in_force`, `working_type`, `client_order_id`, `stop_loss`, `take_profit`, `stop_trigger`, `source`, `instance_key` | Place an order. With `stop_loss` / `take_profit` it becomes a **bracket** (native on Delta, emulated with reduce-only legs on Binance). Sizes may be given in BTC (`size_in_btc: true`) and are converted into the venue's own units |
+| `POST` | `/live-account/orders/cancel` | `broker`, `connection_id`, `order_id` or `client_order_id`, `symbol` | Cancel one order and mark the local row cancelled |
+| `POST` | `/live-account/orders/cancel-all` | `broker`, `connection_id`, `symbol` | Cancel every open order on the contract |
+| `POST` | `/live-account/positions/close` | `broker`, `connection_id`, `symbol`, `size`, `size_in_btc` | Flatten (or partially reduce) the position with a reduce-only market order |
+| `POST` | `/live-account/leverage` | `broker`, `connection_id`, `symbol`, `leverage` | Set contract leverage |
+| `POST` | `/live-account/margin-mode` | `broker`, `connection_id`, `symbol`, `mode` (`isolated`\|`cross`) | Set the margin mode |
+| `POST` | `/live-account/position-margin` | `broker`, `connection_id`, `symbol`, `amount` | Add (positive) or remove (negative) isolated margin |
+| `GET` | `/live-account/rate-limits` | `broker` (query), `connection_id` | Local throttling windows **and** the venue's own remaining quota (Delta) |
+| `GET` | `/live-account/orders` | `broker`, `limit` | Orders sent through PHANTOM, from the local audit table |
+| `GET` | `/live-account/fills` | `broker`, `limit` | Executions recorded locally (kept after the exchange history window) |
+
+All of them require API keys; a missing credential returns `400 API keys not configured for <broker>`.
+Broker failures come back as `{"error": "..."}` (never a 500) so a trading loop survives a rejected
+order, and `{"error": ..., "rate_limited": true}` marks a 429 that exhausted its retries.
+
+Example — place a bracket order for 0.05 BTC with a stop and a target:
+
+```json
+POST /live-account/orders
+{
+  "broker": "Delta",
+  "side": "buy",
+  "order_type": "market",
+  "size": 0.05,
+  "size_in_btc": true,
+  "stop_loss": 65000,
+  "take_profit": 70000,
+  "stop_trigger": "mark_price"
+}
+```
+
+```json
+{
+  "status": "placed",
+  "broker": "Delta",
+  "symbol": "BTCUSD",
+  "contract_value": 0.001,
+  "client_order_id": "ph-9f2c…",
+  "orders": [
+    { "leg": "entry",        "type": "market",              "qty_btc": 0.05 },
+    { "leg": "stop_loss",    "type": "stop_market",         "qty_btc": 0.05, "stop_price": 65000 },
+    { "leg": "take_profit",  "type": "take_profit_market",  "qty_btc": 0.05, "stop_price": 70000 }
+  ],
+  "rate_limits": { "requests_last_second": 3, "orders_last_minute": 3, "limits": { "requests_per_second": 20 } }
+}
+```
+
+### 5c. Broker rate limits
+
+Every broker call — market data, orders, the terminal poller — goes through one shared
+`RateLimiter` per broker connection (`app/core/rate_limit.py`), so several workers can never
+outrun the venue together.
+
+| Venue | Documented limit | What the client enforces |
+| :--- | :--- | :--- |
+| **Delta Exchange** | 10 000 weight per **fixed** 5-minute window; 500 matching-engine ops/second/product; 429 carries `X-RATE-LIMIT-RESET` (ms) | 20 req/s and 1 200 req/min plus the weight budget; `GET /v2/rate_limits/quota` is polled and the remaining quota paces further calls |
+| **Binance Futures** | 2 400 request-weight/minute and 1 200 **orders**/minute per IP; every response carries `X-MBX-USED-WEIGHT-1M` | 20 req/s, 1 200 req/min, order slots counted separately; usage headers tracked and calls slowed at 85 % of the budget |
+
+A 429 is retried up to 4 times honouring `Retry-After` (seconds) / `X-RATE-LIMIT-RESET`
+(milliseconds) before falling back to exponential back-off (0.35 s base, 30 s cap); if it still
+fails the call returns a `rate_limited` error object instead of raising. The safe default of
+**20 requests/second** is deliberately well inside both venues' budgets and can be dialled per
+broker from **Broker → Exchange Registry → Limits**.
 
 ### 6. Backtesting
 | Method | Endpoint | Request Body | Description |
