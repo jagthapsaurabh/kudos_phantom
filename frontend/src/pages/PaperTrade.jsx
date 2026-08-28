@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2, History, Download, RefreshCw, Eye, ChevronDown, ChevronUp, Clock } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
+import TradeScheduleControl from '../components/TradeScheduleControl';
 import { API_URL } from '../api';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
@@ -99,9 +100,11 @@ const TradeCard = ({ trade, onClose }) => (
       </div>
     </div>
     <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
-      <div className="bg-gray-800/50 p-2 rounded">Entry<br /><span className="text-white text-xs">{Number(trade.entry).toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-2 rounded">Current<br /><span className="text-white text-xs">{Number(trade.current).toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-2 rounded">Chg<br /><span className={`text-xs ${trade.chg_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{trade.chg_pct >= 0 ? '+' : ''}{Number(trade.chg_pct).toFixed(2)}%</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Entry<br /><span className="text-white text-xs">{(trade.entry || 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded" title="Mark price at entry">Entry Mark<br /><span className="text-white text-xs">{(trade.entry_mark ?? trade.entry ?? 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded" title="Current mark price">Current Mark<br /><span className="text-white text-xs">{(trade.current_mark ?? trade.current ?? 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Current Trade<br /><span className="text-white text-xs">{(trade.current || 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Chg<br /><span className={`text-xs ${(trade.chg_pct || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(trade.chg_pct || 0) >= 0 ? '+' : ''}{Number(trade.chg_pct).toFixed(2)}%</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Margin<br /><span className="text-white text-xs">₹{Number(trade.margin).toFixed(0)}</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Leverage<br /><span className="text-white text-xs">{trade.leverage ?? '—'}×</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Notional<br /><span className="text-white text-xs">${Number(trade.notional_usd || 0).toFixed(0)}</span></div>
@@ -145,7 +148,9 @@ const ClosedTradesPanel = ({ closedTrades }) => {
             <tr>
               <th className="p-2">Dir</th>
               <th className="p-2">Entry</th>
+              <th className="p-2">Entry Mark</th>
               <th className="p-2">Exit</th>
+              <th className="p-2">Exit Mark</th>
               <th className="p-2">Stop Loss</th>
               <th className="p-2">Take Profit</th>
               <th className="p-2">Trail Stop</th>
@@ -167,7 +172,9 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                 <tr key={i} className="border-b border-gray-700/60 align-top">
                   <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-gray-400" title="Entry mark price">{t.entry_mark != null ? Number(t.entry_mark).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-gray-400" title="Exit mark price">{t.exit_mark != null ? Number(t.exit_mark).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-red-300">{t.sl != null ? Number(t.sl).toFixed(2) : '—'}{slMoved && <span className="text-[9px] text-yellow-400 ml-1">→ {Number(t.sl_final).toFixed(2)} (BE)</span>}</td>
                   <td className="p-2 font-mono text-green-300">{t.tp != null ? Number(t.tp).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-purple-300">{t.trail_stop != null ? Number(t.trail_stop).toFixed(2) : '—'}</td>
@@ -399,7 +406,8 @@ const exportSessionCSV = (session) => {
   const cols = [
     ['entry_time', 'Entry Time (IST)'], ['exit_time', 'Exit Time (IST)'],
     ['direction', 'Direction'], ['symbol', 'Symbol'],
-    ['entry', 'Entry Price'], ['exit', 'Exit Price'],
+    ['entry', 'Entry Price'], ['entry_mark', 'Entry Mark Price'],
+    ['exit', 'Exit Price'], ['exit_mark', 'Exit Mark Price'],
     ['lots', 'Lots'], ['margin_inr', 'Margin (INR)'], ['notional_usd', 'Notional (USD)'],
     ['sl', 'Stop Loss'], ['sl_final', 'Stop Loss (Final)'], ['tp', 'Take Profit'],
     ['trail_stop', 'Trail Stop'], ['atr_at_entry', 'ATR @ Entry'], ['peak_price', 'Peak Price'],
@@ -568,6 +576,11 @@ const PaperTrade = () => {
   const [confirm, setConfirm] = useState(null); // { type, key, ... }
   const [capital, setCapital] = useState(20000);
   const [marginPct, setMarginPct] = useState(25);
+  const [tradeSchedule, setTradeSchedule] = useState({
+    skip_new_trades: false,
+    skip_days: [],
+    skip_blocks: [{ start_day: 'Saturday', start_time: '17:30', end_day: 'Sunday', end_time: '17:30' }],
+  });
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   // Saved sessions (survive stop / server restart) shown in Paper Trade History.
@@ -646,6 +659,9 @@ const PaperTrade = () => {
           margin_pct: parseFloat(marginPct),
           broker_name: dataSource,
           data_source: dataSource,
+          skip_new_trades: !!tradeSchedule.skip_new_trades,
+          skip_days: tradeSchedule.skip_days || [],
+          skip_blocks: tradeSchedule.skip_blocks || [],
         })
       });
       if (res.ok) {
@@ -769,6 +785,15 @@ const PaperTrade = () => {
             </button>
           </div>
         </div>
+      </div>
+
+      {/* Weekly skip schedule (IST) for new entries */}
+      <div className="mb-6 rounded-2xl border border-gray-700 bg-gray-800 p-4">
+        <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-blue-400">Weekly New-Trade Skip</h3>
+        <p className="mb-3 text-[10px] leading-snug text-gray-500">
+          When enabled, new entries are suppressed during the configured IST windows. Positions already open are managed normally.
+        </p>
+        <TradeScheduleControl value={tradeSchedule} onChange={setTradeSchedule} />
       </div>
 
       {/* Summary cards */}

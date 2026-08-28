@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet } from 'lucide-react';
+import TradeScheduleControl from '../components/TradeScheduleControl';
 import { API_URL } from '../api';
 
 // ---------- Confirmation modal ----------
@@ -36,9 +37,12 @@ const TradeCard = ({ trade }) => (
       </div>
     </div>
     <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
-      <div className="bg-gray-800/50 p-1 rounded">Entry: <span className="text-white">{trade.entry.toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-1 rounded">Current: <span className="text-white">{trade.current.toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-1 rounded">Margin: <span className="text-white">₹{trade.margin.toFixed(0)}</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Entry: <span className="text-white">{(trade.entry || 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Entry Mark: <span className="text-white">{(trade.entry_mark || trade.entry || 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Current Mark: <span className="text-white">{(trade.current_mark ?? trade.current ?? 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Current Trade: <span className="text-white">{(trade.current || 0).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Chg: <span className={`text-white ${(trade.chg_pct || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(trade.chg_pct || 0).toFixed(2)}%</span></div>
+      <div className="bg-gray-800/50 p-1 rounded">Margin: <span className="text-white">₹{(trade.margin || 0).toFixed(0)}</span></div>
     </div>
   </div>
 );
@@ -54,6 +58,11 @@ const LiveTrade = () => {
   const [connectionId, setConnectionId] = useState('');
   const [capital, setCapital] = useState(20000);
   const [marginPct, setMarginPct] = useState(25);
+  const [tradeSchedule, setTradeSchedule] = useState({
+    skip_new_trades: false,
+    skip_days: [],
+    skip_blocks: [{ start_day: 'Saturday', start_time: '17:30', end_day: 'Sunday', end_time: '17:30' }],
+  });
   const [confirm, setConfirm] = useState(null); // { instanceKey }
 
   useEffect(() => {
@@ -76,7 +85,10 @@ const LiveTrade = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
-          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct) })
+          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct),
+          skip_new_trades: !!tradeSchedule.skip_new_trades,
+          skip_days: tradeSchedule.skip_days || [],
+          skip_blocks: tradeSchedule.skip_blocks || [] })
       });
       if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
     } catch (e) { console.error(e); alert(e.message); }
@@ -170,6 +182,15 @@ const LiveTrade = () => {
             <Play size={18} /> Start Instance
           </button>
         </div>
+      </div>
+
+      {/* Weekly skip schedule (IST) for new entries */}
+      <div className="mb-6 rounded-2xl border border-gray-700 bg-gray-800 p-4">
+        <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-blue-400">Weekly New-Trade Skip</h3>
+        <p className="mb-3 text-[10px] leading-snug text-gray-500">
+          When enabled, new live entries are suppressed during the configured IST windows. Open positions continue to be managed.
+        </p>
+        <TradeScheduleControl value={tradeSchedule} onChange={setTradeSchedule} />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">

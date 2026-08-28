@@ -66,17 +66,37 @@ class BrokerClient:
                 "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
                 "1d": 86400, "1w": 604800}.get(interval, 3600)
 
+    def _mark_definition(self):
+        """Lightweight object DataSyncService accepts for mark-price fetching."""
+        from types import SimpleNamespace
+        return SimpleNamespace(kind=self.kind, market_data_url=self.market_url,
+                               trading_api_url=self.trading_url, is_builtin=False)
+
+    def _merge_mark(self, rows, symbol, interval, limit):
+        from app.services.data_sync import DataSyncService
+        try:
+            mark_rows = DataSyncService.fetch_mark_klines(
+                self.broker_name, symbol, interval, limit=limit, definition=self._mark_definition())
+            return DataSyncService._merge_mark_rows(rows, mark_rows)
+        except Exception:
+            return rows
+
     def fetch_klines(self, symbol="BTCUSDT", interval="1h", limit=500):
-        """Return normalized OHLCV dictionaries with UTC-naive datetimes."""
+        """Return normalized OHLCV dictionaries with UTC-naive datetimes.
+
+        The returned rows also carry ``mark_open/mark_high/mark_low/mark_close``
+        when the exchange's mark-price klines can be merged in.
+        """
         if self.kind == "binance":
             url = f"{self.market_url}/fapi/v1/klines"
             params = {"symbol": self.normalize_symbol(symbol, "Binance"), "interval": interval, "limit": min(int(limit), 1500)}
             response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
             raw = response.json()
-            return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
+            rows = [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
                      "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
                      "close": float(k[4]), "volume": float(k[5])} for k in raw]
+            return self._merge_mark(rows, symbol, interval, limit)
         if self.kind == "delta":
             url = f"{self.market_url}/v2/history/candles"
             params = {"symbol": self.normalize_symbol(symbol, "Delta"), "resolution": self._interval_delta(interval), "limit": min(int(limit), 2000)}
@@ -100,8 +120,14 @@ class BrokerClient:
             array, error = DataSyncService._extract_delta_array(payload)
             if error:
                 raise RuntimeError(f"Delta data request failed: {error}")
-            return DataSyncService._parse_candle_rows(array)
+            rows = DataSyncService._parse_candle_rows(array)
+            return self._merge_mark(rows, symbol, interval, limit)
         raise RuntimeError(f"No adapter installed for broker '{self.broker_name}'")
+
+    def fetch_mark_price(self, symbol="BTCUSDT"):
+        """Current mark price for the BTC perpetual (Binance / Delta)."""
+        from app.services.data_sync import DataSyncService
+        return DataSyncService.get_current_mark_price(self.broker_name, symbol, definition=self._mark_definition())
 
     def _binance_request(self, method, endpoint, params):
         params = dict(params or {})

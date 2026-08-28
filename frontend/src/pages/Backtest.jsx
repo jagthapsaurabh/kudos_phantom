@@ -3,6 +3,7 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
+import TradeScheduleControl from '../components/TradeScheduleControl';
 import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp } from 'lucide-react';
 
 const PARAM_META = {
@@ -86,8 +87,8 @@ const buildTradesCSV = (trades) => {
     'Trade #', 'Direction', 'Setup',
     'Signal Candle Time', 'Signal Candle Colour',
     'Entry Candle Time', 'Entry Candle Colour',
-    'Entry Price',
-    'Exit Time', 'Exit Candle Colour', 'Exit Price',
+    'Entry Price', 'Entry Mark Price',
+    'Exit Time', 'Exit Candle Colour', 'Exit Price', 'Exit Mark Price',
     '4H Trend',
     'RSI14', 'MACD Hist', 'ADX', 'ATR14', 'EMA50 1h', 'EMA50 4h',
     // Every entry condition, one column each, so the sheet can be filtered.
@@ -115,9 +116,11 @@ const buildTradesCSV = (trades) => {
       fmtTime(t.entry_candle_time || t.entry_time),
       t.entry_candle_type || '',
       num(t.entry_price),
+      num(t.entry_mark_price),
       fmtTime(t.exit_time),
       t.exit_candle_type || '',
       num(t.exit_price),
+      num(t.exit_mark_price),
       t.trend_4h || '',
       num(t.rsi14, 1), num(t.macd_hist), num(t.adx, 1), num(t.atr14),
       num(t.ema50_1h), num(t.ema50_4h),
@@ -230,7 +233,9 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
           <th className="p-3 font-semibold">Signal Candle</th>
           <th className="p-3 font-semibold">Entry Candle</th>
           <th className="p-3 font-semibold">Entry</th>
+          <th className="p-3 font-semibold">Entry Mark</th>
           <th className="p-3 font-semibold">Exit</th>
+          <th className="p-3 font-semibold">Exit Mark</th>
           <th className="p-3 font-semibold">Dir</th>
           <th className="p-3 font-semibold">Setup</th>
           <th className="p-3 font-semibold">4H Trend</th>
@@ -257,10 +262,12 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                 <CandleChip color={t.entry_candle_type} label="entry" />
               </td>
               <td className="p-3">{(t.entry_price || 0).toFixed(2)}</td>
+              <td className="p-3 text-gray-400">{(t.entry_mark_price || 0).toFixed(2)}</td>
               <td className="p-3">
                 <div>{(t.exit_price || 0).toFixed(2)}</div>
                 <CandleChip color={t.exit_candle_type} label="exit" />
               </td>
+              <td className="p-3 text-gray-400">{(t.exit_mark_price || 0).toFixed(2)}</td>
               <td className={`p-3 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'L' : 'S'}</td>
               <td className="p-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold ${t.setup === 'MOMENTUM' ? 'bg-purple-900/40 text-purple-300' : 'bg-blue-900/40 text-blue-300'}`}>{t.setup || '—'}</span></td>
               <td className={`p-3 ${t.trend_4h === 'UP' ? 'text-green-400' : 'text-red-400'}`}>{t.trend_4h || '—'}</td>
@@ -274,7 +281,7 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
             </tr>
             {expandedTrade === i && (
               <tr className="border-b border-gray-700 bg-gray-900/60">
-                <td colSpan={14} className="p-4">
+                <td colSpan={16} className="p-4">
                   {/* Every entry condition spelled out: measured value vs the
                       threshold applied, and PASS/FAIL. Built by the engine so it
                       always matches what was actually evaluated. */}
@@ -338,6 +345,7 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                     <div>
                       <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Risk Model</div>
                       <div className="space-y-0.5 font-mono text-gray-300">
+                        <div>Entry mark: {t.entry_mark_price?.toFixed(2) ?? '—'} · Exit mark: {t.exit_mark_price?.toFixed(2) ?? '—'}</div>
                         <div>SL: {t.sl?.toFixed(2) ?? '—'}{t.sl_entry != null && Math.abs(t.sl - t.sl_entry) > 0.005 ? ` (entry ${t.sl_entry.toFixed(2)})` : ''}</div>
                         <div>TP: {t.tp?.toFixed(2) ?? '—'}</div>
                         <div>Trail stop: {t.trail_stop?.toFixed(2) ?? '—'} • ATR@entry: {t.atr_at_entry?.toFixed(2) ?? '—'}</div>
@@ -376,6 +384,11 @@ const Backtest = () => {
     trail_distance_atr: 0.3, breakeven_atr: 0.75,
     leverage: 2, margin_pct: 0.15,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
+    // Weekly new-trade skip (IST). Defaults to the weekend pause the client
+    // described but leaves the toggle OFF so existing runs are unchanged.
+    skip_new_trades: false,
+    skip_days: [],
+    skip_blocks: [{ start_day: 'Saturday', start_time: '17:30', end_day: 'Sunday', end_time: '17:30' }],
     entry_conditions: {
       // The two direction toggles are intentionally independent. The legacy
       // use_direction_conditions flag is still accepted for older saved runs.
@@ -497,6 +510,13 @@ const Backtest = () => {
         [field]: value,
       },
     },
+  }));
+
+  const setTradeSchedule = (v) => setParams(prev => ({
+    ...prev,
+    skip_new_trades: !!v?.skip_new_trades,
+    skip_days: Array.isArray(v?.skip_days) ? v.skip_days : [],
+    skip_blocks: Array.isArray(v?.skip_blocks) ? v.skip_blocks : [],
   }));
 
   // The parameter form applies to PhantomV2 and to saved Kudos-style
@@ -658,6 +678,9 @@ const Backtest = () => {
           initial_capital: parseFloat(capital),
           data_source: dataSource,
           fee_mode: 'backtest',
+          skip_new_trades: !!params.skip_new_trades,
+          skip_days: params.skip_days || [],
+          skip_blocks: params.skip_blocks || [],
         }),
       });
 
@@ -1058,6 +1081,19 @@ const Backtest = () => {
             Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
             <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds — the ATR switch
             also lets each side pick its own comparison (<b className="text-white">&gt;, &lt;, ≥, ≤</b>) against the 50-bar ATR average.
+          </div>
+
+          <div className="mb-6 border-t border-gray-700 pt-6">
+            <h3 className="mb-1 text-xs font-bold uppercase tracking-wider text-blue-400">Weekly New-Trade Skip (Mark Price)</h3>
+            <p className="mb-3 text-[10px] leading-snug text-gray-500">
+              Suppress <b className="text-white">new entries</b> during the configured days/windows. Existing open positions are always managed and closed normally.
+              Times are India Standard Time (UTC+5:30) and calculations use the exchange mark price.
+            </p>
+            <TradeScheduleControl value={{
+              skip_new_trades: params.skip_new_trades,
+              skip_days: params.skip_days,
+              skip_blocks: params.skip_blocks,
+            }} onChange={setTradeSchedule} />
           </div>
 
           <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">

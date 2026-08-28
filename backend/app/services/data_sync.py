@@ -256,9 +256,17 @@ class DataSyncService:
                 raw = response.json()
                 if not isinstance(raw, list):
                     raise MarketDataError(f"Binance-compatible data request failed: {str(raw)[:300]}")
-                return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
+                rows = [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
                          "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
                          "close": float(k[4]), "volume": float(k[5])} for k in raw]
+                # Merge BTC perpetual mark-price klines by candle time; fall back
+                # to trade prices when the mark endpoint is unavailable.
+                try:
+                    mark_rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
+                                                      end_time, limit, definition=definition)
+                except Exception:
+                    mark_rows = []
+                return cls._merge_mark_rows(rows, mark_rows)
             except MarketDataError:
                 raise
             except Exception as exc:
@@ -272,9 +280,137 @@ class DataSyncService:
                 configured_url = getattr(definition, "market_data_url", None)
                 if configured_url:
                     custom_hosts = [configured_url.rstrip("/")]
-            return cls._delta_fetch(symbol, interval, start_time, end_time, limit, hosts=custom_hosts)
+            rows = cls._delta_fetch(symbol, interval, start_time, end_time, limit, hosts=custom_hosts)
+            try:
+                mark_rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
+                                                  end_time, limit, definition=definition)
+            except Exception:
+                mark_rows = []
+            return cls._merge_mark_rows(rows, mark_rows)
 
         raise MarketDataError(f"No market-data adapter is installed for source '{source}'. Configure a Binance-compatible or Delta-compatible adapter first.")
+
+    @classmethod
+    def fetch_mark_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+                          start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
+                          limit: int = 1000, definition=None):
+        """Fetch the exchange's BTC-perpetual MARK-price candles.
+
+        Binance serves Mark Price Klines from `/fapi/v1/markPriceKlines`; Delta
+        exposes the same OHLC shape under the synthetic symbol `MARK:BTCUSD`.
+        The mark series is merged into the trade-price rows by ``fetch_klines``
+        (and falls back to the trade series when an endpoint is unavailable).
+        """
+        source = cls.normalize_source(source)
+        kind = cls._adapter_kind(source, definition)
+        if kind == "binance":
+            base = cls._base_url(definition, "https://fapi.binance.com")
+            url = f"{base}/fapi/v1/markPriceKlines"
+            params = {"symbol": cls._binance_symbol(symbol), "interval": interval,
+                      "limit": min(max(1, int(limit)), cls.BINANCE_MAX_CANDLES)}
+            if start_time:
+                params["startTime"] = int(cls._as_datetime(start_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            if end_time:
+                params["endTime"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
+            response = requests.get(url, params=params, timeout=20)
+            if response.status_code != 200:
+                body = (response.text or "").strip().replace("\n", " ")[:300]
+                raise MarketDataError(f"Binance mark-price request failed: HTTP {response.status_code} {body}".strip())
+            raw = response.json()
+            if not isinstance(raw, list):
+                raise MarketDataError(f"Binance mark-price request failed: {str(raw)[:300]}")
+            return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
+                     "mark_open": float(k[1]), "mark_high": float(k[2]),
+                     "mark_low": float(k[3]), "mark_close": float(k[4])} for k in raw]
+        if kind == "delta":
+            custom_hosts = None
+            if definition is not None and not getattr(definition, "is_builtin", False):
+                configured_url = getattr(definition, "market_data_url", None)
+                if configured_url:
+                    custom_hosts = [configured_url.rstrip("/")]
+            # Delta's mark candles live under the synthetic MARK:product symbol.
+            return cls._delta_fetch("MARK:" + cls._delta_symbol(symbol), interval,
+                                    start_time, end_time, limit, hosts=custom_hosts)
+        raise MarketDataError(f"No mark-price adapter is installed for source '{source}'.")
+
+    @classmethod
+    def _merge_mark_rows(cls, trade_rows, mark_rows):
+        """Attach mark OHLC to trade rows; fall back to the trade series."""
+        by_time = {cls._as_datetime(r["event_time"]): r for r in (mark_rows or [])}
+        out = []
+        for row in trade_rows or []:
+            gt = cls._as_datetime(row["event_time"])
+            mark = by_time.get(gt, row)
+            out.append({
+                **row,
+                "mark_open": float(mark.get("mark_open", row.get("open", row.get("close")) or 0)),
+                "mark_high": float(mark.get("mark_high", row.get("high", row.get("close")) or 0)),
+                "mark_low": float(mark.get("mark_low", row.get("low", row.get("close")) or 0)),
+                "mark_close": float(mark.get("mark_close", row.get("close")) or 0),
+            })
+        return out
+
+    @classmethod
+    def get_current_mark_price(cls, source="Binance", symbol="BTCUSDT", definition=None):
+        """Return the current mark price (BTC perpetual) for a broker source."""
+        source = cls.normalize_source(source)
+        kind = cls._adapter_kind(source, definition)
+        if kind == "binance":
+            base = cls._base_url(definition, "https://fapi.binance.com")
+            url = f"{base}/fapi/v1/premiumIndex"
+            response = requests.get(url, params={"symbol": cls._binance_symbol(symbol)}, timeout=15)
+            if response.status_code != 200:
+                raise MarketDataError(f"Binance mark-price request failed: HTTP {response.status_code}")
+            payload = response.json()
+            value = payload.get("markPrice") if isinstance(payload, dict) else None
+            if value is None:
+                raise MarketDataError(f"Binance mark-price response missing markPrice: {str(payload)[:200]}")
+            return float(value)
+        if kind == "delta":
+            product = cls._delta_symbol(symbol)
+            hosts = [cls._base_url(definition, "https://api.india.delta.exchange")]
+            if definition is None or getattr(definition, "is_builtin", False):
+                hosts = ["https://api.india.delta.exchange", "https://cdn.india.deltaex.org"]
+            else:
+                configured = getattr(definition, "market_data_url", None)
+                hosts = [configured.rstrip("/")] if configured else hosts
+            last_error = None
+            header = {"Accept": "application/json", "User-Agent": "PHANTOM-Trading-Tool/1.0"}
+            for host in hosts:
+                base = host.rstrip("/")
+                for path, params in (
+                    (f"/v2/tickers/{product}", {}),
+                    ("/v2/tickers", {"symbols": product}),
+                ):
+                    try:
+                        url = f"{base}{path}"
+                        response = requests.get(url, params=params or None, headers=header, timeout=15)
+                        if response.status_code != 200:
+                            last_error = f"HTTP {response.status_code}"
+                            continue
+                        payload = response.json()
+                        # Delta wraps the ticker in {"result": {...}},
+                        # {"data": [...]} or a bare list of ticker dicts.
+                        node = payload
+                        if isinstance(payload, dict):
+                            if isinstance(payload.get("result"), dict):
+                                node = payload["result"]
+                            elif isinstance(payload.get("data"), dict):
+                                node = payload["data"]
+                            elif isinstance(payload.get("result"), list):
+                                node = payload["result"]
+                            elif isinstance(payload.get("data"), list):
+                                node = payload["data"]
+                        if isinstance(node, list) and node:
+                            node = node[0]
+                        value = node.get("mark_price", node.get("markPrice")) if isinstance(node, dict) else None
+                        if value is not None:
+                            return float(value)
+                        last_error = "mark_price missing"
+                    except Exception as exc:
+                        last_error = str(exc)
+            raise MarketDataError(f"Delta mark-price request failed: {last_error}")
+        raise MarketDataError(f"No mark-price adapter is installed for source '{source}'.")
 
     @classmethod
     def test_source(cls, source="Binance", symbol="BTCUSDT", interval="1h", limit=3, definition=None):
@@ -310,6 +446,10 @@ class DataSyncService:
                 "open": float(row["open"]), "high": float(row["high"]),
                 "low": float(row["low"]), "close": float(row["close"]),
                 "volume": float(row.get("volume", 0) or 0),
+                "mark_open": float(row.get("mark_open", row.get("open", row.get("close"))) or 0),
+                "mark_high": float(row.get("mark_high", row.get("high", row.get("close"))) or 0),
+                "mark_low": float(row.get("mark_low", row.get("low", row.get("close"))) or 0),
+                "mark_close": float(row.get("mark_close", row.get("close")) or 0),
             }
         # Historical windows are committed one at a time. Restrict the lookup
         # to this page's timestamps instead of loading an entire multi-year
@@ -839,10 +979,17 @@ class DataSyncService:
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"CSV is missing required columns: {', '.join(sorted(missing))}")
+        # Optional single `mark_price` column maps to the mark-close series;
+        # otherwise mark_* rows upsert with the trade-price fallback.
+        if "mark_price" in df.columns and "mark_close" not in df.columns:
+            df["mark_close"] = df["mark_price"]
         numeric = ['open', 'high', 'low', 'close', 'volume']
+        for optional in ("mark_open", "mark_high", "mark_low", "mark_close"):
+            if optional in df.columns:
+                numeric.append(optional)
         for column in numeric:
             df[column] = pd.to_numeric(df[column], errors='coerce')
-        if df[numeric].isna().any().any():
+        if df[['open', 'high', 'low', 'close', 'volume']].isna().any().any():
             raise ValueError('CSV contains blank or non-numeric OHLCV values; volume is required for every candle')
         rows = df.to_dict("records")
         result = cls.upsert_rows(rows, source, symbol, interval, clear_existing)

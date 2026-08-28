@@ -27,7 +27,9 @@ class BacktestEngine:
 
         if not data: return pd.DataFrame()
         df = pd.DataFrame([
-            {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume}
+            {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume,
+             'mark_open': getattr(k, 'mark_open', None), 'mark_high': getattr(k, 'mark_high', None),
+             'mark_low': getattr(k, 'mark_low', None), 'mark_close': getattr(k, 'mark_close', None)}
             for k in data
         ])
         df.set_index('event_time', inplace=True)
@@ -37,8 +39,15 @@ class BacktestEngine:
     # Helpers
     # ------------------------------------------------------------------
     def _book_closed_trade(self, result, equity_inr, conversion_rate):
-        """Fee + PnL accounting for a closed trade. Returns (net_pnl_inr, trade_dict)."""
-        price_diff = (result.exit_price - result.entry_price) * result.direction
+        """Fee + PnL accounting for a closed trade. Returns (net_pnl_inr, trade_dict).
+
+        PnL is calculated on mark price (the exchange reference used for
+        liquidation/funding and requested by the client); the executed trade
+        price is still stored separately for audit.
+        """
+        entry_mark = getattr(result, 'entry_mark_price', None) or result.entry_price
+        exit_mark = getattr(result, 'exit_mark_price', None) or result.exit_price
+        price_diff = (float(exit_mark) - float(entry_mark)) * result.direction
         pnl_usd = result.lots * price_diff
         pnl_inr = pnl_usd * conversion_rate
 
@@ -59,7 +68,9 @@ class BacktestEngine:
         trade_dict = {
             "entry_time": result.entry_time, "exit_time": result.exit_time,
             "direction": result.direction, "entry_price": result.entry_price,
-            "exit_price": result.exit_price, "lots": result.lots,
+            "exit_price": result.exit_price,
+            "entry_mark_price": entry_mark, "exit_mark_price": exit_mark,
+            "lots": result.lots,
             "margin": result.margin_inr, "notional": result.notional_usd,
             "gross_pnl": pnl_inr, "net_pnl": net_pnl_inr,
             "fees": entry_fee_inr + exit_fee_inr,
@@ -171,7 +182,7 @@ class BacktestEngine:
         close_v = float(meta['close'][i])
         ema4h = float(meta['ema50_4h'][i])
         lines.append(
-            f"1. 4h trend: close {num(close_v)} vs EMA50(4h) {num(ema4h)} -> "
+            f"1. 4h trend: mark close {num(close_v)} vs EMA50(4h) {num(ema4h)} -> "
             f"{'UP' if trend_up else 'DOWN'}; {side} needs "
             f"{'UP' if is_long else 'DOWN'} -> {'PASS' if trend_up == is_long else 'FAIL'}")
 
@@ -297,9 +308,12 @@ class BacktestEngine:
         last_exit_i = -10**9
         cfg = self.config
 
-        def close_active(sym, price, ts, reason):
+        def close_active(sym, price, ts, reason, mark_price=None):
             """Force-close helper used for reversals."""
-            trade = self.oms.close_trade(sym, price, ts, reason)
+            if hasattr(self.oms, 'close_trade'):
+                trade = self.oms.close_trade(sym, price, ts, reason, mark_price=mark_price if mark_price is not None else price)
+            else:
+                trade = self.oms.close_trade(sym, price, ts, reason)
             if trade.bars_held == 0:
                 trade.bars_held = 1
             net, eq, td = self._book_closed_trade(trade, equity_box[0], conversion_rate)
@@ -316,16 +330,25 @@ class BacktestEngine:
         idx = df_1h.index
         opens = df_1h['open'].values
         closes = df_1h['close'].values
+        # Mark-price series drive indicators/ATR/entries/exits; fall back to
+        # trade OHLCV for older seeded data that predates the mark columns.
+        has_mark = 'mark_close' in df_1h.columns
+        mark_closes = (df_1h['mark_close'].fillna(df_1h['close']).values
+                       if has_mark else closes.astype(float))
+        mark_opens = (df_1h['mark_open'].fillna(df_1h['open']).values
+                      if has_mark else opens.astype(float))
         atrs = df_1h['atr14'].values
 
         for i in range(1, n):
             current_time = idx[i]
-            current_price_usd = closes[i]
+            current_mark_usd = float(mark_closes[i])
+            current_trade_usd = float(closes[i])
             current_atr_usd = atrs[i]
 
             # ---- Manage open positions ----------------------------------
             for sym in list(self.oms.active_trades.keys()):
-                result = self.oms.update_trade(sym, current_price_usd, current_atr_usd, current_time)
+                result = self.oms.update_trade(sym, current_mark_usd, current_atr_usd, current_time,
+                                               trade_price=current_trade_usd)
                 if result:
                     net, equity_box[0], td = self._book_closed_trade(result, equity_box[0], conversion_rate)
                     td.update(open_ctx_box.pop(sym, {}))
@@ -350,56 +373,63 @@ class BacktestEngine:
             # ---- Entries -------------------------------------------------
             sig = signals[i]
             if sig != 0 and i + 1 < n:
-                in_cooldown = (i - last_exit_i) <= cfg.cooldown_bars
-                if halted or in_cooldown:
-                    pass
+                # Weekly new-trade skip: existing positions are managed above
+                # and keep running; only this new entry is suppressed.
+                if cfg.is_new_trade_blocked(idx[i]):
+                    rejected_reasons['SKIP_WINDOW'] = rejected_reasons.get('SKIP_WINDOW', 0) + 1
                 else:
-                    open_trade = self.oms.active_trades.get(symbol)
-                    next_open_usd = opens[i + 1]
-                    if open_trade is not None and cfg.allow_reverse and open_trade.direction != sig:
-                        # Close at next open and reverse direction
-                        close_active(symbol, next_open_usd, idx[i + 1], "REV")
-                        last_exit_i = i
-                        open_trade = None
-                    if open_trade is None or cfg.allow_overlap:
-                        ind_slice = df_1h.iloc[max(0, i - 50):i + 1]
-                        val = self.validator_service.validate_signal(sig, closes[i], next_open_usd, ind_slice)
-                        if val.passed:
-                            margin_inr = equity_box[0] * margin_pct_now
-                            if margin_pct_now != cfg.margin_pct:
-                                throttled_entries += 1
-                            if meta is not None:
-                                ctx = self._condition_snapshot(meta, i, int(sig))
-                                ctx["signal_candle_time"] = idx[i]
-                                # The entry fills on the NEXT candle's open, so
-                                # record that candle and its colour separately
-                                # from the signal candle the client asked about.
-                                ctx["entry_candle_time"] = idx[i + 1]
-                                ctx["entry_candle_type"] = self._candle_color(meta, i + 1)
-                                ctx["entry_conditions_detail"] = self._entry_conditions_text(meta, i, int(sig))
-                            else:
-                                ctx = {
-                                    "signal_candle_time": idx[i],
-                                    "entry_candle_time": idx[i + 1],
-                                    "setup": getattr(self.strategy_service, 'label', None)
-                                             or type(self.strategy_service).__name__,
-                                }
-                            ctx["entry_dd_pct"] = dd_pct
-                            ctx["margin_pct_used"] = margin_pct_now
-                            ctx["equity_at_entry"] = equity_box[0]
-                            new_trade = self.oms.create_order(symbol, int(sig), next_open_usd,
-                                                              current_atr_usd, idx[i + 1],
-                                                              margin_inr, conversion_rate)
-                            if new_trade is not None:
-                                open_ctx_box[symbol] = ctx
-                            else:
-                                # Notional below the minimum 0.001 BTC lot
-                                rejected_reasons['LOT_TOO_SMALL'] = rejected_reasons.get('LOT_TOO_SMALL', 0) + 1
-                        else:
-                            reason = val.reason
-                            rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+                    in_cooldown = (i - last_exit_i) <= cfg.cooldown_bars
+                    if halted or in_cooldown:
+                        pass
                     else:
-                        skipped_overlap += 1
+                        open_trade = self.oms.active_trades.get(symbol)
+                        next_trade_usd = opens[i + 1]
+                        next_mark_usd = float(mark_opens[i + 1])
+                        if open_trade is not None and cfg.allow_reverse and open_trade.direction != sig:
+                            # Close at next open and reverse direction
+                            close_active(symbol, next_trade_usd, idx[i + 1], "REV", mark_price=next_mark_usd)
+                            last_exit_i = i
+                            open_trade = None
+                        if open_trade is None or cfg.allow_overlap:
+                            ind_slice = df_1h.iloc[max(0, i - 50):i + 1]
+                            val = self.validator_service.validate_signal(sig, current_mark_usd, next_mark_usd, ind_slice)
+                            if val.passed:
+                                margin_inr = equity_box[0] * margin_pct_now
+                                if margin_pct_now != cfg.margin_pct:
+                                    throttled_entries += 1
+                                if meta is not None:
+                                    ctx = self._condition_snapshot(meta, i, int(sig))
+                                    ctx["signal_candle_time"] = idx[i]
+                                    # The entry fills on the NEXT candle's open, so
+                                    # record that candle and its colour separately
+                                    # from the signal candle the client asked about.
+                                    ctx["entry_candle_time"] = idx[i + 1]
+                                    ctx["entry_candle_type"] = self._candle_color(meta, i + 1)
+                                    ctx["entry_conditions_detail"] = self._entry_conditions_text(meta, i, int(sig))
+                                else:
+                                    ctx = {
+                                        "signal_candle_time": idx[i],
+                                        "entry_candle_time": idx[i + 1],
+                                        "setup": getattr(self.strategy_service, 'label', None)
+                                                 or type(self.strategy_service).__name__,
+                                    }
+                                ctx["entry_dd_pct"] = dd_pct
+                                ctx["margin_pct_used"] = margin_pct_now
+                                ctx["equity_at_entry"] = equity_box[0]
+                                new_trade = self.oms.create_order(symbol, int(sig), next_trade_usd,
+                                                                  current_atr_usd, idx[i + 1],
+                                                                  margin_inr, conversion_rate,
+                                                                  mark_price=next_mark_usd)
+                                if new_trade is not None:
+                                    open_ctx_box[symbol] = ctx
+                                else:
+                                    # Notional below the minimum 0.001 BTC lot
+                                    rejected_reasons['LOT_TOO_SMALL'] = rejected_reasons.get('LOT_TOO_SMALL', 0) + 1
+                            else:
+                                reason = val.reason
+                                rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+                        else:
+                            skipped_overlap += 1
 
             equity_curve.append(equity_box[0])
 
@@ -498,8 +528,8 @@ class BacktestEngine:
             'cond_trend_ok', 'cond_adx_ok', 'cond_macd_hist_ok', 'cond_atr_regime_ok',
             'cond_rsi_ok', 'cond_macd_confirm_ok', 'cond_di_ok',
             'entry_conditions_detail',
-            'entry_price', 'sl', 'sl_entry', 'tp', 'trail_stop',
-            'exit_price', 'exit_reason', 'exit_detail',
+            'entry_price', 'entry_mark_price', 'sl', 'sl_entry', 'tp', 'trail_stop',
+            'exit_price', 'exit_mark_price', 'exit_reason', 'exit_detail',
             'atr_at_entry', 'peak_price',
             'lots', 'margin', 'notional', 'margin_pct_used', 'entry_dd_pct',
             'gross_pnl', 'fees', 'net_pnl', 'equity_at_entry', 'equity_after',

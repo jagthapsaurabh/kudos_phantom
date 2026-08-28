@@ -110,6 +110,8 @@ class PaperTradeService:
             "direction": int(trade.direction),
             "entry": f(trade.entry_price),
             "exit": f(trade.exit_price),
+            "entry_mark": f(getattr(trade, "entry_mark_price", None) or trade.entry_price),
+            "exit_mark": f(getattr(trade, "exit_mark_price", None) or trade.exit_price),
             "pnl": f(pnl_inr),
             "gross_pnl": f(gross_pnl) if gross_pnl is not None else f(pnl_inr),
             "fees": f(fees_inr),
@@ -193,19 +195,32 @@ class PaperTradeService:
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
 
-        current_price = float(df_1h['close'].iloc[-1])
+        current_trade_usd = float(df_1h['close'].iloc[-1])
+        current_price = float(df_1h['mark_close'].fillna(df_1h['close']).iloc[-1]) \
+            if 'mark_close' in df_1h.columns else current_trade_usd
+        try:
+            current_price = float(self._get_current_mark_price() or current_price)
+        except Exception:
+            pass
         self.last_price = current_price
+        self.last_mark_price = current_price
+        self.last_trade_price = current_trade_usd
         self.last_checked = _ist_now()
         current_atr = ind_1h['atr14'][-1]
         current_time = df_1h.index[-1]
         trade_event = False  # a fill this tick forces an immediate DB snapshot
 
         # ---- Manage open positions ----------------------------------
+        # PnL, stop/trailing decisions use the exchange mark price. The trade
+        # (fill) price is the candle close and is stored separately on the trade.
         for symbol in list(self.oms.active_trades.keys()):
-            result = self.oms.update_trade(symbol, current_price, current_atr, current_time)
+            result = self.oms.update_trade(symbol, current_price, current_atr, current_time,
+                                           trade_price=current_trade_usd)
             if result:
                 trade_event = True
-                price_diff = (result.exit_price - result.entry_price) * result.direction
+                entry_mark = getattr(result, "entry_mark_price", None) or result.entry_price
+                exit_mark = getattr(result, "exit_mark_price", None) or result.exit_price
+                price_diff = (float(exit_mark) - float(entry_mark)) * result.direction
                 gross_pnl = (result.lots * price_diff) * self.conversion_rate
                 taker = float(getattr(self.config, "taker_fee_bps", 0.0))
                 maker = float(getattr(self.config, "maker_fee_bps", 0.0))
@@ -225,26 +240,34 @@ class PaperTradeService:
 
         # ---- New entries --------------------------------------------
         if last_sig != 0:
-            ind_slice = df_1h_with_ind.iloc[-50:]
-            validation = self.validator.validate_signal(last_sig, current_price, current_price, ind_slice)
-            if validation.passed:
-                margin_inr = self.equity_inr * (self.margin_pct / 100.0)
-                new_trade = self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time, margin_inr, self.conversion_rate)
-                if new_trade is None:
-                    self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
-                else:
-                    trade_event = True
-                    side = "LONG" if last_sig == 1 else "SHORT"
-                    self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | SL {new_trade.sl:,.2f} | "
-                                        f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
-                                        f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
-                    print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {current_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
+            if self.config.is_new_trade_blocked(current_time):
+                self._log("warn", f"New entry skipped for {current_time:%Y-%m-%d %H:%M} UTC — "
+                                  f"inside the configured weekly skip window (IST)")
+                print(f"⚠️ [{self.strategy_id}] New entry skipped — configured skip window active")
             else:
-                self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
-                print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
+                ind_slice = df_1h_with_ind.iloc[-50:]
+                validation = self.validator.validate_signal(last_sig, current_price, current_price, ind_slice)
+                if validation.passed:
+                    margin_inr = self.equity_inr * (self.margin_pct / 100.0)
+                    new_trade = self.oms.create_order("BTCUSDT", last_sig, current_trade_usd,
+                                                      current_atr, current_time, margin_inr,
+                                                      self.conversion_rate, mark_price=current_price)
+                    if new_trade is None:
+                        self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
+                    else:
+                        trade_event = True
+                        side = "LONG" if last_sig == 1 else "SHORT"
+                        self._log("trade", f"🚀 Opened {side} BTCUSDT @ mark {current_price:,.2f} (trade "
+                                            f"{current_trade_usd:,.2f}) | SL {new_trade.sl:,.2f} | "
+                                            f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
+                                            f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
+                        print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at mark {current_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
+                else:
+                    self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
+                    print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
         else:
-            self._log("info", f"Scanning… BTCUSDT {current_price:,.2f} — no signal")
-            print(f"🔍 [{self.strategy_id}] Scanning... Current Price: {current_price:.2f}, No signal.")
+            self._log("info", f"Scanning… BTCUSDT mark {current_price:,.2f} — no signal")
+            print(f"🔍 [{self.strategy_id}] Scanning... Mark Price: {current_price:.2f}, No signal.")
 
         # ---- History --------------------------------------------------
         # One equity sample per tick; the row is rewritten on every fill and
@@ -271,6 +294,15 @@ class PaperTradeService:
             print(f"[{self.strategy_id}] Candle fetch failed for {self.market_source} {interval}: {exc}")
             return None
 
+    def _get_current_mark_price(self):
+        """Current mark price from the selected broker (falls back to None)."""
+        from app.services.data_sync import DataSyncService
+        try:
+            return DataSyncService.get_current_mark_price(
+                self.market_source, self.symbol, definition=self.broker_definition)
+        except Exception:
+            return None
+
     def _get_data_from_db(self, symbol, interval, limit=500):
         """Return the most recent candles for the selected source."""
         try:
@@ -284,7 +316,11 @@ class PaperTradeService:
                 return pd.DataFrame()
             df = pd.DataFrame([
                 {'event_time': k.event_time, 'open': k.open, 'high': k.high,
-                 'low': k.low, 'close': k.close, 'volume': k.volume}
+                 'low': k.low, 'close': k.close, 'volume': k.volume,
+                 'mark_open': getattr(k, 'mark_open', None),
+                 'mark_high': getattr(k, 'mark_high', None),
+                 'mark_low': getattr(k, 'mark_low', None),
+                 'mark_close': getattr(k, 'mark_close', None)}
                 for k in data
             ])
             df.set_index('event_time', inplace=True)

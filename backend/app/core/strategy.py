@@ -3,9 +3,10 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import os
-from typing import Optional
+from typing import List, Optional
 from dotenv import load_dotenv
 from .indicators import compute_indicators, sma, macd as _macd
+from .trading_schedule import TradeSkipWindow, is_new_trade_blocked
 
 load_dotenv()
 
@@ -156,6 +157,16 @@ class PhantomV2Config(BaseModel):
     # See EntryConditions / BranchConditions above.
     # ------------------------------------------------------------------
     entry_conditions: EntryConditions = Field(default_factory=EntryConditions)
+    # ------------------------------------------------------------------
+    # Weekly skip schedule for NEW trades (backtest / paper / live). Open
+    # positions are never affected. `skip_blocks` are evaluated in IST and can
+    # cross midnight/week boundaries (the default is the Saturday 17:30 ->
+    # Sunday 17:30 India-time weekend pause). `skip_days` is the simpler
+    # "don't open on this weekday at all" list.
+    # ------------------------------------------------------------------
+    skip_new_trades: bool = Field(default=False)
+    skip_days: List[str] = Field(default_factory=list)
+    skip_blocks: List[TradeSkipWindow] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_macd_periods(self):
@@ -286,6 +297,10 @@ class PhantomV2Config(BaseModel):
     def rsi_overbought_for(self, direction: int) -> float:
         return self._pick(direction, 'rsi_overbought', 'rsi_overbought')
 
+    def is_new_trade_blocked(self, dt_utc) -> bool:
+        """Whether a new entry is skipped at ``dt_utc`` (already-open trades continue)."""
+        return is_new_trade_blocked(dt_utc, self.skip_new_trades, self.skip_days, self.skip_blocks)
+
 class StrategyService:
     def __init__(self, config: PhantomV2Config = PhantomV2Config()):
         self.config = config
@@ -304,13 +319,19 @@ class StrategyService:
         ind_4h = compute_indicators(df_4h, macd_fast=cfg.macd_fast, macd_slow=cfg.macd_slow, macd_signal=cfg.macd_signal)
         n = len(df_1h)
 
-        # 1. MODERATE Trend Alignment (4h close vs EMA50, asof-mapped to 1h)
+        def _prices(df, mark_col, fallback_col):
+            col = mark_col if mark_col in df.columns else fallback_col
+            return df[col].values.astype(np.float64)
+
+        # 1. MODERATE Trend Alignment (4h mark close vs EMA50, asof-mapped to 1h)
         ema50_4h_map = pd.merge_asof(
             df_1h,
             pd.DataFrame({'ema50_4h': ind_4h['ema50']}, index=df_4h.index),
             left_index=True, right_index=True, direction='backward'
         )['ema50_4h'].values.astype(np.float64)
-        close = df_1h['close'].values.astype(np.float64)
+        # Calculations are on mark price whenever the exchange provided the
+        # mark series; otherwise fall back to trade close for old seed data.
+        close = _prices(df_1h, 'mark_close', 'close')
         trend_col = np.where(close > ema50_4h_map, 1, -1)
 
         # 2. ATR Regime Filter (optionally per-direction).

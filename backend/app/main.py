@@ -79,6 +79,11 @@ class BacktestRequest(BaseModel):
     initial_capital: Optional[float] = None
     data_source: str = 'Binance'
     fee_mode: str = 'backtest'
+    # Weekly new-trade skip schedule (IST) — overrides params when the client
+    # toggles the skip-day control on the Backtest page.
+    skip_new_trades: Optional[bool] = None
+    skip_days: Optional[List[str]] = None
+    skip_blocks: Optional[List[Dict]] = None
 
 def get_db():
     db = SessionLocal()
@@ -133,6 +138,27 @@ def _fee_config(config, fees):
     except AttributeError:
         return config.copy(update={'taker_fee_bps': float(fees.taker_fee_bps),
                                    'maker_fee_bps': float(fees.maker_fee_bps)})
+
+
+def _apply_trade_schedule(config, payload):
+    """Apply optional per-instance weekly new-trade skip settings."""
+    from .core.strategy import PhantomV2Config
+    from .core.trading_schedule import TradeSkipWindow
+    if payload is None:
+        return config
+    if payload.skip_new_trades is not None:
+        config.skip_new_trades = bool(payload.skip_new_trades)
+    if payload.skip_days is not None:
+        config.skip_days = list(payload.skip_days)
+    if payload.skip_blocks is not None:
+        blocks = []
+        for b in payload.skip_blocks:
+            if isinstance(b, TradeSkipWindow):
+                blocks.append(b)
+            elif isinstance(b, dict):
+                blocks.append(TradeSkipWindow(**b))
+        config.skip_blocks = blocks
+    return config
 
 
 _PHANTOM_PARAM_KEYS = (
@@ -362,10 +388,15 @@ def scan_strategy(payload: ScanRequest, user=Depends(get_current_user)):
         signals = svc.generate_signals(df_1h, df_4h)
 
         out = []
-        closes = df_1h['close'].values
-        opens = df_1h['open'].values
-        highs = df_1h['high'].values
-        lows = df_1h['low'].values
+        has_mark = 'mark_close' in df_1h.columns
+        closes = (df_1h['mark_close'].fillna(df_1h['close']).values
+                  if has_mark else df_1h['close'].values)
+        opens = (df_1h['mark_open'].fillna(df_1h['open']).values
+                 if has_mark else df_1h['open'].values)
+        highs = (df_1h['mark_high'].fillna(df_1h['high']).values
+                 if has_mark else df_1h['high'].values)
+        lows = (df_1h['mark_low'].fillna(df_1h['low']).values
+                if has_mark else df_1h['low'].values)
         for i in range(1, len(df_1h)):
             if signals[i] != 0:
                 out.append({
@@ -373,6 +404,7 @@ def scan_strategy(payload: ScanRequest, user=Depends(get_current_user)):
                     "direction": int(signals[i]),
                     "open": float(opens[i]), "high": float(highs[i]),
                     "low": float(lows[i]), "close": float(closes[i]),
+                    "trade_close": float(df_1h['close'].values[i]),
                 })
         # Return the most recent matches
         return out[-payload.limit:]
@@ -931,7 +963,11 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         meta = None
 
     out = []
-    closes = df_1h['close'].values
+    # Signal preview shows the exchange mark price (the series every indicator
+    # and entry filter is computed on), with the trade close kept as trade_price.
+    has_mark = 'mark_close' in df_1h.columns
+    closes = (df_1h['mark_close'].fillna(df_1h['close']).values
+              if has_mark else df_1h['close'].values)
     for i in range(1, len(df_1h)):
         s = signals[i]
         if s == 0:
@@ -940,6 +976,7 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
             "time": int(_utc_ts(df_1h.index[i])),
             "direction": int(s),
             "price": float(closes[i]),
+            "trade_price": float(df_1h['close'].values[i]),
             "setup": None,
             "rsi14": None,
             "adx": None,
@@ -972,7 +1009,7 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
 
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
-        config = _fee_config(req.params, fees)
+        config = _apply_trade_schedule(_fee_config(req.params, fees), req)
         if req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         else:
@@ -981,12 +1018,13 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             kind, payload, strat = resolved
             if kind == 'phantom':
                 # A saved Phantom params config (may include entry_conditions).
+                payload = _apply_trade_schedule(payload, req)
                 engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source)
             else:
                 from .core.dynamic_strategy import DynamicStrategyService
                 class DynamicBacktestEngine:
                     def __init__(self, rules):
-                        self.config = _fee_config(PhantomV2Config(), fees)
+                        self.config = _apply_trade_schedule(_fee_config(PhantomV2Config(), fees), req)
                         self.strategy_service = DynamicStrategyService(rules)
                         from .core.strategy import ValidatorService
                         self.validator_service = ValidatorService()
@@ -1085,7 +1123,9 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
     run = db.query(BacktestRun).filter(BacktestRun.id == run_id, BacktestRun.user_id == user.id).first()
     if not run: raise HTTPException(status_code=404, detail="Run not found")
     trades = db.query(Trade).filter(Trade.run_id == run_id).all()
-    trade_list = [{ "entry_time": t.entry_time, "exit_time": t.exit_time, "direction": t.direction, "entry_price": t.entry_price, "exit_price": t.exit_price, "lots": t.lots, "margin": t.margin, "notional": t.notional, "net_pnl": t.net_pnl, "fees": t.fees, "exit_reason": t.exit_reason, "equity_after": t.equity_after, "drawdown": t.drawdown, "hold_bars": t.hold_bars,
+    trade_list = [{ "entry_time": t.entry_time, "exit_time": t.exit_time, "direction": t.direction, "entry_price": t.entry_price, "exit_price": t.exit_price,
+                    "entry_mark_price": t.entry_mark_price, "exit_mark_price": t.exit_mark_price,
+                    "lots": t.lots, "margin": t.margin, "notional": t.notional, "net_pnl": t.net_pnl, "fees": t.fees, "exit_reason": t.exit_reason, "equity_after": t.equity_after, "drawdown": t.drawdown, "hold_bars": t.hold_bars,
                     # PHANTOM v3: entry-condition snapshot (candle, setup, indicators)
                     "signal_candle_time": t.signal_candle_time, "setup": t.setup,
                     "candle_type": t.candle_type, "trend_4h": t.trend_4h,
@@ -1282,6 +1322,11 @@ class TradeStartRequest(BaseModel):
     data_source: Optional[str] = None
     connection_id: Optional[int] = None
     testnet: bool = False
+    # Weekly new-trade skip schedule (IST). These override a saved strategy's
+    # schedule when the client toggles it in Paper / Live at start time.
+    skip_new_trades: Optional[bool] = None
+    skip_days: Optional[List[str]] = None
+    skip_blocks: Optional[List[Dict]] = None
 
 def resolve_broker_context(payload, user, db, require_credentials=False):
     code = normalize_source(payload.data_source or payload.broker_name)
@@ -1353,6 +1398,7 @@ def start_paper_trade(
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name)
+    _apply_trade_schedule(service.config, payload)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
@@ -1440,12 +1486,15 @@ def get_paper_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
-                # Prefer the freshest tick price so the "current" value is live.
-                current = getattr(service, 'last_price', None) or getattr(trade, 'current_price', None) or trade.peak_price
-                pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * service.conversion_rate
+                # Mark price drives all calculations; the trade price is the
+                # actual fill/last-trade price recorded separately.
+                current_mark = getattr(service, 'last_mark_price', None) or getattr(trade, 'current_mark_price', None) or trade.peak_price
+                current_trade = getattr(service, 'last_trade_price', None) or getattr(trade, 'current_price', None) or current_mark
+                entry_mark = getattr(trade, 'entry_mark_price', None) or trade.entry_price
+                pnl_inr = (current_mark - entry_mark) * trade.direction * trade.lots * service.conversion_rate
                 leverage = getattr(service.config, 'leverage', 1)
-                # Percent change of the live price vs entry (direction-aware).
-                chg_pct = ((current - trade.entry_price) / trade.entry_price * 100) * trade.direction if trade.entry_price else 0.0
+                # Percent change of the live mark price vs entry mark (direction-aware).
+                chg_pct = ((current_mark - entry_mark) / entry_mark * 100) * trade.direction if entry_mark else 0.0
                 entry_time_ist = _to_ist(trade.entry_time)
                 # Which stop is in force right now: trailing stop once the
                 # peak crossed the activation level, otherwise the hard SL
@@ -1455,12 +1504,14 @@ def get_paper_status(user=Depends(get_current_user)):
                 trail_active = bool((trade.peak_price >= trade.trail_activation) if trade.direction == 1
                                     else (trade.peak_price <= trade.trail_activation))
                 stop_level = getattr(trade, 'trail_stop', None) if trail_active else getattr(trade, 'sl', None)
-                breakeven_active = bool((getattr(trade, 'sl', 0) >= trade.entry_price) if trade.direction == 1
-                                        else (getattr(trade, 'sl', float('inf')) <= trade.entry_price))
+                breakeven_active = bool((getattr(trade, 'sl', 0) >= entry_mark) if trade.direction == 1
+                                        else (getattr(trade, 'sl', float('inf')) <= entry_mark))
                 _f = lambda v: None if v is None else float(v)
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": float(trade.entry_price),
-                    "current": float(current), "pnl": float(pnl_inr), "chg_pct": float(chg_pct),
+                    "entry_mark": _f(entry_mark),
+                    "current": float(current_trade), "current_mark": _f(current_mark),
+                    "pnl": float(pnl_inr), "chg_pct": float(chg_pct),
                     "entry_time": entry_time_ist, "bars_held": int(trade.bars_held),
                     "margin": float(trade.margin_inr), "notional_usd": float(getattr(trade, 'notional_usd', 0)),
                     "lots": float(getattr(trade, 'lots', 0)), "leverage": leverage,
@@ -1489,7 +1540,9 @@ def get_paper_status(user=Depends(get_current_user)):
                 "is_running": service.is_running, "active_trades": active_trades,
                 "open_trade_count": len(service.oms.active_trades),
                 "closed_trades": service.closed_trades[-50:],
-                "last_price": service.last_price, "last_checked": service.last_checked,
+                "last_price": getattr(service, 'last_trade_price', None) or getattr(service, 'last_price', None),
+                "last_mark_price": getattr(service, 'last_mark_price', None) or getattr(service, 'last_price', None),
+                "last_checked": service.last_checked,
             })
     return status_list
 
@@ -1546,6 +1599,7 @@ def start_live_trade(
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition)
+    _apply_trade_schedule(service.config, payload)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
@@ -1568,13 +1622,17 @@ def get_live_status(user=Depends(get_current_user)):
         if f"_{user.username}_" in key:
             active_trades = []
             for symbol, trade in service.oms.active_trades.items():
-                current = getattr(service, 'last_price', None) or getattr(trade, 'current_price', None) or trade.peak_price
-                pnl_inr = (current - trade.entry_price) * trade.direction * trade.lots * getattr(service, 'conversion_rate', 85.0)
+                current_mark = getattr(service, 'last_mark_price', None) or getattr(trade, 'current_mark_price', None) or trade.peak_price
+                current_trade = getattr(service, 'last_trade_price', None) or getattr(trade, 'current_price', None) or current_mark
+                entry_mark = getattr(trade, 'entry_mark_price', None) or trade.entry_price
+                pnl_inr = (current_mark - entry_mark) * trade.direction * trade.lots * getattr(service, 'conversion_rate', 85.0)
                 leverage = getattr(service.config, 'leverage', 1)
-                chg_pct = ((current - trade.entry_price) / trade.entry_price * 100) * trade.direction if trade.entry_price else 0.0
+                chg_pct = ((current_mark - entry_mark) / entry_mark * 100) * trade.direction if entry_mark else 0.0
                 active_trades.append({
                     "symbol": symbol, "direction": trade.direction, "entry": trade.entry_price,
-                    "current": current, "pnl": pnl_inr, "chg_pct": chg_pct,
+                    "entry_mark": entry_mark,
+                    "current": current_trade, "current_mark": current_mark,
+                    "pnl": pnl_inr, "chg_pct": chg_pct,
                     "margin": trade.margin_inr, "notional_usd": getattr(trade, 'notional_usd', 0),
                     "lots": getattr(trade, 'lots', 0), "leverage": leverage,
                     "entry_time": _to_ist(trade.entry_time),
@@ -1585,7 +1643,9 @@ def get_live_status(user=Depends(get_current_user)):
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "leverage": getattr(service.config, 'leverage', 1),
                 "margin_pct": getattr(service, 'margin_pct', 0),
-                "last_price": service.last_price, "last_checked": service.last_checked,
+                "last_price": getattr(service, 'last_trade_price', None) or getattr(service, 'last_price', None),
+                "last_mark_price": getattr(service, 'last_mark_price', None) or getattr(service, 'last_price', None),
+                "last_checked": service.last_checked,
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list
@@ -1613,6 +1673,8 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
                     "low": k.low,
                     "close": k.close,
                     "volume": k.volume,
+                    "mark_open": k.mark_open, "mark_high": k.mark_high,
+                    "mark_low": k.mark_low, "mark_close": k.mark_close,
                 })
             return formatted
 
@@ -1621,7 +1683,9 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
         rows = DataSyncService.fetch_klines(normalize_source(source), symbol, interval, limit=limit)
         return [{"time": int(pd.Timestamp(row['event_time']).timestamp()),
                  "open": row['open'], "high": row['high'], "low": row['low'],
-                 "close": row['close'], "volume": row.get('volume', 0)} for row in rows]
+                 "close": row['close'], "volume": row.get('volume', 0),
+                 "mark_open": row.get('mark_open'), "mark_high": row.get('mark_high'),
+                 "mark_low": row.get('mark_low'), "mark_close": row.get('mark_close')} for row in rows]
     except Exception as e:
         # No local data and the remote API is unreachable — return an empty
         # series so the UI shows an empty chart instead of a hard error.

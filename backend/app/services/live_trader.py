@@ -67,40 +67,55 @@ class LiveTradeService:
             df_1h_with_ind[k] = v
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
-        current_price = float(df_1h['close'].iloc[-1])
+        current_trade_usd = float(df_1h['close'].iloc[-1])
+        current_price = float(df_1h['mark_close'].fillna(df_1h['close']).iloc[-1]) \
+            if 'mark_close' in df_1h.columns else current_trade_usd
+        try:
+            current_price = float(self.broker.fetch_mark_price("BTCUSDT") or current_price)
+        except Exception:
+            pass
         current_atr = float(ind_1h['atr14'][-1])
         current_time = df_1h.index[-1]
         self.last_price = current_price
+        self.last_mark_price = current_price
+        self.last_trade_price = current_trade_usd
         self.last_checked = datetime.utcnow().isoformat(timespec="seconds")
 
+        # All stop/trail/PnL decisions use the exchange mark price; the actual
+        # trade (fill) price is the candle close and stays on the trade record.
         for symbol in list(self.oms.active_trades.keys()):
-            result = self.oms.update_trade(symbol, current_price, current_atr, current_time)
+            result = self.oms.update_trade(symbol, current_price, current_atr, current_time,
+                                           trade_price=current_trade_usd)
             if result:
                 side = "SELL" if result.direction == 1 else "BUY"
                 response = self.broker.place_order(symbol, side, "MARKET", result.lots)
                 if "error" not in response:
-                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {result.exit_price:,.2f}")
+                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at mark {result.exit_mark_price:,.2f} (trade {result.exit_price:,.2f})")
                     if result.exit_detail:
                         print(f"   Exit condition: {result.exit_detail}")
                 else:
                     print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
 
         if last_sig != 0:
-            ind_slice = df_1h_with_ind.iloc[-50:]
-            if self.validator.validate_signal(last_sig, current_price, current_price, ind_slice).passed:
-                margin_inr = self.initial_capital * (self.margin_pct / 100.0)
-                notional_usd = margin_inr / self.conversion_rate * self.config.leverage
-                lots = float(np.floor((notional_usd / current_price) / self.config.lot_size_btc) * self.config.lot_size_btc)
-                if lots <= 0:
-                    return
-                side = "BUY" if last_sig == 1 else "SELL"
-                res = self.broker.place_order("BTCUSDT", side, "MARKET", lots)
-                if "error" not in res:
-                    self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time,
-                                          margin_inr, self.conversion_rate)
-                    print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {current_price} ({lots} BTC)")
-                else:
-                    print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
+            if self.config.is_new_trade_blocked(current_time):
+                print(f"⚠️ [{self.strategy_id}] LIVE new entry skipped — configured weekly skip window")
+            else:
+                ind_slice = df_1h_with_ind.iloc[-50:]
+                if self.validator.validate_signal(last_sig, current_price, current_price, ind_slice).passed:
+                    margin_inr = self.initial_capital * (self.margin_pct / 100.0)
+                    notional_usd = margin_inr / self.conversion_rate * self.config.leverage
+                    lots = float(np.floor((notional_usd / current_price) / self.config.lot_size_btc) * self.config.lot_size_btc)
+                    if lots <= 0:
+                        return
+                    side = "BUY" if last_sig == 1 else "SELL"
+                    res = self.broker.place_order("BTCUSDT", side, "MARKET", lots)
+                    if "error" not in res:
+                        self.oms.create_order("BTCUSDT", last_sig, current_trade_usd, current_atr,
+                                              current_time, margin_inr, self.conversion_rate,
+                                              mark_price=current_price)
+                        print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at mark {current_price} (trade {current_trade_usd}) ({lots} BTC)")
+                    else:
+                        print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
 
     def _fetch_candles(self, interval, limit):
         # Live mode prefers the selected broker's current feed. Seeded data is
@@ -119,7 +134,11 @@ class LiveTradeService:
                                            Klines.source == self.market_source).order_by(Klines.event_time.desc()).limit(limit).all()
             db.close()
             df = pd.DataFrame([{'event_time': k.event_time, 'open': k.open, 'high': k.high,
-                                'low': k.low, 'close': k.close, 'volume': k.volume} for k in rows])
+                                'low': k.low, 'close': k.close, 'volume': k.volume,
+                                'mark_open': getattr(k, 'mark_open', None),
+                                'mark_high': getattr(k, 'mark_high', None),
+                                'mark_low': getattr(k, 'mark_low', None),
+                                'mark_close': getattr(k, 'mark_close', None)} for k in rows])
             if df.empty:
                 return df
             df.set_index('event_time', inplace=True)

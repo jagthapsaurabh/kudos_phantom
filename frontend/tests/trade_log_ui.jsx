@@ -40,9 +40,9 @@ const momTrade = {
   signal_candle_time: '2020-06-26T12:41:59.523330', signal_candle_type: 'RED',
   entry_time: '2020-06-26T13:41:59.523330',
   entry_candle_time: '2020-06-26T13:41:59.523330', entry_candle_type: 'GREEN',
-  entry_price: 10037.92,
+  entry_price: 10037.92, entry_mark_price: 10037.92,
   exit_time: '2020-06-26T14:41:59.523330', exit_candle_type: 'RED',
-  exit_price: 10260.25, exit_reason: 'SL',
+  exit_price: 10260.25, exit_mark_price: 10260.25, exit_reason: 'SL',
   exit_detail: 'Stop loss hit — price rose to 10,260.25 ≥ SL 10,240.23 (initial SL 10,240.23)',
   sl_entry: 10240.227, sl: 10240.227, tp: 9897.7, trail_stop: 10240.227,
   atr_at_entry: 20.0, peak_price: 10037.92,
@@ -186,7 +186,7 @@ const col = (name) => cells[header.indexOf(name)];
 check('CSV uses CRLF line endings', csv.includes('\r\n'));
 check('CSV has one row per trade plus the header', rows.length === 3);
 // Pinned so the documented column count cannot drift from the code.
-check('CSV has exactly 45 columns', header.length === 45, `got ${header.length}`);
+check('CSV has exactly 47 columns', header.length === 47, `got ${header.length}`);
 check('CSV has no duplicate column names',
   new Set(header).size === header.length);
 check('CSV has no empty column name', header.every(h => h.trim().length > 0));
@@ -195,6 +195,9 @@ check('CSV has the signal candle columns',
 check('CSV has the entry candle columns',
   header.includes('Entry Candle Time') && header.includes('Entry Candle Colour'));
 check('CSV has the exit candle colour column', header.includes('Exit Candle Colour'));
+check('CSV has trade and mark price columns',
+  header.includes('Entry Price') && header.includes('Entry Mark Price')
+  && header.includes('Exit Price') && header.includes('Exit Mark Price'));
 check('CSV has one column per entry condition',
   ['Entry Cond 1 - 4H Trend', 'Entry Cond 2 - ADX', 'Entry Cond 3 - MACD Hist',
    'Entry Cond 4 - ATR Regime', 'Entry Cond 5 - RSI Trigger',
@@ -210,6 +213,8 @@ check('CSV has PnL / Fees / Booked columns',
 check('CSV: signal candle colour', col('Signal Candle Colour') === 'RED', col('Signal Candle Colour'));
 check('CSV: entry candle colour', col('Entry Candle Colour') === 'GREEN', col('Entry Candle Colour'));
 check('CSV: exit candle colour', col('Exit Candle Colour') === 'RED', col('Exit Candle Colour'));
+check('CSV: entry mark price', col('Entry Mark Price') === '10037.92', col('Entry Mark Price'));
+check('CSV: exit mark price', col('Exit Mark Price') === '10260.25', col('Exit Mark Price'));
 check('CSV: signal candle time is UTC to the second',
   col('Signal Candle Time') === '2020-06-26 12:41:59', col('Signal Candle Time'));
 check('CSV: entry candle time is UTC to the second',

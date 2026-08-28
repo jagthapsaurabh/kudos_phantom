@@ -122,6 +122,13 @@ class Klines(Base):
     low = Column(Float)
     close = Column(Float)
     volume = Column(Float)  # base-asset volume; required for seeded candles
+    # BTC coin-mark-price series kept next to the trade-price OHLCV. All
+    # calculations run on these columns; existing rows fall back to close
+    # until they are re-seeded from the exchange's mark-price endpoint.
+    mark_open = Column(Float, nullable=True)
+    mark_high = Column(Float, nullable=True)
+    mark_low = Column(Float, nullable=True)
+    mark_close = Column(Float, nullable=True)
     __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
 
 
@@ -215,6 +222,11 @@ class Trade(Base):
     direction = Column(Integer)
     entry_price = Column(Float)
     exit_price = Column(Float)
+    # Both the executed (trade) price and the exchange mark price are kept for
+    # every trade. PnL, SL/TP and trailing exits are calculated on mark price;
+    # the trade-price columns remain available for audit/Excel export.
+    entry_mark_price = Column(Float, nullable=True)
+    exit_mark_price = Column(Float, nullable=True)
     lots = Column(Float)
     margin = Column(Float)
     notional = Column(Float)

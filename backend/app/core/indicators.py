@@ -53,7 +53,19 @@ def macd(close: np.ndarray, fast=12, slow=26, signal_period=9):
     return macd_line, signal_line, macd_line - signal_line
 
 def compute_indicators(df: pd.DataFrame, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9) -> dict[str, np.ndarray]:
-    o, h, l, c, v = (df[col].values.astype(np.float64) for col in ("open", "high", "low", "close", "volume"))
+    # Delta/Binance BTC perpetual mark-price candles are stored as mark_open /
+    # mark_high / mark_low / mark_close. When present they are used for every
+    # calculation (RSI/ADX/ATR/MACD/EMA and candle colour) and old seeded data
+    # falls back to the trade-price OHLCV below.
+    def _pick(prefix, fallback):
+        return df[f"{prefix}close"].values.astype(np.float64) if f"{prefix}close" in df.columns \
+            else df[fallback].values.astype(np.float64)
+
+    o = _pick("mark_open", "open")
+    h = _pick("mark_high", "high")
+    l = _pick("mark_low", "low")
+    c = _pick("mark_close", "close")
+    v = df["volume"].values.astype(np.float64)
     ind = {"o": o, "h": h, "l": l, "c": c, "v": v, "n": len(c)}
     ind["atr14"] = atr(h, l, c, 14)
     ind["rsi14"] = rsi(c, 14)

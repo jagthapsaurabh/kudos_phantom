@@ -80,6 +80,14 @@ returned by `GET /backtest/results/{run_id}`.
 All v3 behaviours are config-driven (`PhantomV2Config`); every new flag defaults to the exact
 v2.5 behaviour, so the API, paper trader and live trader remain fully backward compatible.
 
+### v3.3 addon: Mark price calculation + weekly new-trade skip (Delta / Binance BTC perpetual)
+
+- **Both Delta and Binance run the BTC perpetual** (`BTCUSDT` on Binance Futures, `MARK:BTCUSD` on Delta). The seeders now also fetch the exchange's mark-price candles (`/fapi/v1/markPriceKlines` and Delta `MARK:BTCUSD` candles) and store `mark_open/high/low/close` alongside the trade-price OHLCV in `klines`. When the mark endpoint is unavailable (or old CSV data is loaded), the mark series falls back to the trade-price series so backtests still run.
+- **All calculations are on mark price**: indicators, entry filters, position sizing, SL/TP/trailing stops and PnL use the mark series. The executed fill price is still recorded separately, so every trade now stores **both** `entry_price`/`exit_price` (trade price) and `entry_mark_price`/`exit_mark_price` (mark price) in the `trades` table, the backtest trade log/Excel export and the paper-trade history.
+- **Weekly new-trade skip** is available in Backtest, Paper Trade and Live Trade. It is a toggle plus optional full-day checkboxes and custom weekly windows, all in **India Standard Time (UTC+5:30)**. Open positions are never affected — the worker keeps managing and closing them; only *new* entries are suppressed. The default pre-filled block is the weekend pause `Saturday 17:30 → Sunday 17:30 IST`, and any day (Sunday/Tuesday/Saturday, etc.) or any start→end window can be configured. Skipped entries appear as `SKIP_WINDOW` in the backtest rejected-signal list.
+
+Run `python backend/test_trading_schedule.py` (or `cd backend && python test_trading_schedule.py`) after installing the requirements to verify the IST boundary logic.
+
 ### v3.2 addon: Direction-specific Long / Short thresholds
 When the two sides behave differently, the Backtest page keeps the shared values as the default and
 places two independent switches below them: **Use separate Long / Short MACD hist** and
@@ -136,6 +144,7 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 cd backend
 python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 python test_atr_regime_op.py      # 32 checks: per-side ATR operator
+python test_trading_schedule.py   # 17 checks: IST weekly skip boundaries + full-day skips
 python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
