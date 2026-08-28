@@ -4,11 +4,15 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import pandas as pd
 import json
-from typing import Optional, List, Dict, Union
+from typing import Any, Optional, List, Dict, Union
 import os
 from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
+from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
+from .core.trading_windows import (
+    TradingWindowConfig, TradingWindowGuard, default_config as default_window_config,
+)
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
 from .services.live_trader import LiveTradeService
@@ -79,6 +83,11 @@ class BacktestRequest(BaseModel):
     initial_capital: Optional[float] = None
     data_source: str = 'Binance'
     fee_mode: str = 'backtest'
+    # Optional top-level overrides. The UI sends both inside `params` (so they
+    # are saved with the run and restored later); these exist so a scripted run
+    # can switch them without rebuilding the whole parameter block.
+    use_mark_price: Optional[bool] = None
+    trading_windows: Optional[TradingWindowConfig] = None
 
 def get_db():
     db = SessionLocal()
@@ -112,6 +121,61 @@ def _fee_dict(row, broker_code=None, mode=None):
     }
 
 
+def _apply_run_overrides(req):
+    """Fold the optional top-level mark-price / window switches into params.
+
+    Both switches live inside ``params`` so they are persisted with the run and
+    restored when the run is reopened; a top-level value (when present) wins,
+    which keeps scripted runs short.
+    """
+    if req.use_mark_price is None and req.trading_windows is None:
+        return req
+    try:
+        updates = {}
+        if req.use_mark_price is not None:
+            updates['use_mark_price'] = bool(req.use_mark_price)
+        if req.trading_windows is not None:
+            updates['trading_windows'] = req.trading_windows
+        req.params = req.params.model_copy(update=updates)
+    except Exception:
+        pass
+    return req
+
+
+def _user_window_config(user) -> TradingWindowConfig:
+    """The account's saved schedule (empty/disabled when never configured)."""
+    raw = getattr(user, 'trading_windows_json', None)
+    if raw:
+        try:
+            return TradingWindowConfig(**json.loads(raw))
+        except Exception:
+            pass
+    return TradingWindowConfig()
+
+
+def resolve_window_config(payload, user) -> TradingWindowConfig:
+    """Schedule for a paper/live instance: request value, else account default."""
+    explicit = getattr(payload, 'trading_windows', None)
+    if explicit is not None:
+        if isinstance(explicit, TradingWindowConfig):
+            return explicit
+        if isinstance(explicit, dict):
+            try:
+                return TradingWindowConfig(**explicit)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid trading_windows: {exc}")
+    return _user_window_config(user)
+
+
+def resolve_use_mark_price(payload, user) -> bool:
+    """Mark-price switch: request value, else the account default."""
+    explicit = getattr(payload, 'use_mark_price', None)
+    if explicit is not None:
+        return bool(explicit)
+    value = getattr(user, 'use_mark_price', None)
+    return True if value is None else bool(value)
+
+
 def resolve_fees(db, broker_code: str, mode: str, fallback=None):
     """Resolve the admin schedule; fall back to the strategy/.env defaults."""
     broker_code = normalize_source(broker_code)
@@ -138,7 +202,7 @@ def _fee_config(config, fees):
 _PHANTOM_PARAM_KEYS = (
     'entry_conditions', 'use_direction_conditions', 'rsi_oversold',
     'rsi_overbought', 'stop_loss_atr', 'macd_hist_min', 'atr_regime_ratio',
-    'adx_min', 'trend_ema_period',
+    'adx_min', 'trend_ema_period', 'trading_windows', 'use_mark_price',
 )
 
 
@@ -541,12 +605,47 @@ class BrokerDefinitionPayload(BaseModel):
     trading_api_url: Optional[str] = None
     enabled: bool = True
     notes: Optional[str] = None
+    # Rate-limit policy — NULL falls back to the venue default
+    # (Delta 10 000 weight / 5 min, Binance 2 400 weight + 1 200 orders / min).
+    rate_limit_per_second: Optional[float] = None
+    rate_limit_per_minute: Optional[float] = None
+    quota_per_5min: Optional[float] = None
+    orders_per_minute: Optional[float] = None
+    # Trading defaults for the live terminal.
+    default_leverage: Optional[int] = None
+    margin_mode: Optional[str] = None
+    contract_value: Optional[float] = None
+    tick_size: Optional[float] = None
 
 
 def _broker_dict(row):
     return {'id': row.id, 'code': row.code, 'name': row.name, 'kind': row.kind,
             'market_data_url': row.market_data_url, 'trading_api_url': row.trading_api_url,
-            'enabled': bool(row.enabled), 'is_builtin': bool(row.is_builtin), 'notes': row.notes}
+            'enabled': bool(row.enabled), 'is_builtin': bool(row.is_builtin), 'notes': row.notes,
+            'rate_limit_per_second': row.rate_limit_per_second,
+            'rate_limit_per_minute': row.rate_limit_per_minute,
+            'quota_per_5min': row.quota_per_5min,
+            'orders_per_minute': row.orders_per_minute,
+            'default_leverage': row.default_leverage, 'margin_mode': row.margin_mode,
+            'contract_value': row.contract_value, 'tick_size': row.tick_size}
+
+
+def _apply_broker_payload(row, payload):
+    """Copy the editable broker fields (incl. rate limits) onto a row."""
+    row.name = payload.name
+    row.kind = payload.kind.lower()
+    row.market_data_url = payload.market_data_url
+    row.trading_api_url = payload.trading_api_url
+    row.enabled = int(payload.enabled)
+    row.notes = payload.notes
+    row.rate_limit_per_second = payload.rate_limit_per_second
+    row.rate_limit_per_minute = payload.rate_limit_per_minute
+    row.quota_per_5min = payload.quota_per_5min
+    row.orders_per_minute = payload.orders_per_minute
+    row.default_leverage = payload.default_leverage
+    row.margin_mode = (payload.margin_mode or None)
+    row.contract_value = payload.contract_value
+    row.tick_size = payload.tick_size
 
 
 @app.get('/broker-definitions')
@@ -564,9 +663,8 @@ def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin)
     code = normalize_source(payload.code)
     if db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first():
         raise HTTPException(status_code=400, detail='Broker code already exists')
-    row = BrokerDefinition(code=code, name=payload.name, kind=payload.kind.lower(),
-                           market_data_url=payload.market_data_url, trading_api_url=payload.trading_api_url,
-                           enabled=int(payload.enabled), is_builtin=0, notes=payload.notes)
+    row = BrokerDefinition(code=code, is_builtin=0)
+    _apply_broker_payload(row, payload)
     db.add(row)
     db.flush()
     default_taker = float(os.getenv('TAKER_FEE_BPS', '5.9'))
@@ -582,8 +680,7 @@ def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin)
 def update_broker(broker_id: int, payload: BrokerDefinitionPayload, admin=Depends(require_admin), db=Depends(get_db)):
     row = db.query(BrokerDefinition).filter(BrokerDefinition.id == broker_id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker integration not found')
-    row.name = payload.name; row.kind = payload.kind.lower(); row.market_data_url = payload.market_data_url
-    row.trading_api_url = payload.trading_api_url; row.enabled = int(payload.enabled); row.notes = payload.notes
+    _apply_broker_payload(row, payload)
     db.commit(); db.refresh(row)
     return _broker_dict(row)
 
@@ -714,6 +811,10 @@ class MarketSeedPayload(BaseModel):
     end_date: Optional[str] = None
     limit: int = 1000
     fetch_all: bool = False
+    # Also seed the mark-price series for the BTC perpetual. Risk maths runs on
+    # the mark price, so without it a backtest silently falls back to the
+    # traded price (and says so through mark_price_basis).
+    include_mark_price: bool = False
 
 
 def _market_definition(db, source):
@@ -772,8 +873,24 @@ def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), d
         # the admin can see exactly which interval failed and why.
         ok = sum(1 for item in summary if not item.get('error'))
         status = 'Seed completed' if ok == len(summary) else ('Seed failed' if ok == 0 else 'Seed completed with errors')
+        mark_summary = []
+        if payload.include_mark_price and ok:
+            # Traded candles exist now, so the mark series can be attached to
+            # them. A failure here never fails the seed itself.
+            try:
+                mark_summary = DataSyncService.sync_mark_prices(
+                    source=source, symbol=payload.symbol.upper(), intervals=intervals,
+                    start_time=payload.start_date, end_time=payload.end_date,
+                    limit=max(1, min(payload.limit, DataSyncService.DELTA_MAX_CANDLES)),
+                    definition=definition,
+                )
+            except Exception as exc:
+                mark_summary = [{'error': str(exc)}]
         return {'status': status, 'source': source, 'symbol': payload.symbol.upper(),
-                'fetch_all': payload.fetch_all, 'summary': summary}
+                'fetch_all': payload.fetch_all, 'summary': summary,
+                'mark_price': {'requested': bool(payload.include_mark_price),
+                               'perpetual_symbol': perpetual_symbol(source, payload.symbol.upper()),
+                               'summary': mark_summary}}
     except HTTPException:
         raise
     except Exception as exc:
@@ -840,6 +957,105 @@ async def seed_market_data_csv(source: str = 'Binance', symbol: str = 'BTCUSDT',
         return {'status': 'CSV imported with OHLCV volume', 'summary': result}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# --- BTC PERPETUAL: contract, mark price and "skip new trades" schedule ---
+@app.get("/market/contract")
+def market_contract(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
+    """Which contract the tool trades on a venue.
+
+    Both venues are wired to the BTC **perpetual** (BTCUSDT on Binance, BTCUSD
+    on Delta). Dated futures are never substituted.
+    """
+    code = normalize_source(source)
+    definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
+    return {
+        "source": code,
+        "symbol": "BTCUSDT",
+        "perpetual_symbol": perpetual_symbol(code, "BTCUSDT"),
+        "contract": contract_label(code, "BTCUSDT"),
+        "contract_type": "perpetual",
+        "enabled": bool(getattr(definition, "enabled", 1)) if definition else False,
+    }
+
+
+@app.get("/market/mark-price")
+def market_mark_price(source: str = "Binance", symbol: str = "BTCUSDT",
+                      user=Depends(get_current_user), db=Depends(get_db)):
+    """Live mark price (and traded price) of the BTC perpetual.
+
+    Used by the UI to show exactly which price risk is being managed on.
+    """
+    code = normalize_source(source)
+    definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
+    quote = MarkPriceService.current(code, symbol, definition=definition)
+    if quote is None:
+        raise HTTPException(status_code=502,
+                            detail=f"Mark price unavailable for {code} {perpetual_symbol(code, symbol)}. "
+                                   f"The public market-data endpoint did not answer.")
+    payload = quote.as_dict()
+    payload.update({
+        "contract_type": "perpetual",
+        "use_mark_price": bool(True if getattr(user, 'use_mark_price', None) is None else bool(user.use_mark_price)),
+    })
+    return payload
+
+
+class TradingWindowsPayload(BaseModel):
+    """Account-level schedule used by Backtest / Paper / Live by default."""
+    enabled: Optional[bool] = None
+    timezone: Optional[str] = None
+    utc_offset_minutes: Optional[int] = None
+    block_exits: Optional[bool] = None
+    windows: Optional[List[Dict]] = None
+    # Convenience: replace the whole schedule with these weekday blocks.
+    quick_days: Optional[List[Any]] = None
+
+
+@app.get("/trading-windows")
+def get_trading_windows(user=Depends(get_current_user)):
+    """The signed-in account's default "skip new trades" schedule."""
+    config = _user_window_config(user)
+    guard = TradingWindowGuard(config)
+    return {
+        **guard.summary(),
+        "use_mark_price": bool(True if getattr(user, 'use_mark_price', None) is None else bool(user.use_mark_price)),
+        "now_local": guard.local_now().isoformat(timespec="minutes"),
+        "entry_blocked_now": guard.is_blocked(datetime.utcnow()),
+        "next_open": (guard.next_open_from(datetime.utcnow()).isoformat(timespec="minutes")
+                      if guard.next_open_from(datetime.utcnow()) else None),
+    }
+
+
+@app.put("/trading-windows")
+def save_trading_windows(payload: TradingWindowsPayload, user=Depends(get_current_user), db=Depends(get_db)):
+    """Persist the account default used when a start request omits a schedule."""
+    try:
+        if payload.quick_days is not None:
+            # Shortcut used by the UI's day chips: replace the schedule with
+            # one all-day block per selected weekday.
+            from .core.trading_windows import all_day_window
+            windows = [all_day_window(day) for day in payload.quick_days]
+            config = TradingWindowConfig(
+                enabled=bool(payload.enabled) if payload.enabled is not None else True,
+                timezone=payload.timezone or "Asia/Kolkata",
+                block_exits=bool(payload.block_exits or False),
+                windows=windows,
+            )
+        else:
+            updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()
+                       if k != "quick_days"}
+            merged = {**_user_window_config(user).model_dump(), **updates}
+            config = TradingWindowConfig(**merged)
+        user.trading_windows_json = json.dumps(config.model_dump())
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Invalid trading windows: {exc}")
+    guard = TradingWindowGuard(config)
+    return {"status": "Trading windows saved", **guard.summary()}
 
 
 # --- PHANTOM v3: config + signal overlay for charts ---
@@ -1017,6 +1233,12 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             run.fee_mode = req.fee_mode
             run.taker_fee_bps = float(fees.taker_fee_bps)
             run.maker_fee_bps = float(fees.maker_fee_bps)
+            # What the run actually priced on (mark vs traded) and how many
+            # entries the "skip new trades" schedule refused.
+            run.use_mark_price = int(bool(results.get('mark_price_basis', True)))
+            run.trading_windows_enabled = int(bool(
+                results.get('trading_windows', {}).get('active', False)))
+            run.blocked_entries = int(results.get('diagnostics', {}).get('blocked_entries', 0) or 0)
             
             trade_cols = {c.name for c in Trade.__table__.columns}
             for t in results['trades']:
@@ -1039,6 +1261,9 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
 @app.post("/backtest")
 def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depends(get_db), background_tasks: BackgroundTasks = BackgroundTasks()):
     try:
+        # Fold the optional top-level mark-price / trading-window switches into
+        # the parameter snapshot so they are saved with the run.
+        req = _apply_run_overrides(req)
         start_date_str = req.start_date or "2020-07-04"
         end_date_str = req.end_date or "2026-07-04"
         start_date_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
@@ -1059,6 +1284,10 @@ def run_backtest(req: BacktestRequest, user=Depends(get_current_user), db=Depend
             initial_capital=capital,
             data_source=normalize_source(req.data_source),
             fee_mode=req.fee_mode,
+            # BTC perpetual pricing + "skip new trades" schedule for this run.
+            use_mark_price=int(bool(getattr(req.params, 'use_mark_price', True))),
+            trading_windows_enabled=int(bool(getattr(
+                getattr(req.params, 'trading_windows', None), 'enabled', False))),
             roi=0.0 # Placeholder
         )
         db.add(run)
@@ -1078,7 +1307,9 @@ def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
              "start_date": r.start_date, "end_date": r.end_date,
              "roi": r.roi, "initial_capital": r.initial_capital or 20000,
              "data_source": r.data_source or 'Binance', "taker_fee_bps": r.taker_fee_bps,
-             "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp} for r in runs]
+             "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp,
+             "use_mark_price": int(r.use_mark_price) if r.use_mark_price is not None else 1,
+             "blocked_entries": int(r.blocked_entries or 0)} for r in runs]
 
 @app.get("/backtest/results/{run_id}")
 def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends(get_db)):
@@ -1108,6 +1339,14 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                         "macd_confirm_ok": t.cond_macd_confirm_ok,
                         "di_ok": t.cond_di_ok,
                     },
+                    # BTC perpetual: the traded price and the exchange mark
+                    # price are both persisted; entry/exit_price are the basis
+                    # the PnL was actually computed on.
+                    "entry_trade_price": t.entry_trade_price,
+                    "exit_trade_price": t.exit_trade_price,
+                    "entry_mark_price": t.entry_mark_price,
+                    "exit_mark_price": t.exit_mark_price,
+                    "mark_price_basis": t.mark_price_basis,
                     "gross_pnl": t.gross_pnl, "sl": t.sl, "tp": t.tp,
                     "sl_entry": t.sl_entry, "trail_stop": t.trail_stop,
                     "atr_at_entry": t.atr_at_entry, "peak_price": t.peak_price,
@@ -1138,6 +1377,11 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
             "maker_fee_bps": run.maker_fee_bps,
             "timestamp": run.timestamp,
             "rejected_reasons": json.loads(run.rejected_reasons) if run.rejected_reasons else {},
+            # BTC perpetual pricing + the blackout schedule that shaped the run.
+            "use_mark_price": int(run.use_mark_price) if run.use_mark_price is not None else 1,
+            "trading_windows_enabled": int(run.trading_windows_enabled or 0),
+            "blocked_entries": int(run.blocked_entries or 0),
+            "contract": contract_label(run.data_source or 'Binance', "BTCUSDT"),
         },
         "trades": trade_list
     }
@@ -1184,6 +1428,8 @@ class FilterPreviewRequest(BaseModel):
     symbol: str = "BTCUSDT"
     data_source: str = 'Binance'
     fee_mode: str = 'backtest'
+    use_mark_price: Optional[bool] = None
+    trading_windows: Optional[TradingWindowConfig] = None
 
 @app.post("/backtest/filter-preview")
 def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
@@ -1197,6 +1443,7 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
     trade-off without a separate offline script.
     """
     try:
+        req = _apply_run_overrides(req)
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
         config = _fee_config(req.params, fees)
@@ -1252,6 +1499,12 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'total_trades': len(results['trades']),
         'total_win_rate': round(results['win_rate'], 2),
         'total_profit_factor': round(results['profit_factor'], 2),
+        # BTC perpetual pricing + how many entries the schedule refused, so the
+        # preview explains a drop in trade count.
+        'mark_price_basis': bool(results.get('mark_price_basis', False)),
+        'mark_price_coverage': results.get('mark_price_coverage', 0.0),
+        'trading_windows': results.get('trading_windows', {}),
+        'blocked_entries': int(results.get('diagnostics', {}).get('blocked_entries', 0) or 0),
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
         'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
         'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
@@ -1282,6 +1535,12 @@ class TradeStartRequest(BaseModel):
     data_source: Optional[str] = None
     connection_id: Optional[int] = None
     testnet: bool = False
+    # BTC perpetual pricing: risk the trade on the exchange MARK price.
+    # Omitted → the account default (saved from the UI) is used.
+    use_mark_price: Optional[bool] = None
+    # "Skip new trades" schedule. Omitted → the account default is used.
+    # Open positions keep running; only new entries are refused.
+    trading_windows: Optional[TradingWindowConfig] = None
 
 def resolve_broker_context(payload, user, db, require_credentials=False):
     code = normalize_source(payload.data_source or payload.broker_name)
@@ -1326,6 +1585,9 @@ def start_paper_trade(
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
     strategy_id = str(payload.strategy_id)
     strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
+    # BTC perpetual pricing + "skip new trades" schedule for this instance.
+    window_config = resolve_window_config(payload, user)
+    use_mark = resolve_use_mark_price(payload, user)
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -1333,7 +1595,8 @@ def start_paper_trade(
         from .core.strategy import FastTestStrategyService
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
-                                    broker_definition=definition, strategy_name=strategy_name)
+                                    broker_definition=definition, strategy_name=strategy_name,
+                                    trading_windows=window_config, use_mark_price=use_mark)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -1344,15 +1607,18 @@ def start_paper_trade(
         if kind == 'phantom':
             service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees,
-                                        is_custom=False, broker_definition=definition, strategy_name=strategy_name)
+                                        is_custom=False, broker_definition=definition, strategy_name=strategy_name,
+                                        trading_windows=window_config, use_mark_price=use_mark)
         else:
             service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees,
-                                        is_custom=True, broker_definition=definition, strategy_name=strategy_name)
+                                        is_custom=True, broker_definition=definition, strategy_name=strategy_name,
+                                       trading_windows=window_config, use_mark_price=use_mark)
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
-                                    broker_definition=definition, strategy_name=strategy_name)
+                                    broker_definition=definition, strategy_name=strategy_name,
+                                    trading_windows=window_config, use_mark_price=use_mark)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
@@ -1363,6 +1629,10 @@ def start_paper_trade(
     return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
             "strategy_name": service.strategy_name, "data_source": source,
             "session_id": session_id,
+            "contract": contract_label(source, "BTCUSDT"),
+            "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
+            "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
+            "trading_windows": service.window_guard.summary(),
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
@@ -1472,7 +1742,14 @@ def get_paper_status(user=Depends(get_current_user)):
                     "breakeven_active": breakeven_active,
                     "atr_at_entry": _f(getattr(trade, 'atr_at_entry', None)),
                     "peak_price": _f(getattr(trade, 'peak_price', None)),
+                    # BTC perpetual: the mark price the position is priced on
+                    # and the traded price it was filled at.
+                    "mark": _f(getattr(trade, 'current_mark_price', None)),
+                    "entry_mark": _f(getattr(trade, 'entry_mark_price', None)),
+                    "entry_trade": _f(getattr(trade, 'entry_trade_price', None)),
+                    "mark_price_basis": bool(getattr(trade, 'mark_price_basis', False)),
                 })
+            windows = getattr(service, 'window_guard', None)
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
                 "strategy_name": getattr(service, 'strategy_name', service.strategy_id),
@@ -1490,6 +1767,18 @@ def get_paper_status(user=Depends(get_current_user)):
                 "open_trade_count": len(service.oms.active_trades),
                 "closed_trades": service.closed_trades[-50:],
                 "last_price": service.last_price, "last_checked": service.last_checked,
+                # BTC perpetual: the price the maths runs on (mark) vs the
+                # traded price shown beside it.
+                "last_trade_price": getattr(service, 'last_trade_price', None),
+                "last_mark_price": getattr(service, 'last_mark_price', None),
+                "mark_price_basis": bool(getattr(service, 'mark_price_basis', False)),
+                "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
+                "contract": contract_label(service.market_source, "BTCUSDT"),
+                "perpetual_symbol": perpetual_symbol(service.market_source, "BTCUSDT"),
+                # "Skip new trades" schedule and whether it is blocking now.
+                "trading_windows": windows.summary() if windows else None,
+                "entry_paused": bool(windows.is_blocked(datetime.utcnow())) if windows else False,
+                "blocked_entries": int(getattr(service, 'blocked_entries', 0) or 0),
             })
     return status_list
 
@@ -1520,6 +1809,9 @@ def start_live_trade(
     strategy_id = payload.strategy_id
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
     margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+    # BTC perpetual pricing + "skip new trades" schedule for this instance.
+    window_config = resolve_window_config(payload, user)
+    use_mark = resolve_use_mark_price(payload, user)
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -1527,7 +1819,9 @@ def start_live_trade(
         from .core.strategy import FastTestStrategyService
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
-                                   testnet=testnet, fee_schedule=fees, definition=definition)
+                                   testnet=testnet, fee_schedule=fees, definition=definition,
+                                   trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -1537,18 +1831,28 @@ def start_live_trade(
         if kind == 'phantom':
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=False, broker_name=source,
-                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition)
+                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
+                                       trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
-                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition)
+                                       passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
+                                       trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
-                                   testnet=testnet, fee_schedule=fees, definition=definition)
+                                   testnet=testnet, fee_schedule=fees, definition=definition,
+                                   trading_windows=window_config, use_mark_price=use_mark,
+                                   user_id=user.id, instance_key=instance_key)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
+            "contract": contract_label(source, "BTCUSDT"),
+            "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
+            "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
+            "trading_windows": service.window_guard.summary(),
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
@@ -1578,6 +1882,11 @@ def get_live_status(user=Depends(get_current_user)):
                     "margin": trade.margin_inr, "notional_usd": getattr(trade, 'notional_usd', 0),
                     "lots": getattr(trade, 'lots', 0), "leverage": leverage,
                     "entry_time": _to_ist(trade.entry_time),
+                    # BTC perpetual: mark price (pricing basis) vs traded fill.
+                    "mark": getattr(trade, 'current_mark_price', None) or None,
+                    "entry_mark": getattr(trade, 'entry_mark_price', None) or None,
+                    "entry_trade": getattr(trade, 'entry_trade_price', None) or None,
+                    "mark_price_basis": bool(getattr(trade, 'mark_price_basis', False)),
                 })
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
@@ -1586,6 +1895,15 @@ def get_live_status(user=Depends(get_current_user)):
                 "leverage": getattr(service.config, 'leverage', 1),
                 "margin_pct": getattr(service, 'margin_pct', 0),
                 "last_price": service.last_price, "last_checked": service.last_checked,
+                "last_trade_price": getattr(service, 'last_trade_price', None),
+                "last_mark_price": getattr(service, 'last_mark_price', None),
+                "mark_price_basis": bool(getattr(service, 'mark_price_basis', False)),
+                "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
+                "contract": contract_label(service.market_source, "BTCUSDT"),
+                "perpetual_symbol": getattr(service, 'contract_symbol', None) or perpetual_symbol(service.market_source, "BTCUSDT"),
+                "trading_windows": getattr(service, 'window_guard', None).summary() if getattr(service, 'window_guard', None) else None,
+                "entry_paused": bool(getattr(service, 'window_guard', None).is_blocked(datetime.utcnow())) if getattr(service, 'window_guard', None) else False,
+                "blocked_entries": int(getattr(service, 'blocked_entries', 0) or 0),
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list
@@ -1647,6 +1965,8 @@ class BrokerSettingsUpdate(BaseModel):
     connection_id: Optional[int] = None
     passphrase: Optional[str] = None
     is_testnet: bool = False
+    # BTC perpetual: risk the account on the exchange MARK price (default on).
+    use_mark_price: Optional[bool] = None
 
 
 @app.post("/broker-settings")
@@ -1674,8 +1994,11 @@ def update_broker_settings(settings: BrokerSettingsUpdate, user=Depends(get_curr
     user.initial_capital = settings.initial_capital
     user.margin_deployment_pct = settings.margin_pct
     user.broker_name = code
+    if settings.use_mark_price is not None:
+        user.use_mark_price = int(bool(settings.use_mark_price))
     db.commit()
-    return {"status": "Settings updated", "broker_name": code}
+    return {"status": "Settings updated", "broker_name": code,
+            "use_mark_price": bool(user.use_mark_price if user.use_mark_price is not None else 1)}
 
 
 @app.get("/broker-settings")
@@ -1687,6 +2010,10 @@ def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
         "broker_name": user.broker_name or 'Binance',
         "initial_capital": user.initial_capital,
         "margin_deployment_pct": user.margin_deployment_pct,
+        # BTC perpetual pricing + the account's default "skip new trades"
+        # schedule (see GET/PUT /trading-windows).
+        "use_mark_price": bool(user.use_mark_price if user.use_mark_price is not None else 1),
+        "trading_windows": _user_window_config(user).model_dump(),
         "connections": [_connection_dict(row) for row in rows],
     }
 
@@ -1724,3 +2051,282 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
             "best_roi": 0.0, "avg_roi": 0.0, "total_runs": 0, "completed_runs": 0,
             "avg_win_rate": 0.0, "best_win_rate": 0.0, "last_run": None,
         }
+
+
+# ===========================================================================
+# LIVE ACCOUNT — orders, positions, fills, margin and risk
+#
+# Everything below talks to the real broker through BrokerClient, which
+# throttles each call against that venue's rate limits (Delta: 10 000 weight
+# per fixed 5-minute window; Binance: 2 400 weight/min and 1 200 orders/min —
+# see app/core/rate_limit.py). Broker payloads are normalized by
+# app/services/broker_account.py so both venues render the same way.
+# ===========================================================================
+def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None,
+                 require_credentials: bool = True):
+    """Build a BrokerClient from a broker code + the user's credentials."""
+    from .services.broker_client import BrokerClient
+    code = normalize_source(broker_code)
+    definition = db.query(BrokerDefinition).filter(
+        BrokerDefinition.code == code, BrokerDefinition.enabled == 1).first()
+    if not definition:
+        raise HTTPException(status_code=400, detail=f"Broker '{code}' is not configured or enabled")
+    query = db.query(BrokerConnection).filter(
+        BrokerConnection.user_id == user.id, BrokerConnection.broker_code == code,
+        BrokerConnection.is_active == 1)
+    if connection_id is not None:
+        query = query.filter(BrokerConnection.id == connection_id)
+    connection = query.order_by(BrokerConnection.created_at).first()
+    api_key = (connection.api_key if connection else None) or (user.api_key or '')
+    api_secret = (connection.api_secret if connection else None) or (user.api_secret or '')
+    passphrase = (connection.passphrase if connection else None) or ''
+    testnet = bool(connection.is_testnet) if connection else False
+    if require_credentials and (not api_key or not api_secret):
+        raise HTTPException(status_code=400,
+                            detail=f"API keys not configured for {code}. Add them in Broker Settings.")
+    client = BrokerClient(api_key, api_secret, code, passphrase, testnet, definition)
+    return client, definition, (connection.id if connection else None)
+
+
+class LiveOrderRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    side: str
+    order_type: str = 'market'
+    size: float = 0.0
+    size_in_btc: bool = True
+    price: Optional[float] = None
+    stop_price: Optional[float] = None
+    trail_amount: Optional[float] = None
+    reduce_only: bool = False
+    post_only: bool = False
+    time_in_force: str = 'gtc'
+    working_type: str = 'MARK'
+    client_order_id: Optional[str] = None
+    # Bracket: attach protection legs to the entry.
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    stop_trigger: str = 'mark_price'
+    # 'manual' from the terminal ticket, 'strategy' from a live-trade instance.
+    source: str = 'manual'
+    instance_key: Optional[str] = None
+
+
+class LiveCancelRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    order_id: Optional[str] = None
+    client_order_id: Optional[str] = None
+    symbol: str = 'BTCUSDT'
+
+
+class LiveClosePositionRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    size: Optional[float] = None
+    size_in_btc: bool = True
+    instance_key: Optional[str] = None
+
+
+class LiveLeverageRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    leverage: int = 1
+
+
+class LiveMarginModeRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    mode: str = 'isolated'
+
+
+class LivePositionMarginRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    amount: float = 0.0
+
+
+class LiveSnapshotRequest(BaseModel):
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    include_history: bool = True
+    history_limit: int = 50
+
+
+def _record_placed_order(client, user, broker_code, connection_id, response, request, contract_value):
+    """Persist the local mirror of a placed order (plain or bracketed)."""
+    from .services.broker_account import normalize_order, record_order, split_order_response
+    recorded = []
+    parent_id = None
+    for row, leg_name in split_order_response(response, broker_code):
+        order = normalize_order(row, broker_code, contract_value)
+        if order.get('error'):
+            continue
+        order['symbol'] = client.perpetual_symbol(request.symbol)
+        record_order(user.id, broker_code, order, source=request.source,
+                     instance_key=request.instance_key, connection_id=connection_id,
+                     leg=leg_name, parent_order_id=(None if leg_name == 'entry' else parent_id),
+                     raw=row)
+        if leg_name == 'entry':
+            parent_id = order.get('order_id')
+        recorded.append(order)
+    return recorded
+
+
+@app.post('/live-account/snapshot')
+def live_account_snapshot(payload: LiveSnapshotRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Positions / open orders / stop orders / fills / history / margin for one broker."""
+    from .services.broker_account import account_snapshot
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    return account_snapshot(client, payload.symbol, include_history=payload.include_history,
+                            history_limit=payload.history_limit)
+
+
+@app.post('/live-account/orders')
+def live_place_order(payload: LiveOrderRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Place a market / limit / stop / take-profit order, optionally bracketed."""
+    from .services.broker_account import (normalize_order, record_fills, record_order)
+    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+    symbol = payload.symbol or 'BTCUSDT'
+    instrument = client.get_instrument(symbol) or {}
+    contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
+    client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
+    side = str(payload.side or '').lower()
+    if side not in ('buy', 'sell'):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+
+    if payload.stop_loss is not None or payload.take_profit is not None:
+        response = client.place_bracket_order(
+            symbol, side, payload.size, price=payload.price,
+            stop_loss_price=payload.stop_loss, take_profit_price=payload.take_profit,
+            client_order_id=client_order_id, trigger_method=payload.stop_trigger,
+            size_in_btc=payload.size_in_btc)
+    else:
+        response = client.place_order(
+            symbol, side, payload.order_type, payload.size, price=payload.price,
+            stop_price=payload.stop_price, reduce_only=payload.reduce_only,
+            client_order_id=client_order_id, time_in_force=payload.time_in_force,
+            post_only=payload.post_only, working_type=payload.working_type,
+            trail_amount=payload.trail_amount, size_in_btc=payload.size_in_btc)
+
+    orders = _record_placed_order(client, user, definition.code, connection_id, response, payload, contract_value)
+    fills_recorded = 0
+    if orders:
+        # A market order can fill before the exchange answers; capture it.
+        try:
+            fills = client.get_fills(symbol, limit=10)
+            if isinstance(fills, list) and not (isinstance(fills, dict) and fills.get('error')):
+                from .services.broker_account import normalize_fill
+                fills_recorded = record_fills(user.id, definition.code,
+                                              [normalize_fill(f, definition.code, contract_value) for f in fills],
+                                              source=payload.source, instance_key=payload.instance_key)
+        except Exception:
+            fills_recorded = 0
+    return {
+        "status": "rejected" if (isinstance(response, dict) and response.get('error')) else "placed",
+        "broker": definition.code,
+        "symbol": client.perpetual_symbol(symbol),
+        "contract_value": contract_value,
+        "client_order_id": client_order_id,
+        "response": response,
+        "orders": orders,
+        "fills_recorded": fills_recorded,
+        "rate_limits": client.rate_limit_usage(),
+    }
+
+
+@app.post('/live-account/orders/cancel')
+def live_cancel_order(payload: LiveCancelRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Cancel one order by exchange id or by our client order id."""
+    from .services.broker_account import mark_order_cancelled
+    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+    if not payload.order_id and not payload.client_order_id:
+        raise HTTPException(status_code=400, detail="order_id or client_order_id is required")
+    response = client.cancel_order(payload.order_id, payload.symbol, payload.client_order_id)
+    local_row = None
+    if isinstance(response, dict) and not response.get('error'):
+        local_row = mark_order_cancelled(user.id, definition.code,
+                                         order_id=str(payload.order_id or ''),
+                                         client_order_id=payload.client_order_id)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "cancelled",
+            "response": response, "local": local_row,
+            "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/orders/cancel-all')
+def live_cancel_all_orders(payload: LiveCancelRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Cancel every open order on the contract (or the whole account)."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.cancel_all_orders(payload.symbol)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "cancelled",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/positions/close')
+def live_close_position(payload: LiveClosePositionRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Flatten the open position on the contract."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.close_position(payload.symbol, size=payload.size,
+                                     size_in_btc=payload.size_in_btc)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "closed",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/leverage')
+def live_set_leverage(payload: LiveLeverageRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.set_leverage(payload.symbol, int(payload.leverage))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/margin-mode')
+def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.set_margin_mode(payload.symbol, payload.mode)
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/position-margin')
+def live_change_position_margin(payload: LivePositionMarginRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.change_position_margin(payload.symbol, float(payload.amount))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.get('/live-account/rate-limits')
+def live_rate_limits(broker: str = 'Binance', connection_id: Optional[int] = None,
+                     user=Depends(get_current_user), db=Depends(get_db)):
+    """Local throttling state, plus the exchange's own quota (Delta)."""
+    from .core.rate_limit import all_snapshots
+    client, definition, _ = _live_client(db, user, broker, connection_id)
+    usage = client.rate_limit_usage()
+    quota = None
+    try:
+        quota = client.fetch_rate_limit_quota()
+    except Exception:
+        quota = None
+    return {"broker": definition.code, "local": usage, "exchange_quota": quota,
+            "all": all_snapshots()}
+
+
+@app.get('/live-account/orders')
+def live_local_orders(broker: str = None, limit: int = 200, user=Depends(get_current_user)):
+    """Orders sent through PHANTOM, from the local audit table."""
+    from .services.broker_account import local_order_history
+    return local_order_history(user.id, broker, limit=limit)
+
+
+@app.get('/live-account/fills')
+def live_local_fills(broker: str = None, limit: int = 200, user=Depends(get_current_user)):
+    """Executions recorded locally (kept after the exchange history window)."""
+    from .services.broker_account import local_fills
+    return local_fills(user.id, broker, limit=limit)

@@ -45,6 +45,13 @@ class User(Base):
     is_active = Column(Integer, default=1)
     can_paper = Column(Integer, default=1)
     can_live = Column(Integer, default=0)
+    # Account-level trading defaults.
+    # use_mark_price: risk maths (SL/TP/trail/PnL) runs on the exchange mark
+    # price of the BTC perpetual; the traded price is recorded alongside it.
+    use_mark_price = Column(Integer, default=1)
+    # JSON schedule of "skip new trades" windows shared by Backtest, Paper and
+    # Live (see app.core.trading_windows). Each mode can override it per run.
+    trading_windows_json = Column(String, nullable=True)
     full_name = Column(String, nullable=True)
     mobile = Column(String, nullable=True)
     email = Column(String, nullable=True)
@@ -72,6 +79,20 @@ class BrokerDefinition(Base):
     enabled = Column(Integer, default=1)
     is_builtin = Column(Integer, default=0)
     notes = Column(String, nullable=True)
+    # ---- Broker rate-limit policy (see app.core.rate_limit) ------------
+    # NULL = use the venue default for this definition. Defaults already sit
+    # under both exchanges' documented limits: Delta allows 10 000 weight per
+    # fixed 5-minute window, Binance 2 400 weight/minute and 1 200 orders/min.
+    rate_limit_per_second = Column(Float, nullable=True)
+    rate_limit_per_minute = Column(Float, nullable=True)
+    quota_per_5min = Column(Float, nullable=True)
+    orders_per_minute = Column(Float, nullable=True)
+    # ---- Trading defaults ---------------------------------------------
+    default_leverage = Column(Integer, nullable=True)
+    margin_mode = Column(String, nullable=True)          # isolated | cross
+    # Contract specification override, used when the instrument lookup fails.
+    contract_value = Column(Float, nullable=True)        # BTC represented by 1 contract/lot
+    tick_size = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
@@ -122,6 +143,13 @@ class Klines(Base):
     low = Column(Float)
     close = Column(Float)
     volume = Column(Float)  # base-asset volume; required for seeded candles
+    # Mark-price OHLC of the same bar (BTC perpetual). NULL until the mark
+    # series is seeded for this source — the engine then falls back to the
+    # traded OHLC above and reports mark_price_basis = 0.
+    mark_open = Column(Float, nullable=True)
+    mark_high = Column(Float, nullable=True)
+    mark_low = Column(Float, nullable=True)
+    mark_close = Column(Float, nullable=True)
     __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
 
 
@@ -194,6 +222,11 @@ class BacktestRun(Base):
     fee_mode = Column(String, default='backtest')
     taker_fee_bps = Column(Float, nullable=True)
     maker_fee_bps = Column(Float, nullable=True)
+    # BTC perpetual pricing: 1 = stops/targets/PnL computed on mark price.
+    use_mark_price = Column(Integer, default=1)
+    # 1 when the run skipped new entries during configured trading windows.
+    trading_windows_enabled = Column(Integer, default=0)
+    blocked_entries = Column(Integer, default=0)
     final_equity = Column(Float)
     total_trades = Column(Integer)
     win_rate = Column(Float)
@@ -215,6 +248,15 @@ class Trade(Base):
     direction = Column(Integer)
     entry_price = Column(Float)
     exit_price = Column(Float)
+    # BTC perpetual: the fill/traded price and the exchange mark price are both
+    # stored. `entry_price`/`exit_price` are the pricing basis actually used for
+    # the PnL maths (mark price when `mark_price_basis` = 1), and the other pair
+    # keeps the real execution price so a trade can always be reconciled.
+    entry_trade_price = Column(Float, nullable=True)
+    exit_trade_price = Column(Float, nullable=True)
+    entry_mark_price = Column(Float, nullable=True)
+    exit_mark_price = Column(Float, nullable=True)
+    mark_price_basis = Column(Integer, nullable=True)
     lots = Column(Float)
     margin = Column(Float)
     notional = Column(Float)
@@ -306,6 +348,11 @@ class PaperSession(Base):
     taker_fee_bps = Column(Float, nullable=True)
     maker_fee_bps = Column(Float, nullable=True)
     conversion_rate = Column(Float, nullable=True)
+    # BTC perpetual pricing: 1 = SL/TP/trail/PnL computed on the mark price.
+    use_mark_price = Column(Integer, nullable=True)
+    # "Skip new trades" schedule in force for this session (JSON).
+    trading_windows_json = Column(String, nullable=True)
+    blocked_entries = Column(Integer, default=0)
     # Result roll-up over the closed trades.
     closed_trade_count = Column(Integer, default=0)
     win_rate = Column(Float, nullable=True)
@@ -324,6 +371,82 @@ class PaperSession(Base):
     closed_trades = Column(JSON, nullable=True)
     open_positions = Column(JSON, nullable=True)
     logs = Column(JSON, nullable=True)
+
+
+class BrokerOrder(Base):
+    """One order sent to a live broker, mirrored locally.
+
+    The exchange is the source of truth, but keeping a local row means the
+    terminal can show an order the moment it is sent, keep a durable audit
+    trail after the exchange drops it from its open-order window, and tie a
+    fill back to the strategy instance that opened it.
+    """
+
+    __tablename__ = 'broker_orders'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    broker_code = Column(String, nullable=False, index=True)
+    connection_id = Column(Integer, nullable=True)
+    symbol = Column(String, nullable=False, index=True)
+    # Our own id, sent to the exchange so the two can always be matched.
+    client_order_id = Column(String, nullable=True, index=True)
+    broker_order_id = Column(String, nullable=True, index=True)
+    # Bracket legs point back at the entry order they protect.
+    parent_order_id = Column(String, nullable=True)
+    side = Column(String, nullable=False)                 # buy | sell
+    order_type = Column(String, nullable=False)           # market | limit | stop_market | …
+    leg = Column(String, nullable=True)                   # entry | stop_loss | take_profit
+    size = Column(Float, nullable=True)                   # venue units (contracts / BTC lots)
+    qty_btc = Column(Float, nullable=True)                # same size expressed in BTC
+    price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    trigger_method = Column(String, nullable=True)        # mark_price | last_traded_price
+    reduce_only = Column(Integer, default=0)
+    post_only = Column(Integer, default=0)
+    time_in_force = Column(String, nullable=True)
+    status = Column(String, default='pending', index=True)  # pending|open|filled|cancelled|rejected
+    filled_size = Column(Float, nullable=True)
+    avg_fill_price = Column(Float, nullable=True)
+    fee = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+    # 'manual' (terminal ticket) or 'strategy' (a live-trade instance).
+    source = Column(String, default='manual')
+    instance_key = Column(String, nullable=True, index=True)
+    error = Column(String, nullable=True)
+    raw = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+
+
+class BrokerFill(Base):
+    """One execution (fill) received from a live broker."""
+
+    __tablename__ = 'broker_fills'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    broker_code = Column(String, nullable=False, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    client_order_id = Column(String, nullable=True, index=True)
+    broker_order_id = Column(String, nullable=True, index=True)
+    broker_trade_id = Column(String, nullable=True, index=True)
+    side = Column(String, nullable=True)
+    size = Column(Float, nullable=True)          # venue units
+    qty_btc = Column(Float, nullable=True)
+    price = Column(Float, nullable=True)
+    fee = Column(Float, nullable=True)
+    role = Column(String, nullable=True)         # maker | taker
+    realized_pnl = Column(Float, nullable=True)
+    source = Column(String, default='manual')
+    instance_key = Column(String, nullable=True)
+    filled_at = Column(DateTime, nullable=True)
+    raw = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint('user_id', 'broker_code', 'broker_trade_id',
+                         name='uq_broker_fill_trade'),
+    )
 
 
 def _seed_reference_data():

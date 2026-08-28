@@ -6,6 +6,7 @@ import os
 from typing import Optional
 from dotenv import load_dotenv
 from .indicators import compute_indicators, sma, macd as _macd
+from .trading_windows import TradingWindowConfig
 
 load_dotenv()
 
@@ -156,6 +157,18 @@ class PhantomV2Config(BaseModel):
     # See EntryConditions / BranchConditions above.
     # ------------------------------------------------------------------
     entry_conditions: EntryConditions = Field(default_factory=EntryConditions)
+    # ------------------------------------------------------------------
+    # BTC perpetual pricing (Binance BTCUSDT / Delta BTCUSD perpetual)
+    # ------------------------------------------------------------------
+    # True  → stops, targets, trailing, breakeven and PnL are computed on the
+    #         exchange MARK price; the traded/fill price is stored alongside.
+    # False → legacy behaviour: everything runs on the traded price.
+    use_mark_price: bool = Field(default=True)
+    # ------------------------------------------------------------------
+    # "Skip new trades" schedule (weekend / holiday blackout windows).
+    # Open positions keep being managed; only new entries are blocked.
+    # ------------------------------------------------------------------
+    trading_windows: TradingWindowConfig = Field(default_factory=TradingWindowConfig)
 
     @model_validator(mode="after")
     def _validate_macd_periods(self):

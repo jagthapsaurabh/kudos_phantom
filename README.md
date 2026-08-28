@@ -35,6 +35,115 @@ npm run dev
 
 ---
 
+## 🧭 Live order management & the trading terminal (v3.4)
+
+> Design research for this section — venue capability matrix, bracket-order support, sizing,
+> rate limits and citations — lives in **[docs/order_management_research.md](docs/order_management_research.md)**.
+
+
+PHANTOM now trades the full order lifecycle against the real broker and shows the account the way an
+exchange terminal does. Open **Live Terminal** in the sidebar (or `/terminal`).
+
+**Order lifecycle** — market, limit, stop-market, stop-limit, take-profit and trailing orders; edit
+(Delta), cancel one, cancel all, open orders, order history and fills with fees. Entries can be sent
+as **bracket orders** (entry + stop-loss + take-profit): Delta has a native bracket endpoint, Binance
+does not, so the protection legs are placed as reduce-only `STOP_MARKET` / `TAKE_PROFIT_MARKET`
+orders and are cancelled when the position closes. Stops trigger on the **mark price**
+(`stop_trigger_method: mark_price` on Delta, `workingType: MARK` + `priceProtect` on Binance).
+
+**Terminal panels** — Positions (size in BTC *and* the venue's unit, entry, mark, liquidation,
+margin, leverage, uPnL, ROE, close button), Open Orders, Stop Orders (trigger + trigger method),
+Fills (fee, maker/taker, realised PnL), Order History, plus Wallet & Margin, Risk (margin
+utilisation, effective leverage, long/short/net exposure) and a live Rate-limit panel.
+
+**Sizing** — Delta sizes in whole contracts (1 contract = 0.001 BTC), Binance in BTC lots; the
+ticket accepts either unit and converts using the contract specification read from the venue.
+
+**Local audit trail** — every order (`broker_orders`, tagged with its leg, client id and the strategy
+instance that sent it) and every fill (`broker_fills`) is mirrored locally, deduplicated on the
+exchange trade id, so history survives the exchange's own window.
+
+**Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
+
+| Venue | Documented limit | Enforced |
+| :--- | :--- | :--- |
+| Delta Exchange | 10 000 weight per **fixed** 5-minute window; 500 ops/s per product; 429 → `X-RATE-LIMIT-RESET` (ms) | 20 req/s, 1 200 req/min, weight budget, quota polled from `/v2/rate_limits/quota` |
+| Binance Futures | 2 400 request-weight/min and **1 200 orders/min** per IP | 20 req/s, 1 200 req/min, order slots counted separately, `X-MBX-USED-WEIGHT-1M` tracked |
+
+One limiter is shared per broker connection, 429s are retried (4 attempts, honouring `Retry-After` /
+`X-RATE-LIMIT-RESET`) and a failure is returned as an error object instead of raising, so a trading
+worker survives a rejected order. All limits are editable per broker in **Broker → Exchange
+Registry → Limits** and returned by `GET /live-account/rate-limits`.
+
+Smoke-test the live endpoints without touching a real exchange:
+
+```bash
+cd backend && ../.venv/bin/python tools/mock_exchange.py --port 8099   # fake Binance REST surface
+# then register it in Broker → Exchange Registry (kind: binance, URLs http://127.0.0.1:8099)
+```
+
+**API configuration** — credentials per broker (multiple labelled connections) in
+**Broker & Data Sources**; leverage and margin mode from the terminal or per broker definition;
+contract value and tick size fall back to the venue's instrument endpoint and can be overridden.
+
+## 🎯 BTC perpetual, mark price & trading windows (v3.3)
+
+**Contract.** Every venue is wired to the BTC **perpetual** — `BTCUSDT` on Binance Futures and
+`BTCUSD` on Delta Exchange. Dated futures are never substituted; `app.core.mark_price.perpetual_symbol`
+is the single resolver used by market-data seeding, the backtest engine, the paper worker and the
+live worker (`GET /market/contract` shows which one a venue resolves to).
+
+**Mark price.** Risk runs on the exchange **mark price**, the same price liquidations are computed
+on: stop-loss, take-profit, trailing, breakeven, drawdown and PnL are all evaluated on it. The price
+an order actually fills at (traded/last price) is recorded beside it, so a trade can always be
+reconciled — the database stores **both**:
+
+| Column | Meaning |
+| :--- | :--- |
+| `entry_price` / `exit_price` | the pricing basis the maths ran on (mark price when mark pricing is on) |
+| `entry_trade_price` / `exit_trade_price` | the traded price the order filled at |
+| `entry_mark_price` / `exit_mark_price` | the exchange mark price at that instant |
+| `mark_price_basis` | `1` when PnL was computed on the mark price |
+
+Mark prices are seeded onto the same candle rows (`klines.mark_open/high/low/close`) — Binance via
+`/fapi/v1/markPriceKlines`, Delta via `/v2/history/candles?symbol=MARK:BTCUSD` — by ticking
+**Include mark price** in the Seed Data tab, and are refreshed by the daily sync. Bars with no mark
+price fall back to the traded price bar-by-bar; the run then reports `mark_price_basis: false` and its
+`mark_price_coverage` percentage instead of silently changing its accounting.
+
+**Trading windows ("skip new trades").** Backtest, Paper Trade and Live Trade all carry the same
+switch: *block new entries during chosen periods*. The classic crypto weekend gap is one preset —
+**Saturday 18:30 → Monday 01:00 IST** — but the model is general and client-configurable:
+
+* any number of windows, each with a **start day/time** and an **end day/time**;
+* a window may cross midnight, and may **wrap past Sunday** (Saturday → Monday);
+* `all_day` blocks a whole day, or a span of days (Saturday → Sunday);
+* the schedule is interpreted in any IANA timezone — **Asia/Kolkata** by default;
+* pick single days too: **Sunday**, **Tuesday**, **Saturday**, or any combination;
+* **only new entries are refused.** A position opened before a window keeps its stop-loss,
+  take-profit, breakeven and trailing rules until it closes on its own (turn on *Also freeze exits*
+  to change that). Skipped entries are logged and counted (`TRADING_WINDOW` rejections,
+  `blocked_entries`).
+
+Presets in the UI: *Weekend (Sat 18:30 → Mon 01:00)*, *Skip Sunday*, *Skip Saturday & Sunday*,
+*Fri 18:30 → Sat 02:00*, *No restrictions*. The schedule is stored with the run / paper session /
+live instance so any result can be reproduced, and `GET`/`PUT /trading-windows` saves an
+account-level default that every Backtest / Paper / Live start inherits.
+
+```jsonc
+// params.trading_windows  — days are 0=Mon … 6=Sun (names are accepted)
+{
+  "enabled": true,
+  "timezone": "Asia/Kolkata",
+  "block_exits": false,
+  "windows": [
+    { "label": "Weekend gap", "start_day": "sat", "start_time": "18:30",
+      "end_day": "mon", "end_time": "01:00", "all_day": false, "enabled": true },
+    { "label": "Skip Tuesday", "start_day": 1, "end_day": 1, "all_day": true, "enabled": true }
+  ]
+}
+```
+
 ## ⚡ PHANTOM v3 — What's New
 
 | Area | v2.5 | v3 |
@@ -139,9 +248,11 @@ python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
+python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
+python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 76 checks: trade-log table + CSV export
+cd frontend && npm test            # 216 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

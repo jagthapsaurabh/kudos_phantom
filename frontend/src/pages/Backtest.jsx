@@ -3,7 +3,9 @@ import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
-import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp } from 'lucide-react';
+import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } from '../utils/tradingWindows';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle } from 'lucide-react';
 
 const PARAM_META = {
   trend_ema_period: { label: 'Trend EMA', hint: 'How far back the 4h trend looks. Higher = slower, fewer trades.' },
@@ -29,6 +31,10 @@ const PARAM_META = {
   dd_halt_pct: { label: 'Halt drawdown %', hint: 'Past this, new entries stop. 100 = guard off.' },
   dd_resume_pct: { label: 'Resume drawdown %', hint: 'Start entries again once drawdown falls below this.' },
 };
+
+// The tool trades the BTC *perpetual* on every venue: Binance lists it as
+// BTCUSDT, Delta as BTCUSD. Dated futures are never substituted.
+const perpetualFor = (source) => (String(source || '').toLowerCase() === 'delta' ? 'BTCUSD' : 'BTCUSDT');
 
 // Comparison operators the client can choose for the per-side ATR regime rule.
 // '>=' (ATR ≥ ratio × 50-bar average) is the original Phantom behaviour and is
@@ -86,8 +92,10 @@ const buildTradesCSV = (trades) => {
     'Trade #', 'Direction', 'Setup',
     'Signal Candle Time', 'Signal Candle Colour',
     'Entry Candle Time', 'Entry Candle Colour',
-    'Entry Price',
-    'Exit Time', 'Exit Candle Colour', 'Exit Price',
+    'Entry Price (Basis)', 'Entry Price (Mark)', 'Entry Price (Traded)',
+    'Exit Time', 'Exit Candle Colour',
+    'Exit Price (Basis)', 'Exit Price (Mark)', 'Exit Price (Traded)',
+    'Priced On Mark',
     '4H Trend',
     'RSI14', 'MACD Hist', 'ADX', 'ATR14', 'EMA50 1h', 'EMA50 4h',
     // Every entry condition, one column each, so the sheet can be filtered.
@@ -114,10 +122,11 @@ const buildTradesCSV = (trades) => {
       t.signal_candle_type || t.candle_type || '',
       fmtTime(t.entry_candle_time || t.entry_time),
       t.entry_candle_type || '',
-      num(t.entry_price),
+      num(t.entry_price), num(t.entry_mark_price), num(t.entry_trade_price),
       fmtTime(t.exit_time),
       t.exit_candle_type || '',
-      num(t.exit_price),
+      num(t.exit_price), num(t.exit_mark_price), num(t.exit_trade_price),
+      t.mark_price_basis ? 'YES' : 'NO',
       t.trend_4h || '',
       num(t.rsi14, 1), num(t.macd_hist), num(t.adx, 1), num(t.atr14),
       num(t.ema50_1h), num(t.ema50_4h),
@@ -348,6 +357,13 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                     <div>
                       <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Result</div>
                       <div className="space-y-0.5 font-mono text-gray-300">
+                        {t.mark_price_basis ? (
+                          <div className="text-[10px] text-amber-300">
+                            Entry mark {t.entry_mark_price?.toFixed(2) ?? '—'} (traded {t.entry_trade_price?.toFixed(2) ?? '—'}) · Exit mark {t.exit_mark_price?.toFixed(2) ?? '—'} (traded {t.exit_trade_price?.toFixed(2) ?? '—'})
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-gray-500">Priced on the traded price (mark price off)</div>
+                        )}
                         <div>PnL (Gross): ₹{(t.gross_pnl || 0).toFixed(2)} • Fees: ₹{(t.fees || 0).toFixed(2)}</div>
                         <div className={t.net_pnl > 0 ? 'text-green-400' : 'text-red-400'}>Booked (Net): ₹{(t.net_pnl || 0).toFixed(2)}</div>
                         <div>Exit: {fmtCandleTime(t.exit_time) || '—'} ({t.hold_bars || 0} bars)</div>
@@ -376,6 +392,11 @@ const Backtest = () => {
     trail_distance_atr: 0.3, breakeven_atr: 0.75,
     leverage: 2, margin_pct: 0.15,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
+    // BTC perpetual: risk is managed on the exchange MARK price; the traded
+    // price is recorded next to it (both are stored for every trade).
+    use_mark_price: true,
+    // "Skip new trades" schedule (weekend / holiday blackout windows).
+    trading_windows: emptySchedule(),
     entry_conditions: {
       // The two direction toggles are intentionally independent. The legacy
       // use_direction_conditions flag is still accepted for older saved runs.
@@ -487,6 +508,9 @@ const Backtest = () => {
       },
     };
   });
+
+  const setTradingWindows = (next) => setParams(prev => ({ ...prev, trading_windows: next }));
+  const setUseMarkPrice = (next) => setParams(prev => ({ ...prev, use_mark_price: !!next }));
 
   const setDirectionalValue = (side, field, value) => setParams(prev => ({
     ...prev,
@@ -658,6 +682,10 @@ const Backtest = () => {
           initial_capital: parseFloat(capital),
           data_source: dataSource,
           fee_mode: 'backtest',
+          // Sent both inside `params` (saved with the run) and top level so the
+          // API can apply them even if a strategy payload is rebuilt.
+          use_mark_price: !!params.use_mark_price,
+          trading_windows: params.trading_windows,
         }),
       });
 
@@ -747,6 +775,8 @@ const Backtest = () => {
           end_date: dates.end,
           data_source: dataSource,
           fee_mode: 'backtest',
+          use_mark_price: !!params.use_mark_price,
+          trading_windows: params.trading_windows,
         }),
       });
       const data = await res.json();
@@ -766,6 +796,8 @@ const Backtest = () => {
     const merged = {
       ...base,
       ...saved,
+      // Restored from the saved run when present, otherwise the form default.
+      trading_windows: normalizeSchedule(saved.trading_windows ?? base.trading_windows),
       entry_conditions: {
         ...base.entry_conditions,
         ...savedConditions,
@@ -888,7 +920,12 @@ const Backtest = () => {
     maxDD: results.max_drawdown,
     exitDist: (results.trades || []).reduce((acc, t) => { acc[t.exit_reason] = (acc[t.exit_reason] || 0) + 1; return acc; }, {}),
     directionDist: (results.trades || []).reduce((acc, t) => { const dir = t.direction === 1 ? 'Long' : 'Short'; acc[dir] = (acc[dir] || 0) + 1; return acc; }, {}),
-    rejections: results.rejected_reasons || {}
+    rejections: results.rejected_reasons || {},
+    // BTC perpetual + skip-window facts this run was executed with.
+    useMarkPrice: results.use_mark_price !== 0 && results.use_mark_price !== false,
+    contract: results.contract,
+    blockedEntries: Number(results.blocked_entries || 0),
+    windows: results.params?.trading_windows || null,
   } : null;
 
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
@@ -1041,6 +1078,39 @@ const Backtest = () => {
               <span className="text-[11px] text-gray-400">Maker <b className="ml-1 font-mono text-white">{Number(fees.maker_fee_bps || 0).toFixed(2)} bps</b></span>
               <span className="text-[10px] text-gray-600">Applied to every fill in this run</span>
             </div>
+          </div>
+        </div>
+
+        {/* BTC perpetual pricing + "skip new trades" schedule for this run. */}
+        <div className="mt-4 grid grid-cols-1 gap-4 border-t border-gray-700 pt-4 xl:grid-cols-3">
+          <div className="flex flex-col">
+            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500">
+              <Target size={10} /> Contract
+            </label>
+            <div className="flex min-h-[38px] items-center rounded-lg border border-gray-700 bg-gray-900 px-3 py-2">
+              <span className="font-mono text-xs text-white">{perpetualFor(dataSource)}</span>
+              <span className="ml-2 text-[10px] text-gray-500">perpetual</span>
+            </div>
+            <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+              <input type="checkbox" checked={!!params.use_mark_price}
+                     onChange={e => setUseMarkPrice(e.target.checked)}
+                     className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+              <span>
+                <span className="block font-bold text-white">Use mark price</span>
+                <span className="mt-0.5 block text-gray-500">
+                  Stops, targets, trailing and PnL run on the exchange mark price.
+                  The traded price is stored on every trade as well.
+                </span>
+              </span>
+            </label>
+          </div>
+          <div className="xl:col-span-2">
+            <TradingWindowsEditor
+              value={params.trading_windows}
+              onChange={setTradingWindows}
+              title="Trading windows — skip new trades"
+              subtitle={`Only NEW entries are blocked during these windows (${dataSource} candle time). Trades already open keep running.`}
+            />
           </div>
         </div>
       </SectionCard>
@@ -1262,6 +1332,32 @@ const Backtest = () => {
               <StatCard label="Net Profit" value={formatCurrencyValue(stats?.netProfit)} color={stats?.netProfit >= 0 ? 'text-green-400' : 'text-red-400'} />
               <StatCard label="ROI" value={formatPercentValue(stats?.roi)} color={stats?.roi >= 0 ? 'text-green-400' : 'text-red-400'} />
               <StatCard label="Win Rate" value={formatPercentValue(stats?.winRate)} color="text-purple-400" />
+            </div>
+            {/* What the run was priced on, and how many entries the schedule refused. */}
+            <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-gray-700 bg-gray-900 px-3 py-2 text-[11px]">
+              <span className="rounded border border-gray-700 bg-gray-800 px-2 py-0.5 font-mono text-gray-200">
+                {stats?.contract || `${perpetualFor(results?.data_source)} perpetual`}
+              </span>
+              <span className={`rounded border px-2 py-0.5 font-semibold ${
+                stats?.useMarkPrice ? 'border-amber-700/60 bg-amber-900/20 text-amber-300'
+                                    : 'border-gray-700 bg-gray-800 text-gray-400'}`}>
+                {stats?.useMarkPrice ? 'Priced on MARK price' : 'Priced on traded price'}
+              </span>
+              {isScheduleActive(stats?.windows) ? (
+                <span className="flex items-center gap-1 rounded border border-amber-700/60 bg-amber-900/20 px-2 py-0.5 text-amber-300">
+                  <PauseCircle size={11} />
+                  Skip-windows ON: {describeSchedule(stats?.windows).join(' · ')}
+                </span>
+              ) : (
+                <span className="rounded border border-gray-700 bg-gray-800 px-2 py-0.5 text-gray-400">
+                  No trading windows
+                </span>
+              )}
+              {stats?.blockedEntries > 0 && (
+                <span className="rounded border border-red-900/60 bg-red-900/20 px-2 py-0.5 font-semibold text-red-300">
+                  {stats.blockedEntries} new trades skipped
+                </span>
+              )}
             </div>
           </SectionCard>
 

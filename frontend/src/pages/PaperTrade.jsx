@@ -1,7 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2, History, Download, RefreshCw, Eye, ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, XCircle, PlusCircle, Target, Trash2, History, Download, RefreshCw, Eye, ChevronDown, ChevronUp, Clock, CalendarClock } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { API_URL } from '../api';
+import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import {
+  emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
+} from '../utils/tradingWindows';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
 // explicitly in India Standard Time (UTC+5:30). Guarantees the user always
@@ -100,7 +104,11 @@ const TradeCard = ({ trade, onClose }) => (
     </div>
     <div className="grid grid-cols-3 gap-2 text-center text-[10px] uppercase font-medium text-gray-400">
       <div className="bg-gray-800/50 p-2 rounded">Entry<br /><span className="text-white text-xs">{Number(trade.entry).toFixed(2)}</span></div>
-      <div className="bg-gray-800/50 p-2 rounded">Current<br /><span className="text-white text-xs">{Number(trade.current).toFixed(2)}</span></div>
+      <div className="bg-gray-800/50 p-2 rounded">Current<br /><span className="text-white text-xs">{Number(trade.current).toFixed(2)}</span>
+        {trade.mark_price_basis && trade.mark != null && (
+          <div className="text-[9px] text-amber-400/90">mark {Number(trade.mark).toFixed(2)}</div>
+        )}
+      </div>
       <div className="bg-gray-800/50 p-2 rounded">Chg<br /><span className={`text-xs ${trade.chg_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>{trade.chg_pct >= 0 ? '+' : ''}{Number(trade.chg_pct).toFixed(2)}%</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Margin<br /><span className="text-white text-xs">₹{Number(trade.margin).toFixed(0)}</span></div>
       <div className="bg-gray-800/50 p-2 rounded">Leverage<br /><span className="text-white text-xs">{trade.leverage ?? '—'}×</span></div>
@@ -146,6 +154,7 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Dir</th>
               <th className="p-2">Entry</th>
               <th className="p-2">Exit</th>
+              <th className="p-2" title="Exchange mark price the trade was priced on">Mark (entry → exit)</th>
               <th className="p-2">Stop Loss</th>
               <th className="p-2">Take Profit</th>
               <th className="p-2">Trail Stop</th>
@@ -168,6 +177,15 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                   <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
+                  <td className="p-2 font-mono text-gray-400">
+                    {t.entry_mark_price != null || t.exit_mark_price != null
+                      ? <span className={t.mark_price_basis ? 'text-amber-300' : 'text-gray-400'}>
+                          {t.entry_mark_price != null ? Number(t.entry_mark_price).toFixed(2) : '—'}
+                          {' → '}
+                          {t.exit_mark_price != null ? Number(t.exit_mark_price).toFixed(2) : '—'}
+                        </span>
+                      : '—'}
+                  </td>
                   <td className="p-2 font-mono text-red-300">{t.sl != null ? Number(t.sl).toFixed(2) : '—'}{slMoved && <span className="text-[9px] text-yellow-400 ml-1">→ {Number(t.sl_final).toFixed(2)} (BE)</span>}</td>
                   <td className="p-2 font-mono text-green-300">{t.tp != null ? Number(t.tp).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-purple-300">{t.trail_stop != null ? Number(t.trail_stop).toFixed(2) : '—'}</td>
@@ -272,6 +290,34 @@ const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) 
           </div>
           <div className="truncate font-bold text-sm text-gray-100" title={strategyName}>{strategyName}</div>
           <div className="mt-1 truncate text-[10px] text-blue-300">{inst.data_source || 'Binance'} · {inst.taker_fee_bps ?? '—'}/{inst.maker_fee_bps ?? '—'} bps</div>
+          <div className="mt-1 flex flex-wrap items-center gap-1">
+            <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+              inst.mark_price_basis ? 'border-amber-700/60 bg-amber-900/20 text-amber-300'
+                                    : 'border-gray-700 bg-gray-900 text-gray-400'}`}
+                  title={inst.mark_price_basis
+                    ? 'Stops, targets and PnL run on the exchange mark price of the BTC perpetual'
+                    : 'Priced on the traded price (mark price off)'}>
+              {inst.mark_price_basis ? 'MARK' : 'TRADE'}
+            </span>
+            {inst.entry_paused && (
+              <span className="rounded border border-amber-700/60 bg-amber-900/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300"
+                    title="New entries are paused by your trading windows; open positions keep running.">
+                ⏸ ENTRIES PAUSED
+              </span>
+            )}
+            {isScheduleActive(inst.trading_windows) && !inst.entry_paused && (
+              <span className="max-w-[150px] truncate rounded border border-gray-700 bg-gray-900 px-1.5 py-0.5 text-[9px] text-gray-400"
+                    title={describeSchedule(inst.trading_windows).join(' · ')}>
+                ⏱ {describeSchedule(inst.trading_windows).join(' · ')}
+              </span>
+            )}
+            {(inst.blocked_entries || 0) > 0 && (
+              <span className="rounded border border-red-900/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300"
+                    title="New entries skipped by your trading windows">
+                {inst.blocked_entries} skipped
+              </span>
+            )}
+          </div>
         </div>
         <button onClick={(e) => { e.stopPropagation(); onDelete(inst.instance_key, strategyName); }}
                 className="shrink-0 rounded-lg p-1.5 text-gray-500 transition hover:bg-red-900/30 hover:text-red-300"
@@ -400,6 +446,9 @@ const exportSessionCSV = (session) => {
     ['entry_time', 'Entry Time (IST)'], ['exit_time', 'Exit Time (IST)'],
     ['direction', 'Direction'], ['symbol', 'Symbol'],
     ['entry', 'Entry Price'], ['exit', 'Exit Price'],
+    ['entry_trade_price', 'Entry Price (Traded)'], ['exit_trade_price', 'Exit Price (Traded)'],
+    ['entry_mark_price', 'Entry Price (Mark)'], ['exit_mark_price', 'Exit Price (Mark)'],
+    ['mark_price_basis', 'Priced On Mark'],
     ['lots', 'Lots'], ['margin_inr', 'Margin (INR)'], ['notional_usd', 'Notional (USD)'],
     ['sl', 'Stop Loss'], ['sl_final', 'Stop Loss (Final)'], ['tp', 'Take Profit'],
     ['trail_stop', 'Trail Stop'], ['atr_at_entry', 'ATR @ Entry'], ['peak_price', 'Peak Price'],
@@ -568,6 +617,11 @@ const PaperTrade = () => {
   const [confirm, setConfirm] = useState(null); // { type, key, ... }
   const [capital, setCapital] = useState(20000);
   const [marginPct, setMarginPct] = useState(25);
+  // BTC perpetual: risk on the exchange mark price (default on), and the
+  // "skip new trades" schedule applied to new instances.
+  const [useMarkPrice, setUseMarkPrice] = useState(true);
+  const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
+  const [showWindows, setShowWindows] = useState(false);
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   // Saved sessions (survive stop / server restart) shown in Paper Trade History.
@@ -607,8 +661,15 @@ const PaperTrade = () => {
         if (data) {
           if (data.initial_capital) setCapital(data.initial_capital);
           if (data.margin_deployment_pct) setMarginPct(data.margin_deployment_pct);
+          if (data.use_mark_price !== undefined && data.use_mark_price !== null) setUseMarkPrice(!!data.use_mark_price);
         }
       })
+      .catch(() => {});
+    // The account-level schedule is the default for every new instance; an
+    // explicit per-instance edit overrides it (and can be saved back).
+    fetch(`${API_URL}/trading-windows`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => { if (data) setTradingWindows(normalizeSchedule(data)); })
       .catch(() => {});
   }, []);
 
@@ -646,6 +707,8 @@ const PaperTrade = () => {
           margin_pct: parseFloat(marginPct),
           broker_name: dataSource,
           data_source: dataSource,
+          use_mark_price: useMarkPrice,
+          trading_windows: tradingWindows,
         })
       });
       if (res.ok) {
@@ -752,6 +815,18 @@ const PaperTrade = () => {
             <option value="FastTest">Fast Test Strategy</option>
             {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Pricing &amp; windows</label>
+            <button onClick={() => setShowWindows(!showWindows)}
+                    className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition ${
+                      showWindows || isScheduleActive(tradingWindows) || !useMarkPrice
+                        ? 'border-amber-600 bg-amber-900/20 text-amber-300'
+                        : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600'}`}>
+              <CalendarClock size={15} />
+              {isScheduleActive(tradingWindows) ? 'Windows ON' : 'Windows OFF'}
+              <span className="text-[10px] opacity-70">{useMarkPrice ? '· MARK' : '· TRADE'}</span>
+            </button>
+          </div>
           <div className="flex items-center gap-2">
             <div className="flex flex-col">
               <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Capital (₹)</label>
@@ -770,6 +845,53 @@ const PaperTrade = () => {
           </div>
         </div>
       </div>
+
+      {/* Pricing basis + "skip new trades" schedule for new instances */}
+      {showWindows && (
+        <div className="mb-6 grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <div className="rounded-xl border border-gray-700 bg-gray-800 p-4">
+            <div className="mb-2 text-xs font-bold uppercase tracking-wider text-gray-400">
+              BTC perpetual pricing
+            </div>
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900 p-2.5 text-[11px] text-gray-300">
+              <input type="checkbox" checked={useMarkPrice}
+                     onChange={e => setUseMarkPrice(e.target.checked)}
+                     className="mt-0.5 h-3.5 w-3.5 accent-amber-500" />
+              <span>
+                <span className="block font-bold text-white">Use mark price</span>
+                <span className="mt-0.5 block text-gray-500">
+                  Stops, targets, trailing and PnL run on the mark price of the
+                  {' '}{String(dataSource).toLowerCase() === 'delta' ? 'BTCUSD' : 'BTCUSDT'} perpetual.
+                  The traded price is stored on every trade too.
+                </span>
+              </span>
+            </label>
+            <button onClick={async () => {
+                try {
+                  await fetch(`${API_URL}/trading-windows`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+                    body: JSON.stringify({ ...tradingWindows, enabled: tradingWindows.enabled }),
+                  });
+                } catch (e) { /* saving the default is a convenience only */ }
+              }}
+                    className="mt-2 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-1.5 text-[11px] font-semibold text-gray-300 transition hover:border-blue-500 hover:text-white">
+              Save as my account default
+            </button>
+            <p className="mt-1.5 text-[10px] leading-snug text-gray-600">
+              Saved defaults are used by every instance you start until you change them here.
+            </p>
+          </div>
+          <div className="xl:col-span-2">
+            <TradingWindowsEditor
+              value={tradingWindows}
+              onChange={setTradingWindows}
+              title="Skip new trades"
+              subtitle="New instances started from this page use this schedule. Positions already open keep running inside a window."
+            />
+          </div>
+        </div>
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">

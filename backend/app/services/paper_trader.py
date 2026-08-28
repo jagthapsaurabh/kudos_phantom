@@ -3,6 +3,8 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from app.core.strategy import StrategyService, PhantomV2Config, ValidatorService
 from app.core.dynamic_strategy import DynamicStrategyService
+from app.core.mark_price import MarkPriceService, perpetual_symbol
+from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.broker_client import BrokerClient
 from app.database.models import SessionLocal, Klines
@@ -35,7 +37,8 @@ class PaperTradeService:
 
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
                  is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
-                 broker_definition=None, strategy_name=None, user_id=None):
+                 broker_definition=None, strategy_name=None, user_id=None,
+                 trading_windows=None, use_mark_price=None):
         self.strategy_id = str(strategy_id)
         # Custom strategies are identified by a numeric id internally. Keep a
         # human-readable name on the worker so every status/list view can show
@@ -71,7 +74,33 @@ class PaperTradeService:
         if fee_schedule:
             self.config.taker_fee_bps = float(getattr(fee_schedule, "taker_fee_bps", self.config.taker_fee_bps))
             self.config.maker_fee_bps = float(getattr(fee_schedule, "maker_fee_bps", self.config.maker_fee_bps))
-        self.last_price = None
+        # ---- BTC perpetual pricing (mark price) ----------------------
+        # `last_price` is the pricing basis (mark price when mark pricing is
+        # on); `last_trade_price` is the traded price shown next to it.
+        if use_mark_price is not None:
+            try:
+                self.config.use_mark_price = bool(use_mark_price)
+            except Exception:
+                pass
+        self.use_mark_price = bool(getattr(self.config, "use_mark_price", True))
+        self.last_price = None          # pricing basis (mark when available)
+        self.last_trade_price = None    # traded / last price
+        self.last_mark_price = None     # exchange mark price
+        self.mark_price_basis = False
+        # ---- "Skip new trades" schedule -------------------------------
+        if trading_windows is not None:
+            windows = trading_windows if isinstance(trading_windows, TradingWindowConfig) \
+                else TradingWindowConfig(**trading_windows)
+            self.trading_windows = windows
+            try:
+                self.config.trading_windows = windows
+            except Exception:
+                pass
+        else:
+            self.trading_windows = getattr(self.config, "trading_windows", None) or TradingWindowConfig()
+        self.window_guard = TradingWindowGuard(self.trading_windows)
+        self.blocked_entries = 0
+        self._last_block_notice = None   # de-duplicates "entries paused" logs
         self.last_checked = None
         # Live log buffer: list of {"ts": ISO, "level": "info|warn|error|trade", "msg": str}
         self.logs: list = []
@@ -88,6 +117,14 @@ class PaperTradeService:
         self.history_status = "running"
         self._tick_count = 0
         self._log("info", f"Instance initialised — strategy={self.strategy_name}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
+        # The BTC perpetual is the only contract this tool trades; say which
+        # one the venue uses and which price the maths runs on.
+        self._log("info", f"Contract: {perpetual_symbol(self.market_source, self.symbol)} perpetual on {self.market_source}"
+                          f" — pricing basis: {'MARK price' if self.use_mark_price else 'traded price'}")
+        if self.window_guard.enabled:
+            self._log("info", "Skip-new-trade windows ON — " + "; ".join(self.window_guard.describe()))
+        else:
+            self._log("info", "Skip-new-trade windows OFF — new entries allowed at any time")
 
     def _log(self, level: str, msg: str):
         entry = {"ts": _ist_now(), "level": level, "msg": msg}
@@ -110,6 +147,13 @@ class PaperTradeService:
             "direction": int(trade.direction),
             "entry": f(trade.entry_price),
             "exit": f(trade.exit_price),
+            # BTC perpetual: the traded price and the exchange mark price are
+            # both stored; `entry`/`exit` are the pricing basis used for PnL.
+            "entry_trade_price": f(getattr(trade, "entry_trade_price", None)),
+            "exit_trade_price": f(getattr(trade, "exit_trade_price", None)),
+            "entry_mark_price": f(getattr(trade, "entry_mark_price", None)),
+            "exit_mark_price": f(getattr(trade, "exit_mark_price", None)),
+            "mark_price_basis": bool(getattr(trade, "mark_price_basis", False)),
             "pnl": f(pnl_inr),
             "gross_pnl": f(gross_pnl) if gross_pnl is not None else f(pnl_inr),
             "fees": f(fees_inr),
@@ -193,8 +237,19 @@ class PaperTradeService:
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
 
+        # ---- BTC perpetual: traded price vs mark price ---------------
+        # Risk maths runs on the MARK price of the perpetual; the traded price
+        # is what an order would actually fill at and is recorded alongside.
         current_price = float(df_1h['close'].iloc[-1])
-        self.last_price = current_price
+        mark_quote = self._fetch_mark_price()
+        mark_price = getattr(mark_quote, 'mark_price', None)
+        trade_price = getattr(mark_quote, 'last_price', None) or current_price
+        use_mark = bool(self.use_mark_price) and mark_price is not None
+        decision_price = float(mark_price) if use_mark else float(current_price)
+        self.last_price = decision_price          # pricing basis
+        self.last_trade_price = float(trade_price)
+        self.last_mark_price = float(mark_price) if mark_price is not None else None
+        self.mark_price_basis = bool(use_mark)
         self.last_checked = _ist_now()
         current_atr = ind_1h['atr14'][-1]
         current_time = df_1h.index[-1]
@@ -202,7 +257,9 @@ class PaperTradeService:
 
         # ---- Manage open positions ----------------------------------
         for symbol in list(self.oms.active_trades.keys()):
-            result = self.oms.update_trade(symbol, current_price, current_atr, current_time)
+            result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
+                                           trade_price_usd=trade_price,
+                                           mark_price_usd=mark_price)
             if result:
                 trade_event = True
                 price_diff = (result.exit_price - result.entry_price) * result.direction
@@ -214,7 +271,9 @@ class PaperTradeService:
                 pnl_inr = gross_pnl - entry_fee - exit_fee
                 self.equity_inr += pnl_inr
                 self._record_closed(result, pnl_inr, entry_fee + exit_fee, gross_pnl)
-                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — exit {result.exit_price:,.2f} | "
+                exit_price_note = (f"mark {result.exit_mark_price:,.2f} (traded {result.exit_trade_price:,.2f})"
+                                   if getattr(result, 'mark_price_basis', False) else f"{result.exit_price:,.2f}")
+                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — exit {exit_price_note} | "
                                     f"SL {result.sl_entry:,.2f} → {result.sl:,.2f} | TP {result.tp:,.2f} | "
                                     f"Trail {result.trail_stop:,.2f} | ATR {result.atr_at_entry:,.2f} | "
                                     f"Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | "
@@ -224,26 +283,53 @@ class PaperTradeService:
                 print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason} @ {result.exit_price:.2f}, Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
 
         # ---- New entries --------------------------------------------
+        # "Skip new trades" schedule: an existing position keeps running (its
+        # stop/trail is managed above), only a NEW entry is refused.
+        blocked_window = self.window_guard.blocking_window(current_time)
+        if blocked_window:
+            self.blocked_entries += 1
+            # Log once per block, not on every tick: keep the reason and when
+            # entries open again.
+            if not self._last_block_notice or self._last_block_notice != str(blocked_window.describe()):
+                when = self.window_guard.next_open_from(current_time)
+                self._log("warn", f"⏸ New trade skipped — {blocked_window.describe()}"
+                                  + (f" · entries resume {when:%a %d %b %H:%M}" if when else ""))
+                self._last_block_notice = str(blocked_window.describe())
+        elif self._last_block_notice:
+            self._last_block_notice = None
+
         if last_sig != 0:
             ind_slice = df_1h_with_ind.iloc[-50:]
+            # Drift is measured on the traded price (the fill), not the mark.
             validation = self.validator.validate_signal(last_sig, current_price, current_price, ind_slice)
-            if validation.passed:
+            if blocked_window:
+                self._log("warn", f"Signal {last_sig} not taken — inside a skip-new-trade window "
+                                  f"({blocked_window.describe()})")
+                print(f"⏸ [{self.strategy_id}] Entry skipped by trading window: {blocked_window.describe()}")
+            elif validation.passed:
                 margin_inr = self.equity_inr * (self.margin_pct / 100.0)
-                new_trade = self.oms.create_order("BTCUSDT", last_sig, current_price, current_atr, current_time, margin_inr, self.conversion_rate)
+                new_trade = self.oms.create_order(
+                    "BTCUSDT", last_sig, decision_price, current_atr, current_time, margin_inr,
+                    self.conversion_rate, trade_price_usd=trade_price, mark_price_usd=mark_price,
+                    mark_price_basis=use_mark)
                 if new_trade is None:
                     self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
                 else:
                     trade_event = True
                     side = "LONG" if last_sig == 1 else "SHORT"
-                    self._log("trade", f"🚀 Opened {side} BTCUSDT @ {current_price:,.2f} | SL {new_trade.sl:,.2f} | "
+                    price_note = (f"mark {mark_price:,.2f} (traded {trade_price:,.2f})" if use_mark
+                                  else f"{current_price:,.2f}")
+                    self._log("trade", f"🚀 Opened {side} BTCUSDT @ {price_note} | SL {new_trade.sl:,.2f} | "
                                         f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
                                         f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
-                    print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {current_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
+                    print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {decision_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
             else:
                 self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
                 print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
         else:
-            self._log("info", f"Scanning… BTCUSDT {current_price:,.2f} — no signal")
+            price_note = (f"mark {mark_price:,.2f} / last {trade_price:,.2f}" if use_mark
+                          else f"{current_price:,.2f}")
+            self._log("info", f"Scanning… BTCUSDT {price_note} — no signal")
             print(f"🔍 [{self.strategy_id}] Scanning... Current Price: {current_price:.2f}, No signal.")
 
         # ---- History --------------------------------------------------
@@ -252,6 +338,19 @@ class PaperTradeService:
         self._record_equity_point()
         self._tick_count += 1
         self._persist_history(force=trade_event)
+
+    def _fetch_mark_price(self):
+        """Current mark + last price of the BTC perpetual on this source.
+
+        Returns ``None`` when the venue does not answer; the caller then falls
+        back to the traded candle price (and says so in the status payload).
+        """
+        try:
+            return MarkPriceService.current(self.market_source, self.symbol,
+                                            definition=self.broker_definition)
+        except Exception as exc:
+            print(f"[{self.strategy_id}] mark price fetch failed: {exc}")
+            return None
 
     def _fetch_candles(self, interval, limit):
         """Use candles seeded for this source, then the source public API."""

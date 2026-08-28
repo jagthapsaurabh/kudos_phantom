@@ -1,6 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet } from 'lucide-react';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare } from 'lucide-react';
 import { API_URL } from '../api';
+import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import {
+  emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
+} from '../utils/tradingWindows';
+
+// The tool trades the BTC *perpetual* on every venue: Binance lists it as
+// BTCUSDT, Delta as BTCUSD.
+const perpetualFor = (source) => (String(source || '').toLowerCase() === 'delta' ? 'BTCUSD' : 'BTCUSDT');
 
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -55,6 +63,10 @@ const LiveTrade = () => {
   const [capital, setCapital] = useState(20000);
   const [marginPct, setMarginPct] = useState(25);
   const [confirm, setConfirm] = useState(null); // { instanceKey }
+  // BTC perpetual pricing + "skip new trades" schedule for new instances.
+  const [useMarkPrice, setUseMarkPrice] = useState(true);
+  const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
+  const [showWindows, setShowWindows] = useState(false);
 
   useEffect(() => {
     fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(list => {
@@ -62,8 +74,23 @@ const LiveTrade = () => {
     }).catch(() => {});
     fetch(`${API_URL}/broker-connections`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(setConnections).catch(() => {});
     fetch(`${API_URL}/broker-settings`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : null).then(data => {
-      if (data) { setDataSource(data.broker_name || 'Binance'); setCapital(data.initial_capital || 20000); setMarginPct(data.margin_deployment_pct || 25); }
+      if (data) {
+        setDataSource(data.broker_name || 'Binance');
+        setCapital(data.initial_capital || 20000);
+        setMarginPct(data.margin_deployment_pct || 25);
+        if (data.use_mark_price !== undefined && data.use_mark_price !== null) setUseMarkPrice(!!data.use_mark_price);
+        if (data.trading_windows) setTradingWindows(normalizeSchedule(data.trading_windows));
+      }
     }).catch(() => {});
+    // Account-level defaults for the mark-price switch and the schedule.
+    fetch(`${API_URL}/trading-windows`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (!data) return;
+        setTradingWindows(normalizeSchedule(data));
+        if (data.use_mark_price !== undefined && data.use_mark_price !== null) setUseMarkPrice(!!data.use_mark_price);
+      })
+      .catch(() => {});
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
@@ -76,7 +103,8 @@ const LiveTrade = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
-          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct) })
+          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct),
+          use_mark_price: useMarkPrice, trading_windows: tradingWindows })
       });
       if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
     } catch (e) { console.error(e); alert(e.message); }
@@ -165,12 +193,74 @@ const LiveTrade = () => {
               {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
           </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Pricing &amp; windows</label>
+            <button onClick={() => setShowWindows(!showWindows)}
+                    className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm outline-none transition ${
+                      showWindows || isScheduleActive(tradingWindows) || !useMarkPrice
+                        ? 'border-amber-600 bg-amber-900/20 text-amber-300'
+                        : 'border-gray-700 bg-gray-800 text-gray-300 hover:border-gray-600'}`}>
+              <CalendarClock size={15} />
+              {isScheduleActive(tradingWindows) ? 'Windows ON' : 'Windows OFF'}
+              <span className="text-[10px] opacity-70">{useMarkPrice ? '· MARK' : '· TRADE'}</span>
+            </button>
+          </div>
+          <a href="/terminal"
+             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
+            <TerminalSquare size={16} /> Terminal
+          </a>
           <button onClick={startTrade} disabled={loading}
                   className="px-6 py-2 rounded-lg font-bold transition bg-green-600 hover:bg-green-500 flex items-center gap-2">
             <Play size={18} /> Start Instance
           </button>
         </div>
       </div>
+
+      {/* Pricing basis + "skip new trades" schedule for new instances */}
+      {showWindows && (
+        <div className="mb-8 grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <div className="rounded-xl border border-gray-700 bg-gray-800 p-4">
+            <div className="mb-2 text-xs font-bold uppercase tracking-wider text-gray-400">
+              BTC perpetual pricing
+            </div>
+            <div className="mb-2 rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-1.5 font-mono text-xs text-white">
+              {perpetualFor(dataSource)} <span className="text-[10px] text-gray-500">perpetual</span>
+            </div>
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900 p-2.5 text-[11px] text-gray-300">
+              <input type="checkbox" checked={useMarkPrice}
+                     onChange={e => setUseMarkPrice(e.target.checked)}
+                     className="mt-0.5 h-3.5 w-3.5 accent-amber-500" />
+              <span>
+                <span className="block font-bold text-white">Use mark price</span>
+                <span className="mt-0.5 block text-gray-500">
+                  Stops, targets, trailing and PnL run on the exchange mark price.
+                  The traded fill price is stored on every trade too.
+                </span>
+              </span>
+            </label>
+            <button onClick={async () => {
+                try {
+                  await fetch(`${API_URL}/trading-windows`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+                    body: JSON.stringify(tradingWindows),
+                  });
+                } catch (e) { /* saving the default is a convenience only */ }
+              }}
+                    className="mt-2 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-1.5 text-[11px] font-semibold text-gray-300 transition hover:border-blue-500 hover:text-white">
+              Save as my account default
+            </button>
+          </div>
+          <div className="xl:col-span-2">
+            <TradingWindowsEditor
+              value={tradingWindows}
+              onChange={setTradingWindows}
+              title="Skip new trades"
+              subtitle="New live instances started from this page use this schedule. Positions already open keep their stop, target and trail inside a window."
+            />
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         <div className="lg:col-span-1 space-y-6">
@@ -196,9 +286,35 @@ const LiveTrade = () => {
             <div className="space-y-3">
               {myInstances.map(inst => (
                 <div key={inst.instance_key} className="flex items-center justify-between p-3 bg-gray-900 rounded-lg border border-gray-700">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                    <span className="text-xs font-mono">{inst.broker_name || 'Binance'} · {inst.instance_key.split('_').pop()}</span>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+                      <span className="text-xs font-mono">{inst.broker_name || 'Binance'} · {inst.instance_key.split('_').pop()}</span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1">
+                      <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+                        inst.mark_price_basis ? 'border-amber-700/60 bg-amber-900/20 text-amber-300'
+                                              : 'border-gray-700 bg-gray-900 text-gray-400'}`}
+                            title={inst.mark_price_basis ? 'Priced on the exchange mark price' : 'Priced on the traded price'}>
+                        {inst.mark_price_basis ? 'MARK' : 'TRADE'}
+                      </span>
+                      {inst.entry_paused && (
+                        <span className="flex items-center gap-1 rounded border border-amber-700/60 bg-amber-900/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300">
+                          <PauseCircle size={9} /> ENTRIES PAUSED
+                        </span>
+                      )}
+                      {isScheduleActive(inst.trading_windows) && !inst.entry_paused && (
+                        <span className="max-w-[150px] truncate rounded border border-gray-700 bg-gray-900 px-1.5 py-0.5 text-[9px] text-gray-400"
+                              title={describeSchedule(inst.trading_windows).join(' · ')}>
+                          ⏱ {describeSchedule(inst.trading_windows).join(' · ')}
+                        </span>
+                      )}
+                      {(inst.blocked_entries || 0) > 0 && (
+                        <span className="rounded border border-red-900/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300">
+                          {inst.blocked_entries} skipped
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">
                     <StopCircle size={16} />

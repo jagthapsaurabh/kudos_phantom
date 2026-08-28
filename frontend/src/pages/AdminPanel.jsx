@@ -547,6 +547,9 @@ const SeedDataTab = () => {
 
   const [defs, setDefs] = useState([]);
   const [fetchAll, setFetchAll] = useState(false);
+  // Seed the mark-price series of the BTC perpetual alongside the traded
+  // OHLCV — risk (stops/targets/PnL) is priced on the mark price.
+  const [includeMarkPrice, setIncludeMarkPrice] = useState(true);
   const [source, setSource] = useState('Binance');
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [intervals, setIntervals] = useState(ALL_INTERVALS);
@@ -647,6 +650,7 @@ const SeedDataTab = () => {
           end_date: isDeltaSource ? (end || today()) : (end || null),
           limit: Number(limit),
           fetch_all: isDeltaSource || fetchAll,
+          include_mark_price: includeMarkPrice,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -776,6 +780,7 @@ const SeedDataTab = () => {
             ))}
             {isDeltaSource && <span className="text-[10px] font-semibold text-orange-400">1m / 5m excluded by Delta history plan</span>}
             {!isDeltaSource && <label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={fetchAll} onChange={event => setFetchAll(event.target.checked)} className="accent-blue-500" /> Fetch all date windows</label>}
+            <label className="flex items-center gap-2 text-xs text-gray-400" title="Fetch the mark-price series of the BTC perpetual too (Binance /fapi/v1/markPriceKlines, Delta MARK:BTCUSD)"><input type="checkbox" checked={includeMarkPrice} onChange={event => setIncludeMarkPrice(event.target.checked)} className="accent-amber-500" /> Include mark price</label>
           </div>
           <div>
             <label className="mb-1 block text-[10px] font-bold uppercase text-gray-500">Candles per API request</label>

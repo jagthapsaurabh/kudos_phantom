@@ -24,6 +24,8 @@ All protected endpoints require a Bearer Token in the header:
 | `GET` | `/broker-settings` | None | Get capital defaults and masked legacy settings |
 | `POST` | `/broker-settings` | `api_key`, `api_secret`, `initial_capital`, `margin_pct`, `broker_name` | Update legacy/primary broker keys and capital |
 | `GET` | `/fee-settings` | `broker_code`, `mode` | Read the admin schedule used by a new run |
+| `GET` | `/admin/brokers` | None | Every broker definition **including its rate-limit and trading defaults** |
+| `PUT` | `/admin/brokers/{id}` | `code`, `name`, `kind`, `market_data_url`, `trading_api_url`, `enabled`, `notes`, `rate_limit_per_second`, `rate_limit_per_minute`, `quota_per_5min`, `orders_per_minute`, `default_leverage`, `margin_mode`, `contract_value`, `tick_size` | Edit a broker (admin). Admin-only; blanks fall back to the venue default |
 
 Fees are managed by admins in basis points using `POST /admin/fee-settings` with `broker_code`, `mode` (`backtest`, `paper`, or `live`), `taker_fee_bps`, and `maker_fee_bps`. Schedules are snapshotted on backtest runs; `.env` is only the first-install fallback.
 
@@ -32,15 +34,19 @@ Fees are managed by admins in basis points using `POST /admin/fee-settings` with
 | :--- | :--- | :--- | :--- |
 | `GET` | `/klines` | `symbol`, `interval`, `limit`, `source` | Fetch source-specific OHLCV candle data (including volume) for charts |
 | `GET` | `/symbols` | `source` | List symbols available in the selected local market-data source |
+| `GET` | `/market/contract` | `source` | The BTC **perpetual** contract traded on that venue (`BTCUSDT` on Binance, `BTCUSD` on Delta) |
+| `GET` | `/market/mark-price` | `source`, `symbol` | Live mark price, traded (last) price and index price of the perpetual |
+| `GET` | `/trading-windows` | None | The account's default "skip new trades" schedule + whether entries are paused now |
+| `PUT` | `/trading-windows` | `enabled`, `timezone`, `block_exits`, `windows[]` (or `quick_days[]`) | Save the account default used when a start request omits a schedule |
 | `GET` | `/phantom/signals` | `symbol`, `source`, `start_date`, `end_date`, `strategy_id` | Signal candles for the chart overlay. `strategy_id` may be `PhantomV2` (default, tuned champion), `FastTest`, or a custom strategy id created in the Strategies manager. |
 
 ### 4. Paper Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. Returns the `instance_key` and the `session_id` of its saved history row. |
+| `POST` | `/paper-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital` (optional), `margin_pct` (optional), `use_mark_price` (optional), `trading_windows` (optional) | Starts a source-specific simulation instance using the admin's paper fee schedule. Multiple exchange instances can run concurrently. Returns the `instance_key`, the `session_id` of its saved history row, and the resolved `contract` / `trading_windows` summary. |
 | `POST` | `/paper-trade/stop` | `instance_key` | Stops a specific simulation instance. The result is **saved** to History (`saved_to_history`, `session_id` in the response). |
 | `DELETE` | `/paper-trade/{instance_key}` | None | Stops a session and permanently removes it, including its saved history row (`history_removed`) |
-| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name, `session_id` and the live equity curve |
+| `GET` | `/paper-trade/status` | None | List all running instances, open positions & closed-trade history, including the saved strategy name, `session_id`, the live equity curve, the BTC-perpetual mark/traded prices (`last_mark_price`, `last_trade_price`, `mark_price_basis`), the instance's `trading_windows` schedule, whether `entry_paused` is true right now and how many entries it has `blocked_entries` |
 | `GET` | `/paper-trade/logs` | `instance_key` | Live log buffer for an instance |
 | `GET` | `/paper-trade/history` | None | **Every** paper session the user has run (newest first) with status, equity, ROI, win rate, profit factor, max drawdown and trade count. Survives stop and server restart. |
 | `GET` | `/paper-trade/history/{session_id}` | None | Full saved result of one session: closed trades, equity curve, saved logs, positions still open at stop and the parameter snapshot |
@@ -55,19 +61,134 @@ a saved result.
 ### 5. Live Trading
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/live-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital`, `margin_pct` | Starts a real-money execution instance on the selected broker using the live fee schedule |
+| `POST` | `/live-trade/start` | `strategy_id`, `broker_name`/`data_source`, `connection_id`, `initial_capital`, `margin_pct`, `use_mark_price` (optional), `trading_windows` (optional) | Starts a real-money execution instance on the selected broker using the live fee schedule. Orders go to the venue's BTC perpetual and risk is managed on the mark price when `use_mark_price` is true. |
 | `POST` | `/live-trade/stop` | `instance_key` | Stops a live execution instance |
-| `GET` | `/live-trade/status` | None | List all live instances and positions |
+| `GET` | `/live-trade/status` | None | List all live instances and positions, plus the perpetual `contract`, mark/traded prices, the `trading_windows` schedule in force, `entry_paused` and `blocked_entries` |
+
+Every order a live instance sends is mirrored into `broker_orders` (with its `leg`, `client_order_id`
+and `instance_key`) and every execution into `broker_fills`, so the terminal keeps an audit trail
+after the exchange drops the order from its own history window.
+
+### 5b. Live Account — orders, positions, fills, margin (the terminal)
+
+| Method | Endpoint | Request Body | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/live-account/snapshot` | `broker`, `connection_id`, `symbol`, `include_history`, `history_limit` | Everything the terminal renders in one call: `contract`, `mark_price`, `balance`, `risk`, `positions`, `open_orders`, `stop_orders`, `fills`, `order_history`, `errors`, `rate_limits` |
+| `POST` | `/live-account/orders` | `broker`, `connection_id`, `symbol`, `side`, `order_type`, `size`, `size_in_btc`, `price`, `stop_price`, `trail_amount`, `reduce_only`, `post_only`, `time_in_force`, `working_type`, `client_order_id`, `stop_loss`, `take_profit`, `stop_trigger`, `source`, `instance_key` | Place an order. With `stop_loss` / `take_profit` it becomes a **bracket** (native on Delta, emulated with reduce-only legs on Binance). Sizes may be given in BTC (`size_in_btc: true`) and are converted into the venue's own units |
+| `POST` | `/live-account/orders/cancel` | `broker`, `connection_id`, `order_id` or `client_order_id`, `symbol` | Cancel one order and mark the local row cancelled |
+| `POST` | `/live-account/orders/cancel-all` | `broker`, `connection_id`, `symbol` | Cancel every open order on the contract |
+| `POST` | `/live-account/positions/close` | `broker`, `connection_id`, `symbol`, `size`, `size_in_btc` | Flatten (or partially reduce) the position with a reduce-only market order |
+| `POST` | `/live-account/leverage` | `broker`, `connection_id`, `symbol`, `leverage` | Set contract leverage |
+| `POST` | `/live-account/margin-mode` | `broker`, `connection_id`, `symbol`, `mode` (`isolated`\|`cross`) | Set the margin mode |
+| `POST` | `/live-account/position-margin` | `broker`, `connection_id`, `symbol`, `amount` | Add (positive) or remove (negative) isolated margin |
+| `GET` | `/live-account/rate-limits` | `broker` (query), `connection_id` | Local throttling windows **and** the venue's own remaining quota (Delta) |
+| `GET` | `/live-account/orders` | `broker`, `limit` | Orders sent through PHANTOM, from the local audit table |
+| `GET` | `/live-account/fills` | `broker`, `limit` | Executions recorded locally (kept after the exchange history window) |
+
+All of them require API keys; a missing credential returns `400 API keys not configured for <broker>`.
+Broker failures come back as `{"error": "..."}` (never a 500) so a trading loop survives a rejected
+order, and `{"error": ..., "rate_limited": true}` marks a 429 that exhausted its retries.
+
+Example — place a bracket order for 0.05 BTC with a stop and a target:
+
+```json
+POST /live-account/orders
+{
+  "broker": "Delta",
+  "side": "buy",
+  "order_type": "market",
+  "size": 0.05,
+  "size_in_btc": true,
+  "stop_loss": 65000,
+  "take_profit": 70000,
+  "stop_trigger": "mark_price"
+}
+```
+
+```json
+{
+  "status": "placed",
+  "broker": "Delta",
+  "symbol": "BTCUSD",
+  "contract_value": 0.001,
+  "client_order_id": "ph-9f2c…",
+  "orders": [
+    { "leg": "entry",        "type": "market",              "qty_btc": 0.05 },
+    { "leg": "stop_loss",    "type": "stop_market",         "qty_btc": 0.05, "stop_price": 65000 },
+    { "leg": "take_profit",  "type": "take_profit_market",  "qty_btc": 0.05, "stop_price": 70000 }
+  ],
+  "rate_limits": { "requests_last_second": 3, "orders_last_minute": 3, "limits": { "requests_per_second": 20 } }
+}
+```
+
+### 5c. Broker rate limits
+
+The venue research behind the table below (published limits, weights and the reasoning for the
+conservative defaults) is written up in `docs/order_management_research.md`.
+
+
+Every broker call — market data, orders, the terminal poller — goes through one shared
+`RateLimiter` per broker connection (`app/core/rate_limit.py`), so several workers can never
+outrun the venue together.
+
+| Venue | Documented limit | What the client enforces |
+| :--- | :--- | :--- |
+| **Delta Exchange** | 10 000 weight per **fixed** 5-minute window; 500 matching-engine ops/second/product; 429 carries `X-RATE-LIMIT-RESET` (ms) | 20 req/s and 1 200 req/min plus the weight budget; `GET /v2/rate_limits/quota` is polled and the remaining quota paces further calls |
+| **Binance Futures** | 2 400 request-weight/minute and 1 200 **orders**/minute per IP; every response carries `X-MBX-USED-WEIGHT-1M` | 20 req/s, 1 200 req/min, order slots counted separately; usage headers tracked and calls slowed at 85 % of the budget |
+
+A 429 is retried up to 4 times honouring `Retry-After` (seconds) / `X-RATE-LIMIT-RESET`
+(milliseconds) before falling back to exponential back-off (0.35 s base, 30 s cap); if it still
+fails the call returns a `rate_limited` error object instead of raising. The safe default of
+**20 requests/second** is deliberately well inside both venues' budgets and can be dialled per
+broker from **Broker → Exchange Registry → Limits**.
 
 ### 6. Backtesting
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode` | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
+| `POST` | `/backtest` | `params`, `strategy_id`, `start_date`, `end_date`, `strategy_name`, `initial_capital` (optional), `data_source`, `fee_mode`, `use_mark_price` (optional), `trading_windows` (optional) | Triggers a source-specific background backtest using the admin fee schedule. Defaults to the user's (admin-set) initial capital. |
 | `POST` | `/backtest/filter-preview` | `params`, `start_date`, `end_date`, `symbol`, `data_source`, `fee_mode` | Synchronous per-bucket peek at the current conditions (`LONG/SHORT x REVERSAL/MOMENTUM`) with win rate, profit factor and avg/net PnL — handy while tuning the direction-specific thresholds before a full run. |
 | `GET` | `/backtest/history` | None | Lists all previous backtest runs (incl. `strategy_id` and `initial_capital`) |
-| `GET` | `/backtest/results/{id}` | None | Get detailed trades, equity curve and the exact saved `params` snapshot for a run (incl. `strategy_id` and `initial_capital`) |
+| `GET` | `/backtest/results/{id}` | None | Get detailed trades, equity curve and the exact saved `params` snapshot for a run (incl. `strategy_id`, `initial_capital`, `use_mark_price`, `trading_windows_enabled`, `blocked_entries` and `contract`) |
 | `DELETE` | `/backtest/{id}` | None | Delete a single backtest run and its trades |
 | `DELETE` | `/backtest/clear` | None | Delete all of the user's backtest runs |
+
+**BTC perpetual, mark price and "skip new trades" windows.** Every run — backtest, paper and live —
+is executed on the venue's BTC **perpetual** (`BTCUSDT` on Binance, `BTCUSD` on Delta; dated futures
+are never substituted) and priced on the exchange **mark price** by default:
+
+* `params.use_mark_price` (default `true`) — stops, targets, trailing, breakeven and PnL are computed
+  on the mark price. The traded price is recorded on every trade next to it, so both are always
+  stored: `entry_price`/`exit_price` hold the pricing basis, `entry_trade_price`/`exit_trade_price`
+  the traded fill, and `entry_mark_price`/`exit_mark_price` the mark price at that instant
+  (`mark_price_basis` = 1 when the maths ran on mark).
+* `params.trading_windows` (or the top-level `trading_windows` field) — a schedule of periods in
+  which **new** entries are refused:
+
+```json
+{
+  "enabled": true,
+  "timezone": "Asia/Kolkata",
+  "block_exits": false,
+  "windows": [
+    { "label": "Weekend gap", "start_day": "sat", "start_time": "18:30",
+      "end_day": "mon", "end_time": "01:00", "all_day": false, "enabled": true },
+    { "label": "Skip Tuesday", "start_day": 1, "end_day": 1, "all_day": true, "enabled": true }
+  ]
+}
+```
+
+  Days are `0=Mon … 6=Sun` (names are accepted too). An `all_day` window covers every minute from
+  the start day through the end day. A timed window whose end precedes its start wraps past Sunday,
+  which is how "Saturday 18:30 → Monday 01:00" is expressed. Any number of windows can be combined.
+  `block_exits` is off by default: **positions that are already open keep their stop, target,
+  breakeven and trailing rules** — only new entries are skipped. Refused entries are counted in
+  `diagnostics.blocked_entries` and reported as the rejection reason `TRADING_WINDOW`.
+* The account default lives in `GET`/`PUT /trading-windows` and on `/broker-settings`
+  (`use_mark_price`, `trading_windows`); a start request may override it per run/instance.
+* Historical mark prices are seeded onto the existing candles (`klines.mark_open/high/low/close`)
+  by passing `include_mark_price: true` to `POST /admin/market-data/seed`, and are refreshed by the
+  daily sync. Where no mark series exists the engine falls back to the traded price and reports
+  `mark_price_basis: false` (and `mark_price_coverage` as a percentage) instead of failing.
 
 **Direction-specific conditions (`params.entry_conditions`).** Every `params` object may optionally
 carry an `entry_conditions` block. The new Backtest controls are independent:
