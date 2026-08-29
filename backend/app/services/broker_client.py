@@ -148,6 +148,12 @@ class BrokerClient:
             return default
 
     @staticmethod
+    def _i(value, default=None):
+        """Int coercion for venue fields like leverage ("10" / 10 / 10.0)."""
+        number = BrokerClient._f(value)
+        return default if number is None else int(number)
+
+    @staticmethod
     def _delta_limit_price(price):
         """String form of a limit price, or None when it must not be sent.
 
@@ -1001,11 +1007,118 @@ class BrokerClient:
                         "margin_type": payload[0].get("marginType")}
             return payload
         if self.kind == "delta":
-            response, error = self._delta_request("GET", "/v2/orders/leverage",
-                                                  query={"product_symbol": perp}, weight=5)
+            # docs.delta.exchange: GET /v2/products/{product_id}/orders/leverage
+            # (the product id comes from the instrument lookup, already cached).
+            instrument = self.get_instrument(symbol) or {}
+            product_id = (instrument or {}).get("product_id")
+            if not product_id:
+                return {"error": "product_id unknown — leverage lookup needs the instrument"}
+            response, error = self._delta_request(
+                "GET", f"/v2/products/{int(product_id)}/orders/leverage", weight=5)
             payload = self._json_body(response, error)
-            return self._delta_result(payload)
+            result = self._delta_result(payload)
+            if isinstance(result, dict) and not result.get("error"):
+                return {"leverage": self._f(result.get("leverage")),
+                        "product_id": result.get("product_id")}
+            return result
         return {"error": f"No leverage adapter installed for '{self.broker_name}'"}
+
+    @staticmethod
+    def _margin_family(mode) -> Optional[str]:
+        """Collapse venue margin-mode spellings to isolated | cross.
+
+        Delta reports 'isolated', 'cross' or 'portfolio' (portfolio margin is
+        the cross-margin family); Binance reports 'cross'/'isolated'.
+        """
+        mode = str(mode or "").strip().lower()
+        if mode == "isolated":
+            return "isolated"
+        if mode in ("cross", "portfolio"):
+            return "cross"
+        return None
+
+    def get_account_settings(self, symbol: str = "BTCUSDT") -> Dict[str, Any]:
+        """Margin mode + leverage as the *venue* holds them for this API key.
+
+        The terminal and new live instances should start from these values
+        instead of assuming a local default — a sub-account in cross margin
+        must never be shown as isolated. Sources (docs.delta.exchange):
+
+        * Delta India keeps the margin mode on the (sub)account itself.
+          ``GET /v2/sub_accounts`` lists every account under this key's
+          parent with its own ``margin_mode`` — a parent key resolves to the
+          main entry, and the list is returned so the UI can show each
+          sub-account's mode. A sub-account key cannot list them (parent
+          only, per the docs), so we fall back to the open position's
+          ``margin_type`` and report None when there is nothing to read.
+          Leverage is per product: ``GET /v2/products/{id}/orders/leverage``.
+        * Binance keeps both per symbol: ``GET /fapi/v1/positionRisk`` answers
+          even with no open position (marginType + leverage).
+
+        Failures never raise: they land in ``error`` so a bad key degrades
+        one panel instead of breaking the snapshot.
+        """
+        out: Dict[str, Any] = {"margin_mode": None, "margin_family": None,
+                               "leverage": None, "user_id": None,
+                               "accounts": [], "error": None}
+        if self.kind == "binance":
+            payload = self.get_leverage(symbol)
+            if isinstance(payload, dict) and not payload.get("error"):
+                mode = str(payload.get("margin_type") or "").lower() or None
+                out["margin_mode"] = mode
+                out["margin_family"] = self._margin_family(mode)
+                out["leverage"] = self._i(payload.get("leverage"))
+            else:
+                out["error"] = str(payload.get("error") if isinstance(payload, dict) else payload)
+            return out
+        if self.kind == "delta":
+            errors = []
+            response, error = self._delta_request("GET", "/v2/sub_accounts", weight=5)
+            payload = self._json_body(response, error)
+            result = self._delta_result(payload)
+            accounts = []
+            if isinstance(result, list):
+                for row in result:
+                    if not isinstance(row, dict):
+                        continue
+                    accounts.append({
+                        "id": str(row.get("id") or ""),
+                        "account_name": row.get("account_name"),
+                        "email": row.get("email"),
+                        "margin_mode": (str(row.get("margin_mode") or "").lower() or None),
+                        "is_sub_account": bool(row.get("is_sub_account")),
+                    })
+                out["accounts"] = accounts
+            else:
+                errors.append(str(result.get("error") if isinstance(result, dict) else result))
+            # The key that can list sub-accounts is the parent key; the entry
+            # that is *not* a sub-account is the one this key trades as.
+            ours = next((a for a in accounts if not a["is_sub_account"]), None) \
+                or (accounts[0] if accounts else None)
+            if ours is not None:
+                out["margin_mode"] = ours["margin_mode"]
+                out["margin_family"] = self._margin_family(ours["margin_mode"])
+                out["user_id"] = ours["id"] or None
+            else:
+                # Sub-account keys cannot list the parent's accounts. An open
+                # position still carries its margin type on Delta.
+                try:
+                    positions = self.get_positions(symbol)
+                except Exception as exc:
+                    positions = {"error": f"{exc.__class__.__name__}: {exc}"}
+                if isinstance(positions, list) and positions:
+                    mode = str((positions[0] or {}).get("margin_type") or "").lower() or None
+                    out["margin_mode"] = mode
+                    out["margin_family"] = self._margin_family(mode)
+            lev = self.get_leverage(symbol)
+            if isinstance(lev, dict) and not lev.get("error"):
+                out["leverage"] = self._i(lev.get("leverage"))
+            elif isinstance(lev, dict):
+                errors.append(str(lev.get("error")))
+            if errors:
+                out["error"] = "; ".join(errors)[:300]
+            return out
+        return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
 
     def set_margin_mode(self, symbol: str, mode: str = "isolated"):
         perp = self.perpetual_symbol(symbol)
@@ -1015,10 +1128,28 @@ class BrokerClient:
                                                     weight=1, is_order=True)
             return self._json_body(response, error)
         if self.kind == "delta":
-            body = {"product_symbol": perp, "margin_mode": str(mode).lower()}
-            response, error = self._delta_request("POST", "/v2/positions/margin_mode", body=body,
-                                                  weight=10, is_order=True)
-            return self._delta_result(self._json_body(response, error))
+            # Margin mode on Delta India is an ACCOUNT-level setting
+            # (docs: PUT /v2/users/margin_mode, body {"margin_mode":
+            # "isolated"|"portfolio"|"cross"}). The legacy per-position
+            # POST /v2/positions/margin_mode is no longer in the docs — kept
+            # as a fallback in case a deployment still routes it.
+            body = {"margin_mode": str(mode).lower()}
+            response, error = self._delta_request("PUT", "/v2/users/margin_mode",
+                                                  body=body, weight=5, is_order=True)
+            payload = self._json_body(response, error)
+            result = self._delta_result(payload)
+            if not (isinstance(payload, dict) and payload.get("error")) \
+                    and not (isinstance(result, dict) and result.get("error")):
+                return result if isinstance(result, dict) and result else {"ok": True}
+            legacy = {"product_symbol": perp, "margin_mode": str(mode).lower()}
+            response2, error2 = self._delta_request("POST", "/v2/positions/margin_mode",
+                                                    body=legacy, weight=5, is_order=True)
+            payload2 = self._json_body(response2, error2)
+            result2 = self._delta_result(payload2)
+            if not (isinstance(payload2, dict) and payload2.get("error")) \
+                    and not (isinstance(result2, dict) and result2.get("error")):
+                return result2 if isinstance(result2, dict) and result2 else {"ok": True}
+            return result if isinstance(result, dict) else {"error": str(result)}
         return {"error": f"No margin-mode adapter installed for '{self.broker_name}'"}
 
     # ==================================================================

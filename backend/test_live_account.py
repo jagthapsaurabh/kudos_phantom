@@ -177,10 +177,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"symbol": "BTCUSDT", "leverage": int(query.get("leverage", [0])[0] or 0)})
         if path == "/fapi/v1/marginType":
             return self._send({"code": 200, "msg": "success"})
+        if path == "/fapi/v1/positionRisk":
+            # get_leverage / get_account_settings source (answers when flat too)
+            return self._send([{"symbol": "BTCUSDT", "marginType": "cross",
+                                "leverage": "5", "positionAmt": "0"}])
         if path == "/fapi/v1/positionMargin":
             return self._send({"amount": query.get("amount"), "code": 200, "msg": "Success"})
 
         # -------------------------------------------------- Delta ----------
+        # Specific product routes must run before the generic /v2/products/
+        # instrument lookup below.
+        if path == "/v2/products/139/orders/leverage" and method == "GET":
+            return self._send(self._delta({"leverage": 7, "product_id": 139,
+                                           "order_margin": "142.8"}))
+        if path == "/v2/sub_accounts":
+            if STATE.get("fail_sub_accounts"):
+                return self._send({"success": False,
+                                   "error": {"code": "invalid_api_key"}}, 401)
+            # A parent key sees the main account (cross — the reported setup)
+            # plus one isolated sub-account.
+            return self._send(self._delta([
+                {"id": "5112346", "email": "main@example.com", "account_name": "Main",
+                 "margin_mode": "cross", "is_sub_account": False, "is_kyc_done": True},
+                {"id": "5112347", "email": "sub@example.com", "account_name": "Scalper",
+                 "margin_mode": "isolated", "is_sub_account": True, "is_kyc_done": True},
+            ]))
+        if path == "/v2/users/margin_mode" and method == "PUT":
+            return self._send(self._delta({"id": "5112346",
+                                           "margin_mode": (body or {}).get("margin_mode")}))
         if path.startswith("/v2/products/"):
             return self._send(self._delta({
                 "id": 139, "symbol": "BTCUSD", "contract_value": 0.001,
@@ -242,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._delta([{
                 "product_symbol": "BTCUSD", "size": 30, "entry_price": "67000.5",
                 "mark_price": "67100.5", "margin": "20.10", "leverage": 10,
+                "margin_type": "cross",
                 "unrealized_pnl": "3.00", "realized_pnl": "-0.50",
                 "liquidation_price": "54000", "bankruptcy_price": "53000"}]))
         if path == "/v2/positions/close_all" and method == "POST":
@@ -789,6 +814,101 @@ broken = broker_account.account_snapshot(_BrokenClient(), "BTCUSDT")
 check("a dead endpoint degrades one panel, not the whole screen",
       broken["positions"] == [] and "positions" in broken["errors"]
       and broken["mark_price"] is None, str(broken["errors"]))
+check("generic endpoint failures are NOT reported as an API-key problem",
+      broken.get("auth_error") is None, str(broken.get("auth_error")))
+
+
+class _AuthDeadClient(_BrokenClient):
+    """Every signed call 401s — the exact 'invalid_api_key' wall the terminal
+    used to render as five identical partial-data errors."""
+
+    def get_positions(self, symbol=None):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_open_orders(self, symbol=None):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_fills(self, symbol=None, limit=100):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_order_history(self, symbol=None, limit=100):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_account_balance(self, asset="USDT"):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+
+authdead = broker_account.account_snapshot(_AuthDeadClient(), "BTCUSDT")
+check("all-auth failure collapses into one plain-language verdict",
+      isinstance(authdead.get("auth_error"), str)
+      and "rejected this API key" in authdead["auth_error"]
+      and "invalid_api_key" in authdead["auth_error"],
+      str(authdead.get("auth_error"))[:200])
+check("the verdict points at Broker Settings and an instance restart",
+      "Broker Settings" in authdead["auth_error"] and "restart" in authdead["auth_error"],
+      str(authdead.get("auth_error"))[:200])
+check("one mixed failure must not claim the key is bad",
+      broker_account._is_auth_rejection("fills endpoint throttled") is False
+      and broker_account._is_auth_rejection('Delta HTTP 401: {"code": "invalid_api_key"}') is True
+      and broker_account._is_auth_rejection("Binance HTTP 401: Invalid API-key, IP, or permissions") is True,
+      "marker matching")
+
+
+# ===========================================================================
+section("8b. account settings from the venue (margin mode must not be guessed)")
+# ===========================================================================
+# The reported bug: a Delta account in CROSS margin showed Isolated in the
+# terminal because the UI hardcoded useState('isolated'). Margin mode is an
+# account/sub-account property on Delta — GET /v2/sub_accounts — and a
+# per-symbol property on Binance — positionRisk. Both must now be read back.
+settings_d = delta.get_account_settings("BTCUSD")
+check("Delta: parent key reads the main account's cross margin mode",
+      settings_d["margin_mode"] == "cross" and settings_d["margin_family"] == "cross"
+      and settings_d["user_id"] == "5112346", str(settings_d)[:250])
+check("Delta: sub-account list comes back so each account's mode is visible",
+      len(settings_d["accounts"]) == 2
+      and settings_d["accounts"][1]["margin_mode"] == "isolated"
+      and settings_d["accounts"][1]["is_sub_account"] is True,
+      str(settings_d.get("accounts"))[:200])
+check("Delta: leverage read via GET /v2/products/{id}/orders/leverage",
+      settings_d["leverage"] == 7, str(settings_d.get("leverage")))
+check("Delta: no error when everything reads cleanly",
+      settings_d.get("error") is None, str(settings_d.get("error")))
+
+STATE["fail_sub_accounts"] = True
+settings_sub = delta.get_account_settings("BTCUSD")
+STATE["fail_sub_accounts"] = False
+check("Delta: sub-account key (cannot list accounts) falls back to the open position",
+      settings_sub["margin_mode"] == "cross"
+      and settings_sub["margin_family"] == "cross"
+      and settings_sub["accounts"] == [], str(settings_sub)[:250])
+
+settings_b = binance.get_account_settings("BTCUSDT")
+check("Binance: margin mode + leverage from positionRisk",
+      settings_b["margin_mode"] == "cross" and settings_b["margin_family"] == "cross"
+      and settings_b["leverage"] == 5, str(settings_b)[:250])
+
+snap_set = broker_account.account_snapshot(delta, "BTCUSD")
+check("snapshot carries the venue account settings for the terminal",
+      (snap_set.get("account_settings") or {}).get("margin_mode") == "cross"
+      and (snap_set.get("account_settings") or {}).get("leverage") == 7,
+      str(snap_set.get("account_settings"))[:200])
+
+STATE["requests"].clear()
+mode_resp = delta.set_margin_mode("BTCUSD", "isolated")
+sent_mode = [r for r in STATE["requests"] if r["path"] == "/v2/users/margin_mode"]
+check("Delta: set margin mode uses the documented account-level PUT /v2/users/margin_mode",
+      len(sent_mode) == 1 and sent_mode[0]["method"] == "PUT"
+      and sent_mode[0]["body"] == {"margin_mode": "isolated"},
+      str(sent_mode)[:200])
+check("Delta: set margin mode returns the venue's confirmation",
+      isinstance(mode_resp, dict) and mode_resp.get("margin_mode") == "isolated"
+      and not mode_resp.get("error"), str(mode_resp)[:200])
+check("margin family collapses venue spellings",
+      delta._margin_family("portfolio") == "cross"
+      and delta._margin_family("Cross ") == "cross"
+      and delta._margin_family("isolated") == "isolated"
+      and delta._margin_family("weird") is None, "family mapping")
 
 # ===========================================================================
 section("9. local audit tables")
@@ -881,6 +1001,38 @@ check("POST /live-account/snapshot returns the terminal payload",
       r.text[:300])
 check("snapshot reports the contract", body["contract"]["symbol"] == "BTCUSD"
       and body["contract"]["size_unit"] == "contracts", str(body["contract"])[:200])
+check("snapshot carries the account's real margin mode for the terminal",
+      (body.get("account_settings") or {}).get("margin_mode") == "cross"
+      and (body.get("account_settings") or {}).get("margin_family") == "cross",
+      str(body.get("account_settings"))[:250])
+
+# Connections are saved with the account details the venue just reported —
+# per connection, because each sub-account has its own margin mode.
+# (is_testnet stays false here: the mock definition carries production-style
+# URLs and the constructor maps testnet connections to the real Delta testnet
+# host, which this sandbox cannot reach.)
+r = api.post("/broker-connections", headers=H, json={
+    "broker_code": "Delta", "label": "Nishant main", "api_key": "dk2",
+    "api_secret": "ds2", "is_testnet": False, "is_active": True})
+body = r.json()
+check("POST /broker-connections saves + returns venue account settings",
+      r.status_code == 200 and (body.get("account_settings") or {}).get("margin_mode") == "cross"
+      and (body.get("account_settings") or {}).get("leverage") == 7
+      and body.get("account_settings_at"), r.text[:300])
+settings_conn_id = body.get("id")
+
+r = api.post(f"/broker-connections/{settings_conn_id}/refresh", headers=H)
+body = r.json()
+check("POST /broker-connections/{id}/refresh re-reads settings from the venue",
+      r.status_code == 200 and (body.get("account_settings") or {}).get("margin_mode") == "cross"
+      and (body.get("fetched") or {}).get("user_id") == "5112346"
+      and body.get("account_settings_at"), r.text[:300])
+
+r = api.get("/broker-connections", headers=H)
+saved = next((c for c in r.json() if c.get("id") == settings_conn_id), None)
+check("GET /broker-connections lists each connection's account settings",
+      saved is not None and (saved.get("account_settings") or {}).get("margin_mode") == "cross",
+      str(saved)[:300])
 
 r = api.post("/live-account/orders", headers=H, json={
     "broker": "Delta", "side": "buy", "order_type": "market", "size": 0.03,

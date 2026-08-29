@@ -8,13 +8,13 @@ import {
   CrosshairMode,
 } from 'lightweight-charts';
 import {
-  TrendingUp, Timer, Layers, Volume2, Radio, Filter,
+  TrendingUp, Timer, Layers, Volume2, Radio, Filter, Crosshair,
   Maximize2, Minimize2, Activity, BarChart3, ChevronDown,
 } from 'lucide-react';
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import { computeAll } from '../utils/indicators';
-import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel } from '../utils/chartOverlay';
+import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
 const DEFAULT_INDICATORS = { ema20: false, ema50: true, sma50: false, rsi: false, macd: false };
@@ -31,6 +31,9 @@ const COLOR = {
 };
 
 const fmt = (n, d = 2) => Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+// BTCUSD (Delta) and BTCUSDT (Binance) are the same contract.
+const normSym = (s) => String(s || '').replace(/USDT?$/i, '');
+const pnlClass = (v) => (v == null ? 'text-gray-400' : Number(v) > 0 ? 'text-green-400' : Number(v) < 0 ? 'text-red-400' : 'text-gray-400');
 
 const ChartPage = () => {
   const chartContainerRef = useRef();
@@ -46,6 +49,7 @@ const ChartPage = () => {
   const macdSignalRef = useRef();
   const macdHistRef = useRef();
 
+  const symbolRef = useRef('BTCUSDT'); // stable symbol access inside loaders
   const candlesRef = useRef([]);       // original kline array
   const timesRef = useRef([]);         // aligned times array
   const closesRef = useRef([]);        // aligned closes array
@@ -55,6 +59,12 @@ const ChartPage = () => {
   // hover tooltip over a marked candle (markers render icon-only).
   const markersByTimeRef = useRef(new Map());
   const lastHoverTimeRef = useRef(null);
+  // Executed-trade overlay (paper / live / history): sessions list, the
+  // selected source, the selected trade (SL/TP lines), candle time → trade id
+  // for click-to-select, and the price lines currently drawn on the chart.
+  const execByTimeRef = useRef(new Map());
+  const execLinesRef = useRef([]);
+  const signalsCacheRef = useRef([]);
 
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
@@ -77,6 +87,10 @@ const ChartPage = () => {
   const [noData, setNoData] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [showIndPanel, setShowIndPanel] = useState(false);
+  const [showExec, setShowExec] = useState(false);
+  const [execSessions, setExecSessions] = useState([]);
+  const [execSourceKey, setExecSourceKey] = useState('');
+  const [selectedExecId, setSelectedExecId] = useState(null);
 
   const authHeaders = useCallback(() => ({ Authorization: `Bearer ${localStorage.getItem('token')}` }), []);
   const getChartHeight = useCallback(() => (fullscreenRef.current ? window.innerHeight - 20 : 560), []);
@@ -249,6 +263,14 @@ const ChartPage = () => {
       };
       crosshairRef.current = onCrosshair;
       chart.subscribeCrosshairMove(onCrosshair);
+      // Click an execution marker (entry ● / exit ■) to select that trade:
+      // the chart then draws its entry / SL / TP / trail levels as price lines.
+      const onChartClick = (param) => {
+        if (!param || param.time == null) return;
+        const execId = execByTimeRef.current.get(param.time);
+        if (execId) setSelectedExecId(execId);
+      };
+      chart.subscribeClick(onChartClick);
 
       const handleResize = () => {
         if (chartRef.current && chartContainerRef.current) {
@@ -272,6 +294,7 @@ const ChartPage = () => {
         resizeObserver.disconnect();
         if (crosshairRef.current) chart.unsubscribeCrosshairMove(crosshairRef.current);
         crosshairRef.current = null;
+        try { chart.unsubscribeClick(onChartClick); } catch (_) {}
       };
     } catch (error) {
       console.error('Critical error initializing chart:', error);
@@ -321,6 +344,7 @@ const ChartPage = () => {
 
       applyIndicators(indicators);
       applySignals(showSignals);
+      loadExecutions();
     } catch (e) {
       console.error('Error fetching chart data', e);
     } finally {
@@ -408,14 +432,96 @@ const ChartPage = () => {
 
   useEffect(() => { applyIndicators(indicators); }, [indicators, applyIndicators]);
 
+  // --- Executed trades overlay (paper / live / history) ---------------
+  // Decorated trade list for the selected source: every trade gets an id (so
+  // a marker click or table row maps back to it) and the session label.
+  const execTradesRef = useRef([]);
+  const [execVersion, setExecVersion] = useState(0);
+
+  const loadExecutions = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/trade-executions`, { headers: authHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+      setExecSessions(sessions);
+      setExecSourceKey((current) => {
+        const stillThere = sessions.some(s => s.key === current);
+        if (current && stillThere) return current;
+        const matching = sessions.filter(s => normSym(s.symbol) === normSym(symbolRef.current));
+        return (matching.find(s => s.kind === 'live') || matching.find(s => s.kind === 'paper')
+                || matching[0] || '')?.key || '';
+      });
+    } catch (_) { /* overlay stays empty */ }
+  }, [authHeaders]);
+
+  useEffect(() => { symbolRef.current = symbol; }, [symbol]);
+  useEffect(() => { loadExecutions(); }, [loadExecutions]);
+
+  // Symbol + source → decorated trades; bumps a version so the marker pass
+  // re-runs without threading the array through every dependency list.
+  useEffect(() => {
+    const sess = execSessions.find(s => s.key === execSourceKey);
+    if (!sess || normSym(sess.symbol) !== normSym(symbol)) {
+      execTradesRef.current = [];
+    } else {
+      execTradesRef.current = (sess.trades || []).map((t, i) => ({
+        ...t,
+        exec_id: `${sess.key}#${i}`,
+        source_label: sess.label,
+      }));
+    }
+    setExecVersion(v => v + 1);
+  }, [execSessions, execSourceKey, symbol]);
+
+  // Price lines: the selected trade's full stop plan, plus the open
+  // position's live levels whenever its session is selected.
+  const applyExecLines = useCallback(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+    for (const line of execLinesRef.current) { try { series.removePriceLine(line); } catch (_) {} }
+    execLinesRef.current = [];
+    const execActive = showExec && execSourceKey;
+    if (!execActive) return;
+    const trades = execTradesRef.current;
+    const draw = (price, color, title, style) => {
+      if (price == null || !Number.isFinite(Number(price))) return;
+      execLinesRef.current.push(series.createPriceLine({
+        price: Number(price), color, lineWidth: 1, lineStyle: style ?? 0,
+        axisLabelVisible: true, title,
+      }));
+    };
+    const openTrades = trades.filter(t => t.status === 'open');
+    for (const t of openTrades) {
+      draw(t.entry, '#38bdf8', `ENTRY ${t.entry ? fmt(t.entry, 0) : ''}`, 0);
+      draw(t.sl, '#ef4444', `SL ${t.sl ? fmt(t.sl, 0) : ''}`, 0);
+      draw(t.tp, '#10b981', `TP ${t.tp ? fmt(t.tp, 0) : ''}`, 0);
+      draw(t.trail_stop, '#f59e0b', 'TRAIL', 2);
+    }
+    const selected = selectedExecId ? trades.find(t => t.exec_id === selectedExecId) : null;
+    if (selected && selected.status !== 'open') {
+      draw(selected.entry, '#38bdf8', `ENTRY ${selected.entry ? fmt(selected.entry, 0) : ''}`, 0);
+      if (selected.sl_plan != null && selected.sl_plan !== selected.sl) {
+        draw(selected.sl_plan, '#ef4444', 'SL plan', 2);
+      }
+      draw(selected.sl, '#ef4444', `SL ${selected.sl ? fmt(selected.sl, 0) : ''}`, 0);
+      draw(selected.tp, '#10b981', `TP ${selected.tp ? fmt(selected.tp, 0) : ''}`, 0);
+      draw(selected.trail_stop, '#f59e0b', 'TRAIL', 2);
+    }
+  }, [showExec, execSourceKey, selectedExecId]);
+
+  useEffect(() => { applyExecLines(); }, [applyExecLines, execVersion]);
+
   // --- Signals overlay ------------------------------------------------
   const applySignals = useCallback(async (show) => {
     if (!candleSeriesRef.current) return;
     const trades = runOverlay?.trades || [];
+    const execActive = showExec && execSourceKey;
     const canPlotSignals = show && interval === '1h';
-    if (!canPlotSignals && !trades.length) {
+    if (!canPlotSignals && !trades.length && !execActive) {
       if (markersRef.current) markersRef.current.setMarkers([]);
       markersByTimeRef.current = new Map();
+      execByTimeRef.current = new Map();
       setHoverMarker(null);
       setSignalCount(0);
       setOverlayEvents([]);
@@ -423,16 +529,35 @@ const ChartPage = () => {
     }
     try {
       let sigs = [];
-      if (canPlotSignals) {
+      // Signals feed two things: their own markers AND the trend/setup context
+      // on executed-trade entry markers, so they load when either needs them.
+      if (canPlotSignals || execActive) {
         const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
         const res = await fetch(url, { headers: authHeaders() });
         if (res.ok) sigs = await res.json();
       }
+      sigs = Array.isArray(sigs) ? sigs : [];
+      signalsCacheRef.current = sigs;
       const times = new Set(timesRef.current);
+      // Executions: paper/live trades joined with the signal context (setup,
+      // 4h trend, candle colour, RSI) of the candle they filled on.
+      const executions = execActive
+        ? joinSignalContext(execTradesRef.current, sigs)
+        : [];
       const markers = buildOverlayMarkers({
-        signals: Array.isArray(sigs) ? sigs : [],
+        signals: canPlotSignals ? sigs : [],
         trades,
+        executions,
       }).filter(m => times.has(m.time));
+      // Candle time → executed trade id (click-to-select on the chart).
+      const execByTime = new Map();
+      for (const t of execTradesRef.current) {
+        const et = toUnix(t.entry_time);
+        if (et != null) execByTime.set(et, t.exec_id);
+        const xt = toUnix(t.exit_time);
+        if (xt != null && t.status !== 'open') execByTime.set(xt, t.exec_id);
+      }
+      execByTimeRef.current = execByTime;
       // Feed the hover tooltip: keep the readable detail (label, side, setup,
       // trend, candle type, RSI, price, in/out) per marked time so a hover on
       // the icon can display it without cluttering the candle.
@@ -469,7 +594,8 @@ const ChartPage = () => {
       setSignalCount(0);
       setOverlayEvents([]);
     }
-  }, [symbol, interval, signalRange, overlayStrategy, dataSource, authHeaders, runOverlay]);
+  }, [symbol, interval, signalRange, overlayStrategy, dataSource, authHeaders, runOverlay,
+      showExec, execSourceKey, execVersion]);
 
   useEffect(() => { applySignals(showSignals); }, [applySignals, showSignals]);
 
@@ -513,7 +639,7 @@ const ChartPage = () => {
           <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-3 text-blue-400">
             <TrendingUp size={28} /> Market Chart
           </h1>
-          <p className="text-gray-400 text-sm mt-1">Candlesticks with LONG / SHORT / trend markers — including a finished backtest</p>
+          <p className="text-gray-400 text-sm mt-1">Candles with LONG / SHORT / trend markers, executed trades (entry candle, SL / TP / trail, P&L) and finished backtests</p>
         </div>
         <div className="flex gap-3 items-center flex-wrap">
           <div className="flex items-center gap-2 bg-gray-800 p-1 rounded-lg border border-gray-700">
@@ -576,6 +702,23 @@ const ChartPage = () => {
           <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
             <input type="checkbox" checked={showSignals} onChange={e => setShowSignals(e.target.checked)} className="accent-green-500" /> Signals
           </label>
+          <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+            <input type="checkbox" checked={showExec} onChange={e => setShowExec(e.target.checked)} className="accent-violet-500" /> Trades
+          </label>
+        </div>
+        <div className="flex items-center gap-2">
+          <Crosshair size={15} className="text-gray-400" />
+          <select value={execSourceKey} onChange={e => { setExecSourceKey(e.target.value); setSelectedExecId(null); }}
+                  disabled={!showExec}
+                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none disabled:opacity-50 max-w-[16rem]"
+                  title="Which account/session's executed trades to plot">
+            {execSessions.length === 0 && <option value="">No executed trades yet</option>}
+            {execSessions.map(s => (
+              <option key={s.key} value={s.key}>
+                {s.kind === 'live' ? '● ' : s.kind === 'paper' ? '● ' : '🕘 '}{s.label} · {s.trades.length} trade{s.trades.length === 1 ? '' : 's'}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="flex items-center gap-2">
           <Radio size={15} className="text-gray-400" />
@@ -597,6 +740,15 @@ const ChartPage = () => {
             Backtest: {runOverlay.name} · {runOverlay.trades.length} trades
           </span>
         )}
+        {showExec && execSourceKey && (() => {
+          const t = execTradesRef.current;
+          const open = t.filter(x => x.status === 'open').length;
+          return (
+            <span className="text-xs font-semibold text-violet-300 bg-violet-900/30 border border-violet-800/50 rounded px-2 py-1">
+              Executions: {t.length - open} closed · {open} open — click a marker to draw SL/TP
+            </span>
+          );
+        })()}
         {interval !== '1h' && (
           <span className="text-[11px] text-amber-300">Switch to 1h to plot LONG/SHORT on the signal candle</span>
         )}
@@ -643,6 +795,18 @@ const ChartPage = () => {
                   {hoverMarker.info.rsi != null && <span>RSI: {Number(hoverMarker.info.rsi).toFixed(1)}</span>}
                   {hoverMarker.info.price != null && <span>Price: {fmt(hoverMarker.info.price)}</span>}
                   {hoverMarker.info.kind === 'exit' && hoverMarker.info.reason && <span>Reason: {hoverMarker.info.reason}</span>}
+                  {(hoverMarker.info.kind === 'entry' || hoverMarker.info.kind === 'exit') && (
+                    <>
+                      {hoverMarker.info.status && <span>Status: {hoverMarker.info.status}</span>}
+                      {hoverMarker.info.sl != null && <span className="text-red-400">SL: {fmt(hoverMarker.info.sl)}</span>}
+                      {hoverMarker.info.tp != null && <span className="text-green-400">TP: {fmt(hoverMarker.info.tp)}</span>}
+                      {hoverMarker.info.trail_stop != null && <span className="text-amber-400">Trail: {fmt(hoverMarker.info.trail_stop)}</span>}
+                      {hoverMarker.info.pnl != null && <span className={pnlClass(hoverMarker.info.pnl)}>P&L: ₹{Math.round(Number(hoverMarker.info.pnl)).toLocaleString('en-IN')}</span>}
+                      {hoverMarker.info.lots != null && <span>{Number(hoverMarker.info.lots).toFixed(3)} BTC</span>}
+                      {hoverMarker.info.bars != null && <span>{hoverMarker.info.bars} bars</span>}
+                      {hoverMarker.info.source && <span className="text-violet-300">{hoverMarker.info.source}</span>}
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -690,9 +854,90 @@ const ChartPage = () => {
           <span>↑ 4h uptrend · ↓ 4h downtrend</span>
           <span className="flex items-center gap-1"><span className="text-sky-400">●</span> IN fill</span>
           <span className="flex items-center gap-1"><span className="text-amber-400">■</span> OUT exit</span>
+          <span className="flex items-center gap-1"><span className="text-violet-400">●</span> open position entry</span>
+          <span className="flex items-center gap-1"><span className="text-red-400">—</span> SL</span>
+          <span className="flex items-center gap-1"><span className="text-green-400">—</span> TP</span>
+          <span className="flex items-center gap-1"><span className="text-amber-400">--</span> trail</span>
           <span className="flex items-center gap-1"><Volume2 size={12} className="text-gray-500" /> Volume</span>
         </div>
       </div>
+
+      {/* Executed trades: which candle each entry/exit landed on, the stop
+          plan and P&L. Click a row (or its chart marker) to draw that trade's
+          entry / SL / TP / trail levels as price lines and centre the view. */}
+      {showExec && execTradesRef.current.length > 0 && (
+        <div className="mt-4 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+          <div className="px-4 py-3 text-xs font-bold uppercase tracking-wider text-gray-400 border-b border-gray-700 flex items-center gap-2">
+            <Crosshair size={14} className="text-violet-400" />
+            Executed trades — {execSessions.find(s => s.key === execSourceKey)?.label}
+            <span className="normal-case font-normal text-gray-500">click a row to draw its SL / TP on the chart</span>
+          </div>
+          <div className="overflow-x-auto max-h-72 overflow-y-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-gray-900 uppercase text-gray-500 sticky top-0">
+                <tr>
+                  <th className="p-2 font-semibold">Entry candle (UTC)</th>
+                  <th className="p-2 font-semibold">Side</th>
+                  <th className="p-2 font-semibold">Status</th>
+                  <th className="p-2 font-semibold">Entry</th>
+                  <th className="p-2 font-semibold">Exit / Now</th>
+                  <th className="p-2 font-semibold">SL</th>
+                  <th className="p-2 font-semibold">TP</th>
+                  <th className="p-2 font-semibold">Trail</th>
+                  <th className="p-2 font-semibold">P&L (₹)</th>
+                  <th className="p-2 font-semibold">Trend</th>
+                  <th className="p-2 font-semibold">Reason</th>
+                  <th className="p-2 font-semibold">Bars</th>
+                </tr>
+              </thead>
+              <tbody>
+                {execTradesRef.current.slice().reverse().map((t) => {
+                  const ctx = joinSignalContext([t], signalsCacheRef.current)[0]?.context;
+                  const sel = selectedExecId === t.exec_id;
+                  return (
+                    <tr key={t.exec_id}
+                        onClick={() => {
+                          setSelectedExecId(sel ? null : t.exec_id);
+                          if (!sel) {
+                            const from = toUnix(t.entry_time);
+                            const to = toUnix(t.exit_time) ?? Math.floor(Date.now() / 1000);
+                            try { chartRef.current?.timeScale()?.setVisibleRange({
+                              from: Math.max(0, from - 3600 * 72), to: to + 3600 * 48 }); } catch (_) {}
+                          }
+                        }}
+                        className={`border-b border-gray-700/70 cursor-pointer transition ${sel ? 'bg-violet-900/30' : 'hover:bg-gray-700/40'}`}>
+                      <td className="p-2 font-mono text-gray-300">{fmtUnixUtc(t.entry_time)}</td>
+                      <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>
+                        {t.direction === 1 ? 'LONG' : 'SHORT'}
+                      </td>
+                      <td className="p-2">
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${t.status === 'open'
+                          ? 'bg-violet-900/40 text-violet-300' : Number(t.pnl) >= 0 ? 'bg-green-900/40 text-green-300' : 'bg-red-900/40 text-red-300'}`}>
+                          {t.status === 'open' ? 'OPEN' : Number(t.pnl) >= 0 ? 'WIN' : 'LOSS'}
+                        </span>
+                      </td>
+                      <td className="p-2 font-mono text-gray-300">{t.entry != null ? fmt(t.entry) : '—'}</td>
+                      <td className="p-2 font-mono text-gray-300">{t.status === 'open'
+                        ? (t.current != null ? fmt(t.current) : '—') : (t.exit != null ? fmt(t.exit) : '—')}</td>
+                      <td className="p-2 font-mono text-red-400">{t.sl != null ? fmt(t.sl) : '—'}</td>
+                      <td className="p-2 font-mono text-green-400">{t.tp != null ? fmt(t.tp) : '—'}</td>
+                      <td className="p-2 font-mono text-amber-400">{t.trail_stop != null ? fmt(t.trail_stop) : '—'}</td>
+                      <td className={`p-2 font-mono ${pnlClass(t.pnl)}`}>
+                        {t.pnl != null ? `${Number(t.pnl) >= 0 ? '+' : ''}${Math.round(Number(t.pnl)).toLocaleString('en-IN')}` : '—'}
+                      </td>
+                      <td className={`p-2 ${ctx?.trend === 'UP' ? 'text-green-400' : ctx?.trend === 'DOWN' ? 'text-red-400' : 'text-gray-500'}`}>
+                        {ctx ? `${ctx.trend || '—'}${ctx.setup ? ` ${ctx.setup}` : ''}` : '—'}
+                      </td>
+                      <td className="p-2 text-gray-400">{t.reason || (t.status === 'open' ? 'running' : '—')}</td>
+                      <td className="p-2 font-mono text-gray-400">{t.bars_held ?? '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {overlayEvents.length > 0 && (
         <div className="mt-4 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
@@ -749,7 +994,7 @@ const ChartPage = () => {
             <div className="p-2 bg-purple-500/20 rounded-lg text-purple-400"><Layers size={20} /></div>
             <h3 className="font-bold">Strategy Overlay</h3>
           </div>
-          <p className="text-sm text-gray-400">Overlay Kudos signals or a backtest run (`/chart?run=id`) on {symbol}. Each marker shows LONG/SHORT, REV/MOM and 4h trend.</p>
+          <p className="text-sm text-gray-400">Overlay Kudos signals, executed paper/live trades (Trades toggle — click a marker or row to draw its SL / TP) or a backtest run (`/chart?run=id`) on {symbol}.</p>
         </div>
       </div>
     </div>

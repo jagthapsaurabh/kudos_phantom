@@ -10,6 +10,7 @@ from app.core.dynamic_strategy import DynamicStrategyService
 from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
+from app.services.paper_trader import _to_ist
 from app.services.broker_client import BrokerClient
 from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
@@ -308,6 +309,10 @@ class LiveTradeService:
         # Order ids of the stop-loss / take-profit legs this instance placed.
         # Exiting cancels exactly these and nothing else on the account.
         self.protection_leg_ids = []
+        # Closed-trade history, in the SAME dict shape as the paper worker's
+        # PaperTradeService._record_closed, so the market-chart execution
+        # overlay renders paper and live trades through one builder.
+        self.closed_trades: list = []
         # Entries go out as bracket orders (entry + stop-loss + take-profit) so
         # risk is protected exchange-side even if this worker dies mid-trade.
         self.bracket_orders = bool(bracket_orders)
@@ -679,6 +684,56 @@ class LiveTradeService:
     # ------------------------------------------------------------------
     # Entry gating
     # ------------------------------------------------------------------
+    def _record_closed(self, trade):
+        """Keep one closed trade for the market-chart overlay / history.
+
+        Same dict shape as PaperTradeService._record_closed (entry/exit candle
+        times as IST-offset ISO strings, stop plan at entry vs the levels in
+        force at exit, PnL on the pricing basis). Commissions live on the
+        exchange fills, so `fees` stays None here. Never raises — bookkeeping
+        must not kill the trading loop.
+        """
+        try:
+            rate = float(getattr(self, "conversion_rate", 85.0) or 85.0)
+            entry = float(trade.entry_price or 0.0)
+            exit_price = float(trade.exit_price or trade.entry_price or 0.0)
+            lots = float(getattr(trade, "lots", 0.0) or 0.0)
+            pnl = (exit_price - entry) * int(trade.direction) * lots * rate
+            f = lambda v: None if v is None else float(v)
+            self.closed_trades.append({
+                "symbol": trade.symbol,
+                "direction": int(trade.direction),
+                "entry": f(trade.entry_price),
+                "exit": f(trade.exit_price),
+                "entry_trade_price": f(getattr(trade, "entry_trade_price", None)),
+                "exit_trade_price": f(getattr(trade, "exit_trade_price", None)),
+                "entry_mark_price": f(getattr(trade, "entry_mark_price", None)),
+                "exit_mark_price": f(getattr(trade, "exit_mark_price", None)),
+                "mark_price_basis": bool(getattr(trade, "mark_price_basis", False)),
+                "pnl": pnl,
+                "gross_pnl": pnl,
+                "fees": None,
+                "reason": trade.exit_reason,
+                "exit_detail": getattr(trade, "exit_detail", "") or "",
+                "sl": f(getattr(trade, "sl_entry", None) if getattr(trade, "sl_entry", None) else trade.sl),
+                "sl_final": f(trade.sl),
+                "tp": f(trade.tp),
+                "trail_stop": f(trade.trail_stop),
+                "trail_activation": f(trade.trail_activation),
+                "atr_at_entry": f(trade.atr_at_entry),
+                "peak_price": f(trade.peak_price),
+                "margin_inr": f(trade.margin_inr),
+                "notional_usd": f(trade.notional_usd),
+                "lots": lots,
+                "entry_time": _to_ist(trade.entry_time),
+                "exit_time": _to_ist(trade.exit_time),
+                "bars_held": int(trade.bars_held or 0),
+            })
+            if len(self.closed_trades) > 100:
+                self.closed_trades = self.closed_trades[-100:]
+        except Exception as exc:
+            print(f"[{self.strategy_id}] closed-trade record failed: {exc}")
+
     def _manage_open_positions(self, decision_price, current_atr, current_time,
                                trade_price, mark_price, advance_bar):
         """Mark every open position to market and send any exit it triggers.
@@ -698,6 +753,10 @@ class LiveTradeService:
                                            advance_bar=advance_bar)
             if not result:
                 continue
+            # Settled: keep it for the execution overlay + post-run review
+            # before the exit order is attempted, so even a failed close
+            # order does not lose the trade from the book.
+            self._record_closed(result)
             side = "SELL" if result.direction == 1 else "BUY"
             # reduce-only: this order must flatten, never open the other
             # side. Without it, a position that is already flat (a sibling

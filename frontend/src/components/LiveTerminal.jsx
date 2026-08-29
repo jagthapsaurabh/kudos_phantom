@@ -373,6 +373,11 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
   const [configProblems, setConfigProblems] = useState([]);
   const [leverage, setLeverage] = useState(10);
   const [marginMode, setMarginMode] = useState('isolated');
+  // Margin mode + leverage now come from the exchange account itself (see
+  // account_settings on the snapshot) — the select/input only keep a local
+  // override once the user touches them. Switching broker or connection
+  // (main account vs a sub-account, each with its own margin mode) re-syncs.
+  const touched = useRef({ margin: false, leverage: false });
   // "Unfilled alert": how long a working order may rest before the terminal
   // flags it. 0 switches the alert off.
   const [unfillAfter, setUnfillAfter] = useState(60);
@@ -480,11 +485,19 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
     'Position closed at market.',
   );
   const applyLeverage = () => act(
-    () => call('/live-account/leverage', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', leverage: Number(leverage) }),
+    async () => {
+      await call('/live-account/leverage', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', leverage: Number(leverage) });
+      // Re-sync from the venue on the refresh that follows, so the input
+      // settles on what the exchange actually applied.
+      touched.current.leverage = false;
+    },
     `Leverage set to ${leverage}x.`,
   );
   const applyMarginMode = () => act(
-    () => call('/live-account/margin-mode', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', mode: marginMode }),
+    async () => {
+      await call('/live-account/margin-mode', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', mode: marginMode });
+      touched.current.margin = false;
+    },
     `Margin mode set to ${marginMode}.`,
   );
 
@@ -492,6 +505,20 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
   const contract = data.contract || {};
   const balance = data.balance || {};
   const risk = data.risk || {};
+  const account = data.account_settings || null;
+
+  // Adopt the venue's account settings (margin mode, leverage) until the
+  // user overrides them locally. Re-runs on every refresh but is a no-op
+  // once touched, so it never fights the operator.
+  useEffect(() => {
+    if (!account || account.error) return;
+    if (!touched.current.margin && account.margin_family) setMarginMode(account.margin_family);
+    if (!touched.current.leverage && account.leverage) setLeverage(String(account.leverage));
+  }, [account]);
+  // Different connection = different (sub)account with its own settings.
+  useEffect(() => {
+    touched.current = { margin: false, leverage: false };
+  }, [broker, connectionId]);
   const rate = (data.rate_limits || {}).limits || {};
   const usage = data.rate_limits || {};
   const unit = contract.size_unit === 'contracts' ? 'contracts' : 'lots';
@@ -717,7 +744,18 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
         </div>
       )}
 
-      {Object.keys(data.errors || {}).length > 0 && (
+      {data.auth_error ? (
+        <div className="flex items-start gap-2 rounded-2xl border border-red-900 bg-red-900/20 p-4 text-sm text-red-300">
+          <ShieldAlert size={16} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-bold">API key rejected by the exchange</div>
+            <div className="mt-1 text-xs leading-relaxed">{data.auth_error}</div>
+            <a href="/broker" className="mt-2 inline-flex items-center gap-1 rounded-lg border border-red-700 bg-red-900/30 px-3 py-1.5 text-[11px] font-bold text-red-200 transition hover:bg-red-900/50">
+              Open Broker Settings
+            </a>
+          </div>
+        </div>
+      ) : Object.keys(data.errors || {}).length > 0 && (
         <div className="rounded-2xl border border-amber-900 bg-amber-900/10 p-3 text-[11px] text-amber-300">
           Partial data: {Object.entries(data.errors).map(([k, v]) => `${k} (${v})`).join(' · ')}
         </div>
@@ -745,7 +783,7 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
               <div className="flex-1">
                 <Field label="Leverage">
                   <input type="number" min="1" max="125" value={leverage}
-                         onChange={(e) => setLeverage(e.target.value)}
+                         onChange={(e) => { touched.current.leverage = true; setLeverage(e.target.value); }}
                          className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 font-mono text-sm text-white outline-none focus:border-blue-500" />
                 </Field>
               </div>
@@ -757,7 +795,7 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
             <div className="mt-3 flex items-end gap-2">
               <div className="flex-1">
                 <Field label="Margin mode">
-                  <select value={marginMode} onChange={(e) => setMarginMode(e.target.value)}
+                  <select value={marginMode} onChange={(e) => { touched.current.margin = true; setMarginMode(e.target.value); }}
                           className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-white outline-none focus:border-blue-500">
                     <option value="isolated">Isolated</option>
                     <option value="cross">Cross</option>
@@ -769,6 +807,17 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
                 Apply
               </button>
             </div>
+            <p className="mt-2 text-[10px] leading-relaxed text-gray-500">
+              {account && !account.error && (account.margin_mode || account.leverage)
+                ? <>Read from your exchange account: <b className="text-gray-300">{account.margin_mode || '—'}</b>
+                   {account.leverage ? <> · <b className="text-gray-300">{account.leverage}x</b></> : null}
+                   {account.accounts && account.accounts.length > 1
+                     ? <> · {account.accounts.length} accounts on this key</> : null}
+                   {account.margin_mode === 'portfolio' ? ' (portfolio margin)' : ''}</>
+                : account && account.error
+                  ? <span className="text-amber-500">Account settings unavailable: {String(account.error).slice(0, 120)}</span>
+                  : 'Margin mode and leverage load from the exchange once the account can be read.'}
+            </p>
           </div>
 
           <div className="rounded-2xl border border-gray-700 bg-gray-800 p-4">
