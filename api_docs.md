@@ -18,9 +18,11 @@ All protected endpoints require a Bearer Token in the header:
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/broker-definitions` | None | Enabled exchange/broker data sources (Binance and Delta are built in) |
-| `GET` | `/broker-connections` | None | Current user's masked, multi-broker connections |
-| `POST` | `/broker-connections` | `broker_code`, `label`, `api_key`, `api_secret`, `passphrase`, `is_testnet` | Add a credential connection; multiple may be active |
-| `GET` | `/broker-connections/diagnose` | `broker`, `connection_id` | Whether THIS login can trade that broker: the registry entry, every saved connection (stored vs resolved code, masked key, secret present, on/off, testnet), `ready` and a plain-language `problems` list |
+| `GET` | `/broker-connections` | None | Current user's masked, multi-broker connections, each with the `account_settings` last read from the venue (margin mode, leverage, sub-account list) |
+| `POST` | `/broker-connections` | `broker_code`, `label`, `api_key`, `api_secret`, `passphrase`, `is_testnet` | Add a credential connection; multiple may be active. On save the server reads the account's real settings from the exchange (Delta: `GET /v2/sub_accounts` + product leverage; Binance: `positionRisk`) and returns them as `account_settings` — a bad key is visible immediately |
+| `PUT` | `/broker-connections/{id}` | same as POST | Edit a connection; account settings are re-read from the venue |
+| `POST` | `/broker-connections/{id}/refresh` | None | Re-read margin mode / leverage / sub-accounts from the venue for one connection (use after rotating a key or changing margin mode on the exchange). Auth failures come back as `account_settings.error`, so this doubles as a key check |
+| `GET` | `/broker-connections/diagnose` | `broker`, `connection_id` | Whether THIS login can trade that broker: the registry entry, every saved connection (stored vs resolved code, masked key, secret present, on/off, testnet, account settings), `ready` and a plain-language `problems` list |
 | `DELETE` | `/broker-connections/{id}` | None | Remove a user's connection |
 | `GET` | `/broker-settings` | None | Get capital defaults and masked legacy settings |
 | `POST` | `/broker-settings` | `api_key`, `api_secret`, `initial_capital`, `margin_pct`, `broker_name` | Update legacy/primary broker keys and capital |
@@ -74,7 +76,7 @@ after the exchange drops the order from its own history window.
 
 | Method | Endpoint | Request Body | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/live-account/snapshot` | `broker`, `connection_id`, `symbol`, `include_history`, `history_limit` | Everything the terminal renders in one call: `contract`, `mark_price`, `balance`, `risk`, `positions`, `open_orders`, `stop_orders`, `fills`, `order_history`, `errors`, `rate_limits` |
+| `POST` | `/live-account/snapshot` | `broker`, `connection_id`, `symbol`, `include_history`, `history_limit` | Everything the terminal renders in one call: `contract`, `mark_price`, `balance`, `risk`, `positions`, `open_orders`, `stop_orders`, `fills`, `order_history`, `errors`, `rate_limits`, plus `account_settings` — the margin mode / leverage / sub-account list as the *venue* holds them for the selected connection (the terminal's margin-mode select and leverage input start from these, never a hardcoded default) — and `auth_error`, a single plain-language verdict when every signed section was auth-rejected (invalid/regenerated key, or a production key on a testnet connection) |
 | `POST` | `/live-account/orders` | `broker`, `connection_id`, `symbol`, `side`, `order_type`, `size`, `size_in_btc`, `price`, `stop_price`, `trail_amount`, `reduce_only`, `post_only`, `time_in_force`, `working_type`, `client_order_id`, `stop_loss`, `take_profit`, `stop_trigger`, `source`, `instance_key` | Place an order. With `stop_loss` / `take_profit` it becomes a **bracket** (native on Delta, emulated with reduce-only legs on Binance). Sizes may be given in BTC (`size_in_btc: true`) and are converted into the venue's own units |
 | `POST` | `/live-account/orders/cancel` | `broker`, `connection_id`, `order_id` or `client_order_id`, `symbol` | Cancel one order and mark the local row cancelled |
 | `POST` | `/live-account/orders/cancel-all` | `broker`, `connection_id`, `symbol` | Cancel every open order on the contract |

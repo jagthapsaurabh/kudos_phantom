@@ -792,9 +792,49 @@ def _mask(value):
 
 
 def _connection_dict(row):
+    # Account details as last read from the venue (margin mode / leverage /
+    # sub-accounts). Parsed JSON so the UI never has to guess what mode a
+    # sub-account is in; None until the first successful read.
+    settings = None
+    if getattr(row, 'account_settings', None):
+        try:
+            settings = json.loads(row.account_settings)
+        except (TypeError, ValueError):
+            settings = None
     return {'id': row.id, 'broker_code': row.broker_code, 'label': row.label or row.broker_code,
             'api_key': _mask(row.api_key), 'has_secret': bool(row.api_secret),
-            'is_testnet': bool(row.is_testnet), 'is_active': bool(row.is_active), 'created_at': row.created_at}
+            'is_testnet': bool(row.is_testnet), 'is_active': bool(row.is_active),
+            'account_settings': settings,
+            'account_settings_at': row.account_settings_at.isoformat() if row.account_settings_at else None,
+            'created_at': row.created_at}
+
+
+def _fetch_connection_settings(db, connection):
+    """Read margin mode / leverage / sub-accounts from the venue, per connection.
+
+    Best-effort by design: an invalid key stores an error (surfaced in
+    Broker Settings next to the connection) instead of failing the save, and
+    a venue hiccup never breaks the request. Runs synchronously so the save
+    response already says what the account actually is.
+    """
+    from .services.broker_client import BrokerClient
+    settings = None
+    try:
+        definition = db.query(BrokerDefinition).filter(
+            BrokerDefinition.code == _canonical_broker_code(db, connection.broker_code)).first()
+        client = BrokerClient(connection.api_key, connection.api_secret,
+                              connection.broker_code, connection.passphrase or '',
+                              bool(connection.is_testnet), definition)
+        settings = client.get_account_settings('BTCUSDT')
+    except Exception as exc:
+        settings = {'error': f'{exc.__class__.__name__}: {exc}'}
+    try:
+        connection.account_settings = json.dumps(settings) if settings is not None else None
+        connection.account_settings_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+    return settings
 
 
 @app.get('/broker-connections')
@@ -830,6 +870,7 @@ def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[
         'resolved_code': _canonical_broker_code(db, r.broker_code),
         'api_key': _mask(r.api_key), 'has_secret': bool(r.api_secret),
         'is_active': _connection_is_active(r), 'is_testnet': bool(r.is_testnet),
+        'account_settings': _connection_dict(r).get('account_settings'),
         'created_at': r.created_at,
     } for r in rows]
     legacy_keys = bool(user.api_key and user.api_secret and
@@ -882,6 +923,11 @@ def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_
                            api_secret=payload.api_secret, passphrase=payload.passphrase,
                            is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
     db.add(row); db.commit(); db.refresh(row)
+    # Read margin mode / leverage / sub-accounts from the venue right away so
+    # the connection card shows what the account actually is (and a bad key
+    # is visible immediately instead of surfacing later as a 401 wall).
+    _fetch_connection_settings(db, row)
+    db.refresh(row)
     return _connection_dict(row)
 
 
@@ -896,7 +942,29 @@ def update_broker_connection(connection_id: int, payload: BrokerConnectionPayloa
     if payload.passphrase is not None: row.passphrase = payload.passphrase
     row.is_testnet = int(payload.is_testnet); row.is_active = int(payload.is_active)
     db.commit(); db.refresh(row)
+    # Credentials or environment may have changed: re-read the account details.
+    _fetch_connection_settings(db, row)
+    db.refresh(row)
     return _connection_dict(row)
+
+
+@app.post('/broker-connections/{connection_id}/refresh')
+def refresh_broker_connection(connection_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Re-read account details (margin mode, leverage, sub-accounts) from the venue.
+
+    Use after rotating a key, changing margin mode on the exchange, or moving
+    funds between sub-accounts — the saved values are a cache, this re-pulls
+    them. Doubles as a key check: an auth failure comes back as
+    ``account_settings.error`` on the connection.
+    """
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id,
+                                            BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    settings = _fetch_connection_settings(db, row)
+    db.refresh(row)
+    out = _connection_dict(row)
+    out['fetched'] = settings
+    return out
 
 
 @app.delete('/broker-connections/{connection_id}')

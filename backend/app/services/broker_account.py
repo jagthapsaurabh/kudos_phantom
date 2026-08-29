@@ -565,6 +565,16 @@ def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = Tr
     working_orders = [o for o in open_orders if not o.get("is_stop")]
     risk = portfolio_risk(balance, positions)
 
+    # Account-level settings (margin mode, leverage, sub-account list) come
+    # from the venue so the terminal renders what the exchange will actually
+    # do — a cross-margin sub-account must never display as isolated.
+    account_settings: Dict[str, Any] = {}
+    if hasattr(client, "get_account_settings"):
+        try:
+            account_settings = client.get_account_settings(symbol) or {}
+        except Exception as exc:
+            account_settings = {"error": f"{exc.__class__.__name__}: {exc}"}
+
     return {
         "broker": source,
         "symbol": perpetual_symbol(source, symbol),
@@ -583,6 +593,7 @@ def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = Tr
         "mark_price": mark_price,
         "balance": balance,
         "risk": risk,
+        "account_settings": account_settings,
         "positions": [p for p in positions if not p.get("error")],
         "open_orders": working_orders,
         "stop_orders": stop_orders,

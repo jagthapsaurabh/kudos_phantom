@@ -1,6 +1,6 @@
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, DateTime, ForeignKey,
-    Index, JSON, Boolean, UniqueConstraint, inspect, text,
+    Index, JSON, Boolean, UniqueConstraint, inspect, text, Text,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -108,6 +108,12 @@ class BrokerConnection(Base):
     passphrase = Column(String, nullable=True)
     is_testnet = Column(Integer, default=0)
     is_active = Column(Integer, default=1)
+    # Account details read from the venue when the connection is saved or
+    # refreshed — margin mode, leverage, sub-account list. Per connection,
+    # because most users attach several sub-accounts and each has its own
+    # settings (e.g. one sub-account in cross, another isolated).
+    account_settings = Column(Text, nullable=True)      # JSON from BrokerClient.get_account_settings
+    account_settings_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     user = relationship('User', back_populates='broker_connections')
     __table_args__ = (UniqueConstraint('user_id', 'broker_code', 'label', name='uq_user_broker_label'),)

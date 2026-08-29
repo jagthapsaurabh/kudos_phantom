@@ -233,10 +233,28 @@ const BrokerSettings = () => {
       const res = await fetch(`${API_URL}/broker-connections`, { method: 'POST', headers: auth(), body: JSON.stringify(form) });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Unable to save connection');
-      setMessage({ ok: true, text: `${form.broker_code} connection added. Secrets are stored server-side and masked here.` });
+      const s = data.account_settings || {};
+      const read = s.error
+        ? ` Could not read account details: ${String(s.error).slice(0, 120)}`
+        : ` Account read from the exchange: ${s.margin_mode || 'margin mode unknown'}${s.leverage ? ` · ${s.leverage}x` : ''}.`;
+      setMessage({ ok: true, text: `${form.broker_code} connection added.${read} Secrets are stored server-side and masked here.` });
       setForm(f => ({ ...f, label: '', api_key: '', api_secret: '', passphrase: '' }));
       load();
       loadCheck(form.broker_code);
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    setBusy(false);
+  };
+
+  const refreshConnection = async (id) => {
+    setBusy(true); setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/${id}/refresh`, { method: 'POST', headers: auth() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not read the account');
+      const s = data.account_settings || {};
+      if (s.error) throw new Error(s.error);
+      setMessage({ ok: true, text: `${data.label}: ${s.margin_mode || 'margin mode unknown'}${s.leverage ? ` · ${s.leverage}x` : ''} read from the exchange.` });
+      load();
     } catch (e) { setMessage({ ok: false, text: e.message }); }
     setBusy(false);
   };
@@ -300,12 +318,35 @@ const BrokerSettings = () => {
           <h2 className="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2"><Plug size={18} className="text-blue-400" /> Saved connections</h2>
           <div className="space-y-3">
             {activeConnections.map(c => (
-              <div key={c.id} className="p-3 bg-gray-900 rounded-lg border border-gray-700 flex justify-between items-center gap-2">
-                <div className="min-w-0">
-                  <div className="font-bold text-sm text-white truncate">{c.label}</div>
-                  <div className="text-[11px] text-gray-500 truncate">{c.broker_code} · {c.api_key || 'key saved'} {c.is_testnet ? '· testnet' : ''}</div>
+              <div key={c.id} className="p-3 bg-gray-900 rounded-lg border border-gray-700">
+                <div className="flex justify-between items-center gap-2">
+                  <div className="min-w-0">
+                    <div className="font-bold text-sm text-white truncate">{c.label}</div>
+                    <div className="text-[11px] text-gray-500 truncate">{c.broker_code} · {c.api_key || 'key saved'} {c.is_testnet ? '· testnet' : ''}</div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => refreshConnection(c.id)} disabled={busy}
+                            className="text-gray-400 hover:text-white p-2 disabled:opacity-40"
+                            title="Re-read margin mode, leverage and sub-accounts from the exchange">
+                      <RefreshCw size={14} className={busy ? 'animate-spin' : ''} />
+                    </button>
+                    <button onClick={() => removeConnection(c.id)} className="text-red-400 hover:text-red-300 p-2 shrink-0" title="Remove"><Trash2 size={15} /></button>
+                  </div>
                 </div>
-                <button onClick={() => removeConnection(c.id)} className="text-red-400 hover:text-red-300 p-2 shrink-0" title="Remove"><Trash2 size={15} /></button>
+                {c.account_settings && !c.account_settings.error && (
+                  <div className="mt-1.5 text-[10px] text-gray-400 leading-relaxed">
+                    <span className="font-bold text-green-400">{c.account_settings.margin_mode || 'margin mode unknown'}</span>
+                    {c.account_settings.leverage ? ` · ${c.account_settings.leverage}x` : ''}
+                    {c.account_settings.accounts && c.account_settings.accounts.length > 1
+                      ? ` · ${c.account_settings.accounts.length} accounts on this key` : ''}
+                    {c.account_settings_at ? ` · verified ${String(c.account_settings_at).slice(0, 16).replace('T', ' ')}` : ''}
+                  </div>
+                )}
+                {c.account_settings && c.account_settings.error && (
+                  <div className="mt-1.5 text-[10px] text-amber-500 leading-relaxed">
+                    Could not read account details: {String(c.account_settings.error).slice(0, 140)}
+                  </div>
+                )}
               </div>
             ))}
             {activeConnections.length === 0 && <div className="text-xs text-gray-500">No saved connections yet.</div>}
