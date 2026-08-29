@@ -457,6 +457,48 @@ def portfolio_risk(balance: dict, positions: List[dict]) -> dict:
 # ---------------------------------------------------------------------------
 # Snapshot
 # ---------------------------------------------------------------------------
+# Auth-level rejections (Delta: invalid_api_key / HTTP 401; Binance: -2015,
+# "Invalid API-key"). A key rejected at the auth layer fails every signed
+# endpoint identically, so the snapshot collapses the wall of errors into one
+# verdict the terminal can render as a fix-it banner.
+_AUTH_REJECTION_MARKERS = (
+    "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
+    "api-key format", "-2015", "unauthorized",
+)
+
+
+def _is_auth_rejection(text: Any) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _AUTH_REJECTION_MARKERS)
+
+
+def _auth_error_verdict(source: str, errors: Dict[str, str],
+                        attempted: list) -> Optional[str]:
+    """One plain-language message when *every* signed section was auth-rejected.
+
+    ``attempted`` lists the signed sections actually called (fills and
+    order_history are skipped when ``include_history`` is False). Returns None
+    unless all of them failed with an auth-level error — a single dead panel
+    (e.g. fills throttled) stays a partial-data case, not a key problem.
+    """
+    if not attempted:
+        return None
+    texts = [errors.get(section) for section in attempted]
+    if not all(texts):
+        return None
+    if not all(_is_auth_rejection(t) for t in texts):
+        return None
+    return (
+        f"{source} rejected this API key on every authenticated call "
+        f"({texts[0]}). The key does not work on the environment this "
+        "connection points at: it was regenerated or revoked, pasted "
+        "incompletely, or it is a production key on a testnet connection "
+        "(or the reverse). Update the key in Broker Settings — and restart "
+        "any running live-trade instance afterwards, because instances "
+        "read credentials once, at start."
+    )
+
+
 def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = True,
                      history_limit: int = 50) -> dict:
     """Everything the terminal needs, sourced from one broker client.
@@ -551,6 +593,14 @@ def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = Tr
             "fills": fills_error, "order_history": history_error,
             "balance": balance_error, "instrument": instrument.get("error"),
         }.items() if v},
+        # All-auth-failure verdict (see _auth_error_verdict). None when the
+        # key is fine and only individual panels degraded.
+        "auth_error": _auth_error_verdict(source, {
+            "positions": positions_error, "open_orders": open_error,
+            "fills": fills_error, "order_history": history_error,
+            "balance": balance_error,
+        }, ["positions", "open_orders", "balance"] +
+           (["fills", "order_history"] if include_history else [])),
         "rate_limits": client.rate_limit_usage(),
         "fetched_at": datetime.utcnow().isoformat(timespec="seconds"),
     }

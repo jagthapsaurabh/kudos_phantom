@@ -717,7 +717,18 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
         </div>
       )}
 
-      {Object.keys(data.errors || {}).length > 0 && (
+      {data.auth_error ? (
+        <div className="flex items-start gap-2 rounded-2xl border border-red-900 bg-red-900/20 p-4 text-sm text-red-300">
+          <ShieldAlert size={16} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-bold">API key rejected by the exchange</div>
+            <div className="mt-1 text-xs leading-relaxed">{data.auth_error}</div>
+            <a href="/broker" className="mt-2 inline-flex items-center gap-1 rounded-lg border border-red-700 bg-red-900/30 px-3 py-1.5 text-[11px] font-bold text-red-200 transition hover:bg-red-900/50">
+              Open Broker Settings
+            </a>
+          </div>
+        </div>
+      ) : Object.keys(data.errors || {}).length > 0 && (
         <div className="rounded-2xl border border-amber-900 bg-amber-900/10 p-3 text-[11px] text-amber-300">
           Partial data: {Object.entries(data.errors).map(([k, v]) => `${k} (${v})`).join(' · ')}
         </div>

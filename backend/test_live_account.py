@@ -789,6 +789,44 @@ broken = broker_account.account_snapshot(_BrokenClient(), "BTCUSDT")
 check("a dead endpoint degrades one panel, not the whole screen",
       broken["positions"] == [] and "positions" in broken["errors"]
       and broken["mark_price"] is None, str(broken["errors"]))
+check("generic endpoint failures are NOT reported as an API-key problem",
+      broken.get("auth_error") is None, str(broken.get("auth_error")))
+
+
+class _AuthDeadClient(_BrokenClient):
+    """Every signed call 401s — the exact 'invalid_api_key' wall the terminal
+    used to render as five identical partial-data errors."""
+
+    def get_positions(self, symbol=None):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_open_orders(self, symbol=None):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_fills(self, symbol=None, limit=100):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_order_history(self, symbol=None, limit=100):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+    def get_account_balance(self, asset="USDT"):
+        return {"error": 'Delta HTTP 401: {"code": "invalid_api_key"}'}
+
+
+authdead = broker_account.account_snapshot(_AuthDeadClient(), "BTCUSDT")
+check("all-auth failure collapses into one plain-language verdict",
+      isinstance(authdead.get("auth_error"), str)
+      and "rejected this API key" in authdead["auth_error"]
+      and "invalid_api_key" in authdead["auth_error"],
+      str(authdead.get("auth_error"))[:200])
+check("the verdict points at Broker Settings and an instance restart",
+      "Broker Settings" in authdead["auth_error"] and "restart" in authdead["auth_error"],
+      str(authdead.get("auth_error"))[:200])
+check("one mixed failure must not claim the key is bad",
+      broker_account._is_auth_rejection("fills endpoint throttled") is False
+      and broker_account._is_auth_rejection('Delta HTTP 401: {"code": "invalid_api_key"}') is True
+      and broker_account._is_auth_rejection("Binance HTTP 401: Invalid API-key, IP, or permissions") is True,
+      "marker matching")
 
 # ===========================================================================
 section("9. local audit tables")
