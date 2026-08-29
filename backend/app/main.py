@@ -19,7 +19,7 @@ from .services.live_trader import LiveTradeService, COORDINATOR
 from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
-    MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
+    MarketTick, MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
 )
 import bcrypt
 from passlib.context import CryptContext
@@ -308,6 +308,14 @@ def startup():
         print(f"[paper-history] marked {interrupted} paper session(s) as interrupted")
     # Start the background sync task
     asyncio.create_task(daily_sync_task())
+    # Persist every live tick (Binance + Delta BTC perpetual) so the series
+    # can be replayed / resampled later, even with no paper/live session open.
+    try:
+        from .services.tick_store import collector_enabled, run_collector
+        if collector_enabled():
+            asyncio.create_task(run_collector())
+    except Exception as exc:
+        print(f"[ticks] collector not started: {exc}")
 
 @app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
@@ -2349,6 +2357,97 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
         # series so the UI shows an empty chart instead of a hard error.
         print(f"Klines fetch error for {symbol}/{interval}: {e}")
         return []
+
+@app.get("/ticks")
+def get_ticks(symbol: str = "BTCUSDT", source: str = "Binance",
+              start_date: Optional[str] = None, end_date: Optional[str] = None,
+              limit: int = 5000, user=Depends(get_current_user), db=Depends(get_db)):
+    """Raw live ticks stored from the venue stream / REST poll.
+
+    Windowed like /klines so a backtest range actually contains the ticks
+    that fired inside it (a last-N fetch from "now" would drop them).
+    """
+    from .services.tick_store import flush_ticks, query_ticks
+    flush_ticks()
+    start = end = None
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            start = None
+    if end_date:
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            end = None
+    rows = query_ticks(normalize_source(source), symbol, start=start, end=end,
+                       limit=limit, db=db)
+    out = []
+    for row in rows:
+        out.append({
+            "time": int(_utc_ts(row.event_time)),
+            "mark_price": row.mark_price,
+            "last_price": row.last_price,
+            "index_price": row.index_price,
+            "bid": row.bid,
+            "ask": row.ask,
+            "feed": row.feed_kind,
+        })
+    return out
+
+
+@app.get("/ticks/latest")
+def get_latest_tick(symbol: str = "BTCUSDT", source: str = "Binance",
+                    user=Depends(get_current_user), db=Depends(get_db)):
+    from .services.tick_store import flush_ticks, latest_tick
+    flush_ticks()
+    row = latest_tick(normalize_source(source), symbol, db=db)
+    if row is None:
+        return None
+    return {
+        "time": int(_utc_ts(row.event_time)),
+        "source": row.source, "symbol": row.symbol,
+        "mark_price": row.mark_price, "last_price": row.last_price,
+        "index_price": row.index_price, "bid": row.bid, "ask": row.ask,
+        "feed": row.feed_kind,
+    }
+
+
+@app.get("/ticks/ohlc")
+def get_tick_ohlc(symbol: str = "BTCUSDT", source: str = "Binance",
+                  interval: str = "1m", start_date: Optional[str] = None,
+                  end_date: Optional[str] = None, limit: int = 20000,
+                  user=Depends(get_current_user), db=Depends(get_db)):
+    """Resample stored ticks into OHLC candles (volume = ticks in the bar)."""
+    from .services.tick_store import OHLC_SECONDS, flush_ticks, query_ticks, ticks_to_ohlc
+    if str(interval).lower() not in OHLC_SECONDS:
+        raise HTTPException(status_code=400,
+                            detail=f"interval must be one of {', '.join(OHLC_SECONDS)}")
+    flush_ticks()
+    start = end = None
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            start = None
+    if end_date:
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            end = None
+    rows = query_ticks(normalize_source(source), symbol, start=start, end=end,
+                       limit=limit, db=db)
+    bars = ticks_to_ohlc(rows, interval)
+    return [{"time": int(_utc_ts(b["time"])), "open": b["open"], "high": b["high"],
+             "low": b["low"], "close": b["close"], "volume": b["volume"]} for b in bars]
+
+
+@app.get("/ticks/stats")
+def get_tick_stats(user=Depends(get_current_user), db=Depends(get_db)):
+    from .services.tick_store import collector_stats, flush_ticks, series_stats
+    flush_ticks()
+    return {"series": series_stats(db), "collector": collector_stats()}
+
 
 @app.get("/symbols")
 def list_symbols(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):

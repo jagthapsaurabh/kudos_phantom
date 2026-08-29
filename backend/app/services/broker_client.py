@@ -60,7 +60,9 @@ class BrokerClient:
     DELTA_TESTNET = "https://cdn-ind.testnet.deltaex.org"
     DELTA_WS = {
         "production": {
-            "public": "wss://socket.india.delta.exchange",
+            # Changelog 17.04.26: public channels live on public-socket;
+            # wss://socket.india.delta.exchange public channels were removed 31 Jul 2026.
+            "public": "wss://public-socket.india.delta.exchange",
             "public_v2": "wss://public-socket.india.delta.exchange",
             "private": "wss://socket.india.delta.exchange",
         },
@@ -144,6 +146,18 @@ class BrokerClient:
             return default if number != number else number
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _delta_limit_price(price):
+        """String form of a limit price, or None when it must not be sent.
+
+        Changelog 15.04.26: any ``limit_price`` ≤ 0 is rejected. If the field
+        is not required, omit it (do not send 0 / empty / \"None\").
+        """
+        number = BrokerClient._f(price)
+        if number is None or number <= 0:
+            return None
+        return str(price)
 
     # ------------------------------------------------------------------
     # Intervals
@@ -262,6 +276,12 @@ class BrokerClient:
     # ------------------------------------------------------------------
     def _delta_request(self, method, path, body=None, query=None, weight: float = 1.0,
                        is_order: bool = False):
+        # Changelog 19.08.26 (docs.delta.exchange): GET /v2/profile is rejected
+        # when signed with API keys from 19 Aug 2026. Account identity / a key
+        # ping must use GET /v2/wallet/balances (or GET /v2/users/trading_preferences).
+        if str(path).rstrip("/").endswith("/v2/profile") or str(path).rstrip("/") == "/profile":
+            return None, {"error": "GET /v2/profile is no longer accessible with API keys "
+                                   "(Delta changelog 19.08.26). Use GET /v2/wallet/balances."}
         body_text = json.dumps(body or {}, separators=(",", ":")) if body is not None else ""
         timestamp = str(int(time.time()))
         query_text = "&".join(f"{k}={v}" for k, v in sorted((query or {}).items()))
@@ -584,7 +604,12 @@ class BrokerClient:
                 body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
         else:
             body["order_type"] = "limit_order"
-            body["limit_price"] = str(price)
+            # Changelog 15.04.26: limit_price ≤ 0 is rejected; omit when unused.
+            limit = self._delta_limit_price(price)
+            if limit is None:
+                return {"error": "limit orders require a positive limit_price "
+                                 "(Delta changelog 15.04.26)"}
+            body["limit_price"] = limit
             body["time_in_force"] = "gtc" if str(time_in_force).upper() in ("GTC", "GTX") else "ioc"
             if is_stop:
                 body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
@@ -637,7 +662,11 @@ class BrokerClient:
                 "bracket_stop_trigger_method": trigger_method or "mark_price",
             }
             if price is not None:
-                body["limit_price"] = str(price)
+                limit = self._delta_limit_price(price)
+                if limit is None:
+                    return {"error": "limit orders require a positive limit_price "
+                                     "(Delta changelog 15.04.26)"}
+                body["limit_price"] = limit
             if stop_loss_price is not None:
                 sl_leg: Dict[str, Any] = {"order_type": "market_order",
                                           "stop_price": str(stop_loss_price)}
@@ -745,7 +774,11 @@ class BrokerClient:
             if perp:
                 body["product_symbol"] = perp
             if price is not None:
-                body["limit_price"] = str(price)
+                limit = self._delta_limit_price(price)
+                if limit is None:
+                    return {"error": "limit_price must be positive "
+                                     "(Delta changelog 15.04.26)"}
+                body["limit_price"] = limit
             if size is not None:
                 body["size"] = int(round(size))
             if stop_price is not None:

@@ -80,11 +80,11 @@ def parse_binance(payload: Any, source: str = "Binance") -> Optional[MarkPriceQu
 
 
 def parse_delta(payload: Any, source: str = "Delta") -> Optional[MarkPriceQuote]:
-    """Delta Exchange ``v2/ticker`` message -> quote.
+    """Delta Exchange ``ticker`` message -> quote.
 
-    Delta wraps its stream in ``{"type":"ticker","symbol":...}`` and sends both
-    the mark and the last traded price. Subscriptions are acknowledged with
-    ``{"type":"subscriptions"}``, which carries no price and is skipped.
+    Changelog 17.04.26 renamed ``v2/ticker`` → ``ticker`` on the public socket.
+    Frames still arrive as ``{"type":"ticker","symbol":...}`` with mark + last.
+    Subscription acks carry no price and are skipped.
     """
     if not isinstance(payload, dict):
         return None
@@ -117,17 +117,22 @@ def parse_delta_candlestick(payload: Any) -> Optional[Dict[str, Any]]:
         return None
     if kind in ("ticker", "subscriptions", "heartbeat", "key-auth"):
         return None
-    symbol = str(payload.get("symbol") or payload.get("product_symbol") or "")
-    resolution = str(payload.get("resolution") or payload.get("interval") or "")
+    symbol = str(payload.get("symbol") or payload.get("product_symbol") or payload.get("sy") or "")
+    resolution = str(payload.get("resolution") or payload.get("interval") or payload.get("res") or "")
     if not resolution and kind.startswith("candlestick_"):
         resolution = kind.split("_", 1)[-1]
-    start = payload.get("candle_start_time") or payload.get("start") or payload.get("time")
+    start = payload.get("candle_start_time") or payload.get("start") or payload.get("time") or payload.get("ts")
     try:
         start_ts = float(start) if start is not None else None
     except (TypeError, ValueError):
         start_ts = None
-    if start_ts and start_ts > 1e12:
-        start_ts = start_ts / 1000.0
+    if start_ts:
+        if start_ts > 1e16:       # nanoseconds
+            start_ts /= 1e9
+        elif start_ts > 1e14:     # microseconds (compact candlestick ``ts``)
+            start_ts /= 1e6
+        elif start_ts > 1e11:     # milliseconds
+            start_ts /= 1e3
     event_time = None
     if start_ts:
         from datetime import datetime, timezone
@@ -176,10 +181,13 @@ STREAM_URLS_TESTNET = {
 # so REST candle polling is not needed on every tick.
 def delta_subscribe(symbol: str, include_candles: bool = True,
                     resolution: str = "1h") -> Dict[str, Any]:
-    channels = [{"name": "v2/ticker", "symbols": [symbol]}]
+    # Changelog 17.04.26: ``v2/ticker`` → ``ticker`` on the new public socket.
+    # The old name on wss://socket.india.delta.exchange was removed 31 Jul 2026.
+    channels = [{"name": "ticker", "symbols": [symbol]}]
     if include_candles:
-        # Official candlesticks channel: bare symbol = last-traded OHLC,
-        # ``MARK:symbol`` = mark-price OHLC (docs.delta.exchange, Public Channels).
+        # Official candlesticks channel: ``candlestick_${resolution}``
+        # (docs.delta.exchange Public Channels). Bare symbol = last-traded OHLC,
+        # ``MARK:symbol`` = mark-price OHLC.
         candle_symbols = [symbol]
         if not str(symbol).upper().startswith("MARK:"):
             candle_symbols.append(f"MARK:{symbol}")
@@ -248,6 +256,14 @@ class TickFeed:
         self._quote = quote
         self._received_at = time.monotonic()
         self.messages += 1
+        # Persist every live quote (websocket / REST). A NullTickFeed is the
+        # "off" path and must not write synthetic test prices into the table.
+        if self.kind != "none":
+            try:
+                from app.services.tick_store import record_tick
+                record_tick(quote, feed_kind=self.kind)
+            except Exception:
+                pass
         return True
 
     def quote(self) -> Optional[MarkPriceQuote]:
@@ -278,6 +294,11 @@ class TickFeed:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        try:
+            from app.services.tick_store import flush_ticks
+            flush_ticks()
+        except Exception:
+            pass
 
     async def _run(self):
         raise NotImplementedError

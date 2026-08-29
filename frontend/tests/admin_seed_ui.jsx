@@ -43,6 +43,7 @@ check('fetch-all label mentions the 2020 → today range', /Fetch all date windo
 // The data-health columns make a corrupt seed visible at a glance.
 check('duplicate column in status table', /th[^>]*>Duplicates</.test(html));
 check('off-grid column in status table', /th[^>]*>Off-grid</.test(html));
+check('stored ticks inventory is shown', html.includes('Stored ticks'));
 
 // Binance full-history mode explains the fetch (1500-candle windows, upsert,
 // repair-first) instead of only the generic daily-refresh note.

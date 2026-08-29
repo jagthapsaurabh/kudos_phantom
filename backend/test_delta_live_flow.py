@@ -87,8 +87,8 @@ check("Binance testnet still points at testnet.binancefuture.com",
 
 ws_prod = prod.websocket_urls()
 ws_demo = demo.websocket_urls()
-check("production public WS is India",
-      "india.delta.exchange" in ws_prod["public"], ws_prod)
+check("production public WS is the new public-socket host (changelog 17.04.26)",
+      ws_prod["public"] == "wss://public-socket.india.delta.exchange", ws_prod)
 check("testnet private WS is socket-ind.testnet.deltaex.org",
       ws_demo["private"] == "wss://socket-ind.testnet.deltaex.org", ws_demo)
 check("testnet public WS is socket-ind-pub.testnet.deltaex.org",
@@ -352,8 +352,8 @@ section("5. WS candlesticks 1h — ticker stays channels[0]")
 frame = delta_subscribe("BTCUSD")
 channels = frame["payload"]["channels"]
 check("subscribe type is subscribe", frame["type"] == "subscribe")
-check("channels[0] is still v2/ticker (regression)",
-      channels[0]["name"] == "v2/ticker", channels)
+check("channels[0] is ticker (changelog 17.04.26 renamed v2/ticker)",
+      channels[0]["name"] == "ticker", channels)
 check("candlestick_1h is also subscribed",
       any(c["name"] == "candlestick_1h" for c in channels), channels)
 check("ticker stays on the product symbol",
@@ -391,7 +391,7 @@ feed = build_tick_feed("websocket", "Delta", "BTCUSD", DeltaDef(),
 check("testnet client picks the India testnet socket",
       "testnet.deltaex.org" in feed.url, feed.url)
 check("built feed still subscribes ticker first",
-      feed.subscribe["payload"]["channels"][0]["name"] == "v2/ticker")
+      feed.subscribe["payload"]["channels"][0]["name"] == "ticker")
 
 
 # ===========================================================================
@@ -502,6 +502,60 @@ check("the paper fast tick was counted", paper.fast_ticks == 1, paper.fast_ticks
 check("the closed paper trade was booked",
       len(paper.closed_trades) == 1 and paper.closed_trades[0]["reason"] == "SL",
       paper.closed_trades)
+
+
+# ===========================================================================
+section("9. GET /v2/profile is blocked (changelog 19.08.26)")
+# ===========================================================================
+# docs.delta.exchange changelog 19.08.26: GET /v2/profile is no longer
+# accessible with API keys from 19 Aug 2026. Requests are rejected. Account
+# reads must use GET /v2/wallet/balances (which this client already does).
+import inspect as _inspect
+_src = _inspect.getsource(BrokerClient)
+check("account balance uses GET /v2/wallet/balances, not /v2/profile",
+      "/v2/wallet/balances" in _inspect.getsource(BrokerClient.get_account_balance)
+      and "/v2/profile" not in _inspect.getsource(BrokerClient.get_account_balance))
+blocked = BrokerClient("k", "s", "Delta")
+# Point at a closed port so a leak would fail the request instead of hanging.
+blocked.trading_url = "http://127.0.0.1:1"
+blocked.market_url = "http://127.0.0.1:1"
+refused = blocked._json_body(*blocked._delta_request("GET", "/v2/profile"))
+check("GET /v2/profile is refused locally (no HTTP call)",
+      isinstance(refused, dict) and "19.08.26" in str(refused.get("error", "")),
+      refused)
+refused_alias = blocked._json_body(*blocked._delta_request("GET", "/profile"))
+check("bare /profile is refused the same way",
+      isinstance(refused_alias, dict) and "wallet/balances" in str(refused_alias.get("error", "")),
+      refused_alias)
+via_request = blocked.request("GET", "/v2/profile")
+check("generic request() also refuses /v2/profile",
+      isinstance(via_request, dict) and "19.08.26" in str(via_request.get("error", "")),
+      via_request)
+# Wallet balances is still a real signed GET (RecordingClient captured paths).
+check("source never GETs /v2/profile except to block it",
+      _src.count('GET", "/v2/profile"') == 0 and "changelog 19.08.26" in _src)
+
+# Changelog 15.04.26: limit_price ≤ 0 is rejected — never send it.
+zero = rec.place_order("BTCUSDT", "buy", "limit", 1, price=0, size_in_btc=False)
+check("limit_price 0 is refused before HTTP (changelog 15.04.26)",
+      isinstance(zero, dict) and "15.04.26" in str(zero.get("error", "")), zero)
+neg = rec.place_order("BTCUSDT", "buy", "limit", 1, price=-1, size_in_btc=False)
+check("negative limit_price is refused",
+      isinstance(neg, dict) and "limit_price" in str(neg.get("error", "")), neg)
+before = len(CAPTURE2["calls"])
+rec.place_order("BTCUSDT", "buy", "limit", 1, price=60100, size_in_btc=False)
+limit_call = CAPTURE2["calls"][-1] if len(CAPTURE2["calls"]) > before else {}
+check("a positive limit_price is still sent as a string",
+      (limit_call.get("body") or {}).get("limit_price") == "60100", limit_call)
+
+compact = parse_delta_candlestick({
+    "type": "candlestick_1m", "c": 71748.0, "h": 71751.5, "l": 71737.0,
+    "o": 71737.0, "res": "1m", "sy": "BTCUSD", "ts": 1_700_000_000_000_000,
+})
+check("compact candlestick keys (o/h/l/c/sy/res/ts) parse",
+      compact is not None and compact["close"] == 71748.0
+      and compact["symbol"] == "BTCUSD" and compact["resolution"] == "1m",
+      compact)
 
 
 # ===========================================================================

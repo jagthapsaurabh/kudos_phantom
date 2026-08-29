@@ -307,9 +307,9 @@ check("binance needs no subscribe frame", ws_feed.subscribe is None)
 
 delta_feed = build_tick_feed("websocket", "Delta", "BTCUSD", DeltaDef(), client=FakeClient())
 check("delta websocket is built", delta_feed.kind == "websocket")
-check("delta subscribes to v2/ticker",
+check("delta subscribes to ticker (changelog 17.04.26, not v2/ticker)",
       isinstance(delta_feed.subscribe, dict)
-      and delta_feed.subscribe["payload"]["channels"][0]["name"] == "v2/ticker",
+      and delta_feed.subscribe["payload"]["channels"][0]["name"] == "ticker",
       delta_feed.subscribe)
 check("delta_subscribe is a well-formed frame",
       delta_subscribe("BTCUSD")["type"] == "subscribe")
