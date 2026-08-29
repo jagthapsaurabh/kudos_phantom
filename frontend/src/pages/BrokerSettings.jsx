@@ -20,7 +20,6 @@ const ExchangeRegistry = () => {
 
   const load = () => fetch(`${API_URL}/admin/brokers`, { headers: auth() }).then(r => r.json()).then(setRows).catch(() => {});
   useEffect(() => { load(); }, []);
-  useEffect(() => { loadCheck(defaultBroker); }, [defaultBroker]);
 
   const add = async (e) => {
     e.preventDefault();
