@@ -23,7 +23,7 @@
 | [PR #12](#pr-12--fix-exit-distribution-tooltip-black-on-black-text--add-commit-history-summary-doc) | Fix Exit Distribution tooltip (black-on-black text) + add commit history summary doc | 2026-08-27 |
 | [PR #13](#pr-13--show-per-trade-pnl-fees-and-booked-pnl-in-trade-logs--exports) | Show per-trade PnL, fees and booked PnL in trade logs + exports | 2026-08-27 |
 | [PR #14](#pr-14--btc-perpetual-mark-pricing-skip-new-trade-windows-and-a-full-live-order-management-terminal) | BTC perpetual mark pricing, skip-new-trade windows, and a full live order-management terminal | 2026-08-28 |
-| [PR #15](#pr-15--binancedelta-full-history-seeding-2020today-corrupt-data-repair-unbreakable-long-seeds--navbar-crash-fix) | Binance/Delta full-history seeding (2020→today), corrupt-data repair, unbreakable long seeds + navbar crash fix | Open (2026-08-29) |
+| [PR #15](#pr-15--binancedelta-full-history-seeding-2020today-corrupt-data-repair-unbreakable-long-seeds--navbar-crash-fix) | Binance/Delta full-history seeding (2020→today), corrupt-data repair, unbreakable long seeds + navbar crash fix | 2026-08-29 |
 
 ---
 
@@ -588,7 +588,7 @@
 
 ## PR #15 — Binance/Delta full-history seeding (2020→today), corrupt-data repair, unbreakable long seeds + navbar crash fix
 
-**Status:** OPEN — https://github.com/jagthapsaurabh/kudos_phantom/pull/15 (opened 2026-08-29)  
+**Merged:** 2026-08-29 (squash onto `main`) — https://github.com/jagthapsaurabh/kudos_phantom/pull/15  
 **Branch:** `arena/01a04ba9-kudos-phantom`
 
 ### Commits
@@ -710,4 +710,4 @@ git revert <SHA>
 
 ---
 
-*Last updated: 2026-08-29 | Covers PR #1 through PR #14 (merged to `main`) + PR #15 (open)*
+*Last updated: 2026-08-29 | Covers PR #1 through PR #15 (all merged to `main`)*
