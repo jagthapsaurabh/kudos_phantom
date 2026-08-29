@@ -78,6 +78,53 @@ check('a short venue position is labelled', shortBadges.includes('VENUE SHORT 0.
 check('no badges when nothing was refused',
   renderToString(React.createElement(EntryGuardBadges, {})).trim() === '');
 
+// ------------------------------------------- shared broker account (3-4 runs) --
+// One futures account carries ONE netted position per contract, so several
+// live runs on the same API key take turns. The badge is how an operator sees
+// that an idle strategy is queued rather than broken.
+const waitingBadges = flat(renderToString(React.createElement(EntryGuardBadges, {
+  held: 5,
+  reason: "'Alpha' holds this account's position (LONG 0.0060 BTC) — queued behind 1 other strategy",
+  shared: {
+    strategies_on_account: 3, queue_position: 2, position_held_by: 'Alpha',
+    holds_account_position: false, other_strategies: ['Alpha', 'Gamma'],
+    note: 'one netted position per account — only one strategy can hold a trade at a time; the rest wait their turn',
+  },
+})));
+check('a queued strategy shows its place in line',
+  waitingBadges.includes('QUEUED 2/3'), waitingBadges);
+check('a queued strategy is not labelled as holding the account',
+  !waitingBadges.includes('HOLDS ACCOUNT'), waitingBadges);
+check('the queue badge names the instance holding the position',
+  waitingBadges.includes('Position currently held by: Alpha'), waitingBadges);
+check('the queue badge explains the one-position rule',
+  waitingBadges.includes('one netted position per account'), waitingBadges);
+check('the queue badge lists the other runs on the account',
+  waitingBadges.includes('Alpha, Gamma'), waitingBadges);
+
+const holdingBadges = flat(renderToString(React.createElement(EntryGuardBadges, {
+  shared: {
+    strategies_on_account: 4, queue_position: 1, position_held_by: 'Alpha',
+    holds_account_position: true, other_strategies: ['Beta', 'Gamma', 'Delta'],
+    note: 'one netted position per account',
+  },
+})));
+check('the instance carrying the trade says it holds the account',
+  holdingBadges.includes('HOLDS ACCOUNT · 4 SHARED'), holdingBadges);
+check('the holder is not shown as queued',
+  !holdingBadges.includes('QUEUED'), holdingBadges);
+
+const soloBadges = flat(renderToString(React.createElement(EntryGuardBadges, {
+  held: 2, reason: 'cooldown',
+  shared: { strategies_on_account: 1, queue_position: 1, position_held_by: null,
+            holds_account_position: false, other_strategies: [], note: 'x' },
+})));
+check('a strategy alone on its key shows no shared-account badge',
+  !soloBadges.includes('SHARED') && !soloBadges.includes('QUEUED'), soloBadges);
+check('a missing shared_account payload renders nothing extra',
+  !flat(renderToString(React.createElement(EntryGuardBadges, { held: 1 })))
+    .includes('QUEUED'));
+
 // ------------------------------------------------- broker connection check --
 // The panel that answers "I added the broker, why does it say no API keys?".
 const readyReport = {

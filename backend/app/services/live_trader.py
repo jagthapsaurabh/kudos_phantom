@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -75,6 +76,124 @@ def parse_open_position(rows, contract_value: float = 1.0):
             "entry_price": entry_price,
         }
     return None
+
+
+def account_key(broker_name, api_key):
+    """Identity of the venue account a set of credentials points at.
+
+    Two live instances pointed at the same API key share ONE account, and a
+    futures account carries a single netted position per contract — so they
+    have to take turns. Two instances on different keys (different sub-accounts)
+    are genuinely independent and must not block each other. This mirrors the
+    rate limiter's own notion of an account.
+    """
+    digest = hashlib.sha1(str(api_key or "").encode()).hexdigest()[:12]
+    return f"{broker_name}:{digest}"
+
+
+class AccountCoordinator:
+    """Which live instance currently holds the position on a shared account.
+
+    Every worker keeps its own in-memory order book, but the venue does not:
+    one account, one netted position per contract. Left to themselves, two
+    instances on the same key either stack into a position neither of them
+    sized correctly, or hedge to net zero while both books still report a live
+    trade. This registry lets them queue instead — one position at a time, per
+    account.
+    """
+
+    def __init__(self):
+        self._members: Dict[str, Dict[str, "LiveTradeService"]] = {}
+
+    def register(self, service):
+        key = getattr(service, "account_id", None)
+        if not key:
+            return
+        self._members.setdefault(key, {})[str(service.instance_key or id(service))] = service
+
+    def unregister(self, service):
+        key = getattr(service, "account_id", None)
+        if not key:
+            return
+        bucket = self._members.get(key)
+        if bucket:
+            bucket.pop(str(service.instance_key or id(service)), None)
+            if not bucket:
+                self._members.pop(key, None)
+
+    def siblings(self, service):
+        """Other running instances on the same account."""
+        key = getattr(service, "account_id", None)
+        if not key:
+            return []
+        mine = str(service.instance_key or id(service))
+        return [s for k, s in self._members.get(key, {}).items() if k != mine]
+
+    def holder(self, service):
+        """The sibling currently holding a position on this account, if any."""
+        for sibling in self.siblings(service):
+            if getattr(sibling, "oms", None) and sibling.oms.active_trades:
+                return sibling
+        return None
+
+    def queue_position(self, service):
+        """1-based place in line for this account (1 = it is this instance's turn)."""
+        waiting = [s for s in self.siblings(service)
+                   if getattr(s, "oms", None) and s.oms.active_trades]
+        return len(waiting) + 1
+
+
+# One registry per process. Live workers run as background tasks inside a
+# single event loop, so plain dict access is enough here.
+COORDINATOR = AccountCoordinator()
+
+
+def extract_leg_order_ids(response):
+    """Order ids of the stop-loss / take-profit legs inside a bracket response.
+
+    Cancelling protection has to be scoped to *this* instance's legs. The
+    account-wide ``cancel_all_orders`` wipes every resting order on the
+    contract, including the stop-loss and take-profit another live instance is
+    relying on — leaving that position running unprotected.
+    """
+    ids = []
+    try:
+        from app.services.broker_account import split_order_response
+        for row, leg in split_order_response(response, ""):
+            if leg not in ("stop_loss", "take_profit") or not isinstance(row, dict):
+                continue
+            for key in ("orderId", "id", "order_id", "clientOrderId", "client_order_id"):
+                value = row.get(key)
+                if value not in (None, ""):
+                    ids.append(str(value))
+                    break
+    except Exception:
+        return []
+    return ids
+
+
+_NOTHING_TO_REDUCE = (
+    "reduceonly order is rejected", "reduce only order is rejected",
+    "reduce-only order is rejected", "order would immediately trigger",
+    "no position to reduce", "not enough position", "position not found",
+    "reduce only reject", "reduceonly reject", "-2022",
+)
+
+
+def _is_nothing_to_reduce(response):
+    """True when the venue refused a reduce-only order because there is no
+    position left to flatten.
+
+    Venues word this differently (Binance answers with code -2022, Delta with
+    its own text), so the match is deliberately loose. Only ever applied to a
+    response that already carries an ``error``.
+    """
+    if not isinstance(response, dict):
+        return False
+    message = str(response.get("error") or "").lower()
+    if not message:
+        return False
+    return any(needle in message for needle in _NOTHING_TO_REDUCE)
 
 
 def extract_fill_price(response):
@@ -173,6 +292,13 @@ class LiveTradeService:
         # sends be mirrored into broker_orders / broker_fills for the terminal.
         self.user_id = user_id
         self.instance_key = instance_key
+        # Which venue account this worker sends orders to. Several strategies
+        # can share one API key, and that account holds ONE netted position per
+        # contract, so instances on the same key queue for it.
+        self.account_id = account_key(broker_name or "", api_key)
+        # Order ids of the stop-loss / take-profit legs this instance placed.
+        # Exiting cancels exactly these and nothing else on the account.
+        self.protection_leg_ids = []
         # Entries go out as bracket orders (entry + stop-loss + take-profit) so
         # risk is protected exchange-side even if this worker dies mid-trade.
         self.bracket_orders = bool(bracket_orders)
@@ -200,7 +326,12 @@ class LiveTradeService:
 
     async def start(self):
         self.is_running = True
+        COORDINATOR.register(self)
         print(f"🚀 LIVE Trading Started for {self.broker_name}/{self.strategy_id}")
+        others = len(COORDINATOR.siblings(self))
+        if others:
+            print(f"   Shared account: {others} other live strateg{'y' if others == 1 else 'ies'} "
+                  f"on this API key — one position at a time, they take turns")
         print(f"   Contract: {self.contract_symbol} perpetual · pricing basis: "
               f"{'MARK price' if self.use_mark_price else 'traded price'}")
         if self.window_guard.enabled:
@@ -218,6 +349,7 @@ class LiveTradeService:
 
     async def stop(self):
         self.is_running = False
+        COORDINATOR.unregister(self)
         # Do not silently leave a real position unmanaged. In production an
         # operator can close it from the broker; this worker stops opening new
         # positions and the next status call remains visible until then.
@@ -267,8 +399,25 @@ class LiveTradeService:
                                            advance_bar=new_bar)
             if result:
                 side = "SELL" if result.direction == 1 else "BUY"
+                # reduce-only: this order must flatten, never open the other
+                # side. Without it, a position that is already flat (a sibling
+                # instance closed it, or the venue-side stop got there first)
+                # turns this "exit" into a brand new position nobody manages.
                 response = self.broker.place_order(self.contract_symbol, side, "MARKET",
-                                                   result.lots, size_in_btc=True)
+                                                   result.lots, size_in_btc=True,
+                                                   reduce_only=True)
+                if isinstance(response, dict) and _is_nothing_to_reduce(response):
+                    # The venue has nothing left to reduce: the position is
+                    # already flat. `update_trade` has already settled the
+                    # local book, so all that remains is to clear this
+                    # instance's resting legs and restart the cooldown rather
+                    # than retrying a close the venue cannot accept.
+                    self._cancel_protection_legs()
+                    self._bars_since_exit = 0
+                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: "
+                          f"{result.exit_reason} — venue was already flat "
+                          f"(stop or another instance got there first); local book settled")
+                    continue
                 # Drop the stop-loss / take-profit legs the entry created; the
                 # position they protected is already flat.
                 if "error" not in response and self.cancel_legs_on_exit:
@@ -372,6 +521,10 @@ class LiveTradeService:
                                           size_in_btc=True)
         self._record_order(res, leg="entry")
         if "error" not in res:
+            # Remember exactly which protection legs belong to THIS instance so
+            # the eventual exit cancels its own stops and not a sibling
+            # instance's (they share one account and one order book).
+            self.protection_leg_ids = extract_leg_order_ids(res)
             # This candle's signal is spent: the remaining ticks of the same
             # 1h candle must not send another order.
             self._acted_signal_bar = current_time
@@ -421,7 +574,19 @@ class LiveTradeService:
         if not self.exchange_position_known:
             return (f"could not read the open position on {self.broker_name} — "
                     f"entry held until the venue can be read")
+        holder = COORDINATOR.holder(self)
         pos = self.exchange_position
+        if holder is not None:
+            # Another strategy on the SAME API key is in a trade. One futures
+            # account carries one netted position per contract, so entering now
+            # would either stack onto that position at a size neither instance
+            # sized, or hedge it towards zero while both books still report a
+            # live trade. Wait for the sibling to close instead.
+            side = "LONG" if pos and pos["direction"] == 1 else ("SHORT" if pos else "")
+            queued = COORDINATOR.queue_position(self)
+            detail = f" ({side} {pos['size_btc']:.4f} BTC)" if pos and side else ""
+            return (f"'{holder.strategy_id}' holds this account's position{detail} — "
+                    f"queued behind {queued - 1} other strateg{'y' if queued - 1 == 1 else 'ies'}")
         if pos:
             side = "LONG" if pos["direction"] == 1 else "SHORT"
             return (f"{self.broker_name} already holds a position "
@@ -455,7 +620,8 @@ class LiveTradeService:
         """Flatten the open position so the opposite signal can be taken."""
         side = "SELL" if trade.direction == 1 else "BUY"
         response = self.broker.place_order(self.contract_symbol, side, "MARKET",
-                                           trade.lots, size_in_btc=True)
+                                           trade.lots, size_in_btc=True,
+                                           reduce_only=True)
         if "error" not in response and self.cancel_legs_on_exit:
             self._cancel_protection_legs()
         self._record_order(response, leg="exit")
@@ -513,12 +679,42 @@ class LiveTradeService:
             return None
 
     def _cancel_protection_legs(self):
-        """Cancel the reduce-only stop / target legs of a closed bracket."""
-        try:
-            return self.broker.cancel_all_orders(self.symbol)
-        except Exception as exc:
-            print(f"[{self.strategy_id}] could not cancel protection legs: {exc}")
+        """Cancel the reduce-only stop / target legs of a closed bracket.
+
+        Scoped to the legs *this* instance placed. The account-wide
+        ``cancel_all_orders`` would also pull the stop-loss and take-profit
+        belonging to any other strategy running on the same API key, and that
+        position would then be left with no exchange-side protection at all.
+        """
+        legs = list(self.protection_leg_ids or [])
+        self.protection_leg_ids = []
+        if not legs:
+            # Nothing this instance placed is resting, so nothing is safe to
+            # cancel: the remaining orders on the contract belong to someone
+            # else (another instance, or the client's own terminal orders).
             return None
+        cancelled, failed = [], []
+        for order_id in legs:
+            try:
+                result = self.broker.cancel_order(order_id, symbol=self.symbol)
+                if isinstance(result, dict) and result.get("error"):
+                    # An already-filled or already-cancelled stop is fine;
+                    # anything else means a leg may still be resting.
+                    message = str(result.get("error"))
+                    if any(word in message.lower() for word in
+                           ("unknown order", "not exist", "order does not exist",
+                            "already filled", "order is completed")):
+                        continue
+                    failed.append(f"{order_id}: {message}")
+                else:
+                    cancelled.append(order_id)
+            except Exception as exc:
+                failed.append(f"{order_id}: {exc}")
+        if failed:
+            self.last_order_error = f"protection legs still resting: {'; '.join(failed)}"
+            print(f"⚠️ [{self.strategy_id}] LIVE protection legs NOT cancelled — "
+                  f"{'; '.join(failed)}. This position may still be open on the venue.")
+        return {"cancelled": cancelled, "failed": failed}
 
     def _fetch_mark_price(self):
         """Current mark price of the BTC perpetual; ``None`` when unavailable."""

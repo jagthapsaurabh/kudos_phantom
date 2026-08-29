@@ -15,7 +15,7 @@ from .core.trading_windows import (
 )
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
-from .services.live_trader import LiveTradeService
+from .services.live_trader import LiveTradeService, COORDINATOR
 from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
@@ -2084,6 +2084,38 @@ async def stop_live_trade(instance_key: str, user=Depends(get_current_user)):
         return {"status": "Live trade stopped"}
     raise HTTPException(status_code=404, detail="Instance not found")
 
+def _shared_account_status(service):
+    """How many live runs share this instance's broker account, and whose turn it is.
+
+    A futures account holds ONE netted position per contract, so several
+    strategies on one API key cannot each carry their own trade — they queue.
+    Reporting that here keeps "my strategy is running but not trading" from
+    looking like a bug.
+    """
+    try:
+        siblings = COORDINATOR.siblings(service)
+    except Exception:
+        return None
+    if not siblings:
+        return None
+    holder = COORDINATOR.holder(service)
+    # `holder()` only looks at siblings, so the instance carrying the position
+    # would otherwise report "nobody holds it" — name it explicitly instead.
+    if holder is None and getattr(service, "oms", None) and service.oms.active_trades:
+        held_by = service.strategy_id
+    else:
+        held_by = holder.strategy_id if holder is not None else None
+    return {
+        "strategies_on_account": len(siblings) + 1,
+        "queue_position": COORDINATOR.queue_position(service),
+        "position_held_by": held_by,
+        "holds_account_position": held_by == service.strategy_id,
+        "other_strategies": sorted(getattr(s, "strategy_id", "?") for s in siblings),
+        "note": ("one netted position per account — only one strategy can hold a "
+                 "trade at a time; the rest wait their turn"),
+    }
+
+
 @app.get("/live-trade/status")
 def get_live_status(user=Depends(get_current_user)):
     status_list = []
@@ -2128,6 +2160,11 @@ def get_live_status(user=Depends(get_current_user)):
                 # a post-exit cooldown is running.
                 "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
                 "last_skip_reason": getattr(service, 'last_skip_reason', None),
+                # Shared account: how many live runs point at this same API key.
+                # They share ONE netted position per contract, so they take
+                # turns — surfaced here so "why is my strategy idle?" is
+                # answerable without reading the log.
+                "shared_account": _shared_account_status(service),
                 # What the venue itself reports for this contract, so a position
                 # this instance did not open is visible instead of silent.
                 "exchange_position": getattr(service, 'exchange_position', None),

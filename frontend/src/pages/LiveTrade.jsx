@@ -316,6 +316,7 @@ const LiveTrade = () => {
                         reason={inst.last_skip_reason}
                         position={inst.exchange_position}
                         broker={inst.broker_name || 'the broker'}
+                        shared={inst.shared_account}
                       />
                     </div>
                   </div>

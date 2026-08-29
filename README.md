@@ -98,6 +98,39 @@ returned by `GET /live-trade/status` and `GET /paper-trade/status`, and the inst
 **held** badge (tooltip = the exact reason) plus a **VENUE LONG/SHORT** badge for a position the
 instance did not open itself.
 
+### Running 3–4 strategies at once
+
+You can start as many live instances as you like, and they run side by side — but a futures account
+holds **one netted position per contract**, so how many can actually be *in a trade* depends on how
+they are pointed at the exchange:
+
+| Setup | Behaviour |
+| --- | --- |
+| 3–4 strategies, **one API key** | They **take turns**. One holds the position, the rest queue and trade when it closes. Only one is ever in a trade. |
+| 3–4 strategies, **one key per strategy** (or sub-accounts) | Genuinely independent — all 3–4 can be in a trade at the same time. |
+
+The queue is real, not a limit you can configure away: two instances trading the same contract on one
+account would net into a single position that neither of them sized, and a long and a short would
+cancel out to 0.0000 BTC while both books still reported a live trade. Instances on the same key are
+recognised by a hash of the API key, so separate sub-accounts never block each other.
+
+Three things keep a shared account safe:
+
+* **scoped cancellation** — an exit cancels only the stop-loss / take-profit legs *that instance*
+  placed (per order id), never the account-wide `DELETE /fapi/v1/allOpenOrders`. A strategy closing
+  its trade used to also pull every other resting order on the contract, including protection another
+  instance was relying on and orders you placed yourself from the terminal.
+* **reduce-only exits** — a close is sent `reduceOnly`, so if the position is already flat (the
+  venue-side stop got there first, or another instance closed it) the order is refused and the local
+  book settles instead of opening a fresh opposite position nobody manages.
+* **shared rate limiter** — one weight budget per API key across every instance, so 4 runs do not
+  multiply your order-rate 4×.
+
+`GET /live-trade/status` returns `shared_account` for any run that is not alone on its key:
+`strategies_on_account`, `queue_position`, `position_held_by`, `holds_account_position` and
+`other_strategies`. The instance card shows it as **HOLDS ACCOUNT · n SHARED** or **QUEUED 2/3**, so
+an idle strategy reads as *waiting its turn* rather than broken.
+
 **Broker connection vs Exchange Registry.** Two different things live on the **Broker** page and
 they are the usual reason a live account reports *"API keys not configured"*:
 
@@ -306,9 +339,10 @@ python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + s
 python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
 python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
 python test_broker_connections.py # 37 checks: which saved credentials a live call uses, and why not
+python test_multi_instance_live.py # 85 checks: 3-4 live strategies sharing one broker account
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 268 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 277 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The
