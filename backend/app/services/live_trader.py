@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import time
+from typing import Dict
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -10,6 +11,7 @@ from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.broker_client import BrokerClient
+from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
 from app.core.indicators import compute_indicators
 
@@ -235,7 +237,8 @@ class LiveTradeService:
                  broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
                  definition=None, trading_windows=None, use_mark_price=None,
                  user_id=None, instance_key=None, bracket_orders=True,
-                 price_feed="off", tick_interval=5.0, account_label=None):
+                 price_feed="off", tick_interval=5.0, account_label=None,
+                 heartbeat=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
         self.market_source = broker_name or "Binance"
@@ -339,6 +342,17 @@ class LiveTradeService:
         self.tick_interval = float(tick_interval or 5.0)
         self.tick_feed = None
         self.fast_ticks = 0
+        # ---- Deadman switch (Delta Exchange India) --------------------
+        # Runs in parallel with the import/export flow. Default ON for Delta
+        # (the client document flags it as a must-have) and OFF elsewhere.
+        if heartbeat is None:
+            heartbeat = str(self.broker_name or "").lower() == "delta" or (
+                str(getattr(self.broker, "kind", "") or "").lower() == "delta")
+        self.heartbeat_enabled = bool(heartbeat)
+        self.heartbeat = None
+        self.instrument = None
+        self.wallet_balance = None
+        self._last_closed_candle = None
 
     async def start(self):
         self.is_running = True
@@ -356,15 +370,32 @@ class LiveTradeService:
             print("   Skip-new-trade windows: off")
         print(f"   Entry policy: one order per signal candle · one position at a time · "
               f"{int(getattr(self.config, 'cooldown_bars', 0) or 0)}-candle cooldown after an exit")
-        if self.price_feed_mode == "off":
-            while self.is_running:
-                try:
-                    await self.tick()
-                except Exception as e:
-                    print(f"Live Trade Error [{self.strategy_id}]: {e}")
-                await asyncio.sleep(60)
-            return
-        await self._run_with_feed()
+        if getattr(self.broker, "testnet", False):
+            print("   Environment: TESTNET (demo.delta.exchange / testnet.binancefuture.com)")
+        # ① Products API warmup (tick size, margin, lot size) + wallet.
+        self._warmup()
+        # ⚠ Heartbeat / Deadman Switch — parallel to the whole flow.
+        if self.heartbeat_enabled and self._is_delta():
+            hid = f"phantom_{str(self.instance_key or self.strategy_id)[-24:]}"
+            self.heartbeat = DeadmanSwitch(
+                self.broker, hid, product_symbols=[self.contract_symbol])
+            await self.heartbeat.start()
+            print(f"   Deadman switch: ON · heartbeat {hid} · cancel_orders on 1 missed beat")
+        else:
+            print("   Deadman switch: off")
+        try:
+            if self.price_feed_mode == "off":
+                while self.is_running:
+                    try:
+                        await self.tick()
+                    except Exception as e:
+                        print(f"Live Trade Error [{self.strategy_id}]: {e}")
+                    await asyncio.sleep(60)
+                return
+            await self._run_with_feed()
+        finally:
+            if self.heartbeat is not None:
+                await self.heartbeat.stop()
 
     async def _run_with_feed(self):
         """Candle tick every 60s, plus an exit check on every live price.
@@ -386,7 +417,10 @@ class LiveTradeService:
         try:
             while self.is_running:
                 now = time.monotonic()
-                if now - last_candle_tick >= 60.0:
+                # A closed 1h candle on the WebSocket wakes the slow tick
+                # immediately — that is the import flow the client asked for
+                # (WS candlesticks, not REST polling).
+                if self._consume_closed_candle() or now - last_candle_tick >= 60.0:
                     last_candle_tick = now
                     try:
                         await self.tick()
@@ -434,10 +468,64 @@ class LiveTradeService:
     async def stop(self):
         self.is_running = False
         COORDINATOR.unregister(self)
+        if self.heartbeat is not None:
+            try:
+                await self.heartbeat.stop()
+            except Exception as exc:
+                print(f"[{self.strategy_id}] heartbeat disable failed: {exc}")
         # Do not silently leave a real position unmanaged. In production an
         # operator can close it from the broker; this worker stops opening new
         # positions and the next status call remains visible until then.
         print(f"🔴 LIVE Trading Stopped for {self.broker_name}/{self.strategy_id}")
+
+    def _is_delta(self):
+        return (str(getattr(self.broker, "kind", "") or "").lower() == "delta"
+                or str(self.broker_name or "").lower() == "delta")
+
+    def _warmup(self):
+        """Import flow ① Products API + wallet, once at start.
+
+        Historical candles (②) are fetched on the first ``tick()``. The
+        WebSocket candlesticks channel (③) is subscribed when the live
+        price feed is websocket.
+        """
+        try:
+            self.instrument = self.broker.get_instrument(self.symbol, refresh=True)
+            tick = (self.instrument or {}).get("tick_size")
+            cv = (self.instrument or {}).get("contract_value")
+            print(f"   Products: {self.contract_symbol} · tick {tick} · "
+                  f"contract_value {cv} {(self.instrument or {}).get('size_unit')}")
+        except Exception as exc:
+            print(f"[{self.strategy_id}] product warmup failed: {exc}")
+        try:
+            self.wallet_balance = self.broker.get_account_balance()
+        except Exception as exc:
+            print(f"[{self.strategy_id}] wallet warmup failed: {exc}")
+            self.wallet_balance = None
+
+    def _consume_closed_candle(self):
+        """True once when the candlesticks channel publishes a new closed 1h bar."""
+        feed = self.tick_feed
+        if feed is None:
+            return False
+        candle = getattr(feed, "last_candle", None)
+        if not isinstance(candle, dict) or not candle.get("closed"):
+            return False
+        key = candle.get("event_time") or candle.get("close")
+        if key is None or key == self._last_closed_candle:
+            return False
+        self._last_closed_candle = key
+        return True
+
+    def _trail_amount(self, atr):
+        """ATR trail distance sent on the Delta bracket stop-loss leg."""
+        try:
+            dist = float(getattr(self.config, "trail_distance_atr", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if dist <= 0 or not atr:
+            return None
+        return float(dist) * float(atr)
 
     async def tick(self):
         df_1h = self._fetch_candles("1h", 100)
@@ -559,7 +647,7 @@ class LiveTradeService:
                 self.contract_symbol, side, lots, price=None,
                 stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
                 trigger_method="mark_price" if use_mark else "last_traded_price",
-                size_in_btc=True)
+                size_in_btc=True, trail_amount=self._trail_amount(current_atr))
         else:
             res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots,
                                           size_in_btc=True)

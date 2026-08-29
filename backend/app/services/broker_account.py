@@ -20,6 +20,8 @@ broker account is always native currency).
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -740,3 +742,128 @@ def local_fills(user_id: int, broker_code: str = None, limit: int = 200) -> List
         } for r in rows]
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Fills CSV export (Kudos / backtest-style trade log)
+# ---------------------------------------------------------------------------
+KUDOS_FILL_COLUMNS = (
+    "filled_at", "symbol", "side", "direction", "size", "qty_btc",
+    "price", "fee", "role", "realized_pnl", "trade_id", "order_id",
+    "client_order_id", "broker",
+)
+# Closest mapping to the paper/backtest trade-log headers so the same
+# spreadsheet the client already analyses can ingest live fills.
+KUDOS_TRADE_COLUMNS = (
+    "entry_time", "exit_time", "direction", "symbol", "entry", "exit",
+    "lots", "fees", "pnl", "side_open", "side_close", "trade_id_open",
+    "trade_id_close", "broker",
+)
+
+
+def _csv_text(header, rows) -> str:
+    """UTF-8 BOM + CRLF, matching the backtest Excel/CSV export."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow(row)
+    return "\ufeff" + buf.getvalue()
+
+
+def fills_to_csv(fills: List[dict], broker: str = "Delta") -> str:
+    """One row per execution, Kudos-style columns."""
+    rows = []
+    for fill in fills or []:
+        if not isinstance(fill, dict) or fill.get("error"):
+            continue
+        side = str(fill.get("side") or "").lower()
+        direction = 1 if side == "buy" else (-1 if side == "sell" else "")
+        rows.append([
+            fill.get("filled_at") or "",
+            fill.get("symbol") or "",
+            side,
+            direction,
+            fill.get("size") if fill.get("size") is not None else "",
+            fill.get("qty_btc") if fill.get("qty_btc") is not None else "",
+            fill.get("price") if fill.get("price") is not None else "",
+            fill.get("fee") if fill.get("fee") is not None else "",
+            fill.get("role") or "",
+            fill.get("realized_pnl") if fill.get("realized_pnl") is not None else "",
+            fill.get("trade_id") or "",
+            fill.get("order_id") or "",
+            fill.get("client_order_id") or "",
+            fill.get("broker") or broker,
+        ])
+    return _csv_text(KUDOS_FILL_COLUMNS, rows)
+
+
+def fills_to_kudos_trades_csv(fills: List[dict], broker: str = "Delta") -> str:
+    """FIFO-pair opening and closing fills into round-trip trade rows.
+
+    Live fills are executions, not finished trades. Pairing buy↔sell in
+    time order produces the closest thing to the backtest trade log the
+    client already analyses (entry/exit/direction/lots/fees/pnl).
+    Unpaired (still-open) fills are emitted with a blank exit.
+    """
+    ordered = []
+    for fill in fills or []:
+        if not isinstance(fill, dict) or fill.get("error"):
+            continue
+        ordered.append(fill)
+    ordered.sort(key=lambda f: str(f.get("filled_at") or ""))
+    open_long, open_short = [], []
+    trades = []
+
+    def _lots(fill):
+        return abs(_f(fill.get("qty_btc")) or _f(fill.get("size")) or 0.0)
+
+    def _close(opened, closer, direction):
+        lots = min(_lots(opened), _lots(closer)) or _lots(opened)
+        entry = _f(opened.get("price")) or 0.0
+        exit_px = _f(closer.get("price")) or 0.0
+        fees = (abs(_f(opened.get("fee")) or 0.0) + abs(_f(closer.get("fee")) or 0.0))
+        pnl = (exit_px - entry) * direction * lots
+        realized = _f(closer.get("realized_pnl"))
+        if realized is not None:
+            pnl = realized
+        trades.append([
+            opened.get("filled_at") or "",
+            closer.get("filled_at") or "",
+            direction,
+            opened.get("symbol") or closer.get("symbol") or "",
+            entry, exit_px, lots, fees, pnl,
+            opened.get("side") or "", closer.get("side") or "",
+            opened.get("trade_id") or "", closer.get("trade_id") or "",
+            opened.get("broker") or closer.get("broker") or broker,
+        ])
+
+    for fill in ordered:
+        side = str(fill.get("side") or "").lower()
+        if side == "buy":
+            if open_short:
+                _close(open_short.pop(0), fill, -1)
+            else:
+                open_long.append(fill)
+        elif side == "sell":
+            if open_long:
+                _close(open_long.pop(0), fill, 1)
+            else:
+                open_short.append(fill)
+    for leftover in open_long:
+        trades.append([
+            leftover.get("filled_at") or "", "", 1,
+            leftover.get("symbol") or "", _f(leftover.get("price")) or "",
+            "", _lots(leftover), abs(_f(leftover.get("fee")) or 0.0), "",
+            leftover.get("side") or "", "", leftover.get("trade_id") or "",
+            "", leftover.get("broker") or broker,
+        ])
+    for leftover in open_short:
+        trades.append([
+            leftover.get("filled_at") or "", "", -1,
+            leftover.get("symbol") or "", _f(leftover.get("price")) or "",
+            "", _lots(leftover), abs(_f(leftover.get("fee")) or 0.0), "",
+            leftover.get("side") or "", "", leftover.get("trade_id") or "",
+            "", leftover.get("broker") or broker,
+        ])
+    return _csv_text(KUDOS_TRADE_COLUMNS, trades)

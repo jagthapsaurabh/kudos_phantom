@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare } from 'lucide-react';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import EntryGuardBadges from '../components/EntryGuardBadges';
@@ -32,6 +32,31 @@ export const FeedBadge = ({ feed }) => {
               : 'border-emerald-800/60 bg-emerald-900/20 text-emerald-300'}`}
           title={title}>
       {stale ? `${label} STALE` : label}
+    </span>
+  );
+};
+
+// Deadman switch badge. Required on Delta Exchange India: if the worker
+// stops acknowledging, the exchange cancels open orders. A stale/failed
+// heartbeat must be visible — otherwise the operator thinks the safety
+// net is up when it is not.
+export const HeartbeatBadge = ({ heartbeat }) => {
+  if (!heartbeat) return null;
+  if (!heartbeat.enabled && !heartbeat.created) return null;
+  const stale = heartbeat.stale || heartbeat.failures > 0;
+  const label = stale ? 'HEARTBEAT FAIL' : 'DEADMAN ON';
+  const title = stale
+    ? `Deadman switch is STALE — last ack ${heartbeat.age_seconds == null ? 'never' : heartbeat.age_seconds + 's ago'}.`
+      + ` Open orders will be cancelled if the exchange does not hear from us.`
+      + `${heartbeat.last_error ? `\nLast error: ${heartbeat.last_error}` : ''}`
+    : `Deadman switch alive — ${heartbeat.acks} acks, TTL ${heartbeat.ttl_ms}ms.`
+      + ` Missed beat cancels open orders on ${ (heartbeat.product_symbols || []).join(', ') || 'the contract' }.`;
+  return (
+    <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+        stale ? 'border-red-800/60 bg-red-900/20 text-red-300'
+              : 'border-cyan-800/60 bg-cyan-900/20 text-cyan-300'}`}
+          title={title}>
+      {label}
     </span>
   );
 };
@@ -99,6 +124,8 @@ const LiveTrade = () => {
   const [tickInterval, setTickInterval] = useState(5);
   const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
   const [showWindows, setShowWindows] = useState(false);
+  // Deadman switch: ON by default for Delta (must-have), OFF for others.
+  const [heartbeat, setHeartbeat] = useState(false);
 
   useEffect(() => {
     fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(list => {
@@ -107,7 +134,9 @@ const LiveTrade = () => {
     fetch(`${API_URL}/broker-connections`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(setConnections).catch(() => {});
     fetch(`${API_URL}/broker-settings`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : null).then(data => {
       if (data) {
-        setDataSource(data.broker_name || 'Binance');
+        const broker = data.broker_name || 'Binance';
+        setDataSource(broker);
+        setHeartbeat(String(broker).toLowerCase() === 'delta');
         setCapital(data.initial_capital || 20000);
         setMarginPct(data.margin_deployment_pct || 25);
         if (data.use_mark_price !== undefined && data.use_mark_price !== null) setUseMarkPrice(!!data.use_mark_price);
@@ -137,7 +166,8 @@ const LiveTrade = () => {
         body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
           connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct),
           use_mark_price: useMarkPrice, trading_windows: tradingWindows,
-          price_feed: priceFeed, tick_interval: Number(tickInterval) })
+          price_feed: priceFeed, tick_interval: Number(tickInterval),
+          heartbeat })
       });
       if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
     } catch (e) { console.error(e); alert(e.message); }
@@ -198,7 +228,12 @@ const LiveTrade = () => {
         <div className="flex gap-3 items-end flex-wrap">
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Broker / Data</label>
-            <select value={dataSource} onChange={e => { setDataSource(e.target.value); setConnectionId(''); }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+            <select value={dataSource} onChange={e => {
+                const next = e.target.value;
+                setDataSource(next);
+                setConnectionId('');
+                setHeartbeat(String(next).toLowerCase() === 'delta');
+              }} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
               {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
             </select>
           </div>
@@ -256,6 +291,34 @@ const LiveTrade = () => {
                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-24 outline-none" />
             </div>
           )}
+          {String(dataSource).toLowerCase() === 'delta' && (
+            <label className="flex items-center gap-2 rounded-lg border border-cyan-800/60 bg-cyan-900/10 px-3 py-2 text-xs text-cyan-200"
+                   title="If the worker crashes or disconnects, Delta cancels open orders. Required by the live-trading safety spec.">
+              <input type="checkbox" checked={heartbeat}
+                     onChange={e => setHeartbeat(e.target.checked)}
+                     className="h-3.5 w-3.5 accent-cyan-500" />
+              <HeartPulse size={14} /> Deadman
+            </label>
+          )}
+          <button onClick={async () => {
+              try {
+                const token = localStorage.getItem('token');
+                const url = `${API_URL}/live-account/fills/export?broker=${encodeURIComponent(dataSource)}&format=kudos`;
+                const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+                if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not export fills'); return; }
+                const blob = await res.blob();
+                const href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = href;
+                a.download = `kudos_${String(dataSource).toLowerCase()}_trades.csv`;
+                a.click();
+                URL.revokeObjectURL(href);
+              } catch (e) { alert(e.message); }
+            }}
+            className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-green-500 hover:text-white flex items-center gap-2 text-sm"
+            title="Download live fills as a Kudos/backtest-style CSV">
+            <Download size={16} /> Export fills
+          </button>
           <a href="/terminal"
              className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
             <TerminalSquare size={16} /> Terminal

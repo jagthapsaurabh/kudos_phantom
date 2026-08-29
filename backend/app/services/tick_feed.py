@@ -99,20 +99,114 @@ def parse_delta(payload: Any, source: str = "Delta") -> Optional[MarkPriceQuote]
     return MarkPriceQuote(source, symbol, mark_price=mark, last_price=last, raw=payload)
 
 
+def parse_delta_candlestick(payload: Any) -> Optional[Dict[str, Any]]:
+    """Delta ``candlestick_1h`` / ``candlesticks`` frame -> a candle dict.
+
+    Used by the live import flow so indicator warm-up reacts on the 1h close
+    instead of polling ``GET /v2/history/candles`` (REST is rate-limited).
+    A still-forming bar is returned with ``closed=False``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("type") or payload.get("channel") or "").lower()
+    looks_like = (
+        kind.startswith("candlestick") or kind in ("candles", "ohlc", "candlesticks")
+        or "candle_start_time" in payload
+    )
+    if not looks_like:
+        return None
+    if kind in ("ticker", "subscriptions", "heartbeat", "key-auth"):
+        return None
+    symbol = str(payload.get("symbol") or payload.get("product_symbol") or "")
+    resolution = str(payload.get("resolution") or payload.get("interval") or "")
+    if not resolution and kind.startswith("candlestick_"):
+        resolution = kind.split("_", 1)[-1]
+    start = payload.get("candle_start_time") or payload.get("start") or payload.get("time")
+    try:
+        start_ts = float(start) if start is not None else None
+    except (TypeError, ValueError):
+        start_ts = None
+    if start_ts and start_ts > 1e12:
+        start_ts = start_ts / 1000.0
+    event_time = None
+    if start_ts:
+        from datetime import datetime, timezone
+        try:
+            event_time = datetime.fromtimestamp(start_ts, tz=timezone.utc).replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            event_time = None
+    open_ = _f(payload.get("open") or payload.get("o"))
+    high = _f(payload.get("high") or payload.get("h"))
+    low = _f(payload.get("low") or payload.get("l"))
+    close = _f(payload.get("close") or payload.get("c"))
+    volume = _f(payload.get("volume") or payload.get("v")) or 0.0
+    if close is None and open_ is None:
+        return None
+    closed = payload.get("closed")
+    if closed is None:
+        closed = payload.get("is_closed")
+    closed = True if closed is None else bool(closed)
+    return {
+        "symbol": symbol or "BTCUSD",
+        "resolution": resolution or "1h",
+        "event_time": event_time,
+        "open": open_, "high": high, "low": low, "close": close, "volume": volume,
+        "closed": closed,
+        "raw": payload,
+    }
+
+
 PARSERS = {"binance": parse_binance, "delta": parse_delta}
 
 # Stream endpoints per venue kind. ``{symbol}`` is the venue's perpetual symbol
 # (lower-cased for Binance, as its streams require).
 STREAM_URLS = {
     "binance": "wss://fstream.binance.com/ws/{symbol_lower}@markPrice@1s",
-    "delta": "wss://socket.delta.exchange",
+    "delta": "wss://public-socket.india.delta.exchange",
+}
+STREAM_URLS_TESTNET = {
+    "binance": "wss://stream.binancefuture.com/ws/{symbol_lower}@markPrice@1s",
+    "delta": "wss://socket-ind-pub.testnet.deltaex.org",
 }
 
 # Delta multiplexes every product on one socket and needs an explicit
 # subscription; Binance encodes the stream in the URL and needs nothing.
-def delta_subscribe(symbol: str) -> Dict[str, Any]:
+# The live import flow subscribes to *both* the ticker (mark price for
+# exits) and the 1-hour candlestick channel (indicator updates on close)
+# so REST candle polling is not needed on every tick.
+def delta_subscribe(symbol: str, include_candles: bool = True,
+                    resolution: str = "1h") -> Dict[str, Any]:
+    channels = [{"name": "v2/ticker", "symbols": [symbol]}]
+    if include_candles:
+        # Official candlesticks channel: bare symbol = last-traded OHLC,
+        # ``MARK:symbol`` = mark-price OHLC (docs.delta.exchange, Public Channels).
+        candle_symbols = [symbol]
+        if not str(symbol).upper().startswith("MARK:"):
+            candle_symbols.append(f"MARK:{symbol}")
+        channels.append({"name": f"candlestick_{resolution}", "symbols": candle_symbols})
+    return {"type": "subscribe", "payload": {"channels": channels}}
+
+
+def delta_private_subscribe(symbols: Optional[list] = None) -> Dict[str, Any]:
+    """Positions + orders private channels (after key-auth)."""
+    wanted = list(symbols or ["all"])
     return {"type": "subscribe",
-            "payload": {"channels": [{"name": "v2/ticker", "symbols": [symbol]}]}}
+            "payload": {"channels": [
+                {"name": "orders", "symbols": wanted},
+                {"name": "positions", "symbols": wanted},
+            ]}}
+
+
+def delta_key_auth(api_key: str, api_secret: str) -> Dict[str, Any]:
+    """Socket auth frame: HMAC-SHA256 over ``GET`` + timestamp + ``/live``."""
+    import hashlib
+    import hmac as hmac_mod
+    timestamp = str(int(time.time()))
+    signature = hmac_mod.new(api_secret.encode(),
+                             f"GET{timestamp}/live".encode(),
+                             hashlib.sha256).hexdigest()
+    return {"type": "key-auth",
+            "payload": {"api-key": api_key, "signature": signature, "timestamp": timestamp}}
 
 
 async def _default_connect(url: str):
@@ -135,6 +229,9 @@ class TickFeed:
         self.messages = 0
         self.reconnects = 0
         self.last_error: Optional[str] = None
+        # Last closed 1h candle from the candlesticks channel (Delta import flow).
+        self.last_candle: Optional[Dict[str, Any]] = None
+        self.closed_candles = 0
 
     @property
     def kind(self) -> str:
@@ -194,6 +291,11 @@ class TickFeed:
             "age_seconds": round(self.age(), 2) if self.age() is not None else None,
             "stale": self.quote() is None,
             "last_error": self.last_error,
+            "closed_candles": int(self.closed_candles),
+            "last_candle_time": (
+                self.last_candle["event_time"].isoformat(timespec="seconds")
+                if self.last_candle and self.last_candle.get("event_time") else None
+            ),
         }
 
 
@@ -289,6 +391,11 @@ class WebSocketTickFeed(TickFeed):
         # Some venues batch several updates into one frame.
         for item in (payload if isinstance(payload, list) else [payload]):
             self.publish(self.parser(item, self.source))
+            candle = parse_delta_candlestick(item)
+            if candle is not None:
+                self.last_candle = candle
+                if candle.get("closed"):
+                    self.closed_candles += 1
 
 
 class RestTickFeed(TickFeed):
@@ -350,7 +457,9 @@ def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
     parser = PARSERS.get(venue_kind)
 
     if kind == "websocket" and parser is not None:
-        template = STREAM_URLS.get(venue_kind)
+        testnet = bool(getattr(client, "testnet", False))
+        urls = STREAM_URLS_TESTNET if testnet else STREAM_URLS
+        template = urls.get(venue_kind) or STREAM_URLS.get(venue_kind)
         if template:
             url = template.format(symbol_lower=str(contract).lower())
             subscribe = delta_subscribe(contract) if venue_kind == "delta" else None

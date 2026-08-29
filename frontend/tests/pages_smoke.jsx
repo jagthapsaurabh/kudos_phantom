@@ -10,12 +10,13 @@ globalThis.localStorage = {
   setItem: (k, v) => store.set(k, String(v)),
   removeItem: (k) => store.delete(k),
 };
-globalThis.window = { location: { protocol: 'http:', hostname: 'localhost' }, addEventListener() {}, removeEventListener() {} };
+globalThis.window = { location: { protocol: 'http:', hostname: 'localhost', search: '' }, addEventListener() {}, removeEventListener() {} };
 globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ([]) });
 
 import Backtest from '../src/pages/Backtest.jsx';
+import ChartPage from '../src/pages/Chart.jsx';
 import PaperTrade from '../src/pages/PaperTrade.jsx';
-import LiveTrade, { FeedBadge } from '../src/pages/LiveTrade.jsx';
+import LiveTrade, { FeedBadge, HeartbeatBadge } from '../src/pages/LiveTrade.jsx';
 import EntryGuardBadges from '../src/components/EntryGuardBadges.jsx';
 import ConnectionCheck from '../src/components/ConnectionCheck.jsx';
 
@@ -46,14 +47,26 @@ check('Backtest shows the trading windows editor', html.includes('Trading window
 // component test covers the enabled state.
 check('Backtest windows editor is collapsed until enabled', html.includes('Windows OFF') || html.includes('Trading windows'));
 check('Backtest still shows the run button', html.includes('Run Backtest'));
+check('Backtest tells the user trades plot on market candles',
+  html.includes('LONG/SHORT on market candles'));
+
+const chart = renderToString(React.createElement(ChartPage));
+check('Chart page renders', chart.includes('Market Chart'));
+check('Chart legend names LONG and SHORT', chart.includes('LONG') && chart.includes('SHORT'));
+check('Chart overlay mentions reversal and momentum',
+  chart.includes('REV') && chart.includes('MOM'));
+check('Chart has a Signals control', chart.includes('Signals'));
 
 const paper = renderToString(React.createElement(PaperTrade));
 check('PaperTrade shows the pricing &amp; windows button', paper.includes('Windows'));
 check('PaperTrade keeps the start button', paper.includes('Start Instance'));
+check('PaperTrade offers live ticks for exit checks',
+  paper.includes('Live ticks') && paper.includes('Exit checks'));
 
 const live = renderToString(React.createElement(LiveTrade));
 check('LiveTrade shows the pricing &amp; windows button', live.includes('Windows'));
 check('LiveTrade keeps the start button', live.includes('Start Instance'));
+check('LiveTrade can export fills as Kudos CSV', live.includes('Export fills'));
 
 // Entry-guard badges: the counters that make "the worker deliberately sent no
 // order this tick" visible instead of looking like a dead strategy.
