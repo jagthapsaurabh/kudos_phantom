@@ -20,6 +20,10 @@
 | [PR #9](#pr-9--admin-ui-reconfiguration--delta-seed-diagnostics--paper-trade-exit-details) | Admin UI reconfiguration + Delta seed diagnostics + paper trade exit details | 2026-08-27 |
 | [PR #10](#pr-10--add-resumable-market-data-seeding-and-daily-sync) | Add resumable market data seeding and daily sync | 2026-08-27 |
 | [PR #11](#pr-11--per-side-atr-operator-for-longshort-persistent-paper-trade-history-and-trade-log-candlecolour--full-export) | Per-side ATR operator for Long/Short, persistent paper-trade history, and trade-log candle/colour + full export | 2026-08-27 |
+| [PR #12](#pr-12--fix-exit-distribution-tooltip-black-on-black-text--add-commit-history-summary-doc) | Fix Exit Distribution tooltip (black-on-black text) + add commit history summary doc | 2026-08-27 |
+| [PR #13](#pr-13--show-per-trade-pnl-fees-and-booked-pnl-in-trade-logs--exports) | Show per-trade PnL, fees and booked PnL in trade logs + exports | 2026-08-27 |
+| [PR #14](#pr-14--btc-perpetual-mark-pricing-skip-new-trade-windows-and-a-full-live-order-management-terminal) | BTC perpetual mark pricing, skip-new-trade windows, and a full live order-management terminal | 2026-08-28 |
+| [PR #15](#pr-15--binancedelta-full-history-seeding-2020today-corrupt-data-repair-unbreakable-long-seeds--navbar-crash-fix) | Binance/Delta full-history seeding (2020→today), corrupt-data repair, unbreakable long seeds + navbar crash fix | 2026-08-29 |
 
 ---
 
@@ -503,6 +507,131 @@
 
 ---
 
+## PR #12 — Fix Exit Distribution tooltip (black-on-black text) + add commit history summary doc
+
+**Merged:** 2026-08-27  
+**Branch:** `arena/01a0440f-kudos-phantom` · squash commit on `main`: `ad95c37e`
+
+### Commits
+
+| SHA | Message |
+|-----|---------|
+| `0ed5bb3c` | Fix Exit Distribution tooltip contrast (black-on-black) |
+| `f67f255c` | Add commit history summary doc |
+
+### What Changed
+- **Backtest UI** (`frontend/src/pages/Backtest.jsx`): the Exit Distribution chart's tooltip rendered black text on the dark background — restyled so values are readable.
+- **Docs:** added this `COMMIT_HISTORY_SUMMARY.md` (PR/commit history + rollback guide).
+
+> **Rollback target:** `ad95c37e` (both changes, squash-merged to `main`)
+
+---
+
+## PR #13 — Show per-trade PnL, fees and booked PnL in trade logs + exports
+
+**Merged:** 2026-08-27  
+**Branch:** `arena/01a04469-kudos-phantom` · squash commit on `main`: `2ea13d5c`
+
+### Commits
+
+| SHA | Message |
+|-----|---------|
+| `e772ecbb` | Per-trade PnL, fees and booked PnL in trade logs + CSV exports |
+
+### What Changed
+- **Trade logs** (`frontend/src/pages/Backtest.jsx`, `frontend/src/pages/PaperTrade.jsx`): each trade row now shows its own PnL, the fees paid, and the booked (net) PnL, with the same columns in the CSV export.
+- **Tests** (`frontend/tests/trade_log_ui.jsx`): assertions for the new columns/exports.
+
+> **Rollback target:** `2ea13d5c`
+
+---
+
+## PR #14 — BTC perpetual mark pricing, skip-new-trade windows, and a full live order-management terminal
+
+**Merged:** 2026-08-28  
+**Branch:** `arena/01a0480e-kudos-phantom` · squash commit on `main`: `60f7d374`
+
+### Commits
+
+| SHA | Message |
+|-----|---------|
+| `b292f7a3` | BTC perpetual resolver + mark-price risk pricing + skip-new-trade windows |
+| `8285fa3a` | Live order lifecycle, bracket orders, /terminal page, broker audit trail |
+| `deaeb546` | Shared broker rate limiter + docs/order_management_research.md + test suites |
+
+### What Changed
+
+#### BTC perpetual + mark price (`core/mark_price.py`, `core/engine.py`, `services/data_sync.py`)
+- Single resolver for the BTC **perpetual** (Binance `BTCUSDT` / Delta `BTCUSD`); dated futures are never substituted. Seeding, engine, paper and live all use it.
+- Stops, targets, trailing, breakeven and PnL run on the exchange **mark price**; the traded fill price is stored beside it on every trade and exported in the CSV. Bars without marks fall back to the traded price; runs report `mark_price_basis` / coverage.
+
+#### Skip-new-trade windows (`core/trading_windows.py`, `TradingWindowsEditor.jsx`)
+- Scalable schedule (any number of day+time windows, wraps past Sunday, Asia/Kolkata default) honoured by Backtest, Paper and Live. Only **new entries** are refused; open positions keep their stop/target/trail.
+
+#### Live order management (`services/broker_client.py`, `services/broker_account.py`, `services/live_trader.py`, `components/LiveTerminal.jsx`)
+- Full order lifecycle: market / limit / stop / stop-limit / take-profit / trailing, edit (Delta), cancel one/all, open orders, order history, fills with fees, margined positions, close/partial close, position margin, leverage and margin mode.
+- Bracket orders (entry + SL + TP): native on Delta, emulated with reduce-only legs on Binance; stops trigger on the mark price.
+- New **/terminal** page: Positions · Open Orders · Stop Orders · Fills · Order History, Wallet & Margin, Risk, live rate-limit panel, order ticket, leverage/margin controls, cancel-all and close.
+- Local audit trail in `broker_orders` / `broker_fills`, tagged with leg, client order id and strategy instance, de-duplicated on the exchange trade id.
+
+#### Broker rate limits (`core/rate_limit.py`)
+- Delta 10,000 weight per fixed 5-minute window; Binance 2,400 weight/min plus 1,200 orders/min and 300 orders/10s. One shared limiter per broker connection enforces 20 req/s + 1,200 req/min, tracks venue headers/quota, paces at 85% and retries 429s; limits editable per broker from the UI.
+
+#### Docs & tests
+- `docs/order_management_research.md`; backend 472 checks (`test_live_account.py` 144), frontend 216 (`terminal_ui.jsx` 56); `vite build` clean.
+
+> **Rollback targets:**
+> - SHA `60f7d374` — whole PR (squash on `main`)
+> - `b292f7a3` / `8285fa3a` / `deaeb546` — PR-branch commits (perpetual+windows / terminal / rate-limits+docs)
+
+---
+
+## PR #15 — Binance/Delta full-history seeding (2020→today), corrupt-data repair, unbreakable long seeds + navbar crash fix
+
+**Merged:** 2026-08-29 (squash onto `main`) — https://github.com/jagthapsaurabh/kudos_phantom/pull/15  
+**Branch:** `arena/01a04ba9-kudos-phantom`
+
+### Commits
+
+| SHA | Message |
+|-----|---------|
+| `77d3826` | fix(navbar): import TerminalSquare from lucide-react |
+| `eac8743` | Binance full-history seed (2020 → today, incl. 1d) + corrupted-data repair |
+| `b7918a7` | Full-history seeds never break: background jobs, request/window retries, paged mark backfill |
+| `543f055` | Verify resilient full-history seeding for both Binance and Delta; fix mark-backfill end-date inclusivity |
+
+### What Changed
+
+#### Runtime crash fix (`frontend/src/components/Navbar.jsx`)
+- `TerminalSquare` was used in the nav items without being imported → `ReferenceError: TerminalSquare is not defined` crashed the **entire app** for live/admin users (the only ones shown the Terminal item). Runtime-only failure — the bundle built cleanly because the bare identifier is treated as a global.
+
+#### Corrupt Binance data — root cause + repair (`services/data_sync.py`, `scripts/seeder.py`, `scripts/reset_db.py`)
+- The legacy seeder preferred local CSVs whose 1h timestamps are **off the candle grid** (e.g. `2020-06-26 11:41:59.523330`) and bulk-inserted without an upsert (duplicates on re-run). Off-grid candles also make mark pricing impossible.
+- **"Binance 2020 → today"** preset (Admin → Seed Data) + rewritten `python -m app.scripts.seeder` CLI: clean candles live from the Binance Futures API — `15m, 1h, 4h, 1d` (daily included) — 1 Jan 2020 → today, in 1,500-candle windows with a durable resume cursor. `fetch_all` defaults to 2020-01-01 for **every** source.
+- **Repair:** `repair_klines` deletes duplicate + off-grid candles (well-formed rows untouched) — `POST /admin/market-data/repair`, "Repair existing candles" button, and `repair: true` on the seed payload (presets enable it).
+- **Visibility:** `/admin/market-data/status` always reports `duplicate_rows`; `?health=1` adds `misaligned_rows` per series; the status table shows both columns.
+- **Prevention:** CSV imports are rejected unless timestamps align to the interval grid; `reset_db.py` prints the API-seeder fallback when the legacy CSVs are rejected.
+- Cursor fix: resume advances to the next grid boundary (was `window_end + interval`, which skipped the boundary candle when a completed range was extended).
+
+#### Long seeds never break (`services/data_sync.py`, `main.py`, `AdminPanel.jsx`)
+- **Request retries:** shared `_get_with_retry` (Binance klines, Binance mark price, Delta OHLC) retries timeouts/resets/429/5xx with growing backoff + `Retry-After`; new `TransientMarketDataError` separates hiccups from permanent failures. Delta host fallback preserved.
+- **Window retries:** the full-history loop retries a transient failure at the **same cursor** (default 3 attempts) before marking the range failed; committed windows are never lost, the error says to re-run, and a re-run **resumes** instead of restarting. Knobs: `SEED_REQUEST_RETRIES`, `SEED_REQUEST_BACKOFF_SECONDS`, `SEED_WINDOW_RETRIES`, `SEED_WINDOW_BACKOFF_SECONDS`.
+- **Background mode:** `background: true` on the seed payload (set automatically by the full-history presets) runs the job in a server-side worker under a single-job lock (serialized with the daily sync); `GET /admin/market-data/seed-job` exposes live state; the UI polls every 10 s with a running banner — a browser/proxy timeout can no longer truncate an hours-long fetch.
+- **Mark price for ALL data:** `sync_mark_prices` pages the mark series across the whole range (same grid-window batching) instead of a single 1,500-candle page; the seed job derives the mark range from the `fetch_all` default.
+- **Both venues verified** (`test_seed_repair.py`, 57 checks): adapter classification (incl. mixed-host), pre-listing empty windows, listing-spanning partial pages, `MARK:BTCUSD` paging, background endpoint end-to-end for Binance **and** Delta. Cross-check also fixed: date-only `end_time` in `sync_mark_prices` is now inclusive through that day (previously skipped the final day's marks).
+
+#### Tests & docs
+- New `backend/test_seed_repair.py` (57 checks), `frontend/tests/admin_seed_ui.jsx` (14 checks). Full suites green: **backend 529**, **frontend 230**, `vite build` clean. `README.md` / `api_docs.md` document presets, repair, background mode, health columns and retry knobs.
+- Sandbox caveat: no outbound access to either exchange (TLS-blocked), so exchange paths run against faithful mock/scripted exchanges — same convention as the existing Delta suite.
+
+> **Rollback targets:**
+> - SHA `77d3826` — navbar crash fix
+> - SHA `eac8743` — Binance 2020→today seed + repair + health columns
+> - SHA `b7918a7` — background jobs + request/window retries + paged mark backfill
+> - SHA `543f055` — Delta verification + inclusive mark end date
+
+---
+
 ## Quick Rollback Guide
 
 To roll back the codebase to any specific commit SHA:
@@ -543,6 +672,13 @@ git revert <SHA>
 | Persistent paper-trade history | `687c0540` |
 | Trade-log candle/colour + 45-col export | `fea581c3` |
 | Candle timezone display fix | `845c8f67` |
+| Exit Distribution tooltip contrast | `ad95c37e` |
+| Per-trade PnL/fees/booked PnL in logs + exports | `2ea13d5c` |
+| BTC perpetual + mark pricing + trading windows + /terminal | `60f7d374` |
+| TerminalSquare navbar crash fix | `77d3826` |
+| Binance 2020→today seed + corrupt-data repair | `eac8743` |
+| Background seeds + retries + paged mark backfill | `b7918a7` |
+| Delta-parity verification + inclusive mark end date | `543f055` |
 
 ---
 
@@ -574,4 +710,4 @@ git revert <SHA>
 
 ---
 
-*Last updated: 2026-08-27 | Covers PR #1 through PR #11 (all commits on `main`)*
+*Last updated: 2026-08-29 | Covers PR #1 through PR #15 (all merged to `main`)*

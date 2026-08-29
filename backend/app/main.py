@@ -24,6 +24,7 @@ from .database.models import (
 import bcrypt
 from passlib.context import CryptContext
 import asyncio
+import threading
 from datetime import datetime, timezone
 from sqlalchemy import func
 
@@ -811,6 +812,15 @@ class MarketSeedPayload(BaseModel):
     end_date: Optional[str] = None
     limit: int = 1000
     fetch_all: bool = False
+    # Run the seed in a background worker instead of the request thread. Long
+    # full-history walks then cannot be killed by a browser/proxy request
+    # timeout; the client polls /admin/market-data/progress instead.
+    background: bool = False
+    # Remove duplicate and off-grid candles from the selected series before
+    # fetching. This is the repair path for a corrupted seed (legacy CSV
+    # imports carried timestamps off the candle grid and the legacy seeder
+    # inserted batches without an upsert, duplicating every candle).
+    repair: bool = False
     # Also seed the mark-price series for the BTC perpetual. Risk maths runs on
     # the mark price, so without it a backtest silently falls back to the
     # traded price (and says so through mark_price_basis).
@@ -828,69 +838,211 @@ def _market_definition(db, source):
     return normalized, row
 
 
-@app.get('/admin/market-data/status')
-def market_data_status(admin=Depends(require_admin), db=Depends(get_db)):
-    rows = db.query(
-        Klines.source, Klines.symbol, Klines.interval,
-        func.count(Klines.id).label('count'), func.count(Klines.volume).label('volume_rows'),
-        func.min(Klines.event_time).label('first'), func.max(Klines.event_time).label('last'),
-    ).group_by(Klines.source, Klines.symbol, Klines.interval).order_by(
-        Klines.source, Klines.symbol, Klines.interval).all()
-    return [{'source': source or 'Binance', 'symbol': symbol, 'interval': interval,
-             'count': int(count), 'volume_rows': int(volume_rows), 'first': first, 'last': last}
-            for source, symbol, interval, count, volume_rows, first, last in rows]
+# One background seed at a time; state is polled by the admin UI.
+_seed_job_state = {'running': False, 'started_at': None, 'source': None, 'symbol': None,
+                   'intervals': None, 'fetch_all': None, 'last': None}
+_seed_job_state_lock = threading.Lock()
 
 
-@app.post('/admin/market-data/seed')
-def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), db=Depends(get_db)):
+def _seed_job_snapshot():
+    return {key: _seed_job_state.get(key) for key in
+            ('running', 'started_at', 'source', 'symbol', 'intervals', 'fetch_all')}
+
+
+def _validated_seed_request(db, source, symbol, intervals):
+    """Shared payload validation for the sync and background seed paths."""
+    source, definition = _market_definition(db, source)
+    kind = DataSyncService._adapter_kind(source, definition)
+    if intervals is not None:
+        intervals = [str(interval).lower() for interval in intervals
+                     if str(interval).lower() in DataSyncService.TIMEFRAMES]
+        if not intervals:
+            raise HTTPException(status_code=400, detail='Select at least one valid interval')
+    if kind == 'delta' and intervals:
+        excluded = sorted(set(intervals) & DataSyncService.DELTA_EXCLUDED_INTERVALS)
+        if excluded:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Delta Exchange full-history seeding excludes {', '.join(excluded)}. "
+                        f"Select only {', '.join(DataSyncService.DELTA_HISTORY_INTERVALS)}."),
+            )
+    return source, definition, kind, intervals
+
+
+def _run_seed_job(source, symbol, intervals, start_date, end_date, limit,
+                  fetch_all, repair, include_mark_price):
+    """Repair + fetch + mark-price seed for one request.
+
+    Runs in the request thread (synchronous seed) or in the background worker
+    thread; opens its own DB session so ORM objects never cross threads.
+    """
+    db = SessionLocal()
     try:
-        source, definition = _market_definition(db, payload.source)
-        kind = DataSyncService._adapter_kind(source, definition)
-        intervals = payload.intervals
-        if intervals is not None:
-            intervals = [str(interval).lower() for interval in intervals if str(interval).lower() in DataSyncService.TIMEFRAMES]
-            if not intervals:
-                raise HTTPException(status_code=400, detail='Select at least one valid interval')
-        if kind == 'delta' and intervals:
-            excluded = sorted(set(intervals) & DataSyncService.DELTA_EXCLUDED_INTERVALS)
-            if excluded:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(f"Delta Exchange full-history seeding excludes {', '.join(excluded)}. "
-                            f"Select only {', '.join(DataSyncService.DELTA_HISTORY_INTERVALS)}."),
-                )
+        source, definition, kind, intervals = _validated_seed_request(db, source, symbol, intervals)
+        # Optional repair pass runs first so the seed below upserts into a
+        # clean series: it removes duplicate timestamps (legacy batch inserts)
+        # and candles whose timestamps are off the interval grid (legacy CSV
+        # imports). A failure here never blocks the fetch itself.
+        repair_summary = []
+        if repair:
+            effective_intervals = intervals if intervals is not None else (
+                DataSyncService.DELTA_HISTORY_INTERVALS if kind == 'delta'
+                else DataSyncService.TIMEFRAMES)
+            try:
+                repair_summary = DataSyncService.repair_klines(
+                    source, symbol, effective_intervals, definition=definition)
+            except Exception as exc:
+                repair_summary = [{'error': str(exc)}]
         summary = DataSyncService.seed_market_data(
-            source=source,
-            symbol=payload.symbol.upper(),
-            intervals=intervals,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            limit=max(1, min(payload.limit, DataSyncService.DELTA_MAX_CANDLES)),
-            fetch_all=payload.fetch_all,
-            definition=definition,
+            source=source, symbol=symbol, intervals=intervals,
+            start_date=start_date, end_date=end_date,
+            limit=max(1, min(limit, DataSyncService.DELTA_MAX_CANDLES)),
+            fetch_all=fetch_all, definition=definition,
         )
         # Per-interval failures are reported in the summary instead of 502 so
         # the admin can see exactly which interval failed and why.
         ok = sum(1 for item in summary if not item.get('error'))
         status = 'Seed completed' if ok == len(summary) else ('Seed failed' if ok == 0 else 'Seed completed with errors')
         mark_summary = []
-        if payload.include_mark_price and ok:
+        if include_mark_price and ok:
             # Traded candles exist now, so the mark series can be attached to
-            # them. A failure here never fails the seed itself.
+            # them — paged across the whole seeded range, not just one page.
+            # A failure here never fails the seed itself.
             try:
+                mark_start = start_date or (
+                    DataSyncService.FULL_HISTORY_START.strftime('%Y-%m-%d') if fetch_all else None)
                 mark_summary = DataSyncService.sync_mark_prices(
-                    source=source, symbol=payload.symbol.upper(), intervals=intervals,
-                    start_time=payload.start_date, end_time=payload.end_date,
-                    limit=max(1, min(payload.limit, DataSyncService.DELTA_MAX_CANDLES)),
+                    source=source, symbol=symbol, intervals=intervals,
+                    start_time=mark_start, end_time=end_date,
+                    limit=max(1, min(limit, DataSyncService.DELTA_MAX_CANDLES)),
                     definition=definition,
                 )
             except Exception as exc:
                 mark_summary = [{'error': str(exc)}]
-        return {'status': status, 'source': source, 'symbol': payload.symbol.upper(),
-                'fetch_all': payload.fetch_all, 'summary': summary,
-                'mark_price': {'requested': bool(payload.include_mark_price),
-                               'perpetual_symbol': perpetual_symbol(source, payload.symbol.upper()),
+        return {'status': status, 'source': source, 'symbol': symbol,
+                'fetch_all': fetch_all, 'summary': summary,
+                'repair': {'requested': bool(repair),
+                           'removed': sum(int(item.get('removed', 0)) for item in repair_summary
+                                          if not item.get('error')),
+                           'summary': repair_summary},
+                'mark_price': {'requested': bool(include_mark_price),
+                               'perpetual_symbol': perpetual_symbol(source, symbol),
                                'summary': mark_summary}}
+    finally:
+        db.close()
+
+
+def _seed_job_worker(source, symbol, intervals, start_date, end_date, limit,
+                     fetch_all, repair, include_mark_price):
+    """Background seed entry point; stores the result for /seed-job polling."""
+    try:
+        # One seed at a time, and never on top of the daily refresh cycle.
+        with DataSyncService.DAILY_SYNC_LOCK:
+            result = _run_seed_job(source, symbol, intervals, start_date, end_date,
+                                   limit, fetch_all, repair, include_mark_price)
+    except Exception as exc:
+        result = {'status': 'Seed failed', 'error': str(exc), 'summary': []}
+    with _seed_job_state_lock:
+        _seed_job_state['running'] = False
+        _seed_job_state['last'] = result
+
+
+@app.get('/admin/market-data/status')
+def market_data_status(health: bool = False, admin=Depends(require_admin), db=Depends(get_db)):
+    """Per-series inventory. `duplicate_rows` is always reported (SQL
+    count/distinct). With ?health=1 the response also carries `misaligned_rows`
+    — candles whose timestamp is off the interval grid, the signature of the
+    corrupted CSV imports — via an exact (capped) scan."""
+    rows = db.query(
+        Klines.source, Klines.symbol, Klines.interval,
+        func.count(Klines.id).label('count'), func.count(Klines.volume).label('volume_rows'),
+        func.count(func.distinct(Klines.event_time)).label('distinct_times'),
+        func.min(Klines.event_time).label('first'), func.max(Klines.event_time).label('last'),
+    ).group_by(Klines.source, Klines.symbol, Klines.interval).order_by(
+        Klines.source, Klines.symbol, Klines.interval).all()
+    health_by_key = {}
+    if health:
+        for item in DataSyncService.data_health():
+            health_by_key[(item['source'], item['symbol'], item['interval'])] = item
+    result = []
+    for source, symbol, interval, count, volume_rows, distinct_times, first, last in rows:
+        source = source or 'Binance'
+        entry = {'source': source, 'symbol': symbol, 'interval': interval,
+                 'count': int(count), 'volume_rows': int(volume_rows),
+                 'duplicate_rows': int(count) - int(distinct_times),
+                 'first': first, 'last': last}
+        if health:
+            item = health_by_key.get((source, symbol, interval), {})
+            entry['misaligned_rows'] = item.get('misaligned_rows')
+            entry['scanned_rows'] = item.get('scanned', 0)
+        result.append(entry)
+    return result
+
+
+@app.post('/admin/market-data/seed')
+def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), db=Depends(get_db)):
+    # Validate in the request thread so bad payloads fail fast with a 4xx.
+    _validated_seed_request(db, payload.source, payload.symbol.upper(), payload.intervals)
+    if payload.background:
+        # A 2020 → today walk over several intervals is thousands of bounded
+        # requests and can legitimately run for a long time. Running it in the
+        # request thread ties it to the browser/proxy request timeout — the
+        # classic "long seed breaks" failure. The durable cursor makes the job
+        # resumable, so it runs in a worker thread and the client polls
+        # /admin/market-data/progress instead of holding a request open.
+        with _seed_job_state_lock:
+            if _seed_job_state['running']:
+                return {'status': 'Seed already running in background', 'background': True,
+                        'job': _seed_job_snapshot(), 'summary': []}
+            _seed_job_state.update(
+                running=True, started_at=datetime.utcnow(), last=None,
+                source=payload.source, symbol=payload.symbol.upper(),
+                intervals=payload.intervals, fetch_all=payload.fetch_all)
+        threading.Thread(
+            target=_seed_job_worker, daemon=True,
+            args=(payload.source, payload.symbol.upper(), payload.intervals, payload.start_date,
+                  payload.end_date, payload.limit, payload.fetch_all, payload.repair,
+                  payload.include_mark_price),
+        ).start()
+        return {'status': 'Seed started in background', 'background': True,
+                'job': _seed_job_snapshot(),
+                'note': ('The seed runs server-side and survives this request; watch '
+                         'GET /admin/market-data/progress or the Historical seed progress table. '
+                         'Completed ranges are skipped and an interrupted range resumes at its '
+                         'committed cursor, so re-running never refetches finished windows.'),
+                'summary': []}
+    try:
+        return _run_seed_job(payload.source, payload.symbol.upper(), payload.intervals,
+                             payload.start_date, payload.end_date, payload.limit,
+                             payload.fetch_all, payload.repair, payload.include_mark_price)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get('/admin/market-data/seed-job')
+def market_data_seed_job(admin=Depends(require_admin)):
+    """Live state of the background seed worker (running flag, request and
+    last result) so the UI can poll without holding the seed request open."""
+    with _seed_job_state_lock:
+        return dict(_seed_job_state)
+
+
+@app.post('/admin/market-data/repair')
+def repair_market_data(source: str = 'Binance', symbol: str = 'BTCUSDT', intervals: Optional[str] = None,
+                       admin=Depends(require_admin), db=Depends(get_db)):
+    """Remove corrupted candles without fetching: duplicate timestamps (legacy
+    batch inserts stored each candle again) and off-grid timestamps (legacy
+    CSV imports, e.g. 11:41:59.523330 on a 1h series). Well-formed rows are
+    never touched. Follow up with a seed to refill whatever was removed."""
+    try:
+        source, definition = _market_definition(db, source)
+        wanted = [interval.strip().lower() for interval in (intervals or '').split(',') if interval.strip()] or None
+        summary = DataSyncService.repair_klines(source, symbol.upper(), wanted, definition=definition)
+        removed = sum(int(item.get('removed', 0)) for item in summary)
+        status = 'Repair completed' if not any(item.get('error') for item in summary) else 'Repair completed with errors'
+        return {'status': f'{status} — {removed} corrupt candles removed', 'summary': summary}
     except HTTPException:
         raise
     except Exception as exc:

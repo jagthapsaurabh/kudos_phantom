@@ -15,11 +15,14 @@ def factory_reset():
     print("🏗️ Re-creating database schema...")
     init_db()
     
-    # 3. Seed Market Data from CSVs
+    # 3. Seed Market Data from CSVs (rejected when off the candle grid)
     print("📊 Seeding market data from CSVs...")
     # Paths relative to backend folder
-    seed_from_csv("data/btc_1h.csv", "1h")
-    seed_from_csv("data/btc_4h.csv", "4h")
+    ok_1h = seed_from_csv("data/btc_1h.csv", "1h")
+    ok_4h = seed_from_csv("data/btc_4h.csv", "4h")
+    if not (ok_1h and ok_4h):
+        print("⚠️ CSV history unavailable/corrupt. Fetch clean candles from the exchange instead:")
+        print("     python -m app.scripts.seeder        # Binance 2020 → today (15m, 1h, 4h, 1d)")
     
     # 4. Seed Admin User
     print("👤 Seeding admin user...")
