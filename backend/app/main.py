@@ -19,13 +19,13 @@ from .services.live_trader import LiveTradeService, COORDINATOR
 from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
-    MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
+    MarketTick, MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
 )
 import bcrypt
 from passlib.context import CryptContext
 import asyncio
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import func
 
 # Load environment variables
@@ -308,6 +308,14 @@ def startup():
         print(f"[paper-history] marked {interrupted} paper session(s) as interrupted")
     # Start the background sync task
     asyncio.create_task(daily_sync_task())
+    # Persist every live tick (Binance + Delta BTC perpetual) so the series
+    # can be replayed / resampled later, even with no paper/live session open.
+    try:
+        from .services.tick_store import collector_enabled, run_collector
+        if collector_enabled():
+            asyncio.create_task(run_collector())
+    except Exception as exc:
+        print(f"[ticks] collector not started: {exc}")
 
 @app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
@@ -1397,20 +1405,49 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         s = signals[i]
         if s == 0:
             continue
+        direction = int(s)
         item = {
             "time": int(_utc_ts(df_1h.index[i])),
-            "direction": int(s),
+            "direction": direction,
+            "side": "LONG" if direction == 1 else "SHORT",
             "price": float(closes[i]),
-            "setup": None,
+            "setup": label or "CUSTOM",
             "rsi14": None,
             "adx": None,
+            "macd_hist": None,
+            "trend": None,
+            "trend_label": None,
+            "candle_type": None,
         }
         if meta is not None:
             item["setup"] = str(meta['setup'][i])
-            item["rsi14"] = round(float(meta['rsi14'][i]), 2)
-            item["adx"] = round(float(meta['adx'][i]), 3)
-        else:
-            item["setup"] = label or "CUSTOM"
+            try:
+                item["rsi14"] = round(float(meta['rsi14'][i]), 2)
+            except Exception:
+                pass
+            try:
+                item["adx"] = round(float(meta['adx'][i]), 3)
+            except Exception:
+                pass
+            try:
+                item["macd_hist"] = round(float(meta['macd_hist'][i]), 4)
+            except Exception:
+                pass
+            try:
+                trend = int(meta['trend'][i])
+                item["trend"] = trend
+                item["trend_label"] = "UP" if trend == 1 else ("DOWN" if trend == -1 else "FLAT")
+            except Exception:
+                pass
+            try:
+                if bool(meta['is_green'][i]):
+                    item["candle_type"] = "GREEN"
+                elif bool(meta['is_red'][i]):
+                    item["candle_type"] = "RED"
+                else:
+                    item["candle_type"] = "DOJI"
+            except Exception:
+                pass
         out.append(item)
         if len(out) >= 2000:
             break
@@ -1792,6 +1829,8 @@ class TradeStartRequest(BaseModel):
     # for a closed 1h candle either way.
     price_feed: str = 'off'
     tick_interval: float = 5.0
+    # Deadman switch (Delta Exchange India). None = ON for Delta, OFF otherwise.
+    heartbeat: Optional[bool] = None
 
 def resolve_broker_context(payload, user, db, require_credentials=False):
     code = normalize_source(payload.data_source or payload.broker_name)
@@ -1839,6 +1878,7 @@ def start_paper_trade(
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
+    feed_mode, feed_interval = _resolve_price_feed(payload)
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -1847,7 +1887,8 @@ def start_paper_trade(
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
-                                    trading_windows=window_config, use_mark_price=use_mark)
+                                    trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -1859,17 +1900,20 @@ def start_paper_trade(
             service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees,
                                         is_custom=False, broker_definition=definition, strategy_name=strategy_name,
-                                        trading_windows=window_config, use_mark_price=use_mark)
+                                        trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
         else:
             service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees,
                                         is_custom=True, broker_definition=definition, strategy_name=strategy_name,
-                                       trading_windows=window_config, use_mark_price=use_mark)
+                                       trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
-                                    trading_windows=window_config, use_mark_price=use_mark)
+                                    trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
@@ -1884,6 +1928,7 @@ def start_paper_trade(
             "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
             "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
             "trading_windows": service.window_guard.summary(),
+            "price_feed": feed_mode, "tick_interval": feed_interval,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/paper-trade/stop")
@@ -2035,6 +2080,13 @@ def get_paper_status(user=Depends(get_current_user)):
                 # running. Surfaced so "why is it not trading?" is answerable.
                 "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
                 "last_skip_reason": getattr(service, 'last_skip_reason', None),
+                "price_feed": {
+                    "mode": getattr(service, "price_feed_mode", "off"),
+                    "tick_interval": getattr(service, "tick_interval", 60.0),
+                    "fast_ticks": int(getattr(service, "fast_ticks", 0) or 0),
+                    **(getattr(service, "tick_feed", None).stats()
+                       if getattr(service, "tick_feed", None) else {}),
+                },
             })
     return status_list
 
@@ -2069,6 +2121,11 @@ def start_live_trade(
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
     feed_mode, feed_interval = _resolve_price_feed(payload)
+    # Deadman switch: required on Delta from day one (client document).
+    # Explicit False disables it; omitted defaults to ON for Delta.
+    heartbeat_on = payload.heartbeat
+    if heartbeat_on is None:
+        heartbeat_on = str(source).lower() == "delta"
     # Name the account this instance will trade on. With several strategies
     # pinned to different sub-accounts this is what tells the operator which
     # instance is which; without it every card just says "Binance".
@@ -2085,7 +2142,7 @@ def start_live_trade(
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label)
+                                   account_label=account_label, heartbeat=heartbeat_on)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -2099,7 +2156,7 @@ def start_live_trade(
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label)
+                                   account_label=account_label, heartbeat=heartbeat_on)
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
@@ -2107,7 +2164,7 @@ def start_live_trade(
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label)
+                                   account_label=account_label, heartbeat=heartbeat_on)
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
@@ -2115,7 +2172,7 @@ def start_live_trade(
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label)
+                                   account_label=account_label, heartbeat=heartbeat_on)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
@@ -2123,6 +2180,8 @@ def start_live_trade(
             "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
             "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
             "trading_windows": service.window_guard.summary(),
+            "heartbeat": bool(getattr(service, "heartbeat_enabled", False)),
+            "testnet": bool(testnet),
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
@@ -2234,24 +2293,47 @@ def get_live_status(user=Depends(get_current_user)):
                 # this instance did not open is visible instead of silent.
                 "exchange_position": getattr(service, 'exchange_position', None),
                 "last_order_error": getattr(service, 'last_order_error', None),
+                "heartbeat": (getattr(service, "heartbeat", None).stats()
+                              if getattr(service, "heartbeat", None)
+                              else {"enabled": bool(getattr(service, "heartbeat_enabled", False)),
+                                    "created": False, "stale": True}),
+                "testnet": bool(getattr(getattr(service, "broker", None), "testnet", False)),
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list
 
 # --- DATA ENDPOINTS ---
 @app.get("/klines")
-def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, source: str = "Binance", db=Depends(get_db)):
+def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
+               source: str = "Binance", start_date: Optional[str] = None,
+               end_date: Optional[str] = None, db=Depends(get_db)):
     try:
-        # First, try to fetch from the database for speed and history
-        data = db.query(Klines).filter(
+        # A date window is required for strategy/backtest overlays: the last-N
+        # candles from "now" never contain a 2020–2024 trade marker.
+        q = db.query(Klines).filter(
             Klines.symbol == symbol,
             Klines.interval == interval,
             Klines.source == normalize_source(source)
-        ).order_by(Klines.event_time.desc()).limit(limit).all()
+        )
+        windowed = bool(start_date or end_date)
+        if start_date:
+            try:
+                q = q.filter(Klines.event_time >= datetime.strptime(start_date, "%Y-%m-%d"))
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                q = q.filter(Klines.event_time < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+            except ValueError:
+                pass
+        cap = max(1, min(int(limit or 500), 60000 if windowed else 5000))
+        if windowed:
+            data = q.order_by(Klines.event_time.asc()).limit(cap).all()
+        else:
+            data = q.order_by(Klines.event_time.desc()).limit(cap).all()
+            data.reverse()
 
         if data:
-            # Reverse to get chronological order
-            data.reverse()
             formatted = []
             for k in data:
                 formatted.append({
@@ -2275,6 +2357,97 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500, 
         # series so the UI shows an empty chart instead of a hard error.
         print(f"Klines fetch error for {symbol}/{interval}: {e}")
         return []
+
+@app.get("/ticks")
+def get_ticks(symbol: str = "BTCUSDT", source: str = "Binance",
+              start_date: Optional[str] = None, end_date: Optional[str] = None,
+              limit: int = 5000, user=Depends(get_current_user), db=Depends(get_db)):
+    """Raw live ticks stored from the venue stream / REST poll.
+
+    Windowed like /klines so a backtest range actually contains the ticks
+    that fired inside it (a last-N fetch from "now" would drop them).
+    """
+    from .services.tick_store import flush_ticks, query_ticks
+    flush_ticks()
+    start = end = None
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            start = None
+    if end_date:
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            end = None
+    rows = query_ticks(normalize_source(source), symbol, start=start, end=end,
+                       limit=limit, db=db)
+    out = []
+    for row in rows:
+        out.append({
+            "time": int(_utc_ts(row.event_time)),
+            "mark_price": row.mark_price,
+            "last_price": row.last_price,
+            "index_price": row.index_price,
+            "bid": row.bid,
+            "ask": row.ask,
+            "feed": row.feed_kind,
+        })
+    return out
+
+
+@app.get("/ticks/latest")
+def get_latest_tick(symbol: str = "BTCUSDT", source: str = "Binance",
+                    user=Depends(get_current_user), db=Depends(get_db)):
+    from .services.tick_store import flush_ticks, latest_tick
+    flush_ticks()
+    row = latest_tick(normalize_source(source), symbol, db=db)
+    if row is None:
+        return None
+    return {
+        "time": int(_utc_ts(row.event_time)),
+        "source": row.source, "symbol": row.symbol,
+        "mark_price": row.mark_price, "last_price": row.last_price,
+        "index_price": row.index_price, "bid": row.bid, "ask": row.ask,
+        "feed": row.feed_kind,
+    }
+
+
+@app.get("/ticks/ohlc")
+def get_tick_ohlc(symbol: str = "BTCUSDT", source: str = "Binance",
+                  interval: str = "1m", start_date: Optional[str] = None,
+                  end_date: Optional[str] = None, limit: int = 20000,
+                  user=Depends(get_current_user), db=Depends(get_db)):
+    """Resample stored ticks into OHLC candles (volume = ticks in the bar)."""
+    from .services.tick_store import OHLC_SECONDS, flush_ticks, query_ticks, ticks_to_ohlc
+    if str(interval).lower() not in OHLC_SECONDS:
+        raise HTTPException(status_code=400,
+                            detail=f"interval must be one of {', '.join(OHLC_SECONDS)}")
+    flush_ticks()
+    start = end = None
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            start = None
+    if end_date:
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            end = None
+    rows = query_ticks(normalize_source(source), symbol, start=start, end=end,
+                       limit=limit, db=db)
+    bars = ticks_to_ohlc(rows, interval)
+    return [{"time": int(_utc_ts(b["time"])), "open": b["open"], "high": b["high"],
+             "low": b["low"], "close": b["close"], "volume": b["volume"]} for b in bars]
+
+
+@app.get("/ticks/stats")
+def get_tick_stats(user=Depends(get_current_user), db=Depends(get_db)):
+    from .services.tick_store import collector_stats, flush_ticks, series_stats
+    flush_ticks()
+    return {"series": series_stats(db), "collector": collector_stats()}
+
 
 @app.get("/symbols")
 def list_symbols(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
@@ -2623,7 +2796,7 @@ def live_place_order(payload: LiveOrderRequest, user=Depends(get_current_user), 
             symbol, side, payload.size, price=payload.price,
             stop_loss_price=payload.stop_loss, take_profit_price=payload.take_profit,
             client_order_id=client_order_id, trigger_method=payload.stop_trigger,
-            size_in_btc=payload.size_in_btc)
+            size_in_btc=payload.size_in_btc, trail_amount=payload.trail_amount)
     else:
         response = client.place_order(
             symbol, side, payload.order_type, payload.size, price=payload.price,
@@ -2747,3 +2920,48 @@ def live_local_fills(broker: str = None, limit: int = 200, user=Depends(get_curr
     """Executions recorded locally (kept after the exchange history window)."""
     from .services.broker_account import local_fills
     return local_fills(user.id, broker, limit=limit)
+
+
+@app.get('/live-account/fills/export')
+def live_fills_export(broker: str = 'Delta', connection_id: Optional[int] = None,
+                      symbol: str = 'BTCUSDT', limit: int = 200,
+                      format: str = 'kudos', start_time: Optional[int] = None,
+                      end_time: Optional[int] = None,
+                      user=Depends(get_current_user), db=Depends(get_db)):
+    """Download live fills as a Kudos/backtest-style CSV.
+
+    ``format=fills`` is one row per execution; ``format=kudos`` FIFO-pairs
+    them into round-trip trades matching the paper/backtest trade log.
+    Falls back to the local audit table if the venue history window is empty.
+    """
+    from fastapi.responses import Response
+    from .services.broker_account import (
+        fills_to_csv, fills_to_kudos_trades_csv, local_fills, normalize_fill,
+    )
+    client, definition, _ = _live_client(db, user, broker, connection_id)
+    instrument = client.get_instrument(symbol) or {}
+    contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
+    raw = []
+    try:
+        raw = client.get_fills(symbol, start_time=start_time, end_time=end_time,
+                               limit=max(1, min(int(limit), 1000)))
+    except Exception:
+        raw = []
+    fills = []
+    if isinstance(raw, list):
+        fills = [normalize_fill(row, definition.code, contract_value) for row in raw
+                 if isinstance(row, dict) and not row.get('error')]
+    if not fills:
+        fills = local_fills(user.id, definition.code, limit=limit)
+    kind = str(format or 'kudos').lower()
+    if kind in ('kudos', 'trades', 'trade'):
+        csv_text = fills_to_kudos_trades_csv(fills, broker=definition.code)
+        filename = f"kudos_{definition.code.lower()}_trades.csv"
+    else:
+        csv_text = fills_to_csv(fills, broker=definition.code)
+        filename = f"kudos_{definition.code.lower()}_fills.csv"
+    return Response(
+        content=csv_text.encode('utf-8'),
+        media_type='text/csv; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )

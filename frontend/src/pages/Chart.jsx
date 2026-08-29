@@ -14,6 +14,7 @@ import {
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import { computeAll } from '../utils/indicators';
+import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel } from '../utils/chartOverlay';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
 const DEFAULT_INDICATORS = { ema20: false, ema50: true, sma50: false, rsi: false, macd: false };
@@ -57,8 +58,10 @@ const ChartPage = () => {
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   const [showSignals, setShowSignals] = useState(true);
-  const [signalRange, setSignalRange] = useState({ start: '2026-01-01', end: '2026-06-25' });
+  const [signalRange, setSignalRange] = useState(() => defaultSignalRange());
   const [signalCount, setSignalCount] = useState(0);
+  const [overlayEvents, setOverlayEvents] = useState([]);
+  const [runOverlay, setRunOverlay] = useState(null);
   const [overlayStrategy, setOverlayStrategy] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
   const [indicators, setIndicators] = useState({ ...DEFAULT_INDICATORS });
@@ -108,6 +111,33 @@ const ChartPage = () => {
         if (Array.isArray(list) && list.length) { setSymbols(list); if (!list.includes(symbol)) setSymbol(list[0]); }
       }).catch(() => {});
   }, [dataSource]);
+
+  // Deep-link a finished backtest onto the market candles: /chart?run=<id>
+  useEffect(() => {
+    const runId = new URLSearchParams(window.location.search).get('run');
+    if (!runId) return;
+    fetch(`${API_URL}/backtest/results/${runId}`, { headers: authHeaders() })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (!data?.run_details) return;
+        const d = data.run_details;
+        const start = d.start_date ? String(d.start_date).slice(0, 10) : null;
+        const end = d.end_date ? String(d.end_date).slice(0, 10) : null;
+        if (start && end) setSignalRange({ start, end });
+        if (d.data_source) setDataSource(d.data_source);
+        if (d.strategy_id) setOverlayStrategy(String(d.strategy_id));
+        setInterval('1h');
+        setShowSignals(true);
+        setRunOverlay({
+          id: d.id,
+          name: d.name || `Run #${d.id}`,
+          trades: Array.isArray(data.trades) ? data.trades : [],
+          strategy_id: d.strategy_id,
+        });
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Chart init ----------------------------------------------------
   const initChart = useCallback(() => {
@@ -234,7 +264,12 @@ const ChartPage = () => {
     if (!candleSeriesRef.current) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/klines?symbol=${symbol}&interval=${interval}&limit=500&source=${encodeURIComponent(dataSource)}`);
+      const params = new URLSearchParams({
+        symbol, interval, limit: '50000', source: dataSource,
+      });
+      if (signalRange.start) params.set('start_date', signalRange.start);
+      if (signalRange.end) params.set('end_date', signalRange.end);
+      const res = await fetch(`${API_URL}/klines?${params.toString()}`);
       const data = await res.json();
       candlesRef.current = data;
       timesRef.current = data.map(d => d.time);
@@ -265,7 +300,7 @@ const ChartPage = () => {
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, interval, showSignals, overlayStrategy, dataSource]);
+  }, [symbol, interval, showSignals, overlayStrategy, dataSource, signalRange.start, signalRange.end]);
 
   useEffect(() => {
     if (chartRef.current && candleSeriesRef.current) fetchData();
@@ -349,35 +384,49 @@ const ChartPage = () => {
   // --- Signals overlay ------------------------------------------------
   const applySignals = useCallback(async (show) => {
     if (!candleSeriesRef.current) return;
-    if (!show || interval !== '1h') {
+    const trades = runOverlay?.trades || [];
+    const canPlotSignals = show && interval === '1h';
+    if (!canPlotSignals && !trades.length) {
       if (markersRef.current) markersRef.current.setMarkers([]);
       setSignalCount(0);
+      setOverlayEvents([]);
       return;
     }
     try {
-      const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
-      const res = await fetch(url, { headers: authHeaders() });
-      if (!res.ok) { if (markersRef.current) markersRef.current.setMarkers([]); setSignalCount(0); return; }
-      const sigs = await res.json();
+      let sigs = [];
+      if (canPlotSignals) {
+        const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
+        const res = await fetch(url, { headers: authHeaders() });
+        if (res.ok) sigs = await res.json();
+      }
       const times = new Set(timesRef.current);
-      const markers = sigs
-        .filter(s => times.has(s.time))
-        .map(s => ({
-          time: s.time,
-          position: s.direction === 1 ? 'belowBar' : 'aboveBar',
-          color: s.direction === 1 ? '#22c55e' : '#ef4444',
-          shape: s.direction === 1 ? 'arrowUp' : 'arrowDown',
-          text: `${(s.setup || 'S').slice(0, 1)} ${s.rsi14 != null ? `RSI:${Number(s.rsi14).toFixed(0)}` : ''}`.trim(),
-        }))
-        .sort((a, b) => a.time - b.time);
+      const markers = buildOverlayMarkers({
+        signals: Array.isArray(sigs) ? sigs : [],
+        trades,
+      }).filter(m => times.has(m.time));
       if (markersRef.current) markersRef.current.setMarkers([]);
       markersRef.current = createSeriesMarkers(candleSeriesRef.current, markers);
       setSignalCount(markers.length);
+      const events = (Array.isArray(sigs) ? sigs : [])
+        .filter(s => times.has(s.time))
+        .slice(-80)
+        .reverse()
+        .map(s => ({
+          time: s.time,
+          label: signalLabel(s),
+          setup: s.setup,
+          trend: s.trend_label || (s.trend === 1 ? 'UP' : s.trend === -1 ? 'DOWN' : ''),
+          candle: s.candle_type,
+          rsi: s.rsi14,
+          side: s.side || (s.direction === 1 ? 'LONG' : 'SHORT'),
+        }));
+      setOverlayEvents(events);
     } catch (e) {
       if (markersRef.current) markersRef.current.setMarkers([]);
       setSignalCount(0);
+      setOverlayEvents([]);
     }
-  }, [symbol, interval, signalRange, overlayStrategy, dataSource, authHeaders]);
+  }, [symbol, interval, signalRange, overlayStrategy, dataSource, authHeaders, runOverlay]);
 
   useEffect(() => { applySignals(showSignals); }, [applySignals, showSignals]);
 
@@ -421,7 +470,7 @@ const ChartPage = () => {
           <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-3 text-blue-400">
             <TrendingUp size={28} /> Market Chart
           </h1>
-          <p className="text-gray-400 text-sm mt-1">Candlesticks, volume, indicators & strategy signal overlay</p>
+          <p className="text-gray-400 text-sm mt-1">Candlesticks with LONG / SHORT / trend markers — including a finished backtest</p>
         </div>
         <div className="flex gap-3 items-center flex-wrap">
           <div className="flex items-center gap-2 bg-gray-800 p-1 rounded-lg border border-gray-700">
@@ -500,6 +549,14 @@ const ChartPage = () => {
           <div className="w-[9.5rem]"><DateInput value={signalRange.end} onChange={e => setSignalRange({ ...signalRange, end: e.target.value })} /></div>
         </div>
         <span className="text-xs font-bold text-green-400">{signalCount} markers</span>
+        {runOverlay && (
+          <span className="text-xs font-semibold text-sky-300 bg-sky-900/30 border border-sky-800/50 rounded px-2 py-1">
+            Backtest: {runOverlay.name} · {runOverlay.trades.length} trades
+          </span>
+        )}
+        {interval !== '1h' && (
+          <span className="text-[11px] text-amber-300">Switch to 1h to plot LONG/SHORT on the signal candle</span>
+        )}
         {loading && <span className="text-xs text-gray-500 animate-pulse">Loading…</span>}
       </div>
 
@@ -540,13 +597,50 @@ const ChartPage = () => {
           {o.rsi != null && <span className="text-gray-500">RSI14 <span style={{ color: COLOR.rsi }}>{fmt(o.rsi)}</span></span>}
           {o.macdHist != null && <span className="text-gray-500">MACD <span style={{ color: COLOR.macd }}>{fmt(o.macdLine)}</span></span>}
         </div>
-        <div className="flex gap-6 mt-1 px-2 text-[11px] text-gray-400">
-          <span className="flex items-center gap-1"><span className="text-green-500">▲</span> Long</span>
-          <span className="flex items-center gap-1"><span className="text-red-500">▼</span> Short</span>
+        <div className="flex flex-wrap gap-x-5 gap-y-1 mt-1 px-2 text-[11px] text-gray-400">
+          <span className="flex items-center gap-1"><span className="text-green-500">▲</span> LONG</span>
+          <span className="flex items-center gap-1"><span className="text-red-500">▼</span> SHORT</span>
+          <span>REV = reversal · MOM = momentum</span>
+          <span>↑ 4h uptrend · ↓ 4h downtrend</span>
+          <span className="flex items-center gap-1"><span className="text-sky-400">●</span> IN fill</span>
+          <span className="flex items-center gap-1"><span className="text-amber-400">■</span> OUT exit</span>
           <span className="flex items-center gap-1"><Volume2 size={12} className="text-gray-500" /> Volume</span>
-          <span className="text-gray-600">Hover a candle to read values · overlay a custom strategy from the Signals menu</span>
         </div>
       </div>
+
+      {overlayEvents.length > 0 && (
+        <div className="mt-4 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+          <div className="px-4 py-3 text-xs font-bold uppercase tracking-wider text-gray-400 border-b border-gray-700">
+            Signal candles in view ({overlayEvents.length}{overlayEvents.length === 80 ? '+' : ''})
+          </div>
+          <div className="overflow-x-auto max-h-64 overflow-y-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-gray-900 uppercase text-gray-500 sticky top-0">
+                <tr>
+                  <th className="p-2 font-semibold">Candle (UTC)</th>
+                  <th className="p-2 font-semibold">Side</th>
+                  <th className="p-2 font-semibold">Setup</th>
+                  <th className="p-2 font-semibold">4h trend</th>
+                  <th className="p-2 font-semibold">Candle</th>
+                  <th className="p-2 font-semibold">RSI</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overlayEvents.map((e) => (
+                  <tr key={e.time} className="border-b border-gray-700/70">
+                    <td className="p-2 font-mono text-gray-300">{fmtUnixUtc(e.time)}</td>
+                    <td className={`p-2 font-bold ${e.side === 'LONG' ? 'text-green-400' : 'text-red-400'}`}>{e.side}</td>
+                    <td className="p-2 text-gray-300">{e.setup || '—'}</td>
+                    <td className={`p-2 ${e.trend === 'UP' ? 'text-green-400' : e.trend === 'DOWN' ? 'text-red-400' : 'text-gray-500'}`}>{e.trend || '—'}</td>
+                    <td className={`p-2 ${e.candle === 'GREEN' ? 'text-green-400' : e.candle === 'RED' ? 'text-red-400' : 'text-gray-500'}`}>{e.candle || '—'}</td>
+                    <td className="p-2 font-mono text-gray-400">{e.rsi != null ? Number(e.rsi).toFixed(1) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Info cards */}
       <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -555,7 +649,7 @@ const ChartPage = () => {
             <div className="p-2 bg-blue-500/20 rounded-lg text-blue-400"><Timer size={20} /></div>
             <h3 className="font-bold">Timeframe</h3>
           </div>
-          <p className="text-sm text-gray-400">1m → 1d candle resolution. Signals overlay on 1h.</p>
+          <p className="text-sm text-gray-400">1m → 1d candle resolution. LONG/SHORT markers plot on the 1h signal candle.</p>
         </div>
         <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
           <div className="flex items-center gap-3 mb-4">
@@ -569,7 +663,7 @@ const ChartPage = () => {
             <div className="p-2 bg-purple-500/20 rounded-lg text-purple-400"><Layers size={20} /></div>
             <h3 className="font-bold">Strategy Overlay</h3>
           </div>
-          <p className="text-sm text-gray-400">Overlay Kudos or any custom strategy's signals on {symbol}.</p>
+          <p className="text-sm text-gray-400">Overlay Kudos signals or a backtest run (`/chart?run=id`) on {symbol}. Each marker shows LONG/SHORT, REV/MOM and 4h trend.</p>
         </div>
       </div>
     </div>

@@ -54,6 +54,26 @@ class BrokerClient:
         "Binance": {"kind": "binance", "market": "https://fapi.binance.com", "trading": "https://fapi.binance.com"},
         "Delta": {"kind": "delta", "market": "https://api.india.delta.exchange", "trading": "https://api.india.delta.exchange"},
     }
+    # Official Delta Exchange India environments (docs.delta.exchange).
+    # Production keys on the testnet host (or the reverse) return InvalidApiKey.
+    DELTA_PRODUCTION = "https://api.india.delta.exchange"
+    DELTA_TESTNET = "https://cdn-ind.testnet.deltaex.org"
+    DELTA_WS = {
+        "production": {
+            # Changelog 17.04.26: public channels live on public-socket;
+            # wss://socket.india.delta.exchange public channels were removed 31 Jul 2026.
+            "public": "wss://public-socket.india.delta.exchange",
+            "public_v2": "wss://public-socket.india.delta.exchange",
+            "private": "wss://socket.india.delta.exchange",
+        },
+        "testnet": {
+            "public": "wss://socket-ind-pub.testnet.deltaex.org",
+            "public_v2": "wss://socket-ind-pub.testnet.deltaex.org",
+            "private": "wss://socket-ind.testnet.deltaex.org",
+        },
+    }
+    # Required on every Delta request — omitting it can 4XX the call.
+    USER_AGENT = "PHANTOM-Trading-Tool/1.0"
 
     # Accepted aliases for Binance's `workingType` (stop-trigger source).
     BINANCE_WORKING_TYPES = {
@@ -86,6 +106,10 @@ class BrokerClient:
         if self.testnet and self.kind == "binance":
             self.market_url = "https://testnet.binancefuture.com"
             self.trading_url = "https://testnet.binancefuture.com"
+        elif self.testnet and self.kind == "delta":
+            # Demo account at demo.delta.exchange → testnet REST host.
+            self.market_url = self.DELTA_TESTNET
+            self.trading_url = self.DELTA_TESTNET
         # Backwards-compatible alias used by the original Binance client.
         self.base_url = self.trading_url
         # One limiter per broker (+ credentials) shared by every caller, so the
@@ -123,6 +147,18 @@ class BrokerClient:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _delta_limit_price(price):
+        """String form of a limit price, or None when it must not be sent.
+
+        Changelog 15.04.26: any ``limit_price`` ≤ 0 is rejected. If the field
+        is not required, omit it (do not send 0 / empty / \"None\").
+        """
+        number = BrokerClient._f(price)
+        if number is None or number <= 0:
+            return None
+        return str(price)
+
     # ------------------------------------------------------------------
     # Intervals
     # ------------------------------------------------------------------
@@ -151,6 +187,11 @@ class BrokerClient:
         """One HTTP call inside the rate-limit budget, retrying 429/5xx."""
         cfg = self.rate_limit_config
         last_error = None
+        # Delta requires a User-Agent on every request (public and signed);
+        # missing it can 4XX. Harmless on Binance, so always set it.
+        headers = dict(headers or {})
+        headers.setdefault("User-Agent", self.USER_AGENT)
+        headers.setdefault("Accept", "application/json")
         for attempt in range(1, int(max(1, cfg.max_retries)) + 1):
             try:
                 self.limiter.acquire(weight=weight, is_order=is_order)
@@ -235,6 +276,12 @@ class BrokerClient:
     # ------------------------------------------------------------------
     def _delta_request(self, method, path, body=None, query=None, weight: float = 1.0,
                        is_order: bool = False):
+        # Changelog 19.08.26 (docs.delta.exchange): GET /v2/profile is rejected
+        # when signed with API keys from 19 Aug 2026. Account identity / a key
+        # ping must use GET /v2/wallet/balances (or GET /v2/users/trading_preferences).
+        if str(path).rstrip("/").endswith("/v2/profile") or str(path).rstrip("/") == "/profile":
+            return None, {"error": "GET /v2/profile is no longer accessible with API keys "
+                                   "(Delta changelog 19.08.26). Use GET /v2/wallet/balances."}
         body_text = json.dumps(body or {}, separators=(",", ":")) if body is not None else ""
         timestamp = str(int(time.time()))
         query_text = "&".join(f"{k}={v}" for k, v in sorted((query or {}).items()))
@@ -434,6 +481,30 @@ class BrokerClient:
         self._instrument_cache[key] = instrument
         return instrument
 
+    def get_products(self, contract_types: Optional[str] = "perpetual_futures"):
+        """``GET /v2/products`` — contract specs (tick size, margin, lot size).
+
+        Called once at live-worker startup (and on a daily refresh) so sizing
+        uses the venue's current tick / contract value, not a stale cache.
+        """
+        if self.kind != "delta":
+            return [self.get_instrument()]
+        query: Dict[str, Any] = {}
+        if contract_types:
+            query["contract_types"] = contract_types
+        response, error = self._throttled_request(
+            "GET", f"{self.market_url}/v2/products", params=query or None, weight=3)
+        payload = self._json_body(response, error)
+        result = self._delta_result(payload)
+        return result if isinstance(result, list) else payload
+
+    def websocket_urls(self) -> Dict[str, str]:
+        """Public / private Delta socket hosts for this environment."""
+        if self.kind != "delta":
+            return {}
+        env = "testnet" if self.testnet else "production"
+        return dict(self.DELTA_WS.get(env) or self.DELTA_WS["production"])
+
     def base_to_venue_size(self, quantity_btc: float, symbol: str = "BTCUSDT") -> float:
         """Convert a BTC quantity into the venue's order size (contracts/lots)."""
         instrument = self.get_instrument(symbol)
@@ -533,7 +604,12 @@ class BrokerClient:
                 body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
         else:
             body["order_type"] = "limit_order"
-            body["limit_price"] = str(price)
+            # Changelog 15.04.26: limit_price ≤ 0 is rejected; omit when unused.
+            limit = self._delta_limit_price(price)
+            if limit is None:
+                return {"error": "limit orders require a positive limit_price "
+                                 "(Delta changelog 15.04.26)"}
+            body["limit_price"] = limit
             body["time_in_force"] = "gtc" if str(time_in_force).upper() in ("GTC", "GTX") else "ioc"
             if is_stop:
                 body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
@@ -561,12 +637,15 @@ class BrokerClient:
                             stop_loss_price: Optional[float] = None,
                             take_profit_price: Optional[float] = None,
                             client_order_id: Optional[str] = None,
-                            trigger_method: str = "mark_price", size_in_btc: bool = True):
+                            trigger_method: str = "mark_price", size_in_btc: bool = True,
+                            trail_amount: Optional[float] = None):
         """Entry order with an attached stop-loss and take-profit.
 
         Delta supports this natively (``POST /v2/orders/bracket``) and cancels
-        the unused leg when the other fills. Binance has no bracket endpoint,
-        so the entry is sent first and the two protection legs are placed as
+        the unused leg when the other fills. ``trail_amount`` is sent as a
+        string on the stop-loss leg so it matches the Phantom ATR trail
+        (``trail_distance_atr × ATR``). Binance has no bracket endpoint, so
+        the entry is sent first and the two protection legs are placed as
         reduce-only STOP_MARKET / TAKE_PROFIT_MARKET orders afterwards.
         """
         perp = self.perpetual_symbol(symbol)
@@ -583,10 +662,17 @@ class BrokerClient:
                 "bracket_stop_trigger_method": trigger_method or "mark_price",
             }
             if price is not None:
-                body["limit_price"] = str(price)
+                limit = self._delta_limit_price(price)
+                if limit is None:
+                    return {"error": "limit orders require a positive limit_price "
+                                     "(Delta changelog 15.04.26)"}
+                body["limit_price"] = limit
             if stop_loss_price is not None:
-                body["stop_loss_order"] = {"order_type": "market_order",
-                                           "stop_price": str(stop_loss_price)}
+                sl_leg: Dict[str, Any] = {"order_type": "market_order",
+                                          "stop_price": str(stop_loss_price)}
+                if trail_amount is not None:
+                    sl_leg["trail_amount"] = str(trail_amount)
+                body["stop_loss_order"] = sl_leg
             if take_profit_price is not None:
                 body["take_profit_order"] = {"order_type": "market_order",
                                              "stop_price": str(take_profit_price)}
@@ -653,6 +739,32 @@ class BrokerClient:
             return self._delta_result(self._json_body(response, error))
         return {"error": f"No cancel adapter installed for '{self.broker_name}'"}
 
+    def edit_bracket_order(self, order_id, symbol: Optional[str] = None,
+                           stop_loss_price: Optional[float] = None,
+                           take_profit_price: Optional[float] = None,
+                           trail_amount: Optional[float] = None):
+        """``PUT /v2/orders/bracket`` — adjust SL / TP / trail after entry."""
+        if self.kind != "delta":
+            return {"error": "Editing a bracket is only supported on Delta Exchange."}
+        body: Dict[str, Any] = {"id": int(order_id)}
+        perp = self.perpetual_symbol(symbol) if symbol else None
+        if perp:
+            body["product_symbol"] = perp
+        if stop_loss_price is not None:
+            sl_leg: Dict[str, Any] = {"order_type": "market_order",
+                                      "stop_price": str(stop_loss_price)}
+            if trail_amount is not None:
+                sl_leg["trail_amount"] = str(trail_amount)
+            body["stop_loss_order"] = sl_leg
+        elif trail_amount is not None:
+            body["stop_loss_order"] = {"trail_amount": str(trail_amount)}
+        if take_profit_price is not None:
+            body["take_profit_order"] = {"order_type": "market_order",
+                                         "stop_price": str(take_profit_price)}
+        response, error = self._delta_request("PUT", "/v2/orders/bracket", body=body,
+                                              weight=10, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
     def edit_order(self, order_id, symbol: Optional[str] = None, price: Optional[float] = None,
                    size: Optional[float] = None, stop_price: Optional[float] = None,
                    client_order_id: Optional[str] = None):
@@ -662,7 +774,11 @@ class BrokerClient:
             if perp:
                 body["product_symbol"] = perp
             if price is not None:
-                body["limit_price"] = str(price)
+                limit = self._delta_limit_price(price)
+                if limit is None:
+                    return {"error": "limit_price must be positive "
+                                     "(Delta changelog 15.04.26)"}
+                body["limit_price"] = limit
             if size is not None:
                 body["size"] = int(round(size))
             if stop_price is not None:
@@ -904,6 +1020,57 @@ class BrokerClient:
             "limits": self.rate_limit_config.as_dict(),
         })
         return snapshot
+
+    # ==================================================================
+    # Heartbeat / Deadman Switch (Delta Exchange India)
+    # ==================================================================
+    def create_heartbeat(self, heartbeat_id: str, impact: str = "contracts",
+                         contract_types: Optional[List[str]] = None,
+                         product_symbols: Optional[List[str]] = None,
+                         underlying_assets: Optional[List[str]] = None,
+                         config: Optional[List[Dict[str, Any]]] = None):
+        """``POST /v2/heartbeat/create`` — register a deadman switch.
+
+        When acknowledgments stop, the exchange runs ``config`` (default:
+        cancel all open orders after one missed beat).
+        """
+        if self.kind != "delta":
+            return {"error": "Heartbeat / deadman switch is a Delta Exchange feature"}
+        body: Dict[str, Any] = {
+            "heartbeat_id": str(heartbeat_id),
+            "impact": impact or "contracts",
+            "config": config or [{"action": "cancel_orders", "unhealthy_count": 1}],
+        }
+        if contract_types:
+            body["contract_types"] = list(contract_types)
+        if product_symbols:
+            body["product_symbols"] = list(product_symbols)
+        if underlying_assets:
+            body["underlying_assets"] = list(underlying_assets)
+        response, error = self._delta_request("POST", "/v2/heartbeat/create", body=body,
+                                              weight=5)
+        return self._json_body(response, error)
+
+    def send_heartbeat(self, heartbeat_id: str, ttl: int = 30000):
+        """``POST /v2/heartbeat`` — ack. ``ttl=0`` disables the heartbeat."""
+        if self.kind != "delta":
+            return {"error": "Heartbeat / deadman switch is a Delta Exchange feature"}
+        body = {"heartbeat_id": str(heartbeat_id), "ttl": int(ttl)}
+        response, error = self._delta_request("POST", "/v2/heartbeat", body=body, weight=3)
+        return self._json_body(response, error)
+
+    def get_heartbeats(self, heartbeat_id: Optional[str] = None):
+        """``GET /v2/heartbeat`` — active deadman-switch registrations."""
+        if self.kind != "delta":
+            return {"error": "Heartbeat / deadman switch is a Delta Exchange feature"}
+        query = {"heartbeat_id": heartbeat_id} if heartbeat_id else None
+        response, error = self._delta_request("GET", "/v2/heartbeat", query=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def disable_heartbeat(self, heartbeat_id: str):
+        """Graceful shutdown: ack with ttl=0 so a planned stop is not a crash."""
+        return self.send_heartbeat(heartbeat_id, ttl=0)
 
     def fetch_rate_limit_quota(self):
         """Delta's remaining quota for the current 5-minute window."""

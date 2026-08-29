@@ -562,6 +562,8 @@ export const SeedDataTab = () => {
   const [end, setEnd] = useState('');
   const [limit, setLimit] = useState(1000);
   const [status, setStatus] = useState([]);
+  const [tickStats, setTickStats] = useState([]);
+  const [tickCollector, setTickCollector] = useState(null);
   const [progress, setProgress] = useState([]);
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -577,14 +579,17 @@ export const SeedDataTab = () => {
 
   const load = async () => {
     try {
-      const [definitions, datasets, seedProgress] = await Promise.all([
+      const [definitions, datasets, seedProgress, ticks] = await Promise.all([
         fetch(`${API_URL}/broker-definitions`, { headers: authHeaders() }).then(r => r.json()),
         fetch(`${API_URL}/admin/market-data/status?health=1`, { headers: authHeaders() }).then(r => r.json()),
         fetch(`${API_URL}/admin/market-data/progress`, { headers: authHeaders() }).then(r => r.json()),
+        fetch(`${API_URL}/ticks/stats`, { headers: authHeaders() }).then(r => r.json()).catch(() => ({})),
       ]);
       setDefs(Array.isArray(definitions) ? definitions : []);
       setStatus(Array.isArray(datasets) ? datasets : []);
       setProgress(Array.isArray(seedProgress) ? seedProgress : []);
+      setTickStats(Array.isArray(ticks?.series) ? ticks.series : []);
+      setTickCollector(ticks?.collector || null);
     } catch (error) {
       setMsg({ ok: false, text: `Could not load seed status: ${error.message}` });
     }
@@ -927,6 +932,44 @@ export const SeedDataTab = () => {
         <div className="flex items-center justify-between border-b border-gray-700 p-4"><div><h3 className="font-bold text-gray-300">Seeded datasets</h3><p className="mt-1 text-[10px] text-gray-600">Daily refresh runs automatically after the API starts, then every 24 hours.</p></div><button onClick={load} className="text-gray-400 transition hover:text-white" title="Refresh dataset status"><RefreshCw size={15} /></button></div>
         <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead className="bg-gray-900 text-gray-500 uppercase"><tr><th className="p-3">Source</th><th className="p-3">Symbol</th><th className="p-3">Interval</th><th className="p-3">Candles</th><th className="p-3">With volume</th><th className="p-3" title="Rows sharing a timestamp with another row of the same series">Duplicates</th><th className="p-3" title="Candles whose timestamp is not on the interval grid, e.g. 11:41:59 on a 1h series — the signature of the corrupt CSV imports">Off-grid</th><th className="p-3">Range</th></tr></thead><tbody>{status.map(row => <tr key={`${row.source}-${row.symbol}-${row.interval}`} className="border-t border-gray-700"><td className="p-3 font-bold text-blue-300">{row.source}</td><td className="p-3">{row.symbol}</td><td className="p-3">{row.interval}</td><td className="p-3 font-mono">{Number(row.count || 0).toLocaleString()}</td><td className="p-3 text-green-400">{row.volume_rows}/{row.count}</td><td className={`p-3 font-mono ${Number(row.duplicate_rows || 0) > 0 ? 'text-red-400 font-bold' : 'text-gray-600'}`}>{Number(row.duplicate_rows || 0).toLocaleString()}</td><td className={`p-3 font-mono ${Number(row.misaligned_rows || 0) > 0 ? 'text-red-400 font-bold' : 'text-gray-600'}`}>{row.misaligned_rows == null ? '—' : Number(row.misaligned_rows).toLocaleString()}</td><td className="p-3 text-gray-500">{row.first?.split('T')[0]} → {row.last?.split('T')[0]}</td></tr>)}</tbody></table></div>
         {status.length === 0 && <div className="p-8 text-center text-sm text-gray-500">No seeded data yet.</div>}
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-gray-700 bg-gray-800">
+        <div className="flex items-center justify-between border-b border-gray-700 p-4">
+          <div>
+            <h3 className="font-bold text-gray-300">Stored ticks</h3>
+            <p className="mt-1 text-[10px] text-gray-600">
+              Every live quote from the venue stream is written to the database so it can be replayed or resampled into candles.
+              {tickCollector?.running ? ' Collector is listening.' : ' Collector starts with the API.'}
+            </p>
+          </div>
+          <div className="text-[10px] text-gray-500 font-mono">
+            {tickCollector?.recorder ? `${Number(tickCollector.recorder.written || 0).toLocaleString()} written · ${Number(tickCollector.recorder.pending || 0)} pending` : ''}
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-gray-900 text-gray-500 uppercase">
+              <tr>
+                <th className="p-3">Source</th>
+                <th className="p-3">Symbol</th>
+                <th className="p-3">Ticks</th>
+                <th className="p-3">Range</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tickStats.map(row => (
+                <tr key={`${row.source}-${row.symbol}`} className="border-t border-gray-700">
+                  <td className="p-3 font-bold text-blue-300">{row.source}</td>
+                  <td className="p-3">{row.symbol}</td>
+                  <td className="p-3 font-mono">{Number(row.count || 0).toLocaleString()}</td>
+                  <td className="p-3 text-gray-500">{row.first ? String(row.first).replace('T', ' ').slice(0, 19) : '—'} → {row.last ? String(row.last).replace('T', ' ').slice(0, 19) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {tickStats.length === 0 && <div className="p-8 text-center text-sm text-gray-500">No ticks stored yet — they appear once the API is running with a live feed.</div>}
       </div>
     </div>
   );

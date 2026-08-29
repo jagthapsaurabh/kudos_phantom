@@ -5,7 +5,8 @@ import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } from '../utils/tradingWindows';
-import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle } from 'lucide-react';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart } from 'lucide-react';
+import MarketOverlayChart from '../components/MarketOverlayChart';
 
 const PARAM_META = {
   trend_ema_period: { label: 'Trend EMA', hint: 'How far back the 4h trend looks. Higher = slower, fewer trades.' },
@@ -423,6 +424,8 @@ const Backtest = () => {
   const [runName, setRunName] = useState('');
   const [confirm, setConfirm] = useState(null); // { type, runId, ... }
   const [capital, setCapital] = useState(20000); // starting capital for the run (default = admin set)
+  const [overlayCandles, setOverlayCandles] = useState([]);
+  const [overlayLoading, setOverlayLoading] = useState(false);
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   const [fees, setFees] = useState({ taker_fee_bps: 5.9, maker_fee_bps: 2.36 });
@@ -433,6 +436,7 @@ const Backtest = () => {
     preview: true,
     summary: true,
     equity: true,
+    candles: true,
     breakdown: true,
     trades: true,
   };
@@ -443,6 +447,7 @@ const Backtest = () => {
     preview: false,
     summary: true,
     equity: true,
+    candles: true,
     breakdown: true,
     trades: false,
   };
@@ -633,6 +638,24 @@ const Backtest = () => {
       return () => clearTimeout(timer);
     }
   }, [results, sectionVisibility.equity]);
+
+  useEffect(() => {
+    if (!results) { setOverlayCandles([]); return undefined; }
+    const start = results.start_date ? String(results.start_date).slice(0, 10) : null;
+    const end = results.end_date ? String(results.end_date).slice(0, 10) : null;
+    const source = results.data_source || 'Binance';
+    const symbol = perpetualFor(source);
+    const params = new URLSearchParams({ symbol, interval: '1h', limit: '50000', source });
+    if (start) params.set('start_date', start);
+    if (end) params.set('end_date', end);
+    setOverlayLoading(true);
+    fetch(`${API_URL}/klines?${params.toString()}`)
+      .then(r => (r.ok ? r.json() : []))
+      .then(data => setOverlayCandles(Array.isArray(data) ? data : []))
+      .catch(() => setOverlayCandles([]))
+      .finally(() => setOverlayLoading(false));
+    return undefined;
+  }, [results]);
 
   useEffect(() => {
     if (!sectionVisibility.equity && chartRef.current) {
@@ -983,7 +1006,7 @@ const Backtest = () => {
       <div className="mb-8 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h1 className="text-3xl font-extrabold tracking-tight text-blue-400">Backtest</h1>
-          <p className="text-sm text-gray-500">Strategy optimizer with collapsible setup, configuration and results sections.</p>
+          <p className="text-sm text-gray-500">Strategy optimizer — finished runs plot LONG/SHORT on market candles.</p>
         </div>
         <div className="flex flex-wrap gap-3">
           <button onClick={requestClearAll} className="flex items-center gap-2 rounded-lg border border-red-900/50 bg-red-900/20 px-4 py-2 text-sm font-semibold text-red-400 transition hover:bg-red-900/40">
@@ -1016,6 +1039,10 @@ const Backtest = () => {
                   <div className="font-bold text-gray-200 transition group-hover:text-blue-400">{run.name || 'Unnamed Run'}</div>
                   <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Binance'}</div>
                   <div className={`mt-2 text-sm font-mono ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
+                  <a href={`/chart?run=${run.id}`} onClick={(e) => e.stopPropagation()}
+                     className="mt-2 inline-flex items-center gap-1 text-[11px] font-semibold text-sky-400 hover:text-sky-300">
+                    <LineChart size={12} /> View on market chart
+                  </a>
                 </div>
                 <button onClick={(e) => { e.stopPropagation(); requestDeleteRun(run.id, run.name); }}
                         className="absolute right-3 top-3 rounded-lg p-1.5 text-gray-500 transition hover:bg-red-900/20 hover:text-red-400"
@@ -1316,6 +1343,10 @@ const Backtest = () => {
             onToggle={() => toggleSection('summary')}
             actions={
               <>
+                <a href={`/chart?run=${results.id}`}
+                   className="flex items-center gap-2 rounded-lg border border-sky-800/60 bg-sky-900/30 px-4 py-2 text-xs font-bold text-sky-300 transition hover:bg-sky-900/50">
+                  <LineChart size={14} /> View on market chart
+                </a>
                 <button onClick={exportTradesCSV} title="Opens directly in Excel — includes every entry condition, the exit condition and the candle colours"
                         className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-bold transition hover:bg-blue-500">
                   <Download size={14} /> Excel / CSV Export
@@ -1369,6 +1400,35 @@ const Backtest = () => {
             onToggle={() => toggleSection('equity')}
           >
             <div ref={chartContainerRef} className="w-full" />
+          </SectionCard>
+
+          <SectionCard
+            title="Market candles"
+            subtitle="Every LONG / SHORT on the 1h candle that signalled it, plus IN fills and OUT exits. Open the Market Chart for a full-size view."
+            icon={LineChart}
+            collapsed={!sectionVisibility.candles}
+            onToggle={() => toggleSection('candles')}
+            actions={
+              <a href={`/chart?run=${results.id}`}
+                 className="inline-flex items-center gap-1 rounded-lg border border-sky-800/60 bg-sky-900/20 px-3 py-1.5 text-[11px] font-semibold text-sky-300 hover:text-white">
+                Open on Market Chart
+              </a>
+            }
+          >
+            <div className="mb-2 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-gray-400">
+              <span className="flex items-center gap-1"><span className="text-green-500">▲</span> LONG</span>
+              <span className="flex items-center gap-1"><span className="text-red-500">▼</span> SHORT</span>
+              <span>REV = reversal · MOM = momentum</span>
+              <span className="flex items-center gap-1"><span className="text-sky-400">●</span> IN fill</span>
+              <span className="flex items-center gap-1"><span className="text-amber-400">■</span> OUT exit</span>
+              {overlayLoading && <span className="animate-pulse text-gray-500">Loading candles…</span>}
+              {!overlayLoading && <span className="text-gray-600">{overlayCandles.length} candles</span>}
+            </div>
+            {overlayLoading && !overlayCandles.length ? (
+              <div className="flex h-48 items-center justify-center text-sm text-gray-500">Loading market candles…</div>
+            ) : (
+              <MarketOverlayChart candles={overlayCandles} trades={results.trades || []} height={420} />
+            )}
           </SectionCard>
 
           <SectionCard

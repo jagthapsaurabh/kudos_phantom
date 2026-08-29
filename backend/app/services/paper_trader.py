@@ -38,7 +38,8 @@ class PaperTradeService:
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
                  is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
                  broker_definition=None, strategy_name=None, user_id=None,
-                 trading_windows=None, use_mark_price=None):
+                 trading_windows=None, use_mark_price=None,
+                 price_feed="off", tick_interval=5.0, testnet=False):
         self.strategy_id = str(strategy_id)
         # Custom strategies are identified by a numeric id internally. Keep a
         # human-readable name on the worker so every status/list view can show
@@ -113,6 +114,18 @@ class PaperTradeService:
         self.last_skip_reason = None
         self._last_skip_notice = None     # de-duplicates the "held back" log
         self.last_checked = None
+        self._last_atr = None             # ATR of the last 1h candle, reused by fast ticks
+        # ---- Live price feed ------------------------------------------
+        # Same as live trading: "off" keeps the 60-second cadence; websocket
+        # or rest re-checks open positions on every live price so a paper
+        # stop is acted on in seconds, not up to a minute late. Entries still
+        # wait for a closed 1h candle.
+        self.price_feed_mode = str(price_feed or "off").lower()
+        self.tick_interval = float(tick_interval or 5.0)
+        self.tick_feed = None
+        self.fast_ticks = 0
+        self._last_closed_candle = None
+        self.testnet = bool(testnet)
         # Live log buffer: list of {"ts": ISO, "level": "info|warn|error|trade", "msg": str}
         self.logs: list = []
         # Closed-trade history: list of trade dicts
@@ -215,6 +228,11 @@ class PaperTradeService:
         self.is_running = True
         self._log("info", f"🟢 Paper trading started — strategy={self.strategy_id}")
         print(f"🟢 Paper Trading Started for Strategy: {self.strategy_id}")
+        if self.price_feed_mode != "off":
+            self._log("info", f"Live ticks ON ({self.price_feed_mode}) — exits every "
+                              f"{self.tick_interval:g}s; entries still wait for a closed 1h candle")
+            await self._run_with_feed()
+            return
         while self.is_running:
             try:
                 await self.tick()
@@ -223,8 +241,87 @@ class PaperTradeService:
                 print(f"Paper Trade Error [{self.strategy_id}]: {e}")
             await asyncio.sleep(60)  # Check every minute
 
+    async def _run_with_feed(self):
+        """Candle tick every 60s, plus an exit check on every live price."""
+        from app.services.tick_feed import build_tick_feed
+        feed_client = BrokerClient(broker_name=self.market_source,
+                                   definition=self.broker_definition,
+                                   testnet=self.testnet)
+        self.tick_feed = build_tick_feed(
+            self.price_feed_mode, self.market_source, self.symbol,
+            definition=self.broker_definition,
+            perpetual=perpetual_symbol(self.market_source, self.symbol),
+            client=feed_client, interval=self.tick_interval)
+        await self.tick_feed.start()
+        last_candle_tick = 0.0
+        try:
+            while self.is_running:
+                now = time.monotonic()
+                if self._consume_closed_candle() or now - last_candle_tick >= 60.0:
+                    last_candle_tick = now
+                    try:
+                        await self.tick()
+                    except Exception as e:
+                        self._log("error", f"Tick error: {e}")
+                        print(f"Paper Trade Error [{self.strategy_id}]: {e}")
+                else:
+                    try:
+                        await self.fast_tick()
+                    except Exception as e:
+                        self._log("error", f"Fast-tick error: {e}")
+                        print(f"Paper fast-tick error [{self.strategy_id}]: {e}")
+                await asyncio.sleep(self.tick_interval)
+        finally:
+            if self.tick_feed is not None:
+                await self.tick_feed.stop()
+
+    def _consume_closed_candle(self):
+        feed = self.tick_feed
+        if feed is None:
+            return False
+        candle = getattr(feed, "last_candle", None)
+        if not isinstance(candle, dict) or not candle.get("closed"):
+            return False
+        key = candle.get("event_time") or candle.get("close")
+        if key is None or key == self._last_closed_candle:
+            return False
+        self._last_closed_candle = key
+        return True
+
+    async def fast_tick(self):
+        """Re-check open paper positions against the newest live price.
+
+        No candles, no signals, no entries — the same narrow exit path the
+        live worker uses. A stale quote is ignored.
+        """
+        if not self.oms.active_trades or self.tick_feed is None:
+            return
+        quote = self.tick_feed.quote()
+        if quote is None:
+            return
+        price = quote.basis_price
+        if price is None or self._last_atr is None or self._last_bar_time is None:
+            return
+        self.fast_ticks += 1
+        self.last_price = float(price)
+        if quote.last_price:
+            self.last_trade_price = float(quote.last_price)
+        if quote.mark_price:
+            self.last_mark_price = float(quote.mark_price)
+        closed = self._manage_open_positions(
+            float(price), self._last_atr, self._last_bar_time,
+            quote.last_price or price, quote.mark_price, False)
+        if closed:
+            self._record_equity_point()
+            self._persist_history(force=True)
+
     async def stop(self):
         self.is_running = False
+        if self.tick_feed is not None:
+            try:
+                await self.tick_feed.stop()
+            except Exception:
+                pass
         self._log("info", "🔴 Paper trading stopped by user — results saved to History")
         print(f"🔴 Paper Trading Stopped for Strategy: {self.strategy_id}")
         # Final snapshot so the saved session holds the closing equity, the
@@ -264,6 +361,9 @@ class PaperTradeService:
         self.last_checked = _ist_now()
         current_atr = ind_1h['atr14'][-1]
         current_time = df_1h.index[-1]
+        # Remembered so the fast tick can re-mark a position without paying
+        # for another candle fetch.
+        self._last_atr = current_atr
         trade_event = False  # a fill this tick forces an immediate DB snapshot
 
         # ---- Candle clock -------------------------------------------
@@ -277,16 +377,9 @@ class PaperTradeService:
                 self._bars_since_exit += 1
 
         # ---- Manage open positions ----------------------------------
-        for symbol in list(self.oms.active_trades.keys()):
-            result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
-                                           trade_price_usd=trade_price,
-                                           mark_price_usd=mark_price,
-                                           advance_bar=new_bar)
-            if result:
-                trade_event = True
-                # Restart the post-exit cooldown in candles, not in ticks.
-                self._bars_since_exit = 0
-                self._book_close(result)
+        if self._manage_open_positions(decision_price, current_atr, current_time,
+                                       trade_price, mark_price, new_bar):
+            trade_event = True
 
         # ---- New entries --------------------------------------------
         # "Skip new trades" schedule: an existing position keeps running (its
@@ -376,6 +469,27 @@ class PaperTradeService:
     # ------------------------------------------------------------------
     # Trade management helpers
     # ------------------------------------------------------------------
+    def _manage_open_positions(self, decision_price, current_atr, current_time,
+                               trade_price, mark_price, advance_bar):
+        """Mark every open paper position and book any exit it triggers.
+
+        Shared by the 60-second candle tick and the live-tick path so a stop
+        is acted on as soon as the price arrives, not up to a minute late.
+        ``advance_bar`` stays False on the fast path (holding time is candles).
+        Returns True when at least one trade closed.
+        """
+        closed = False
+        for symbol in list(self.oms.active_trades.keys()):
+            result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
+                                           trade_price_usd=trade_price,
+                                           mark_price_usd=mark_price,
+                                           advance_bar=advance_bar)
+            if result:
+                closed = True
+                self._bars_since_exit = 0
+                self._book_close(result)
+        return closed
+
     def _book_close(self, result):
         """Apply a closed trade to equity, the closed-trade list and the log.
 

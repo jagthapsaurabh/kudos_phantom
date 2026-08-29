@@ -153,6 +153,30 @@ class Klines(Base):
     __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
 
 
+class MarketTick(Base):
+    """One live quote from a venue stream or REST poll.
+
+    Paper and live workers already consume ticks for exits. Storing every
+    quote means the same series can be replayed, resampled into candles, or
+    inspected later — the last-N klines table is too coarse for that.
+    """
+    __tablename__ = 'market_ticks'
+    id = Column(Integer, primary_key=True)
+    source = Column(String, nullable=False, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    event_time = Column(DateTime, nullable=False, index=True)
+    received_at = Column(DateTime, nullable=True)
+    mark_price = Column(Float, nullable=True)
+    last_price = Column(Float, nullable=True)
+    index_price = Column(Float, nullable=True)
+    bid = Column(Float, nullable=True)
+    ask = Column(Float, nullable=True)
+    feed_kind = Column(String, nullable=True)  # websocket | rest
+    __table_args__ = (
+        Index('ix_market_ticks_source_symbol_time', 'source', 'symbol', 'event_time'),
+    )
+
+
 class MarketDataSeedProgress(Base):
     """Durable cursor for a bounded historical market-data seed.
 

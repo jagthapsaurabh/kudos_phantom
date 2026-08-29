@@ -4,6 +4,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import EntryGuardBadges from '../components/EntryGuardBadges';
+import { FeedBadge } from './LiveTrade';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -317,6 +318,7 @@ const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) 
               held={inst.skipped_entries || 0}
               reason={inst.last_skip_reason}
             />
+            <FeedBadge feed={inst.price_feed} />
           </div>
         </div>
         <button onClick={(e) => { e.stopPropagation(); onDelete(inst.instance_key, strategyName); }}
@@ -622,6 +624,10 @@ const PaperTrade = () => {
   const [useMarkPrice, setUseMarkPrice] = useState(true);
   const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
   const [showWindows, setShowWindows] = useState(false);
+  // Live ticks for paper exits — same options as Live Trade. Entries still
+  // wait for a closed 1h candle either way.
+  const [priceFeed, setPriceFeed] = useState('off');
+  const [tickInterval, setTickInterval] = useState(5);
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
   // Saved sessions (survive stop / server restart) shown in Paper Trade History.
@@ -709,6 +715,7 @@ const PaperTrade = () => {
           data_source: dataSource,
           use_mark_price: useMarkPrice,
           trading_windows: tradingWindows,
+          price_feed: priceFeed, tick_interval: Number(tickInterval),
         })
       });
       if (res.ok) {
@@ -815,6 +822,24 @@ const PaperTrade = () => {
             <option value="FastTest">Fast Test Strategy</option>
             {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
+          <div className="flex flex-col">
+            <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Exit checks</label>
+            <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                    title="How often open paper positions are re-checked against the live price. Entries always wait for a closed 1h candle.">
+              <option value="off">Every 60s (default)</option>
+              <option value="websocket">Live ticks · WebSocket</option>
+              <option value="rest">Live ticks · polling</option>
+            </select>
+          </div>
+          {priceFeed !== 'off' && (
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Tick interval (s)</label>
+              <input type="number" min="1" max="60" step="1" value={tickInterval}
+                     onChange={e => setTickInterval(e.target.value)}
+                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-20 outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+          )}
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Pricing &amp; windows</label>
             <button onClick={() => setShowWindows(!showWindows)}
