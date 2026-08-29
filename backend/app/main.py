@@ -701,7 +701,10 @@ def admin_brokers(admin=Depends(require_admin), db=Depends(get_db)):
 @app.post('/admin/brokers')
 def create_broker(payload: BrokerDefinitionPayload, admin=Depends(require_admin), db=Depends(get_db)):
     code = normalize_source(payload.code)
-    if db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first():
+    # Case-insensitive: connections and instance settings resolve codes with
+    # func.lower(), so "bybit" and "Bybit" would be two rows fighting over one
+    # identity. One spelling per venue, enforced at the door.
+    if db.query(BrokerDefinition).filter(func.lower(BrokerDefinition.code) == code.lower()).first():
         raise HTTPException(status_code=400, detail='Broker code already exists')
     row = BrokerDefinition(code=code, is_builtin=0)
     _apply_broker_payload(row, payload)

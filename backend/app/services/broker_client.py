@@ -596,12 +596,24 @@ class BrokerClient:
             "side": str(side).lower(),
         }
         lowered = str(order_type).lower()
-        is_stop = "stop" in lowered or trail_amount is not None
-        if lowered in ("market", "market_order"):
+        # A stop order is anything with a trigger: stop_loss / take_profit
+        # variants (the take-profit names do not contain "stop") or a trail.
+        is_stop = "stop" in lowered or "take_profit" in lowered or trail_amount is not None
+        # The leg the trigger belongs to. Callers may say it explicitly via
+        # stop_side; otherwise the order-type name itself carries the intent
+        # (take_profit_market / take_profit_limit are take-profit legs).
+        take_profit_leg = stop_side == "take_profit" or "take_profit" in lowered
+        # Market-class orders carry no limit price: a plain market order plus
+        # the market-triggered stop legs (a standalone trailing stop is a
+        # market stop too — its activation price travels in stop_price).
+        # Everything else (limit, stop_limit, take_profit_limit, …) is a limit
+        # order with a trigger.
+        market_class = lowered in ("market", "market_order", "stop_market",
+                                   "take_profit_market", "trailing_stop")
+        if market_class:
             body["order_type"] = "market_order"
             if is_stop:
-                body["order_type"] = "market_order"
-                body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
+                body["stop_order_type"] = "take_profit_order" if take_profit_leg else "stop_loss_order"
         else:
             body["order_type"] = "limit_order"
             # Changelog 15.04.26: limit_price ≤ 0 is rejected; omit when unused.
@@ -612,7 +624,7 @@ class BrokerClient:
             body["limit_price"] = limit
             body["time_in_force"] = "gtc" if str(time_in_force).upper() in ("GTC", "GTX") else "ioc"
             if is_stop:
-                body["stop_order_type"] = "stop_loss_order" if stop_side != "take_profit" else "take_profit_order"
+                body["stop_order_type"] = "take_profit_order" if take_profit_leg else "stop_loss_order"
         if is_stop:
             if stop_price is None and trail_amount is None:
                 return {"error": "stop orders require a stop_price (or trail_amount)"}

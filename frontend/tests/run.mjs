@@ -22,6 +22,18 @@ const targets = process.argv.slice(2).map((f) => (f.endsWith('.jsx') ? f : `${f}
 const files = targets.length ? targets : ['trade_log_ui.jsx', 'trading_windows_ui.jsx', 'pages_smoke.jsx', 'terminal_ui.jsx', 'admin_seed_ui.jsx', 'chart_overlay.jsx'];
 
 let failed = 0;
+
+// Static guard first: a component used in JSX but never imported (e.g. a
+// missing lucide-react icon) renders fine in some dev flows but crashes the
+// minified production bundle with a ReferenceError. Vite/esbuild will NOT
+// fail the build for it, so it has to be caught here.
+console.log('\n=== check_jsx_imports (all src) ===\n');
+try {
+  execFileSync(process.execPath, [join(here, 'check_jsx_imports.mjs'), join(root, 'src')], { stdio: 'inherit' });
+} catch {
+  failed = 1;
+}
+
 for (const file of files) {
   const entry = join(here, file);
   const out = join(outDir, file.replace(/\.jsx$/, '.cjs'));

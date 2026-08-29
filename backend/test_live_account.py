@@ -571,6 +571,36 @@ sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders"][-1]
 check("Delta stop triggers on the MARK price",
       sent["body"].get("stop_trigger_method") == "mark_price"
       and sent["body"].get("stop_order_type") == "stop_loss_order", str(sent["body"]))
+check("Delta stop-market carries no limit price",
+      sent["body"].get("order_type") == "market_order" and "limit_price" not in sent["body"],
+      str(sent["body"]))
+
+tp = delta.place_order("BTCUSDT", "buy", "take_profit_market", 0.03, stop_price=70000.0,
+                       size_in_btc=True)
+sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders"][-1]
+check("Delta take-profit is a market order with the take-profit trigger",
+      sent["body"].get("order_type") == "market_order"
+      and sent["body"].get("stop_order_type") == "take_profit_order"
+      and sent["body"].get("stop_trigger_method") == "mark_price"
+      and "limit_price" not in sent["body"], str(sent["body"]))
+
+trail = delta.place_order("BTCUSDT", "sell", "trailing_stop", 0.03, stop_price=66000.0,
+                          trail_amount=250.0, size_in_btc=True)
+sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders"][-1]
+check("Delta standalone trailing stop is a market stop with a trail amount",
+      sent["body"].get("order_type") == "market_order"
+      and sent["body"].get("stop_order_type") == "stop_loss_order"
+      and sent["body"].get("trail_amount") == "250.0"
+      and "limit_price" not in sent["body"], str(sent["body"]))
+
+sl_limit = delta.place_order("BTCUSDT", "sell", "stop_limit", 0.03, price=64500.0,
+                             stop_price=65000.0, size_in_btc=True)
+sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders"][-1]
+check("Delta stop-limit stays a limit order with both prices",
+      sent["body"].get("order_type") == "limit_order"
+      and sent["body"].get("limit_price") == "64500.0"
+      and sent["body"].get("stop_price") == "65000.0"
+      and sent["body"].get("stop_order_type") == "stop_loss_order", str(sent["body"]))
 
 STATE["requests"].clear()
 bracket = delta.place_bracket_order("BTCUSDT", "buy", 0.03, stop_loss_price=65000.0,
