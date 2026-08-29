@@ -31,18 +31,24 @@ const markers = buildOverlayMarkers({
     exit_reason: 'SL',
   }],
 });
-const texts = markers.map(m => m.text);
+// The rendered marker is icon-only (empty text) so labels never collide with
+// narrow candles; the detail lives in `tooltip` for hover and `data` for click.
+check('markers are icon-only (visible text is empty)',
+  markers.every(m => m.text === ''), markers.map(m => m.text).join(' | '));
+const tips = markers.map(m => m.tooltip);
 check('a long signal candle is marked LONG REV ↑',
-  texts.some(t => t.includes('LONG REV')), texts.join(' | '));
+  tips.some(t => t.includes('LONG REV')), tips.join(' | '));
 check('a short signal candle is marked SHORT MOM',
-  texts.some(t => t.includes('SHORT MOM')), texts.join(' | '));
+  tips.some(t => t.includes('SHORT MOM')), tips.join(' | '));
 check('an exit candle is marked OUT SL',
-  texts.some(t => t.includes('OUT SL')), texts.join(' | '));
+  tips.some(t => t.includes('OUT SL')), tips.join(' | '));
 check('one marker per timestamp',
   new Set(markers.map(m => m.time)).size === markers.length, markers.length);
 check('same-bar signal+entry keeps both labels',
-  texts.some(t => t.includes('SHORT') && t.includes('IN')) || texts.some(t => t.includes('IN')),
-  texts.join(' | '));
+  tips.some(t => t.includes('SHORT') && t.includes('IN')) || tips.some(t => t.includes('IN')),
+  tips.join(' | '));
+check('markers carry structured hover data',
+  markers.every(m => m.data && typeof m.data.label === 'string'), markers.length);
 
 const range = defaultSignalRange(new Date('2026-08-29T00:00:00Z'));
 check('default overlay window is the last 90 days',

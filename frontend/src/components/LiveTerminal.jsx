@@ -367,6 +367,10 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
   const [notice, setNotice] = useState(null);
   const [error, setError] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
+  // Broker not ready (no keys / switched-off connection): the snapshot API
+  // would 400 on every poll, so we surface the fix instead of hammering it.
+  const [configRequired, setConfigRequired] = useState(false);
+  const [configProblems, setConfigProblems] = useState([]);
   const [leverage, setLeverage] = useState(10);
   const [marginMode, setMarginMode] = useState('isolated');
   // "Unfilled alert": how long a working order may rest before the terminal
@@ -393,19 +397,44 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
     if (!broker) return;
     setLoading(true);
     try {
+      // Confirm the broker is actually usable before hitting the account API.
+      // Without credentials the snapshot endpoint 400s on every poll and the
+      // console fills with "Bad Request"; the diagnose response says precisely
+      // what to fix instead.
+      try {
+        const diagUrl = `${API_URL}/broker-connections/diagnose?broker=${encodeURIComponent(broker)}`
+          + (connectionId ? `&connection_id=${connectionId}` : '');
+        const diagRes = await fetch(diagUrl, { headers });
+        const diag = diagRes.ok ? await diagRes.json() : null;
+        if (diag && diag.ready === false) {
+          setConfigRequired(true);
+          setConfigProblems(Array.isArray(diag.problems) ? diag.problems : []);
+          setError(null);
+          setNotice(null);
+          setSnapshot(EMPTY);
+          setLastRefresh(null);
+          return;
+        }
+        if (diag && diag.ready) setConfigRequired(false);
+      } catch (_) {
+        // If the readiness probe itself fails, fall through to the snapshot
+        // call rather than showing a misleading "not configured" state.
+      }
+
       const data = await call('/live-account/snapshot', {
         broker, connection_id: connectionId || null, symbol: 'BTCUSDT',
         include_history: true, history_limit: 50,
       });
       setSnapshot(data || EMPTY);
       setError(null);
+      setConfigRequired(false);
       setLastRefresh(new Date().toISOString().slice(11, 19));
     } catch (err) {
       setError(err.message || 'Could not load the account');
     } finally {
       setLoading(false);
     }
-  }, [broker, connectionId, call]);
+  }, [broker, connectionId, call, headers]);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
@@ -656,6 +685,27 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
           )}
         </div>
       </div>
+
+      {configRequired && (
+        <div className="flex items-start gap-2 rounded-2xl border border-amber-800 bg-amber-900/20 p-4 text-sm text-amber-300">
+          <ShieldCheck size={16} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-bold">Connect this broker to see the account</div>
+            <div className="mt-1 text-xs leading-relaxed">
+              The live terminal pulls your positions, orders and fills straight from the exchange.
+              Add your API key and secret in Broker Settings, or check that the selected connection is switched on.
+            </div>
+            {configProblems.length > 0 && (
+              <ul className="mt-1 list-inside list-disc text-[11px] text-amber-200/80">
+                {configProblems.slice(0, 4).map((p, i) => <li key={i}>{p}</li>)}
+              </ul>
+            )}
+            <a href="/broker" className="mt-2 inline-flex items-center gap-1 rounded-lg border border-amber-700 bg-amber-900/30 px-3 py-1.5 text-[11px] font-bold text-amber-200 transition hover:bg-amber-900/50">
+              Open Broker Settings
+            </a>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="flex items-start gap-2 rounded-2xl border border-red-900 bg-red-900/20 p-4 text-sm text-red-300">

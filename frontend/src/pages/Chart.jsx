@@ -51,6 +51,10 @@ const ChartPage = () => {
   const closesRef = useRef([]);        // aligned closes array
   const crosshairRef = useRef(null);   // subscription handler
   const fullscreenRef = useRef(false);
+  // time → { label, side, setup, trend, candle, rsi, price, kind } for the
+  // hover tooltip over a marked candle (markers render icon-only).
+  const markersByTimeRef = useRef(new Map());
+  const lastHoverTimeRef = useRef(null);
 
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
@@ -66,6 +70,7 @@ const ChartPage = () => {
   const [strategies, setStrategies] = useState([]);
   const [indicators, setIndicators] = useState({ ...DEFAULT_INDICATORS });
   const [legend, setLegend] = useState(null);   // hovered bar values
+  const [hoverMarker, setHoverMarker] = useState(null);   // { info, x, y } hovered marker
   const [loading, setLoading] = useState(false);
   const [lastPrice, setLastPrice] = useState('—');
   const [dataLen, setDataLen] = useState(0);
@@ -208,9 +213,9 @@ const ChartPage = () => {
 
       // Legend readout on crosshair
       const onCrosshair = (param) => {
-        if (!param || !param.time) { setLegend(null); return; }
+        if (!param || !param.time) { setLegend(null); setHoverMarker(null); lastHoverTimeRef.current = null; return; }
         const s = param.seriesData.get(candleSeriesRef.current);
-        if (!s) { setLegend(null); return; }
+        if (!s) { setLegend(null); setHoverMarker(null); lastHoverTimeRef.current = null; return; }
         const idx = timesRef.current.indexOf(param.time);
         let vals = null;
         if (idx >= 0) {
@@ -227,6 +232,20 @@ const ChartPage = () => {
           };
         }
         setLegend(vals);
+        // Marker detail: markers are icon-only, so surface the full strategy
+        // data (side / setup / trend / candle / RSI) in a tooltip next to the
+        // cursor, TradingView-style, only when the hovered bar has a marker.
+        const markerInfo = markersByTimeRef.current.get(param.time);
+        const markerTime = markerInfo ? param.time : null;
+        if (lastHoverTimeRef.current !== markerTime) {
+          lastHoverTimeRef.current = markerTime;
+          if (markerInfo) {
+            const pt = param.point || {};
+            setHoverMarker({ info: markerInfo, x: pt.x, y: pt.y });
+          } else {
+            setHoverMarker(null);
+          }
+        }
       };
       crosshairRef.current = onCrosshair;
       chart.subscribeCrosshairMove(onCrosshair);
@@ -237,12 +256,20 @@ const ChartPage = () => {
             width: chartContainerRef.current.clientWidth,
             height: getChartHeight(),
           });
+          // Refit the visible range so a reflow never leaves the price axis or
+          // the last candle stretched across a stale width.
+          chartRef.current?.timeScale()?.fitContent();
         }
       };
       window.addEventListener('resize', handleResize);
+      // Watch the container directly too: window resize misses layout changes
+      // (sidebar reflow, header wrap, fullscreen) that move the chart's width.
+      const resizeObserver = new ResizeObserver(handleResize);
+      if (chartContainerRef.current) resizeObserver.observe(chartContainerRef.current);
 
       return () => {
         window.removeEventListener('resize', handleResize);
+        resizeObserver.disconnect();
         if (crosshairRef.current) chart.unsubscribeCrosshairMove(crosshairRef.current);
         crosshairRef.current = null;
       };
@@ -388,6 +415,8 @@ const ChartPage = () => {
     const canPlotSignals = show && interval === '1h';
     if (!canPlotSignals && !trades.length) {
       if (markersRef.current) markersRef.current.setMarkers([]);
+      markersByTimeRef.current = new Map();
+      setHoverMarker(null);
       setSignalCount(0);
       setOverlayEvents([]);
       return;
@@ -404,6 +433,18 @@ const ChartPage = () => {
         signals: Array.isArray(sigs) ? sigs : [],
         trades,
       }).filter(m => times.has(m.time));
+      // Feed the hover tooltip: keep the readable detail (label, side, setup,
+      // trend, candle type, RSI, price, in/out) per marked time so a hover on
+      // the icon can display it without cluttering the candle.
+      const byTime = new Map();
+      for (const m of markers) {
+        byTime.set(m.time, {
+          label: m.tooltip || '',
+          kind: m.kind,
+          ...(m.data || {}),
+        });
+      }
+      markersByTimeRef.current = byTime;
       if (markersRef.current) markersRef.current.setMarkers([]);
       markersRef.current = createSeriesMarkers(candleSeriesRef.current, markers);
       setSignalCount(markers.length);
@@ -423,6 +464,8 @@ const ChartPage = () => {
       setOverlayEvents(events);
     } catch (e) {
       if (markersRef.current) markersRef.current.setMarkers([]);
+      markersByTimeRef.current = new Map();
+      setHoverMarker(null);
       setSignalCount(0);
       setOverlayEvents([]);
     }
@@ -570,16 +613,59 @@ const ChartPage = () => {
           <span className="mx-1 text-gray-600">•</span>
           <span className="font-mono font-bold text-yellow-400">{lastPrice}</span>
         </div>
-        <div ref={chartContainerRef} className="w-full" />
-        {noData && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500">
-            <TrendingUp size={40} className="mb-2 opacity-30" />
-            <p className="text-sm">No market data available for {symbol}/{interval}.</p>
-            <p className="text-[11px] mt-1">Please run the seeder or ensure Binance is reachable.</p>
-          </div>
-        )}
+        <div className="relative">
+          <div ref={chartContainerRef} className="w-full" />
+          {noData && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500">
+              <TrendingUp size={40} className="mb-2 opacity-30" />
+              <p className="text-sm">No market data available for {symbol}/{interval}.</p>
+              <p className="text-[11px] mt-1">Please run the seeder or ensure Binance is reachable.</p>
+            </div>
+          )}
+
+          {/* Marker detail on hover — markers are icon-only, so the strategy
+              data (side / setup / trend / candle / RSI) appears beside the
+              cursor instead of on every candle. */}
+          {hoverMarker && (
+            <div className="pointer-events-none absolute z-30"
+                 style={{ left: hoverMarker.x ?? 0, top: hoverMarker.y ?? 0 }}>
+              <div className="-translate-x-1/2 -translate-y-[calc(100%+12px)] whitespace-nowrap rounded-lg border border-gray-600 bg-gray-900/95 px-3 py-2 font-mono text-[11px] shadow-xl">
+                <div className="flex items-center gap-2">
+                  <span className={`font-bold ${hoverMarker.info.side === 'SHORT' ? 'text-red-400' : 'text-green-400'}`}>
+                    {hoverMarker.info.side || 'SIG'}
+                  </span>
+                  <span className="text-gray-300">{hoverMarker.info.label || ''}</span>
+                </div>
+                <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-gray-400">
+                  {hoverMarker.info.setup && <span>Setup: {hoverMarker.info.setup}</span>}
+                  {hoverMarker.info.trend && <span>Trend: {hoverMarker.info.trend}</span>}
+                  {hoverMarker.info.candle && <span>Candle: {hoverMarker.info.candle}</span>}
+                  {hoverMarker.info.rsi != null && <span>RSI: {Number(hoverMarker.info.rsi).toFixed(1)}</span>}
+                  {hoverMarker.info.price != null && <span>Price: {fmt(hoverMarker.info.price)}</span>}
+                  {hoverMarker.info.kind === 'exit' && hoverMarker.info.reason && <span>Reason: {hoverMarker.info.reason}</span>}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* TradingView-style value legend */}
+        {hoverMarker && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 px-2 font-mono text-[11px]">
+            <span className={`rounded border px-1.5 py-0.5 font-bold ${
+              hoverMarker.info.side === 'SHORT'
+                ? 'border-red-800 bg-red-900/20 text-red-300'
+                : 'border-green-800 bg-green-900/20 text-green-300'}`}>
+              {hoverMarker.info.side || 'SIG'}
+            </span>
+            <span className="text-gray-300">{hoverMarker.info.label || ''}</span>
+            {hoverMarker.info.setup && <span className="text-gray-500">Setup {hoverMarker.info.setup}</span>}
+            {hoverMarker.info.trend && <span className="text-gray-500">4h {hoverMarker.info.trend}</span>}
+            {hoverMarker.info.candle && <span className="text-gray-500">Candle {hoverMarker.info.candle}</span>}
+            {hoverMarker.info.rsi != null && <span className="text-gray-500">RSI {Number(hoverMarker.info.rsi).toFixed(1)}</span>}
+            {hoverMarker.info.kind === 'exit' && hoverMarker.info.reason && <span className="text-amber-400">{hoverMarker.info.reason}</span>}
+          </div>
+        )}
         <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 px-2 text-[11px] font-mono">
           <span className="text-gray-500">O <span className="text-white">{o.open != null ? fmt(o.open) : '—'}</span></span>
           <span className="text-gray-500">H <span className="text-green-400">{o.high != null ? fmt(o.high) : '—'}</span></span>
