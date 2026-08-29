@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, BellRing, Clock, Crosshair,
-  DollarSign, Gauge, History, Layers, Percent, RefreshCw, ShieldAlert, Sliders,
+  DollarSign, Gauge, History, Layers, Percent, RefreshCw, ShieldAlert, ShieldCheck, Sliders,
   Trash2, TrendingUp, Wallet, XCircle, Zap,
 } from 'lucide-react';
 import { API_URL } from '../api';
