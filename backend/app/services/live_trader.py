@@ -235,7 +235,7 @@ class LiveTradeService:
                  broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
                  definition=None, trading_windows=None, use_mark_price=None,
                  user_id=None, instance_key=None, bracket_orders=True,
-                 price_feed="off", tick_interval=5.0):
+                 price_feed="off", tick_interval=5.0, account_label=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
         self.market_source = broker_name or "Binance"
@@ -298,6 +298,10 @@ class LiveTradeService:
         # can share one API key, and that account holds ONE netted position per
         # contract, so instances on the same key queue for it.
         self.account_id = account_key(broker_name or "", api_key)
+        # Human-readable name of that account (the saved connection's label, or
+        # "Primary"). With 3-4 runs on 3-4 sub-accounts this is the only way to
+        # tell from the UI which instance is trading which account.
+        self.account_label = account_label or "Primary"
         # Order ids of the stop-loss / take-profit legs this instance placed.
         # Exiting cancels exactly these and nothing else on the account.
         self.protection_leg_ids = []

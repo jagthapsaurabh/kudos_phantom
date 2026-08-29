@@ -2069,6 +2069,11 @@ def start_live_trade(
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
     feed_mode, feed_interval = _resolve_price_feed(payload)
+    # Name the account this instance will trade on. With several strategies
+    # pinned to different sub-accounts this is what tells the operator which
+    # instance is which; without it every card just says "Binance".
+    account_label = (getattr(connection, "label", None) or
+                     getattr(connection, "broker_code", None) or "Primary") if connection else "Primary"
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -2079,7 +2084,8 @@ def start_live_trade(
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
-                                   price_feed=feed_mode, tick_interval=feed_interval)
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -2092,21 +2098,24 @@ def start_live_trade(
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
-                                   price_feed=feed_mode, tick_interval=feed_interval)
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label)
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
-                                   price_feed=feed_mode, tick_interval=feed_interval)
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label)
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
-                                   price_feed=feed_mode, tick_interval=feed_interval)
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
@@ -2184,6 +2193,9 @@ def get_live_status(user=Depends(get_current_user)):
             status_list.append({
                 "instance_key": key, "strategy_id": service.strategy_id,
                 "broker_name": service.broker_name, "data_source": service.market_source,
+                # Which saved connection (sub-account / API key) this instance
+                # trades on, so 3-4 runs on 3-4 accounts are tellable apart.
+                "account_label": getattr(service, "account_label", "Primary"),
                 "taker_fee_bps": service.config.taker_fee_bps, "maker_fee_bps": service.config.maker_fee_bps,
                 "leverage": getattr(service.config, 'leverage', 1),
                 "margin_pct": getattr(service, 'margin_pct', 0),

@@ -509,6 +509,28 @@ check("a stopped worker no longer blocks entries",
 COORDINATOR.unregister(watcher)
 
 # ===========================================================================
+section("9b. each instance records which account it trades on")
+# ===========================================================================
+# With 3-4 runs pinned to 3-4 sub-accounts, the account id alone is a hash —
+# nothing an operator can read. The label is what makes the cards tellable
+# apart, and it must default to something sane when no connection was chosen.
+lone_key = SharedAccount("L1")
+labelled = make("SubB", 1, lone_key, "label-key-b")
+labelled.account_label = "Sub-account B"
+plain = make("NoConn", 1, SharedAccount("L2"), "label-key-a")
+check("a chosen connection is named", labelled.account_label == "Sub-account B",
+      labelled.account_label)
+check("an instance with no chosen connection defaults to Primary",
+      plain.account_label == "Primary", plain.account_label)
+check("the label defaults to Primary when the argument is omitted",
+      LiveTradeService("Z", [], "k", "s", is_custom=True,
+                       broker_name="Binance").account_label == "Primary")
+check("the label is independent of the hashed account id",
+      labelled.account_id != plain.account_id)
+for _s in (labelled, plain):
+    COORDINATOR.unregister(_s)
+
+# ===========================================================================
 section("10. the status payload explains a shared account")
 # ===========================================================================
 from app.main import _shared_account_status                         # noqa: E402

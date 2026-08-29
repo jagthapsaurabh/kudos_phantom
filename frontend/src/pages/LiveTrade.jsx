@@ -341,6 +341,12 @@ const LiveTrade = () => {
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
                       <span className="text-xs font-mono">{inst.broker_name || 'Binance'} · {inst.instance_key.split('_').pop()}</span>
+                      {inst.account_label && inst.account_label !== 'Primary' && (
+                        <span className="max-w-[140px] truncate rounded border border-blue-800/60 bg-blue-900/20 px-1.5 py-0.5 text-[9px] font-bold text-blue-300"
+                              title={`Trading on the broker connection '${inst.account_label}'`}>
+                          {inst.account_label}
+                        </span>
+                      )}
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-1">
                       <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
