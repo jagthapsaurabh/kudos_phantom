@@ -98,6 +98,35 @@ returned by `GET /live-trade/status` and `GET /paper-trade/status`, and the inst
 **held** badge (tooltip = the exact reason) plus a **VENUE LONG/SHORT** badge for a position the
 instance did not open itself.
 
+### Live tick data for exit checks
+
+By default the worker wakes every 60 seconds, re-reads the candles and re-checks the stop-loss. A
+position can therefore run past its stop for up to a minute before the worker notices — and that
+minute is exactly when a stop matters.
+
+The **Exit checks** selector on the Live Trade page speeds that up:
+
+| Option | Behaviour |
+| --- | --- |
+| Every 60s (default) | Original cadence. Nothing changes. |
+| Live ticks · WebSocket | Subscribes to the venue stream (`markPrice` on Binance, `v2/ticker` on Delta). Costs no rate-limit weight. |
+| Live ticks · polling | Polls the mark-price endpoint every *n* seconds. The fallback on a venue with no stream. |
+
+Only **exits** speed up. Entries still wait for a closed 1h candle, because the signals come from the
+1h/4h frames — re-reading them faster would burn rate-limit weight and change nothing. The fast tick
+never advances the holding-time clock either, so `timeout_bars` still means candles.
+
+Two guards matter:
+
+* **a stale price is never traded on.** If the feed has not produced a price within `max_age`
+  (15s), the worker ignores it and waits for the 60-second tick instead. Acting on a number nobody
+  refreshed would be worse than acting late.
+* **a dropped socket reconnects** with capped exponential backoff, and the instance card flips to
+  **TICK·WS STALE** so a silently-dead feed is visible instead of quietly downgrading.
+
+`GET /live-trade/status` returns `price_feed` (`mode`, `kind`, `connected`, `stale`, `age_seconds`,
+`messages`, `reconnects`, `fast_ticks`, `last_error`).
+
 ### Running 3–4 strategies at once
 
 You can start as many live instances as you like, and they run side by side — but a futures account
@@ -341,9 +370,10 @@ python test_live_account.py       # 144 checks: rate limits, order lifecycle, te
 python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
 python test_broker_connections.py # 37 checks: which saved credentials a live call uses, and why not
 python test_multi_instance_live.py # 92 checks: 3-4 live strategies sharing one broker account
+python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 277 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 289 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

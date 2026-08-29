@@ -1,0 +1,365 @@
+"""Live price feeds for the live trader.
+
+The live worker used to wake every 60 seconds, re-read the candles and re-check
+the stop-loss / take-profit. A position could therefore run past its stop for up
+to a full minute before the worker noticed — and that minute is exactly when a
+stop matters. These feeds hand the worker the price continuously so exits react
+on the tick instead of on the minute.
+
+Three implementations share one interface:
+
+* :class:`WebSocketTickFeed` — subscribes to the venue's own stream. No polling,
+  so it costs no rate-limit weight at all.
+* :class:`RestTickFeed` — polls the mark-price endpoint. The fallback when a
+  socket is unavailable, and the only option on a venue with no stream adapter.
+* :class:`NullTickFeed` — returns nothing. The default, which leaves the worker
+  behaving exactly as it did before feeds existed.
+
+Every feed reports itself **stale** once its last price is older than
+``max_age``. A stale price is never traded on: ``quote()`` returns ``None`` and
+the caller keeps using the candle price it already had. Acting on a number
+nobody has refreshed would be worse than acting late.
+
+Feeds produce the same :class:`~app.core.mark_price.MarkPriceQuote` the REST
+path already returns, so nothing downstream has to know which one it came from.
+"""
+import asyncio
+import json
+import time
+from typing import Any, Callable, Dict, Optional
+
+from app.core.mark_price import MarkPriceQuote
+
+# How long a price stays usable. Well past a normal stream gap, well short of
+# the 60-second poll it replaces.
+DEFAULT_MAX_AGE = 15.0
+
+
+def _f(value) -> Optional[float]:
+    """Tolerant float parse: venues send prices as strings, sometimes empty."""
+    try:
+        if value is None or value == "":
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+# ---------------------------------------------------------------------------
+# Venue message parsers
+# ---------------------------------------------------------------------------
+def parse_binance(payload: Any, source: str = "Binance") -> Optional[MarkPriceQuote]:
+    """Binance futures stream message -> quote.
+
+    Handles the two streams worth having:
+
+    * ``btcusdt@markPrice``  — ``{"e":"markPriceUpdate","p":"<mark>","i":"<index>"}``
+    * ``btcusdt@bookTicker`` — ``{"b":"<bid>","a":"<ask>"}``, taken at the mid.
+
+    Anything else is ignored rather than guessed at: a partial fill report or a
+    book-depth update carries no usable single price.
+    """
+    if not isinstance(payload, dict):
+        return None
+    symbol = str(payload.get("s") or "BTCUSDT")
+    event = str(payload.get("e") or "")
+
+    if event == "markPriceUpdate" or (payload.get("p") and "b" not in payload):
+        mark = _f(payload.get("p"))
+        if mark is None:
+            return None
+        return MarkPriceQuote(source, symbol, mark_price=mark,
+                              index_price=_f(payload.get("i")), raw=payload)
+
+    bid, ask = _f(payload.get("b")), _f(payload.get("a"))
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2.0
+        return MarkPriceQuote(source, symbol, mark_price=mid, last_price=mid, raw=payload)
+    return None
+
+
+def parse_delta(payload: Any, source: str = "Delta") -> Optional[MarkPriceQuote]:
+    """Delta Exchange ``v2/ticker`` message -> quote.
+
+    Delta wraps its stream in ``{"type":"ticker","symbol":...}`` and sends both
+    the mark and the last traded price. Subscriptions are acknowledged with
+    ``{"type":"subscriptions"}``, which carries no price and is skipped.
+    """
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("type") or "").lower()
+    if kind != "ticker":
+        return None
+    symbol = str(payload.get("symbol") or "BTCUSD")
+    mark = _f(payload.get("mark_price"))
+    last = _f(payload.get("last_price")) or _f(payload.get("close"))
+    if mark is None and last is None:
+        return None
+    return MarkPriceQuote(source, symbol, mark_price=mark, last_price=last, raw=payload)
+
+
+PARSERS = {"binance": parse_binance, "delta": parse_delta}
+
+# Stream endpoints per venue kind. ``{symbol}`` is the venue's perpetual symbol
+# (lower-cased for Binance, as its streams require).
+STREAM_URLS = {
+    "binance": "wss://fstream.binance.com/ws/{symbol_lower}@markPrice@1s",
+    "delta": "wss://socket.delta.exchange",
+}
+
+# Delta multiplexes every product on one socket and needs an explicit
+# subscription; Binance encodes the stream in the URL and needs nothing.
+def delta_subscribe(symbol: str) -> Dict[str, Any]:
+    return {"type": "subscribe",
+            "payload": {"channels": [{"name": "v2/ticker", "symbols": [symbol]}]}}
+
+
+async def _default_connect(url: str):
+    """Open a real socket. Imported lazily so the module loads without it."""
+    from websockets.asyncio.client import connect
+    return await connect(url, ping_interval=20, ping_timeout=20, max_queue=64)
+
+
+class TickFeed:
+    """Base feed: keeps the newest price and knows when it has gone stale."""
+
+    def __init__(self, source: str, symbol: str, max_age: float = DEFAULT_MAX_AGE):
+        self.source = source
+        self.symbol = symbol
+        self.max_age = float(max_age)
+        self._quote: Optional[MarkPriceQuote] = None
+        self._received_at: Optional[float] = None
+        self._task: Optional[asyncio.Task] = None
+        self._stopping = False
+        self.messages = 0
+        self.reconnects = 0
+        self.last_error: Optional[str] = None
+
+    @property
+    def kind(self) -> str:
+        return "none"
+
+    @property
+    def connected(self) -> bool:
+        return False
+
+    def publish(self, quote: Optional[MarkPriceQuote]) -> bool:
+        """Store a parsed quote. Returns False when there was nothing usable."""
+        if quote is None or quote.basis_price is None:
+            return False
+        self._quote = quote
+        self._received_at = time.monotonic()
+        self.messages += 1
+        return True
+
+    def quote(self) -> Optional[MarkPriceQuote]:
+        """Newest price, or ``None`` when there is none fresh enough to trust."""
+        if self._quote is None or self._received_at is None:
+            return None
+        if time.monotonic() - self._received_at > self.max_age:
+            return None
+        return self._quote
+
+    def age(self) -> Optional[float]:
+        """Seconds since the last usable price; ``None`` when never received."""
+        if self._received_at is None:
+            return None
+        return time.monotonic() - self._received_at
+
+    async def start(self):
+        if self._task is None or self._task.done():
+            self._stopping = False
+            self._task = asyncio.ensure_future(self._run())
+
+    async def stop(self):
+        self._stopping = True
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _run(self):
+        raise NotImplementedError
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "connected": self.connected,
+            "messages": self.messages,
+            "reconnects": self.reconnects,
+            "age_seconds": round(self.age(), 2) if self.age() is not None else None,
+            "stale": self.quote() is None,
+            "last_error": self.last_error,
+        }
+
+
+class NullTickFeed(TickFeed):
+    """No feed. The worker falls back to the candle price, as it always did."""
+
+    @property
+    def kind(self) -> str:
+        return "none"
+
+    async def _run(self):
+        while not self._stopping:
+            await asyncio.sleep(3600)
+
+
+class WebSocketTickFeed(TickFeed):
+    """Subscribes to the venue's price stream and reconnects when it drops.
+
+    ``connect_fn`` is injectable so the reconnect and parsing logic can be
+    exercised against a local socket instead of a real venue.
+    """
+
+    def __init__(self, url: str, source: str, symbol: str,
+                 parser: Callable[[Any, str], Optional[MarkPriceQuote]],
+                 subscribe: Optional[Dict[str, Any]] = None,
+                 max_age: float = DEFAULT_MAX_AGE,
+                 connect_fn: Optional[Callable] = None,
+                 backoff_cap: float = 30.0):
+        super().__init__(source, symbol, max_age)
+        self.url = url
+        self.parser = parser
+        self.subscribe = subscribe
+        self.connect_fn = connect_fn or _default_connect
+        self.backoff_cap = float(backoff_cap)
+        self._connected = False
+
+    @property
+    def kind(self) -> str:
+        return "websocket"
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    async def _run(self):
+        backoff = 1.0
+        while not self._stopping:
+            ws = None
+            try:
+                ws = await self.connect_fn(self.url)
+                self._connected = True
+                self.last_error = None
+                backoff = 1.0
+                if self.subscribe is not None:
+                    await ws.send(json.dumps(self.subscribe))
+                async for raw in ws:
+                    if self._stopping:
+                        break
+                    self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a dropped socket must never kill the worker
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._connected = False
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+            if self._stopping:
+                break
+            self.reconnects += 1
+            # The cap bounds every wait including the first one; applying it
+            # only when doubling would make an initial 1s delay ignore a
+            # caller that asked for a much tighter retry.
+            await asyncio.sleep(min(backoff, self.backoff_cap))
+            backoff = min(backoff * 2, self.backoff_cap)
+
+    def _handle(self, raw):
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8", "replace")
+            except Exception:
+                return
+        if isinstance(raw, str):
+            try:
+                payload = json.loads(raw)
+            except (ValueError, TypeError):
+                return
+        else:
+            payload = raw
+        # Some venues batch several updates into one frame.
+        for item in (payload if isinstance(payload, list) else [payload]):
+            self.publish(self.parser(item, self.source))
+
+
+class RestTickFeed(TickFeed):
+    """Polls the venue's mark-price endpoint on a fixed interval.
+
+    Costs rate-limit weight, so the interval matters: four instances on one API
+    key polling every second is 240 requests a minute against a shared budget.
+    """
+
+    def __init__(self, fetch: Callable[[], Any], source: str, symbol: str,
+                 interval: float = 5.0, max_age: float = DEFAULT_MAX_AGE):
+        # A polled price is only as fresh as the poll, so it must not be
+        # discarded before the next one is due.
+        super().__init__(source, symbol, max(max_age, interval * 2.5))
+        self.fetch = fetch
+        self.interval = float(interval)
+
+    @property
+    def kind(self) -> str:
+        return "rest"
+
+    @property
+    def connected(self) -> bool:
+        return self._quote is not None and self.quote() is not None
+
+    async def _run(self):
+        while not self._stopping:
+            try:
+                quote = self.fetch()
+                if quote is not None:
+                    self.last_error = None
+                self.publish(quote)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            try:
+                await asyncio.sleep(self.interval)
+            except asyncio.CancelledError:
+                break
+
+
+def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
+                    perpetual: Optional[str] = None,
+                    client=None, interval: float = 5.0,
+                    max_age: float = DEFAULT_MAX_AGE,
+                    connect_fn: Optional[Callable] = None) -> TickFeed:
+    """Build the requested feed, degrading to REST and then to nothing.
+
+    ``kind`` is ``websocket``, ``rest`` or ``none``. An unsupported venue never
+    raises: the caller still gets a working feed object, it simply has no live
+    price and the worker behaves as it did before.
+    """
+    venue_kind = str(getattr(definition, "kind", "") or "").lower()
+    if not venue_kind:
+        venue_kind = "binance" if str(source).lower().startswith("binance") else (
+            "delta" if "delta" in str(source).lower() else "")
+    contract = perpetual or symbol
+    parser = PARSERS.get(venue_kind)
+
+    if kind == "websocket" and parser is not None:
+        template = STREAM_URLS.get(venue_kind)
+        if template:
+            url = template.format(symbol_lower=str(contract).lower())
+            subscribe = delta_subscribe(contract) if venue_kind == "delta" else None
+            return WebSocketTickFeed(url, source, contract, parser,
+                                     subscribe=subscribe, max_age=max_age,
+                                     connect_fn=connect_fn)
+
+    if kind in ("websocket", "rest") and client is not None:
+        return RestTickFeed(lambda: client.fetch_mark_price(symbol), source, contract,
+                            interval=interval, max_age=max_age)
+
+    return NullTickFeed(source, contract, max_age=max_age)

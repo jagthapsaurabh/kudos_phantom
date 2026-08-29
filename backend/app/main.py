@@ -177,6 +177,37 @@ def resolve_use_mark_price(payload, user) -> bool:
     return True if value is None else bool(value)
 
 
+PRICE_FEED_MODES = ("off", "websocket", "rest")
+# A sub-second interval buys nothing — entries wait for a closed 1h candle —
+# and on the REST feed it would burn the shared rate-limit budget for no gain.
+MIN_TICK_INTERVAL = 1.0
+MAX_TICK_INTERVAL = 60.0
+
+
+def _resolve_price_feed(payload):
+    """Validate the live-price-feed request into ``(mode, interval)``.
+
+    Rejects a bad mode rather than silently falling back: a client asking for
+    websocket exits and quietly getting the 60-second cadence would believe a
+    stop is being watched continuously when it is not.
+    """
+    mode = str(getattr(payload, "price_feed", None) or "off").strip().lower()
+    if mode not in PRICE_FEED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"price_feed must be one of {', '.join(PRICE_FEED_MODES)} (got '{mode}')")
+    try:
+        interval = float(getattr(payload, "tick_interval", None) or 5.0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tick_interval must be a number of seconds")
+    if not (MIN_TICK_INTERVAL <= interval <= MAX_TICK_INTERVAL):
+        raise HTTPException(
+            status_code=400,
+            detail=f"tick_interval must be between {MIN_TICK_INTERVAL:g} and "
+                   f"{MAX_TICK_INTERVAL:g} seconds (got {interval})")
+    return mode, interval
+
+
 def resolve_fees(db, broker_code: str, mode: str, fallback=None):
     """Resolve the admin schedule; fall back to the strategy/.env defaults."""
     broker_code = normalize_source(broker_code)
@@ -1755,6 +1786,12 @@ class TradeStartRequest(BaseModel):
     # "Skip new trades" schedule. Omitted → the account default is used.
     # Open positions keep running; only new entries are refused.
     trading_windows: Optional[TradingWindowConfig] = None
+    # Live price feed for exit checks. "off" (default) keeps the original
+    # 60-second cadence; "websocket" subscribes to the venue stream; "rest"
+    # polls the mark-price endpoint. Only exits speed up — entries still wait
+    # for a closed 1h candle either way.
+    price_feed: str = 'off'
+    tick_interval: float = 5.0
 
 def resolve_broker_context(payload, user, db, require_credentials=False):
     code = normalize_source(payload.data_source or payload.broker_name)
@@ -2031,6 +2068,7 @@ def start_live_trade(
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
+    feed_mode, feed_interval = _resolve_price_feed(payload)
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -2040,7 +2078,8 @@ def start_live_trade(
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
-                                   user_id=user.id, instance_key=instance_key)
+                                   user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -2052,19 +2091,22 @@ def start_live_trade(
                                        margin_pct=margin_pct, is_custom=False, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
                                        trading_windows=window_config, use_mark_price=use_mark,
-                                   user_id=user.id, instance_key=instance_key)
+                                   user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval)
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
                                        passphrase=passphrase, testnet=testnet, fee_schedule=fees, definition=definition,
                                        trading_windows=window_config, use_mark_price=use_mark,
-                                   user_id=user.id, instance_key=instance_key)
+                                   user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval)
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
-                                   user_id=user.id, instance_key=instance_key)
+                                   user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
@@ -2165,6 +2207,17 @@ def get_live_status(user=Depends(get_current_user)):
                 # turns — surfaced here so "why is my strategy idle?" is
                 # answerable without reading the log.
                 "shared_account": _shared_account_status(service),
+                # Live price feed: which source is driving exit checks, whether
+                # it is connected, and how old its last price is. Surfaced so a
+                # silently-dead socket is visible instead of quietly falling
+                # back to the 60-second cadence.
+                "price_feed": {
+                    "mode": getattr(service, "price_feed_mode", "off"),
+                    "tick_interval": getattr(service, "tick_interval", 60.0),
+                    "fast_ticks": int(getattr(service, "fast_ticks", 0) or 0),
+                    **(getattr(service, "tick_feed", None).stats()
+                       if getattr(service, "tick_feed", None) else {}),
+                },
                 # What the venue itself reports for this contract, so a position
                 # this instance did not open is visible instead of silent.
                 "exchange_position": getattr(service, 'exchange_position', None),

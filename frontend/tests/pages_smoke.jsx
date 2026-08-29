@@ -15,7 +15,7 @@ globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ([]) });
 
 import Backtest from '../src/pages/Backtest.jsx';
 import PaperTrade from '../src/pages/PaperTrade.jsx';
-import LiveTrade from '../src/pages/LiveTrade.jsx';
+import LiveTrade, { FeedBadge } from '../src/pages/LiveTrade.jsx';
 import EntryGuardBadges from '../src/components/EntryGuardBadges.jsx';
 import ConnectionCheck from '../src/components/ConnectionCheck.jsx';
 
@@ -124,6 +124,49 @@ check('a strategy alone on its key shows no shared-account badge',
 check('a missing shared_account payload renders nothing extra',
   !flat(renderToString(React.createElement(EntryGuardBadges, { held: 1 })))
     .includes('QUEUED'));
+
+// ------------------------------------------------------- live price feed --
+// The feed badge is how an operator sees that exits are being re-checked on
+// live ticks -- and, more importantly, that a dropped socket has silently
+// fallen back to the 60-second cadence.
+const wsLive = flat(renderToString(React.createElement(FeedBadge, {
+  feed: { mode: 'websocket', kind: 'websocket', connected: true, stale: false,
+          age_seconds: 0.4, messages: 1200, reconnects: 0, tick_interval: 5 },
+})));
+check('a live websocket feed is labelled', wsLive.includes('TICK·WS'), wsLive);
+check('a live websocket feed is not flagged stale', !wsLive.includes('STALE'), wsLive);
+check('the tooltip reports message and reconnect counts',
+  wsLive.includes('1200 messages') && wsLive.includes('0 reconnects'), wsLive);
+check('the tooltip notes entries still wait for a candle',
+  wsLive.includes('closed 1h candle'), wsLive);
+
+const restLive = flat(renderToString(React.createElement(FeedBadge, {
+  feed: { mode: 'rest', kind: 'rest', connected: true, stale: false,
+          age_seconds: 1.2, messages: 40, reconnects: 0, tick_interval: 5 },
+})));
+check('a polling feed is labelled distinctly', restLive.includes('TICK·REST'), restLive);
+
+const dead = flat(renderToString(React.createElement(FeedBadge, {
+  feed: { mode: 'websocket', kind: 'websocket', connected: false, stale: true,
+          age_seconds: 42.5, messages: 900, reconnects: 7, tick_interval: 5,
+          last_error: 'ConnectionClosed: sent 1006' },
+})));
+check('a stale feed is flagged STALE', dead.includes('TICK·WS STALE'), dead);
+check('a stale feed says it fell back to the 60s cadence',
+  dead.includes('60-second cadence'), dead);
+check('a stale feed surfaces the last socket error',
+  dead.includes('ConnectionClosed: sent 1006'), dead);
+check('a stale feed reports how old the price is',
+  dead.includes('42.5s'), dead);
+
+check('no badge when the feed is off',
+  renderToString(React.createElement(FeedBadge, {
+    feed: { mode: 'off' },
+  })).trim() === '');
+check('no badge when the payload is absent',
+  renderToString(React.createElement(FeedBadge, { feed: null })).trim() === '');
+check('no badge when the mode is missing',
+  renderToString(React.createElement(FeedBadge, { feed: {} })).trim() === '');
 
 // ------------------------------------------------- broker connection check --
 // The panel that answers "I added the broker, why does it say no API keys?".

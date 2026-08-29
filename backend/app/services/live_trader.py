@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -233,7 +234,8 @@ class LiveTradeService:
                  initial_capital=20000.0, margin_pct=25.0, is_custom=False,
                  broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
                  definition=None, trading_windows=None, use_mark_price=None,
-                 user_id=None, instance_key=None, bracket_orders=True):
+                 user_id=None, instance_key=None, bracket_orders=True,
+                 price_feed="off", tick_interval=5.0):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
         self.market_source = broker_name or "Binance"
@@ -313,6 +315,7 @@ class LiveTradeService:
         # so a single live run stacked a new position on the exchange once a
         # minute for as long as the signal held.
         self._last_bar_time = None        # candle this worker last processed
+        self._last_atr = None             # ATR of that candle, reused by fast ticks
         self._acted_signal_bar = None     # candle whose signal already traded
         self._bars_since_exit = None      # candles since the last close
         self.skipped_entries = 0          # entries held back by the guards
@@ -323,6 +326,15 @@ class LiveTradeService:
         self.sync_exchange_positions = True
         self.exchange_position = None
         self.exchange_position_known = True
+        # ---- Live price feed ------------------------------------------
+        # "off" keeps the original 60-second cadence exactly. "websocket" or
+        # "rest" additionally re-checks open positions on every live price, so
+        # a stop is acted on within seconds instead of up to a minute late.
+        # Entries still wait for a closed 1h candle — only exits speed up.
+        self.price_feed_mode = str(price_feed or "off").lower()
+        self.tick_interval = float(tick_interval or 5.0)
+        self.tick_feed = None
+        self.fast_ticks = 0
 
     async def start(self):
         self.is_running = True
@@ -340,12 +352,80 @@ class LiveTradeService:
             print("   Skip-new-trade windows: off")
         print(f"   Entry policy: one order per signal candle · one position at a time · "
               f"{int(getattr(self.config, 'cooldown_bars', 0) or 0)}-candle cooldown after an exit")
-        while self.is_running:
-            try:
-                await self.tick()
-            except Exception as e:
-                print(f"Live Trade Error [{self.strategy_id}]: {e}")
-            await asyncio.sleep(60)
+        if self.price_feed_mode == "off":
+            while self.is_running:
+                try:
+                    await self.tick()
+                except Exception as e:
+                    print(f"Live Trade Error [{self.strategy_id}]: {e}")
+                await asyncio.sleep(60)
+            return
+        await self._run_with_feed()
+
+    async def _run_with_feed(self):
+        """Candle tick every 60s, plus an exit check on every live price.
+
+        The 60-second cadence still owns everything measured in candles —
+        signals, entries, the holding-time clock, the post-exit cooldown. The
+        fast loop only re-marks open positions, which is the one thing that
+        genuinely needed to happen sooner than once a minute.
+        """
+        from app.services.tick_feed import build_tick_feed
+        self.tick_feed = build_tick_feed(
+            self.price_feed_mode, self.market_source, self.symbol,
+            definition=self.definition, perpetual=self.contract_symbol,
+            client=self.broker, interval=self.tick_interval)
+        await self.tick_feed.start()
+        print(f"   Live price feed: {self.tick_feed.kind} · exit checks every "
+              f"{self.tick_interval:g}s (entries still wait for a closed 1h candle)")
+        last_candle_tick = 0.0
+        try:
+            while self.is_running:
+                now = time.monotonic()
+                if now - last_candle_tick >= 60.0:
+                    last_candle_tick = now
+                    try:
+                        await self.tick()
+                    except Exception as e:
+                        print(f"Live Trade Error [{self.strategy_id}]: {e}")
+                else:
+                    try:
+                        await self.fast_tick()
+                    except Exception as e:
+                        print(f"Live fast-tick error [{self.strategy_id}]: {e}")
+                await asyncio.sleep(self.tick_interval)
+        finally:
+            await self.tick_feed.stop()
+
+    async def fast_tick(self):
+        """Re-check open positions against the newest live price.
+
+        Deliberately narrow: no candles, no signals, no entries. It costs no
+        rate-limit weight on the websocket feed, and on the REST feed it reuses
+        the same throttled client the slow tick uses.
+        """
+        if not self.oms.active_trades:
+            return
+        if self.tick_feed is None:
+            return
+        quote = self.tick_feed.quote()
+        if quote is None:
+            # No price fresh enough to trust. Better to act a little late on
+            # the 60-second tick than to trade on a number nobody refreshed.
+            return
+        price = quote.basis_price
+        if price is None or self._last_atr is None or self._last_bar_time is None:
+            return
+        self.fast_ticks += 1
+        self.last_price = float(price)
+        if quote.last_price:
+            self.last_trade_price = float(quote.last_price)
+        if quote.mark_price:
+            self.last_mark_price = float(quote.mark_price)
+        # advance_bar=False: the holding-time clock counts candles, and the
+        # candle has not rolled over just because the price moved.
+        self._manage_open_positions(float(price), self._last_atr, self._last_bar_time,
+                                    quote.last_price or price, quote.mark_price, False)
 
     async def stop(self):
         self.is_running = False
@@ -376,6 +456,9 @@ class LiveTradeService:
         decision_price = float(mark_price) if use_mark else float(current_price)
         current_atr = float(ind_1h['atr14'][-1])
         current_time = df_1h.index[-1]
+        # Remembered so the fast tick can re-mark a position without paying for
+        # another candle fetch. The ATR only changes when the candle rolls over.
+        self._last_atr = current_atr
         self.last_price = decision_price
         self.last_trade_price = float(trade_price)
         self.last_mark_price = float(mark_price) if mark_price is not None else None
@@ -393,51 +476,8 @@ class LiveTradeService:
                 self._bars_since_exit += 1
 
         # ---- Manage open positions ------------------------------------
-        for symbol in list(self.oms.active_trades.keys()):
-            result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
-                                           trade_price_usd=trade_price, mark_price_usd=mark_price,
-                                           advance_bar=new_bar)
-            if result:
-                side = "SELL" if result.direction == 1 else "BUY"
-                # reduce-only: this order must flatten, never open the other
-                # side. Without it, a position that is already flat (a sibling
-                # instance closed it, or the venue-side stop got there first)
-                # turns this "exit" into a brand new position nobody manages.
-                response = self.broker.place_order(self.contract_symbol, side, "MARKET",
-                                                   result.lots, size_in_btc=True,
-                                                   reduce_only=True)
-                if isinstance(response, dict) and _is_nothing_to_reduce(response):
-                    # The venue has nothing left to reduce: the position is
-                    # already flat. `update_trade` has already settled the
-                    # local book, so all that remains is to clear this
-                    # instance's resting legs and restart the cooldown rather
-                    # than retrying a close the venue cannot accept.
-                    self._cancel_protection_legs()
-                    self._bars_since_exit = 0
-                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: "
-                          f"{result.exit_reason} — venue was already flat "
-                          f"(stop or another instance got there first); local book settled")
-                    continue
-                # Drop the stop-loss / take-profit legs the entry created; the
-                # position they protected is already flat.
-                if "error" not in response and self.cancel_legs_on_exit:
-                    self._cancel_protection_legs()
-                self._record_order(response, leg="exit")
-                if "error" not in response:
-                    filled = extract_fill_price(response)
-                    if filled:
-                        result.exit_trade_price = float(filled)
-                    # Restart the post-exit cooldown in candles, not in ticks.
-                    self._bars_since_exit = 0
-                    exit_note = (price_note(result.exit_mark_price, result.exit_trade_price,
-                                            result.exit_price, True)
-                                 if result.mark_price_basis else f"{result.exit_price:,.2f}")
-                    print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {exit_note}")
-                    if result.exit_detail:
-                        print(f"   Exit condition: {result.exit_detail}")
-                else:
-                    self.last_order_error = response.get("error")
-                    print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
+        self._manage_open_positions(decision_price, current_atr, current_time,
+                                    trade_price, mark_price, new_bar)
 
         # "Skip new trades" schedule. A position already open keeps being
         # managed above — only a NEW entry is refused.
@@ -547,6 +587,66 @@ class LiveTradeService:
     # ------------------------------------------------------------------
     # Entry gating
     # ------------------------------------------------------------------
+    def _manage_open_positions(self, decision_price, current_atr, current_time,
+                               trade_price, mark_price, advance_bar):
+        """Mark every open position to market and send any exit it triggers.
+
+        Split out of ``tick()`` so the same exit logic runs on the 60-second
+        candle tick *and* on every live price tick. Exits are the part of the
+        worker that is genuinely price-sensitive — a stop checked once a minute
+        can be a minute late — while entries wait for a closed 1h candle either
+        way, so re-reading the candles faster would only burn rate-limit weight.
+
+        ``advance_bar`` must stay False on the fast path: it moves the
+        holding-time clock, which is counted in candles.
+        """
+        for symbol in list(self.oms.active_trades.keys()):
+            result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
+                                           trade_price_usd=trade_price, mark_price_usd=mark_price,
+                                           advance_bar=advance_bar)
+            if not result:
+                continue
+            side = "SELL" if result.direction == 1 else "BUY"
+            # reduce-only: this order must flatten, never open the other
+            # side. Without it, a position that is already flat (a sibling
+            # instance closed it, or the venue-side stop got there first)
+            # turns this "exit" into a brand new position nobody manages.
+            response = self.broker.place_order(self.contract_symbol, side, "MARKET",
+                                               result.lots, size_in_btc=True,
+                                               reduce_only=True)
+            if isinstance(response, dict) and _is_nothing_to_reduce(response):
+                # The venue has nothing left to reduce: the position is
+                # already flat. `update_trade` has already settled the
+                # local book, so all that remains is to clear this
+                # instance's resting legs and restart the cooldown rather
+                # than retrying a close the venue cannot accept.
+                self._cancel_protection_legs()
+                self._bars_since_exit = 0
+                print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: "
+                      f"{result.exit_reason} — venue was already flat "
+                      f"(stop or another instance got there first); local book settled")
+                continue
+            # Drop the stop-loss / take-profit legs the entry created; the
+            # position they protected is already flat.
+            if "error" not in response and self.cancel_legs_on_exit:
+                self._cancel_protection_legs()
+            self._record_order(response, leg="exit")
+            if "error" not in response:
+                filled = extract_fill_price(response)
+                if filled:
+                    result.exit_trade_price = float(filled)
+                # Restart the post-exit cooldown in candles, not in ticks.
+                self._bars_since_exit = 0
+                exit_note = (price_note(result.exit_mark_price, result.exit_trade_price,
+                                        result.exit_price, True)
+                             if result.mark_price_basis else f"{result.exit_price:,.2f}")
+                print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {exit_note}")
+                if result.exit_detail:
+                    print(f"   Exit condition: {result.exit_detail}")
+            else:
+                self.last_order_error = response.get("error")
+                print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
+
     def _entry_hold_reason(self, signal, current_time):
         """Why no new order may go out this tick; ``None`` means go ahead.
 
