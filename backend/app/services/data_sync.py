@@ -2,11 +2,13 @@
 import os
 import threading
 import time
+import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 import pandas as pd
 import requests
+from sqlalchemy import func
 
 from app.database.models import (
     BrokerDefinition, MarketDataSeedProgress, SessionLocal, Klines, init_db,
@@ -31,6 +33,15 @@ class DataSyncService:
     DELTA_MAX_CANDLES = 2000
     BINANCE_MAX_CANDLES = 1500
     SEED_PAGE_SLEEP_SECONDS = float(os.getenv("SEED_PAGE_SLEEP_SECONDS", "0.10"))
+    # Full-history seeds default to 1 Jan 2020 for every adapter. Binance's
+    # BTCUSDT perpetual lists in 2019, so a 2020 start always has candles;
+    # Delta's pre-listing windows simply come back empty. An explicit
+    # start_date always wins.
+    FULL_HISTORY_START = datetime(2020, 1, 1)
+    # Data-health scans walk stored timestamps in Python (exact candle-grid
+    # math that works identically on SQLite and PostgreSQL). The walk is
+    # capped per series so a giant 1m history cannot pin the admin request.
+    HEALTH_SCAN_ROW_LIMIT = 300_000
     # Delta serves the same public history API from more than one host. If the
     # primary API host is down/geo-blocked the CDN host (the one in Delta's own
     # API guide) still answers, so we fall back through the list in order.
@@ -433,6 +444,145 @@ class DataSyncService:
             db.close()
 
     @classmethod
+    def _aligned_to_grid(cls, event_time, interval_seconds):
+        """True when a candle timestamp sits exactly on the interval grid.
+
+        Binance opens 1h candles at whole hours, Delta at whole hours too; a
+        stored timestamp like 2020-06-26 11:41:59.523330 for a 1h series is
+        corrupt — it can never line up with the exchange grid and can never
+        receive a mark price.
+        """
+        return not (event_time.microsecond or event_time.second
+                    or calendar.timegm(event_time.timetuple()) % interval_seconds)
+
+    @staticmethod
+    def _next_grid_time(value, interval_seconds):
+        """First candle-grid instant strictly after `value`.
+
+        A window can end mid-candle (a date-string end becomes 23:59:59.999999),
+        so advancing by a whole interval would skip that candle's timestamp
+        when the range is later extended — the resumed cursor must land exactly
+        on the next boundary.
+        """
+        epoch = calendar.timegm(value.timetuple())
+        return datetime(1970, 1, 1) + timedelta(
+            seconds=epoch - (epoch % interval_seconds) + interval_seconds)
+
+    @classmethod
+    def repair_klines(cls, source="Binance", symbol="BTCUSDT", intervals=None, definition=None):
+        """Remove corrupted candles from a stored series.
+
+        Two defects have shipped from historical seeding paths and both corrupt
+        charts, backtests and mark pricing:
+          - duplicate candles — the legacy seeder inserted whole batches with
+            no upsert, so every re-run stored each candle again;
+          - off-grid candles — the bundled CSV history carries timestamps that
+            are not on the interval grid (e.g. 11:41:59.523330 for a 1h
+            series), which never match exchange data or the mark-price series.
+
+        Per interval this keeps the newest row of each duplicate timestamp
+        (the row the upsert path would update) and deletes every row whose
+        timestamp is not a whole multiple of the interval. Well-formed rows
+        are never touched. Re-seed afterwards to refill what was removed.
+        """
+        source = cls.normalize_source(source)
+        kind = cls._adapter_kind(source, definition)
+        if intervals is None:
+            intervals = cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES
+        intervals = [str(interval).lower() for interval in intervals]
+        unknown = sorted(set(intervals) - set(cls.TIMEFRAMES))
+        if unknown:
+            raise MarketDataError(f"Unsupported repair interval(s): {', '.join(unknown)}")
+
+        init_db()
+        summary = []
+        db = SessionLocal()
+        try:
+            for interval in intervals:
+                interval_seconds = cls._interval_seconds(interval)
+                # id-ascending so the last id per timestamp is the newest write
+                rows = db.query(Klines.id, Klines.event_time).filter(
+                    Klines.source == source, Klines.symbol == symbol,
+                    Klines.interval == interval,
+                ).order_by(Klines.event_time.asc(), Klines.id.asc()).all()
+
+                aligned_ids_by_time = {}
+                misaligned_ids = set()
+                for row_id, event_time in rows:
+                    if cls._aligned_to_grid(event_time, interval_seconds):
+                        aligned_ids_by_time.setdefault(event_time, []).append(row_id)
+                    else:
+                        misaligned_ids.add(row_id)
+                duplicate_ids = set()
+                for ids in aligned_ids_by_time.values():
+                    duplicate_ids.update(ids[:-1])  # keep the newest (max id)
+
+                remove_ids = sorted(misaligned_ids | duplicate_ids)
+                removed = 0
+                for chunk_start in range(0, len(remove_ids), 500):
+                    chunk = remove_ids[chunk_start:chunk_start + 500]
+                    removed += db.query(Klines).filter(
+                        Klines.id.in_(chunk)).delete(synchronize_session=False)
+                db.commit()
+                summary.append({
+                    "source": source, "symbol": symbol, "interval": interval,
+                    "total": len(rows), "removed": len(remove_ids),
+                    "duplicates_removed": len(duplicate_ids),
+                    "misaligned_removed": len(misaligned_ids),
+                    "kept": len(rows) - len(remove_ids),
+                })
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return summary
+
+    @classmethod
+    def data_health(cls, scan_limit=None):
+        """Per-series corruption counters: duplicate and off-grid candles.
+
+        ``duplicate_rows`` is a cheap SQL count/distinct and always exact.
+        ``misaligned_rows`` uses the exact grid check in Python and is capped
+        per series by ``scan_limit`` (a full 1m history can be millions of
+        rows); ``scanned`` reports how many rows were checked and
+        ``misaligned_rows`` is None when the scan was truncated before any
+        corruption was found.
+        """
+        scan_limit = cls.HEALTH_SCAN_ROW_LIMIT if scan_limit is None else int(scan_limit)
+        init_db()
+        db = SessionLocal()
+        try:
+            report = {}
+            for source, symbol, interval, total, distinct in db.query(
+                Klines.source, Klines.symbol, Klines.interval,
+                func.count(Klines.id), func.count(func.distinct(Klines.event_time)),
+            ).group_by(Klines.source, Klines.symbol, Klines.interval).all():
+                key = (source or "Binance", symbol, interval)
+                report[key] = {
+                    "source": key[0], "symbol": symbol, "interval": interval,
+                    "count": int(total),
+                    "duplicate_rows": int(total) - int(distinct),
+                    "misaligned_rows": None, "scanned": 0,
+                }
+            for (source, symbol, interval), entry in report.items():
+                interval_seconds = cls._interval_seconds(interval)
+                rows = db.query(Klines.event_time).filter(
+                    Klines.source == source, Klines.symbol == symbol,
+                    Klines.interval == interval,
+                ).order_by(Klines.event_time.desc()).limit(scan_limit + 1).all()
+                truncated = len(rows) > scan_limit
+                misaligned = 0
+                for index, (event_time,) in enumerate(rows[:scan_limit]):
+                    if not cls._aligned_to_grid(event_time, interval_seconds):
+                        misaligned += 1
+                entry["scanned"] = min(len(rows), scan_limit)
+                entry["misaligned_rows"] = misaligned if (misaligned or not truncated) else None
+            return [report[key] for key in sorted(report)]
+        finally:
+            db.close()
+
+    @classmethod
     def _seed_definition_key(cls, source, definition=None):
         """Stable progress namespace for a built-in or configured definition."""
         code = getattr(definition, "code", None) if definition is not None else None
@@ -618,13 +768,12 @@ class DataSyncService:
             end = end + timedelta(days=1) - timedelta(microseconds=1)
         if start_date:
             requested_start = cls._as_datetime(start_date)
-        elif fetch_all and kind == "delta":
-            # Explicit product-history default requested for the Delta seed
-            # preset. The API will naturally return no rows before a product's
-            # listing date, while later windows continue until `end`.
-            requested_start = datetime(2020, 1, 1)
         elif fetch_all:
-            requested_start = end - timedelta(days=365)
+            # Full-history mode defaults to 1 Jan 2020 for every adapter
+            # (Binance BTCUSDT futures list in 2019-09, so a 2020 start always
+            # has candles; Delta's pre-listing windows come back empty and the
+            # seed keeps advancing). An explicit start_date still wins.
+            requested_start = cls.FULL_HISTORY_START
         else:
             requested_start = end - timedelta(
                 seconds=cls._interval_seconds(intervals[0]) * max(1, int(limit))
@@ -755,12 +904,13 @@ class DataSyncService:
                 if not page_rows:
                     empty_pages += 1
                 # Delta treats the requested time range as inclusive. Advance
-                # by one candle so committed windows do not overlap or repeat
-                # historical API work. The one-candle page case also advances
-                # explicitly. A final window is complete when that next cursor
-                # reaches or passes the requested end, even when the end date
-                # includes a time-of-day remainder after the last candle.
-                next_cursor = window_end + timedelta(seconds=interval_seconds)
+                # to the next candle boundary so committed windows do not
+                # overlap or repeat historical API work, and a cursor saved at
+                # a mid-candle window end (23:59:59.999999) still lands on the
+                # boundary candle when the range is extended later. A final
+                # window is complete once that cursor reaches the requested
+                # end, even when the end date has a time-of-day remainder.
+                next_cursor = cls._next_grid_time(window_end, interval_seconds)
                 is_complete = next_cursor >= end
                 try:
                     cls._persist_seed_window(
@@ -935,6 +1085,24 @@ class DataSyncService:
             df[column] = pd.to_numeric(df[column], errors='coerce')
         if df[numeric].isna().any().any():
             raise ValueError('CSV contains blank or non-numeric OHLCV values; volume is required for every candle')
+        # Candle timestamps must sit on the interval grid. The bundled legacy
+        # CSVs carry timestamps like 2020-06-26 11:41:59.523330 for a "1h"
+        # series — importing them corrupts charts, backtests and mark pricing,
+        # so the import is rejected with the exact offending rows instead.
+        times = pd.to_datetime(df['event_time'], errors='coerce')
+        interval_seconds = cls._interval_seconds(str(interval).lower())
+        # Unit-safe epoch seconds: pandas 2 stores parsed columns in varying
+        # resolutions (s/us/ns), so subtracting the epoch beats raw int64 casts.
+        epochs = (times - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
+        bad = times.isna() | (epochs % interval_seconds != 0)
+        if bool(bad.any()):
+            samples = ', '.join(str(value) for value in times[bad].head(3))
+            raise ValueError(
+                f"{int(bad.sum())} of {len(df)} rows are not aligned to the {interval} candle grid "
+                f"(e.g. {samples}). Misaligned candles corrupt charts, backtests and mark pricing, "
+                f"so the import was rejected. Fetch clean candles from the exchange instead "
+                f"(Admin → Seed Data → 'Binance 2020 → today', or python -m app.scripts.seeder)."
+            )
         rows = df.to_dict("records")
         result = cls.upsert_rows(rows, source, symbol, interval, clear_existing)
         return {"source": cls.normalize_source(source), "symbol": symbol, "interval": interval,
@@ -953,10 +1121,14 @@ def fetch_binance_klines(symbol, interval, start_time, end_time=None):
 
 
 def seed_to_db(symbol="BTCUSDT", interval="1h", years=6, source="Binance"):
+    """Back-compat full-history seed (the old helper fetched a single page and
+    inserted it without an upsert, leaving partial data and duplicates)."""
     end = datetime.utcnow()
     start = end - timedelta(days=years * 365)
-    rows = DataSyncService.fetch_klines(source, symbol, interval, start, end, 1500)
-    return DataSyncService.upsert_rows(rows, source, symbol, interval)
+    return DataSyncService.seed_market_data(
+        source, symbol, [interval], start_date=start.strftime("%Y-%m-%d"),
+        end_date=None, limit=1500, fetch_all=True,
+    )
 
 
 def seed_from_csv(csv_path, interval, symbol="BTCUSDT", source="Binance"):

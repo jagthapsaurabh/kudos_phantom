@@ -811,6 +811,11 @@ class MarketSeedPayload(BaseModel):
     end_date: Optional[str] = None
     limit: int = 1000
     fetch_all: bool = False
+    # Remove duplicate and off-grid candles from the selected series before
+    # fetching. This is the repair path for a corrupted seed (legacy CSV
+    # imports carried timestamps off the candle grid and the legacy seeder
+    # inserted batches without an upsert, duplicating every candle).
+    repair: bool = False
     # Also seed the mark-price series for the BTC perpetual. Risk maths runs on
     # the mark price, so without it a backtest silently falls back to the
     # traded price (and says so through mark_price_basis).
@@ -829,16 +834,35 @@ def _market_definition(db, source):
 
 
 @app.get('/admin/market-data/status')
-def market_data_status(admin=Depends(require_admin), db=Depends(get_db)):
+def market_data_status(health: bool = False, admin=Depends(require_admin), db=Depends(get_db)):
+    """Per-series inventory. `duplicate_rows` is always reported (SQL
+    count/distinct). With ?health=1 the response also carries `misaligned_rows`
+    — candles whose timestamp is off the interval grid, the signature of the
+    corrupted CSV imports — via an exact (capped) scan."""
     rows = db.query(
         Klines.source, Klines.symbol, Klines.interval,
         func.count(Klines.id).label('count'), func.count(Klines.volume).label('volume_rows'),
+        func.count(func.distinct(Klines.event_time)).label('distinct_times'),
         func.min(Klines.event_time).label('first'), func.max(Klines.event_time).label('last'),
     ).group_by(Klines.source, Klines.symbol, Klines.interval).order_by(
         Klines.source, Klines.symbol, Klines.interval).all()
-    return [{'source': source or 'Binance', 'symbol': symbol, 'interval': interval,
-             'count': int(count), 'volume_rows': int(volume_rows), 'first': first, 'last': last}
-            for source, symbol, interval, count, volume_rows, first, last in rows]
+    health_by_key = {}
+    if health:
+        for item in DataSyncService.data_health():
+            health_by_key[(item['source'], item['symbol'], item['interval'])] = item
+    result = []
+    for source, symbol, interval, count, volume_rows, distinct_times, first, last in rows:
+        source = source or 'Binance'
+        entry = {'source': source, 'symbol': symbol, 'interval': interval,
+                 'count': int(count), 'volume_rows': int(volume_rows),
+                 'duplicate_rows': int(count) - int(distinct_times),
+                 'first': first, 'last': last}
+        if health:
+            item = health_by_key.get((source, symbol, interval), {})
+            entry['misaligned_rows'] = item.get('misaligned_rows')
+            entry['scanned_rows'] = item.get('scanned', 0)
+        result.append(entry)
+    return result
 
 
 @app.post('/admin/market-data/seed')
@@ -859,6 +883,20 @@ def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), d
                     detail=(f"Delta Exchange full-history seeding excludes {', '.join(excluded)}. "
                             f"Select only {', '.join(DataSyncService.DELTA_HISTORY_INTERVALS)}."),
                 )
+        # Optional repair pass runs first so the seed below upserts into a
+        # clean series: it removes duplicate timestamps (legacy batch inserts)
+        # and candles whose timestamps are off the interval grid (legacy CSV
+        # imports). A failure here never blocks the fetch itself.
+        repair_summary = []
+        if payload.repair:
+            effective_intervals = intervals if intervals is not None else (
+                DataSyncService.DELTA_HISTORY_INTERVALS if kind == 'delta'
+                else DataSyncService.TIMEFRAMES)
+            try:
+                repair_summary = DataSyncService.repair_klines(
+                    source, payload.symbol.upper(), effective_intervals, definition=definition)
+            except Exception as exc:
+                repair_summary = [{'error': str(exc)}]
         summary = DataSyncService.seed_market_data(
             source=source,
             symbol=payload.symbol.upper(),
@@ -888,9 +926,33 @@ def seed_market_data(payload: MarketSeedPayload, admin=Depends(require_admin), d
                 mark_summary = [{'error': str(exc)}]
         return {'status': status, 'source': source, 'symbol': payload.symbol.upper(),
                 'fetch_all': payload.fetch_all, 'summary': summary,
+                'repair': {'requested': bool(payload.repair),
+                           'removed': sum(int(item.get('removed', 0)) for item in repair_summary
+                                          if not item.get('error')),
+                           'summary': repair_summary},
                 'mark_price': {'requested': bool(payload.include_mark_price),
                                'perpetual_symbol': perpetual_symbol(source, payload.symbol.upper()),
                                'summary': mark_summary}}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post('/admin/market-data/repair')
+def repair_market_data(source: str = 'Binance', symbol: str = 'BTCUSDT', intervals: Optional[str] = None,
+                       admin=Depends(require_admin), db=Depends(get_db)):
+    """Remove corrupted candles without fetching: duplicate timestamps (legacy
+    batch inserts stored each candle again) and off-grid timestamps (legacy
+    CSV imports, e.g. 11:41:59.523330 on a 1h series). Well-formed rows are
+    never touched. Follow up with a seed to refill whatever was removed."""
+    try:
+        source, definition = _market_definition(db, source)
+        wanted = [interval.strip().lower() for interval in (intervals or '').split(',') if interval.strip()] or None
+        summary = DataSyncService.repair_klines(source, symbol.upper(), wanted, definition=definition)
+        removed = sum(int(item.get('removed', 0)) for item in summary)
+        status = 'Repair completed' if not any(item.get('error') for item in summary) else 'Repair completed with errors'
+        return {'status': f'{status} — {removed} corrupt candles removed', 'summary': summary}
     except HTTPException:
         raise
     except Exception as exc:
