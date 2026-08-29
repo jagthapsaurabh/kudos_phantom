@@ -622,6 +622,22 @@ class LiveTradeService:
         response = self.broker.place_order(self.contract_symbol, side, "MARKET",
                                            trade.lots, size_in_btc=True,
                                            reduce_only=True)
+        if isinstance(response, dict) and _is_nothing_to_reduce(response):
+            # The venue is already flat — its stop got there first, or another
+            # instance closed it. There is nothing to flatten, so settle the
+            # local book and let the opposite entry through. Refusing here
+            # instead would wedge the worker permanently: the phantom trade
+            # stays in the book, every later tick retries a close the venue
+            # cannot accept, and no order is ever sent again.
+            self._cancel_protection_legs()
+            self.oms.close_trade("BTCUSDT", float(price), current_time, "REV",
+                                 "Close & reverse — venue was already flat",
+                                 trade_price_usd=trade_price, mark_price_usd=mark_price)
+            self._bars_since_exit = 0
+            self.last_order_error = None
+            print(f"🔁 [{self.strategy_id}] LIVE close-&-reverse: venue was already "
+                  f"flat (stop or another instance got there first); local book settled")
+            return True
         if "error" not in response and self.cancel_legs_on_exit:
             self._cancel_protection_legs()
         self._record_order(response, leg="exit")

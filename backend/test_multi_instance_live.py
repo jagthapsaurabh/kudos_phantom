@@ -417,6 +417,43 @@ check("the rejected reduce-only is not surfaced as a hard error",
 check("protection legs were still cleared", settler.protection_leg_ids == [])
 COORDINATOR.unregister(settler)
 
+section("7c. close-&-reverse on an already-flat venue settles instead of wedging")
+# Regression: the reverse close is reduce-only too. When the venue had nothing
+# to reduce, the worker refused the close, kept the phantom trade in its local
+# book, retried the same rejected order on every tick and never sent another
+# order again -- permanently wedged with a position it believed but did not own.
+rev = SharedAccount("A11")
+flipper = make("Flipper", 1, rev, "flip-key")
+rev.config = flipper.config
+flipper.config.allow_reverse = True
+run(flipper)
+check("the long entry went out", rev.position == 0.006, rev.position)
+
+rev.position = 0.0                          # venue-side stop got there first
+rev.resting = []
+orders_before = len(rev.orders)
+flipper.strategy = PersistentSignal(-1)     # opposite signal -> close & reverse
+for bar in (2, 3, 4):
+    flipper.state["bar"] = bar
+    run(flipper)
+
+check("the worker was not wedged — the reverse entry went out",
+      len(rev.orders) > orders_before, (orders_before, len(rev.orders)))
+check("the account now holds the new side", rev.position == -0.006, rev.position)
+check("the rejected reduce-only is not left as a hard error",
+      flipper.last_order_error is None, flipper.last_order_error)
+trade = flipper.oms.active_trades.get("BTCUSDT")
+check("the local book agrees with the venue",
+      trade is not None and abs(trade.lots * trade.direction - rev.position) < 1e-9,
+      (trade.lots if trade else None, rev.position))
+check("exactly one reverse entry was sent, not one per tick",
+      len([o for o in rev.orders if o[3] == "opening"]) == 2, rev.orders)
+check("the settled close cleared its own legs, and the new entry's are tracked",
+      flipper.protection_leg_ids == [o["orderId"] for o in rev.resting]
+      and "A11-stop_loss-2" not in flipper.protection_leg_ids,
+      (flipper.protection_leg_ids, [o["orderId"] for o in rev.resting]))
+COORDINATOR.unregister(flipper)
+
 # ===========================================================================
 section("8. response parsing helpers")
 # ===========================================================================
