@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -9,6 +10,31 @@ import {
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
 // BTCUSDT, Delta as BTCUSD.
 const perpetualFor = (source) => (String(source || '').toLowerCase() === 'delta' ? 'BTCUSD' : 'BTCUSDT');
+
+// ---------- Live price feed badge ----------
+// Shows how open positions are being re-priced. A websocket that has dropped
+// and gone stale must be visible here: otherwise the instance silently falls
+// back to the 60-second cadence and a stop that the operator believes is being
+// watched continuously is not.
+export const FeedBadge = ({ feed }) => {
+  if (!feed || !feed.mode || feed.mode === 'off') return null;
+  const stale = feed.stale;
+  const label = feed.kind === 'websocket' ? 'TICK·WS' : 'TICK·REST';
+  const title = stale
+    ? `Live feed is STALE — no price for ${feed.age_seconds == null ? 'an unknown' : feed.age_seconds + 's'}. `
+      + `Exit checks have fallen back to the 60-second cadence.${feed.last_error ? `\nLast error: ${feed.last_error}` : ''}`
+    : `Live price feed (${feed.kind}) — exits re-checked every ${feed.tick_interval}s.`
+      + ` Last price ${feed.age_seconds}s ago, ${feed.messages} messages, ${feed.reconnects} reconnects.`
+      + `\nEntries still wait for a closed 1h candle.`;
+  return (
+    <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+        stale ? 'border-red-800/60 bg-red-900/20 text-red-300'
+              : 'border-emerald-800/60 bg-emerald-900/20 text-emerald-300'}`}
+          title={title}>
+      {stale ? `${label} STALE` : label}
+    </span>
+  );
+};
 
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -65,6 +91,12 @@ const LiveTrade = () => {
   const [confirm, setConfirm] = useState(null); // { instanceKey }
   // BTC perpetual pricing + "skip new trades" schedule for new instances.
   const [useMarkPrice, setUseMarkPrice] = useState(true);
+  // Live price feed for exit checks. "off" keeps the original 60-second cadence;
+  // the others re-check open positions on every live price so a stop is acted
+  // on in seconds instead of up to a minute late. Entries still wait for a
+  // closed 1h candle either way.
+  const [priceFeed, setPriceFeed] = useState('off');
+  const [tickInterval, setTickInterval] = useState(5);
   const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
   const [showWindows, setShowWindows] = useState(false);
 
@@ -104,7 +136,8 @@ const LiveTrade = () => {
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
         body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
           connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct),
-          use_mark_price: useMarkPrice, trading_windows: tradingWindows })
+          use_mark_price: useMarkPrice, trading_windows: tradingWindows,
+          price_feed: priceFeed, tick_interval: Number(tickInterval) })
       });
       if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
     } catch (e) { console.error(e); alert(e.message); }
@@ -205,6 +238,24 @@ const LiveTrade = () => {
               <span className="text-[10px] opacity-70">{useMarkPrice ? '· MARK' : '· TRADE'}</span>
             </button>
           </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Exit checks</label>
+            <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none"
+                    title="How often open positions are re-checked against the live price. Entries always wait for a closed 1h candle.">
+              <option value="off">Every 60s (default)</option>
+              <option value="websocket">Live ticks · WebSocket</option>
+              <option value="rest">Live ticks · polling</option>
+            </select>
+          </div>
+          {priceFeed !== 'off' && (
+            <div className="flex flex-col">
+              <label className="text-xs text-gray-500 uppercase font-bold mb-1">Tick interval (s)</label>
+              <input type="number" min="1" max="60" step="1" value={tickInterval}
+                     onChange={e => setTickInterval(e.target.value)}
+                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-24 outline-none" />
+            </div>
+          )}
           <a href="/terminal"
              className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
             <TerminalSquare size={16} /> Terminal
@@ -290,6 +341,12 @@ const LiveTrade = () => {
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
                       <span className="text-xs font-mono">{inst.broker_name || 'Binance'} · {inst.instance_key.split('_').pop()}</span>
+                      {inst.account_label && inst.account_label !== 'Primary' && (
+                        <span className="max-w-[140px] truncate rounded border border-blue-800/60 bg-blue-900/20 px-1.5 py-0.5 text-[9px] font-bold text-blue-300"
+                              title={`Trading on the broker connection '${inst.account_label}'`}>
+                          {inst.account_label}
+                        </span>
+                      )}
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-1">
                       <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
@@ -309,11 +366,15 @@ const LiveTrade = () => {
                           ⏱ {describeSchedule(inst.trading_windows).join(' · ')}
                         </span>
                       )}
-                      {(inst.blocked_entries || 0) > 0 && (
-                        <span className="rounded border border-red-900/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300">
-                          {inst.blocked_entries} skipped
-                        </span>
-                      )}
+                      <EntryGuardBadges
+                        blocked={inst.blocked_entries || 0}
+                        held={inst.skipped_entries || 0}
+                        reason={inst.last_skip_reason}
+                        position={inst.exchange_position}
+                        broker={inst.broker_name || 'the broker'}
+                        shared={inst.shared_account}
+                      />
+                      <FeedBadge feed={inst.price_feed} />
                     </div>
                   </div>
                   <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">

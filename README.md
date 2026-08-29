@@ -55,9 +55,20 @@ orders and are cancelled when the position closes. Stops trigger on the **mark p
 (`stop_trigger_method: mark_price` on Delta, `workingType: MARK` + `priceProtect` on Binance).
 
 **Terminal panels** — Positions (size in BTC *and* the venue's unit, entry, mark, liquidation,
-margin, leverage, uPnL, ROE, close button), Open Orders, Stop Orders (trigger + trigger method),
-Fills (fee, maker/taker, realised PnL), Order History, plus Wallet & Margin, Risk (margin
-utilisation, effective leverage, long/short/net exposure) and a live Rate-limit panel.
+margin, leverage, uPnL, ROE, close button), Open Orders (**Resting** age + **Unfilled** size per
+order), Stop Orders (trigger + trigger method), Fills (fee, maker/taker, realised PnL), Order
+History, plus Wallet & Margin, Risk (margin utilisation, effective leverage, long/short/net
+exposure) and a live Rate-limit panel.
+
+**Ticket** — Buy/Long and Sell/Short; Market, Limit, Stop Market, Stop Limit, Take Profit and
+Trailing Stop; size in BTC or in the venue's own lots/contracts; **Reduce only** and **Maker only
+(post-only**, limit orders only, so the order can never take liquidity and pay a taker fee**)**;
+bracket stop-loss / take-profit; and Leverage + margin mode (Isolated / Cross) beside it.
+
+**Unfilled alert** — an open entry that has been resting unfilled longer than the chosen threshold
+(off / 30s / 1m / 5m / 15m) raises a banner above the tables naming the order, its price, the size
+still open and how long it has waited, and the same age is flagged inline in Open Orders. Stop and
+take-profit legs are deliberately excluded: they are meant to rest until price reaches the trigger.
 
 **Sizing** — Delta sizes in whole contracts (1 contract = 0.001 BTC), Binance in BTC lots; the
 ticket accepts either unit and converts using the contract specification read from the venue.
@@ -65,6 +76,108 @@ ticket accepts either unit and converts using the contract specification read fr
 **Local audit trail** — every order (`broker_orders`, tagged with its leg, client id and the strategy
 instance that sent it) and every fill (`broker_fills`) is mirrored locally, deduplicated on the
 exchange trade id, so history survives the exchange's own window.
+
+**When a live run sends an order.** The live worker polls every 60 seconds, but an entry condition —
+a custom rule set especially — can stay TRUE for many 1h candles. A run therefore applies the same
+three gates the backtest engine uses, so pressing **Start Instance** can never machine-gun the
+exchange:
+
+* **one order per signal candle** — once a candle's signal has been traded, the remaining ticks of
+  that candle send nothing;
+* **one position at a time** — a new entry is refused while a position is open (the documented
+  `allow_reverse` still closes and flips; `allow_overlap` is refused live because the worker manages
+  one position per contract);
+* **`cooldown_bars` after a close** — counted in candles, not in ticks, and the holding-time clock
+  (`timeout_bars`) is too, so a position is closed after 72 *hours*, not 72 minutes;
+* **the venue is believed over the local book** — if the exchange already holds a position (an
+  earlier run, a worker restart, or a manual order from the terminal) no entry goes out on top of it,
+  and if the position cannot be read at all the entry is held rather than guessed.
+
+Refusals are counted, not silent: `skipped_entries` + `last_skip_reason` and `exchange_position` are
+returned by `GET /live-trade/status` and `GET /paper-trade/status`, and the instance card shows a
+**held** badge (tooltip = the exact reason) plus a **VENUE LONG/SHORT** badge for a position the
+instance did not open itself.
+
+### Live tick data for exit checks
+
+By default the worker wakes every 60 seconds, re-reads the candles and re-checks the stop-loss. A
+position can therefore run past its stop for up to a minute before the worker notices — and that
+minute is exactly when a stop matters.
+
+The **Exit checks** selector on the Live Trade page speeds that up:
+
+| Option | Behaviour |
+| --- | --- |
+| Every 60s (default) | Original cadence. Nothing changes. |
+| Live ticks · WebSocket | Subscribes to the venue stream (`markPrice` on Binance, `v2/ticker` on Delta). Costs no rate-limit weight. |
+| Live ticks · polling | Polls the mark-price endpoint every *n* seconds. The fallback on a venue with no stream. |
+
+Only **exits** speed up. Entries still wait for a closed 1h candle, because the signals come from the
+1h/4h frames — re-reading them faster would burn rate-limit weight and change nothing. The fast tick
+never advances the holding-time clock either, so `timeout_bars` still means candles.
+
+Two guards matter:
+
+* **a stale price is never traded on.** If the feed has not produced a price within `max_age`
+  (15s), the worker ignores it and waits for the 60-second tick instead. Acting on a number nobody
+  refreshed would be worse than acting late.
+* **a dropped socket reconnects** with capped exponential backoff, and the instance card flips to
+  **TICK·WS STALE** so a silently-dead feed is visible instead of quietly downgrading.
+
+`GET /live-trade/status` returns `price_feed` (`mode`, `kind`, `connected`, `stale`, `age_seconds`,
+`messages`, `reconnects`, `fast_ticks`, `last_error`).
+
+### Running 3–4 strategies at once
+
+You can start as many live instances as you like, and they run side by side — but a futures account
+holds **one netted position per contract**, so how many can actually be *in a trade* depends on how
+they are pointed at the exchange:
+
+| Setup | Behaviour |
+| --- | --- |
+| 3–4 strategies, **one API key** | They **take turns**. One holds the position, the rest queue and trade when it closes. Only one is ever in a trade. |
+| 3–4 strategies, **one key per strategy** (or sub-accounts) | Genuinely independent — all 3–4 can be in a trade at the same time. |
+
+The queue is real, not a limit you can configure away: two instances trading the same contract on one
+account would net into a single position that neither of them sized, and a long and a short would
+cancel out to 0.0000 BTC while both books still reported a live trade. Instances on the same key are
+recognised by a hash of the API key, so separate sub-accounts never block each other.
+
+Three things keep a shared account safe:
+
+* **scoped cancellation** — an exit cancels only the stop-loss / take-profit legs *that instance*
+  placed (per order id), never the account-wide `DELETE /fapi/v1/allOpenOrders`. A strategy closing
+  its trade used to also pull every other resting order on the contract, including protection another
+  instance was relying on and orders you placed yourself from the terminal.
+* **reduce-only exits** — a close is sent `reduceOnly`, so if the position is already flat (the
+  venue-side stop got there first, or another instance closed it) the order is refused and the local
+  book settles instead of opening a fresh opposite position nobody manages.
+* **shared rate limiter** — one weight budget per API key across every instance, so 4 runs do not
+  multiply your order-rate 4×.
+
+`GET /live-trade/status` returns `shared_account` for any run that is not alone on its key:
+`strategies_on_account`, `queue_position`, `position_held_by`, `holds_account_position` and
+`other_strategies`. The instance card shows it as **HOLDS ACCOUNT · n SHARED** or **QUEUED 2/3**, so
+an idle strategy reads as *waiting its turn* rather than broken.
+
+**Broker connection vs Exchange Registry.** Two different things live on the **Broker** page and
+they are the usual reason a live account reports *"API keys not configured"*:
+
+* **Exchange Registry** (admin) — registers the *integration*: a code, a display name, the adapter
+  kind (`binance` / `delta` / generic) and the market-data and trading URLs. It holds **no
+  credentials**. Adding an entry here does not let anyone trade.
+* **Add broker connection** (each login) — that account's **API key and secret** for one venue.
+  Connections are stored **per user**, so keys added while signed in as the admin are *not* shared
+  with a client account; each client adds its own.
+
+A saved connection is matched to a venue by its registry code, and any spelling resolves (code, any
+case, or the display name), as does a row inserted straight into the database with `is_active` left
+NULL. When a live call still cannot find credentials, the error now says which case applies — no
+connection on this login, connection switched off, no secret stored, keys on another account — and
+`GET /broker-connections/diagnose?broker=Binance` returns the same picture as data: the registry
+entry, every saved connection (stored vs resolved code, masked key, secret present, on/off,
+testnet), a `ready` flag and a plain-language `problems` list. **Broker Settings** renders it as a
+*Ready to trade* / *Not ready* panel so the cause is visible without reading the database.
 
 **Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
 
@@ -251,11 +364,16 @@ python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_paper_history.py      # 56 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
+python test_seed_repair.py        # 57 checks: full-history seed + corrupt-candle repair
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
 python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
+python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
+python test_broker_connections.py # 37 checks: which saved credentials a live call uses, and why not
+python test_multi_instance_live.py # 92 checks: 3-4 live strategies sharing one broker account
+python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 216 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 289 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

@@ -13,7 +13,8 @@ globalThis.localStorage = {
 globalThis.window = { location: { protocol: 'http:', hostname: 'localhost' }, addEventListener() {}, removeEventListener() {} };
 globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ({}) });
 
-import LiveTerminal, { fmt, fmtBtc, fmtSize, signed, pnlClass, perpetualFor, TABS, ORDER_TYPES } from '../src/components/LiveTerminal.jsx';
+import LiveTerminal, { fmt, fmtBtc, fmtSize, signed, pnlClass, perpetualFor, TABS, ORDER_TYPES,
+  orderAgeSeconds, unfilledOrders, ageLabel, UNFILL_THRESHOLDS } from '../src/components/LiveTerminal.jsx';
 import TerminalPage from '../src/pages/Terminal.jsx';
 
 let pass = 0, fail = 0;
@@ -108,7 +109,11 @@ check('order type selector', ORDER_TYPES.every((t) => html.includes(t.label)));
 check('size input in BTC + venue unit', html.includes('Size (BTC)') && html.includes('Unit'));
 check('bracket stop-loss / take-profit inputs', html.includes('Stop loss') && html.includes('Take profit'));
 check('bracket explains the venue behaviour', html.includes('native bracket order'));
-check('reduce-only + post-only flags', html.includes('Reduce only') && html.includes('Post only'));
+// "Post only" is what the venue calls it; the ticket says what it does.
+check('reduce-only + maker-only flags',
+  html.includes('Reduce only') && html.includes('Maker only (post-only)'), html.slice(0, 120));
+check('maker-only is limited to limit orders',
+  /Maker only[\s\S]{0,200}disabled/.test(html) || html.includes('disabled'));
 check('submit button sizes the order in BTC', html.includes('Buy 0.0100 BTC'));
 
 // --------------------------------------------------------- account controls --
@@ -176,6 +181,63 @@ check('signed adds a plus for gains and nothing for losses',
 check('pnlClass colours gains green and losses red',
   pnlClass(1) === 'text-green-400' && pnlClass(-1) === 'text-red-400' && pnlClass(0) === 'text-gray-400');
 check('perpetualFor maps both venues', perpetualFor('Delta') === 'BTCUSD' && perpetualFor('Binance') === 'BTCUSDT');
+
+// ------------------------------------------------------ unfilled-order alert --
+const NOW = Date.parse('2026-08-28T12:00:00Z');
+const resting = { ...snapshot.open_orders[0], created_at: '2026-08-28T11:59:00Z' };
+const stale = { ...snapshot.open_orders[0], created_at: '2026-08-28T11:00:00Z' };
+const partFilled = { ...stale, order_id: '91003', filled_size: 10, unfilled_size: 20 };
+const stopLeg = { ...snapshot.stop_orders[0], created_at: '2026-08-28T11:00:00Z', unfilled_size: 30 };
+const filledOrder = { ...stale, order_id: '91004', filled_size: 30, unfilled_size: 0 };
+
+check('orderAgeSeconds measures the wait', orderAgeSeconds(stale, NOW) === 3600,
+  String(orderAgeSeconds(stale, NOW)));
+check('orderAgeSeconds is null without a timestamp',
+  orderAgeSeconds({ order_id: 'x' }, NOW) === null);
+check('orderAgeSeconds accepts epoch millis',
+  orderAgeSeconds({ created_at: NOW - 5000 }, NOW) === 5);
+check('ageLabel formats seconds, minutes and hours',
+  ageLabel(45) === '45s' && ageLabel(125) === '2m 5s' && ageLabel(3660) === '1h 1m',
+  `${ageLabel(45)}/${ageLabel(125)}/${ageLabel(3660)}`);
+
+const flagged = unfilledOrders([resting, stale, partFilled, stopLeg, filledOrder],
+  { nowMs: NOW, olderThanSeconds: 300 });
+check('only orders older than the threshold are flagged',
+  flagged.length === 2, JSON.stringify(flagged.map((o) => o.order_id)));
+check('the flagged rows carry their age',
+  flagged.every((o) => typeof o.age_seconds === 'number' && o.age_seconds >= 300));
+check('a stop / take-profit leg is never flagged',
+  !flagged.some((o) => o.is_stop), 'stop legs are meant to rest until they trigger');
+check('a fully filled order is not flagged',
+  !flagged.some((o) => o.order_id === '91004'));
+check('a partly filled order is still flagged',
+  flagged.some((o) => o.order_id === '91003'));
+check('oldest first', flagged[0].age_seconds >= flagged[1].age_seconds);
+check('threshold 0 switches the alert off',
+  unfilledOrders([stale], { nowMs: NOW, olderThanSeconds: 0 }).length === 0);
+check('the thresholds offered include an off switch',
+  UNFILL_THRESHOLDS.some((t) => t.value === 0) && UNFILL_THRESHOLDS.length >= 4);
+
+// The banner, the aged Open Orders table and the alert control, as rendered.
+const alertHtml = renderToString(React.createElement(LiveTerminal, {
+  broker: 'Delta', connectionId: 1, snapshot, autoRefresh: false, initialTab: 'open_orders',
+}));
+check('the unfilled banner is rendered for a stale order',
+  alertHtml.includes('unfilled order') && alertHtml.includes('resting longer than'),
+  alertHtml.slice(0, 300));
+check('the banner names the order and how long it waited',
+  alertHtml.includes('91001') || alertHtml.includes('BTCUSD'));
+check('Open Orders gained a Resting column', alertHtml.includes('Resting'));
+check('Open Orders gained an Unfilled column', alertHtml.includes('Unfilled'));
+check('the terminal exposes the alert threshold control',
+  alertHtml.includes('Unfilled alert') && alertHtml.includes('Flag a working order after'));
+check('the ticket offers maker-only execution', html.includes('Maker only (post-only)'));
+check('the ticket keeps both sides and every order type',
+  html.includes('Buy / Long') && html.includes('Sell / Short')
+  && ORDER_TYPES.every((t) => html.includes(t.label)));
+check('the terminal has leverage and margin-type controls',
+  html.includes('Leverage') && html.includes('Margin mode')
+  && html.includes('Isolated') && html.includes('Cross'));
 
 // -------------------------------------------------------------- page shell --
 const pageHtml = renderToString(React.createElement(TerminalPage));

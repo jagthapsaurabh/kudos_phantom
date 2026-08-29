@@ -8,6 +8,9 @@ pydantic
 python-multipart
 passlib[bcrypt]
 python-dotenv
+# Live price streams for the live trader's fast exit checks. Also pulled in by
+# uvicorn[standard], but declared explicitly because app code imports it.
+websockets
 sqlalchemy
 bcrypt
 # PostgreSQL driver — required when DATABASE_URL points at a Postgres instance

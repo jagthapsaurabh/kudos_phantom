@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { API_URL } from '../api';
 import { KeyRound, Plus, Trash2, ShieldCheck, RefreshCw, Wallet, Plug } from 'lucide-react';
+import ConnectionCheck from '../components/ConnectionCheck';
 
 const auth = () => ({ Authorization: `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 const field = 'w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm outline-none focus:border-blue-500';
@@ -19,6 +20,7 @@ const ExchangeRegistry = () => {
 
   const load = () => fetch(`${API_URL}/admin/brokers`, { headers: auth() }).then(r => r.json()).then(setRows).catch(() => {});
   useEffect(() => { load(); }, []);
+  useEffect(() => { loadCheck(defaultBroker); }, [defaultBroker]);
 
   const add = async (e) => {
     e.preventDefault();
@@ -76,6 +78,11 @@ const ExchangeRegistry = () => {
         <h2 className="text-lg font-bold text-gray-200">Exchange Registry</h2>
         <span className="text-[10px] font-bold uppercase bg-purple-900/50 text-purple-300 px-2 py-0.5 rounded">Admin</span>
       </div>
+      <p className="text-xs text-gray-500 mb-1 max-w-3xl">
+        <b className="text-gray-300">The integration itself — not your API keys.</b> The registry names a venue and
+        picks the adapter and URLs it talks to. Adding an entry here does <b className="text-gray-300">not</b> let anyone
+        trade: each login still needs its own key and secret under <b className="text-gray-300">Add broker connection</b>.
+      </p>
       <p className="text-xs text-gray-500 mb-4 max-w-3xl">
         Binance Futures and Delta Exchange are ready-to-use adapters. Register another provider here so it is
         available as a named source for every client. Choose <b className="text-gray-300">Binance-compatible</b> or
@@ -183,8 +190,23 @@ const BrokerSettings = () => {
   const [form, setForm] = useState({ broker_code: 'Binance', label: '', api_key: '', api_secret: '', passphrase: '', is_testnet: false });
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
+  // `GET /broker-connections/diagnose` — what the server sees for this login,
+  // so "API keys not configured" can be answered on the page instead of guessed.
+  const [check, setCheck] = useState(null);
+  const [checkBusy, setCheckBusy] = useState(false);
+
+  const loadCheck = async (broker) => {
+    setCheckBusy(true);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/diagnose?broker=${encodeURIComponent(broker)}`,
+                              { headers: auth() });
+      setCheck(res.ok ? await res.json() : null);
+    } catch (e) { setCheck(null); }
+    setCheckBusy(false);
+  };
 
   const load = async () => {
+    let broker = defaultBroker;
     try {
       const [defs, cons, settings] = await Promise.all([
         fetch(`${API_URL}/broker-definitions`, { headers: auth() }).then(r => r.json()),
@@ -196,12 +218,15 @@ const BrokerSettings = () => {
       if (settings) {
         setCapital(settings.initial_capital || 20000);
         setMargin(settings.margin_deployment_pct || 25);
-        setDefaultBroker(settings.broker_name || 'Binance');
-        setForm(f => ({ ...f, broker_code: settings.broker_name || 'Binance' }));
+        broker = settings.broker_name || 'Binance';
+        setDefaultBroker(broker);
+        setForm(f => ({ ...f, broker_code: broker }));
       }
     } catch (e) { setMessage({ ok: false, text: 'Could not load broker settings' }); }
+    loadCheck(broker);
   };
   useEffect(() => { load(); }, []);
+  useEffect(() => { loadCheck(defaultBroker); }, [defaultBroker]);
 
   const addConnection = async (e) => {
     e.preventDefault(); setBusy(true); setMessage(null);
@@ -212,6 +237,7 @@ const BrokerSettings = () => {
       setMessage({ ok: true, text: `${form.broker_code} connection added. Secrets are stored server-side and masked here.` });
       setForm(f => ({ ...f, label: '', api_key: '', api_secret: '', passphrase: '' }));
       load();
+      loadCheck(form.broker_code);
     } catch (e) { setMessage({ ok: false, text: e.message }); }
     setBusy(false);
   };
@@ -219,7 +245,7 @@ const BrokerSettings = () => {
   const removeConnection = async (id) => {
     if (!window.confirm('Remove this broker connection? Running instances are not changed.')) return;
     const res = await fetch(`${API_URL}/broker-connections/${id}`, { method: 'DELETE', headers: auth() });
-    if (res.ok) load(); else setMessage({ ok: false, text: 'Could not remove connection' });
+    if (res.ok) { load(); loadCheck(defaultBroker); } else setMessage({ ok: false, text: 'Could not remove connection' });
   };
 
   const saveCapital = async () => {
@@ -285,6 +311,9 @@ const BrokerSettings = () => {
             ))}
             {activeConnections.length === 0 && <div className="text-xs text-gray-500">No saved connections yet.</div>}
           </div>
+          <div className="mt-4">
+            <ConnectionCheck report={check} loading={checkBusy} />
+          </div>
           <div className="mt-5 p-3 bg-green-900/10 border border-green-900/30 rounded-lg text-xs text-gray-400 flex gap-2">
             <ShieldCheck size={15} className="text-green-400 shrink-0 mt-0.5" /> Multiple connections can run at the same time from Paper Trade or Live Trade.
           </div>
@@ -292,6 +321,10 @@ const BrokerSettings = () => {
 
         <form onSubmit={addConnection} className={`${card} md:col-span-2 lg:col-span-1`}>
           <h2 className="text-lg font-bold text-gray-200 mb-1 flex items-center gap-2"><Plus size={18} className="text-green-400" /> Add broker connection</h2>
+          <p className="text-xs text-gray-500 mb-1">
+            <b className="text-gray-300">Your API keys, for this login.</b> This is what Live Trade and the Terminal
+            actually use. Connections are saved per account — keys added while signed in as someone else are not shared.
+          </p>
           <p className="text-xs text-gray-500 mb-4">API secrets are never returned in full. Use read/write trading permissions only when live trading is enabled.</p>
           <div className="space-y-3">
             <div>

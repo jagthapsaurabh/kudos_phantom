@@ -117,10 +117,20 @@ class OrderManager:
         return trade
 
     def update_trade(self, symbol, current_price_usd, current_atr_usd, timestamp,
-                     trade_price_usd=None, mark_price_usd=None):
+                     trade_price_usd=None, mark_price_usd=None, advance_bar=True):
+        """Mark-to-market an open position and apply its stop/target rules.
+
+        ``advance_bar`` controls the holding-time clock only. The backtest
+        engine calls this once per candle, so it stays True there. The live and
+        paper workers poll every 60 seconds — often dozens of times inside one
+        1h candle — so they pass ``advance_bar=False`` until the candle actually
+        rolls over, otherwise ``timeout_bars`` (72 candles = 3 days) would
+        force-close a position after 72 *minutes*.
+        """
         if symbol not in self.active_trades: return None
         trade = self.active_trades[symbol]
-        trade.bars_held += 1
+        if advance_bar:
+            trade.bars_held += 1
         trade.current_price = current_price_usd
         # Keep both prices current: `current_price` is the pricing basis (mark),
         # `exit_trade_price` records what the market was trading at when the
