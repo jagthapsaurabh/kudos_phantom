@@ -20,6 +20,7 @@ All protected endpoints require a Bearer Token in the header:
 | `GET` | `/broker-definitions` | None | Enabled exchange/broker data sources (Binance and Delta are built in) |
 | `GET` | `/broker-connections` | None | Current user's masked, multi-broker connections |
 | `POST` | `/broker-connections` | `broker_code`, `label`, `api_key`, `api_secret`, `passphrase`, `is_testnet` | Add a credential connection; multiple may be active |
+| `GET` | `/broker-connections/diagnose` | `broker`, `connection_id` | Whether THIS login can trade that broker: the registry entry, every saved connection (stored vs resolved code, masked key, secret present, on/off, testnet), `ready` and a plain-language `problems` list |
 | `DELETE` | `/broker-connections/{id}` | None | Remove a user's connection |
 | `GET` | `/broker-settings` | None | Get capital defaults and masked legacy settings |
 | `POST` | `/broker-settings` | `api_key`, `api_secret`, `initial_capital`, `margin_pct`, `broker_name` | Update legacy/primary broker keys and capital |

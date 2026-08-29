@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, Clock, Crosshair,
+  Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Ban, BellRing, Clock, Crosshair,
   DollarSign, Gauge, History, Layers, Percent, RefreshCw, ShieldAlert, Sliders,
   Trash2, TrendingUp, Wallet, XCircle, Zap,
 } from 'lucide-react';
@@ -49,6 +49,73 @@ export const ORDER_TYPES = [
   { value: 'take_profit_market', label: 'Take Profit' },
   { value: 'trailing_stop', label: 'Trailing Stop' },
 ];
+
+// How long a resting order may sit unfilled before the terminal shouts about it.
+export const UNFILL_THRESHOLDS = [
+  { value: 0, label: 'Unfilled alert off' },
+  { value: 30, label: '30 seconds' },
+  { value: 60, label: '1 minute' },
+  { value: 300, label: '5 minutes' },
+  { value: 900, label: '15 minutes' },
+];
+
+/**
+ * Seconds an order has been resting, or ``null`` when the venue gave no time.
+ *
+ * ``created_at`` arrives as an ISO string from either venue; a bare number is
+ * accepted too (epoch ms) so a raw payload still ages correctly.
+ */
+export const orderAgeSeconds = (order, nowMs = Date.now()) => {
+  const raw = order && order.created_at;
+  if (!raw) return null;
+  const ms = typeof raw === 'number' ? raw : Date.parse(String(raw));
+  if (!Number.isFinite(ms)) return null;
+  return Math.max(0, (Number(nowMs) - ms) / 1000);
+};
+
+/**
+ * Size still waiting to fill.
+ *
+ * The API sends ``unfilled_size``, but it is derived from ``size`` and
+ * ``filled_size``, so a payload that only carries those two still ages and
+ * alerts correctly instead of reading as fully filled.
+ */
+export const remainingSize = (order) => {
+  if (!order) return 0;
+  const direct = Number(order.unfilled_size);
+  if (Number.isFinite(direct)) return direct;
+  const size = Number(order.size) || 0;
+  const filled = Number(order.filled_size) || 0;
+  return Math.max(0, size - filled);
+};
+
+/**
+ * Open (or partly filled) orders that are still unfilled and older than the
+ * threshold — the "unfilled alert" the terminal shows above the tables.
+ *
+ * A stop / take-profit leg is deliberately excluded: it is *meant* to rest
+ * until price reaches the trigger, so flagging it would be noise. Only working
+ * entries that should have filled are reported. Each row carries `age_seconds`
+ * so the caller can show how long it has been waiting.
+ */
+export const unfilledOrders = (orders, { nowMs = Date.now(), olderThanSeconds = 60 } = {}) => {
+  const threshold = Number(olderThanSeconds);
+  if (!Number.isFinite(threshold) || threshold <= 0 || !Array.isArray(orders)) return [];
+  return orders
+    .filter((o) => o && !o.is_stop && remainingSize(o) > 0)
+    .map((o) => ({ ...o, age_seconds: orderAgeSeconds(o, nowMs) }))
+    .filter((o) => o.age_seconds !== null && o.age_seconds >= threshold)
+    .sort((a, b) => b.age_seconds - a.age_seconds);
+};
+
+
+export const ageLabel = (seconds) => {
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return '—';
+  if (n < 60) return `${Math.floor(n)}s`;
+  if (n < 3600) return `${Math.floor(n / 60)}m ${Math.floor(n % 60)}s`;
+  return `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
+};
 
 export const TABS = [
   { key: 'positions', label: 'Positions', icon: Layers },
@@ -258,11 +325,17 @@ const OrderTicket = ({ broker, symbol, contract, markPrice, disabled, onSubmit, 
             <input type="checkbox" checked={reduceOnly} onChange={(e) => setReduceOnly(e.target.checked)}
                    className="h-3.5 w-3.5 accent-blue-500" /> Reduce only
           </label>
-          <label className="flex items-center gap-1.5">
+          <label className="flex items-center gap-1.5"
+                 title="Maker only: the venue rejects the order instead of taking liquidity, so it never pays a taker fee. Limit orders only.">
             <input type="checkbox" checked={postOnly} onChange={(e) => setPostOnly(e.target.checked)}
-                   className="h-3.5 w-3.5 accent-blue-500" /> Post only
+                   disabled={orderType !== 'limit'}
+                   className="h-3.5 w-3.5 accent-blue-500" />
+            Maker only (post-only)
           </label>
         </div>
+        {orderType !== 'limit' && postOnly && (
+          <p className="text-[10px] text-amber-400">Maker only applies to limit orders — it will be ignored for {orderType.replace(/_/g, ' ')}.</p>
+        )}
 
         <div className="flex items-center justify-between rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2 text-[11px]">
           <span className="text-gray-500">Notional</span>
@@ -296,6 +369,9 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
   const [lastRefresh, setLastRefresh] = useState(null);
   const [leverage, setLeverage] = useState(10);
   const [marginMode, setMarginMode] = useState('isolated');
+  // "Unfilled alert": how long a working order may rest before the terminal
+  // flags it. 0 switches the alert off.
+  const [unfillAfter, setUnfillAfter] = useState(60);
   const timer = useRef(null);
 
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
@@ -397,6 +473,9 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
     fills: data.fills || [],
     order_history: data.order_history || [],
   };
+  // Working entries still unfilled past the chosen age — shown as a banner and
+  // aged inline in the Open Orders table.
+  const unfilled = unfilledOrders(rows.open_orders, { olderThanSeconds: unfillAfter });
 
   const columns = {
     positions: [
@@ -425,12 +504,25 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
     ],
     open_orders: [
       { key: 'created_at', label: 'Time', render: (r) => shortTime(r.created_at) },
+      { key: '_age', label: 'Resting', render: (r) => {
+        const age = orderAgeSeconds(r);
+        if (age === null) return <span className="text-gray-600">—</span>;
+        const stale = unfillAfter > 0 && age >= unfillAfter;
+        return <span className={stale ? 'font-bold text-amber-400' : 'text-gray-400'}
+                     title={stale ? `Unfilled for ${ageLabel(age)} — past the ${ageLabel(unfillAfter)} alert threshold` : `Waiting ${ageLabel(age)}`}>
+          {ageLabel(age)}{stale ? ' ⚠' : ''}
+        </span>;
+      } },
       { key: 'symbol', label: 'Contract', render: (r) => r.symbol },
       { key: 'type', label: 'Type', render: (r) => <span className="uppercase">{String(r.type || '').replace(/_/g, ' ').toUpperCase()}</span> },
       { key: 'side', label: 'Side', render: (r) => <Badge tone={r.side === 'buy' ? 'green' : 'red'}>{r.side}</Badge> },
       { key: 'qty_btc', label: 'Size (BTC)', render: (r) => fmtBtc(r.qty_btc) },
       { key: 'price', label: 'Price', render: (r) => fmt(r.price, 2) },
       { key: 'filled_size', label: 'Filled', render: (r) => fmtSize(r.filled_size, unit) },
+      { key: 'unfilled_size', label: 'Unfilled', render: (r) => (
+        <span className={remainingSize(r) > 0 ? 'text-amber-400' : 'text-gray-500'}>
+          {fmtSize(remainingSize(r), unit)}
+        </span>) },
       { key: 'order_id', label: 'Order ID', render: (r) => <span className="text-gray-500">{r.order_id}</span> },
       { key: '_cancel', label: '', render: (r) => (
         <button onClick={() => cancelOrder(r)} disabled={busy}
@@ -631,6 +723,24 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
 
           <div className="rounded-2xl border border-gray-700 bg-gray-800 p-4">
             <h3 className="mb-3 flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-gray-400">
+              <BellRing size={15} /> Unfilled alert
+            </h3>
+            <Field label="Flag a working order after"
+                   hint="Applies to open entries only — stop / take-profit legs are meant to rest until they trigger.">
+              <select value={unfillAfter} onChange={(e) => setUnfillAfter(Number(e.target.value))}
+                      className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-white outline-none focus:border-blue-500">
+                {UNFILL_THRESHOLDS.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+              </select>
+            </Field>
+            <p className="mt-2 text-[11px] text-gray-500">
+              {unfillAfter > 0
+                ? `${unfilled.length} order${unfilled.length === 1 ? '' : 's'} unfilled for more than ${ageLabel(unfillAfter)}.`
+                : 'Alert is off — the Open Orders table still shows how long each order has been resting.'}
+            </p>
+          </div>
+
+          <div className="rounded-2xl border border-gray-700 bg-gray-800 p-4">
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-gray-400">
               <ShieldAlert size={15} /> Risk actions
             </h3>
             <div className="space-y-2">
@@ -652,6 +762,35 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
 
         {/* ---------------- tabs ---------------------------------------- */}
         <div className="xl:col-span-2">
+          {/* Unfilled alert: a working order that should have filled by now. */}
+          {unfilled.length > 0 && (
+            <div className="mb-3 rounded-2xl border border-amber-800 bg-amber-900/20 p-3">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <BellRing size={15} className="text-amber-400" />
+                <span className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                  {unfilled.length} unfilled order{unfilled.length > 1 ? 's' : ''}
+                </span>
+                <span className="text-[11px] text-amber-200/70">
+                  resting longer than {ageLabel(unfillAfter)}
+                </span>
+                <button onClick={() => setTab('open_orders')}
+                        className="ml-auto rounded border border-amber-800 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40">
+                  Open Orders
+                </button>
+              </div>
+              <ul className="space-y-0.5">
+                {unfilled.slice(0, 4).map((o) => (
+                  <li key={o.order_id || o.client_order_id} className="font-mono text-[11px] text-amber-200/80">
+                    {String(o.side || '').toUpperCase()} {o.symbol} · {String(o.type || '').replace(/_/g, ' ')} @ {fmt(o.price, 2)}
+                    {' '}· {fmtSize(o.unfilled_size, unit)} left · waiting {ageLabel(o.age_seconds)}
+                  </li>
+                ))}
+                {unfilled.length > 4 && (
+                  <li className="text-[11px] text-amber-200/60">+{unfilled.length - 4} more…</li>
+                )}
+              </ul>
+            </div>
+          )}
           <div className="rounded-2xl border border-gray-700 bg-gray-800">
             <div className="flex flex-wrap gap-1 border-b border-gray-700 p-2">
               {TABS.map(({ key, label, icon: Icon }) => (

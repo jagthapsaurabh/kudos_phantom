@@ -17,6 +17,7 @@ import Backtest from '../src/pages/Backtest.jsx';
 import PaperTrade from '../src/pages/PaperTrade.jsx';
 import LiveTrade from '../src/pages/LiveTrade.jsx';
 import EntryGuardBadges from '../src/components/EntryGuardBadges.jsx';
+import ConnectionCheck from '../src/components/ConnectionCheck.jsx';
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = '') => {
@@ -76,6 +77,50 @@ const shortBadges = flat(renderToString(React.createElement(EntryGuardBadges, {
 check('a short venue position is labelled', shortBadges.includes('VENUE SHORT 0.0040'), shortBadges);
 check('no badges when nothing was refused',
   renderToString(React.createElement(EntryGuardBadges, {})).trim() === '');
+
+// ------------------------------------------------- broker connection check --
+// The panel that answers "I added the broker, why does it say no API keys?".
+const readyReport = {
+  broker: 'Binance', account: 'client1',
+  definition: { code: 'Binance', name: 'Binance Futures', kind: 'binance', enabled: true, is_builtin: true },
+  connections: [{ id: 3, label: 'primary', stored_code: 'Binance Futures', resolved_code: 'Binance',
+                  api_key: 'KEY1••••1234', has_secret: true, is_active: true, is_testnet: false }],
+  legacy_account_keys: false, ready: true, problems: [],
+};
+const ready = flat(renderToString(React.createElement(ConnectionCheck, { report: readyReport })));
+check('a ready broker shows the READY badge', ready.includes('Ready to trade'), ready.slice(0, 160));
+check('the check names the broker and the login',
+  ready.includes('Binance') && ready.includes('client1'));
+check('the check separates Registry from connection',
+  ready.includes('Exchange Registry:') && ready.includes('primary'));
+check('a code saved under another spelling is shown resolving',
+  ready.includes('Binance Futures → Binance'), ready.slice(0, 400));
+check('the secret itself is never rendered', !ready.includes('SECRET'));
+
+const brokenReport = {
+  broker: 'Binance', account: 'client2', definition: readyReport.definition,
+  connections: [{ id: 4, label: 'primary', stored_code: 'Binance', resolved_code: 'Binance',
+                  api_key: '', has_secret: false, is_active: false, is_testnet: false }],
+  legacy_account_keys: false, ready: false,
+  problems: ["The Binance connection 'primary' on the account 'client2' is switched off."],
+};
+const broken = flat(renderToString(React.createElement(ConnectionCheck, { report: brokenReport })));
+check('a broken broker shows NOT READY', broken.includes('Not ready'));
+check('the exact problem is printed', broken.includes('switched off'), broken.slice(-260));
+check('a connection with no secret is flagged', broken.includes('NO SECRET'));
+check('a switched-off connection reads as off', broken.includes('off'));
+
+const empty = flat(renderToString(React.createElement(ConnectionCheck, {
+  report: { broker: 'Delta', account: 'solo', definition: null, connections: [],
+            legacy_account_keys: false, ready: false,
+            problems: ["No broker connection saved on the account 'solo'."] },
+})));
+check('a missing registry entry is called out', empty.includes('not registered'));
+check('no connections is stated plainly', empty.includes('No broker connection saved on this login'));
+
+check('loading and empty states render',
+  renderToString(React.createElement(ConnectionCheck, { loading: true })).includes('Checking connection')
+  && renderToString(React.createElement(ConnectionCheck, {})).includes('No connection check yet'));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -55,9 +55,20 @@ orders and are cancelled when the position closes. Stops trigger on the **mark p
 (`stop_trigger_method: mark_price` on Delta, `workingType: MARK` + `priceProtect` on Binance).
 
 **Terminal panels** — Positions (size in BTC *and* the venue's unit, entry, mark, liquidation,
-margin, leverage, uPnL, ROE, close button), Open Orders, Stop Orders (trigger + trigger method),
-Fills (fee, maker/taker, realised PnL), Order History, plus Wallet & Margin, Risk (margin
-utilisation, effective leverage, long/short/net exposure) and a live Rate-limit panel.
+margin, leverage, uPnL, ROE, close button), Open Orders (**Resting** age + **Unfilled** size per
+order), Stop Orders (trigger + trigger method), Fills (fee, maker/taker, realised PnL), Order
+History, plus Wallet & Margin, Risk (margin utilisation, effective leverage, long/short/net
+exposure) and a live Rate-limit panel.
+
+**Ticket** — Buy/Long and Sell/Short; Market, Limit, Stop Market, Stop Limit, Take Profit and
+Trailing Stop; size in BTC or in the venue's own lots/contracts; **Reduce only** and **Maker only
+(post-only**, limit orders only, so the order can never take liquidity and pay a taker fee**)**;
+bracket stop-loss / take-profit; and Leverage + margin mode (Isolated / Cross) beside it.
+
+**Unfilled alert** — an open entry that has been resting unfilled longer than the chosen threshold
+(off / 30s / 1m / 5m / 15m) raises a banner above the tables naming the order, its price, the size
+still open and how long it has waited, and the same age is flagged inline in Open Orders. Stop and
+take-profit legs are deliberately excluded: they are meant to rest until price reaches the trigger.
 
 **Sizing** — Delta sizes in whole contracts (1 contract = 0.001 BTC), Binance in BTC lots; the
 ticket accepts either unit and converts using the contract specification read from the venue.
@@ -86,6 +97,25 @@ Refusals are counted, not silent: `skipped_entries` + `last_skip_reason` and `ex
 returned by `GET /live-trade/status` and `GET /paper-trade/status`, and the instance card shows a
 **held** badge (tooltip = the exact reason) plus a **VENUE LONG/SHORT** badge for a position the
 instance did not open itself.
+
+**Broker connection vs Exchange Registry.** Two different things live on the **Broker** page and
+they are the usual reason a live account reports *"API keys not configured"*:
+
+* **Exchange Registry** (admin) — registers the *integration*: a code, a display name, the adapter
+  kind (`binance` / `delta` / generic) and the market-data and trading URLs. It holds **no
+  credentials**. Adding an entry here does not let anyone trade.
+* **Add broker connection** (each login) — that account's **API key and secret** for one venue.
+  Connections are stored **per user**, so keys added while signed in as the admin are *not* shared
+  with a client account; each client adds its own.
+
+A saved connection is matched to a venue by its registry code, and any spelling resolves (code, any
+case, or the display name), as does a row inserted straight into the database with `is_active` left
+NULL. When a live call still cannot find credentials, the error now says which case applies — no
+connection on this login, connection switched off, no secret stored, keys on another account — and
+`GET /broker-connections/diagnose?broker=Binance` returns the same picture as data: the registry
+entry, every saved connection (stored vs resolved code, masked key, secret present, on/off,
+testnet), a `ready` flag and a plain-language `problems` list. **Broker Settings** renders it as a
+*Ready to trade* / *Not ready* panel so the cause is visible without reading the database.
 
 **Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
 
@@ -275,9 +305,10 @@ python test_api_e2e.py            # 47 checks: API end to end
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
 python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
 python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
+python test_broker_connections.py # 37 checks: which saved credentials a live call uses, and why not
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 235 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 268 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

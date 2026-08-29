@@ -767,9 +767,71 @@ def list_broker_connections(user=Depends(get_current_user), db=Depends(get_db)):
     return result
 
 
+@app.get('/broker-connections/diagnose')
+def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[int] = None,
+                               user=Depends(get_current_user), db=Depends(get_db)):
+    """Explain, for THIS login, whether a broker is ready to trade.
+
+    "API keys not configured" used to cover five different situations that look
+    identical from the browser. This reports what the server actually found —
+    the registry entry, every saved connection (with the code it resolves to),
+    the legacy per-account keys, and a plain-language list of what is missing —
+    so the difference between the Exchange Registry and a broker connection is
+    visible instead of guessed at.
+    """
+    code = normalize_source(broker)
+    definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
+    rows = _user_connections(db, user, code)
+    connections = [{
+        'id': r.id, 'label': r.label or r.broker_code,
+        'stored_code': r.broker_code,
+        'resolved_code': _canonical_broker_code(db, r.broker_code),
+        'api_key': _mask(r.api_key), 'has_secret': bool(r.api_secret),
+        'is_active': _connection_is_active(r), 'is_testnet': bool(r.is_testnet),
+        'created_at': r.created_at,
+    } for r in rows]
+    legacy_keys = bool(user.api_key and user.api_secret and
+                       normalize_source(user.broker_name) == code)
+    usable = [c for c in connections
+              if c['is_active'] and c['api_key'] and c['has_secret']
+              and (connection_id is None or c['id'] == connection_id)]
+
+    problems = []
+    if not definition:
+        problems.append(f"'{code}' is not in the Exchange Registry, so no adapter can trade it.")
+    elif not definition.enabled:
+        problems.append(f"'{code}' is disabled in the Exchange Registry — enable it to use it.")
+    if not connections:
+        problems.append(f"No broker connection saved on the account '{user.username}'. The Exchange "
+                        f"Registry only registers the integration; credentials belong to a login.")
+    else:
+        if not any(c['is_active'] for c in connections):
+            problems.append("Every saved connection is switched off.")
+        if not any(c['has_secret'] for c in connections):
+            problems.append("No saved connection has an API secret. Secrets are never returned, so "
+                            "re-enter it when editing the connection.")
+    if not usable and not legacy_keys:
+        problems.append(_credentials_problem(db, user, code, connection_id))
+
+    return {
+        'broker': code,
+        'account': user.username,
+        'definition': ({'code': definition.code, 'name': definition.name, 'kind': definition.kind,
+                        'enabled': bool(definition.enabled), 'is_builtin': bool(definition.is_builtin)}
+                       if definition else None),
+        'connections': connections,
+        'legacy_account_keys': legacy_keys,
+        'ready': bool(usable or legacy_keys) and bool(definition and definition.enabled),
+        'problems': problems,
+    }
+
+
 @app.post('/broker-connections')
 def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
-    code = normalize_source(payload.broker_code)
+    # Accept any spelling the UI or a script may send (code, case, or the
+    # display name) and store the canonical registry code, so a saved row always
+    # matches what the live call looks up.
+    code = _canonical_broker_code(db, payload.broker_code)
     if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
@@ -785,7 +847,7 @@ def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_
 def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
     row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
-    row.broker_code = normalize_source(payload.broker_code); row.label = payload.label
+    row.broker_code = _canonical_broker_code(db, payload.broker_code); row.label = payload.label
     # Empty secrets mean "keep the existing secret" in the edit form.
     if payload.api_key: row.api_key = payload.api_key
     if payload.api_secret: row.api_secret = payload.api_secret
@@ -1701,23 +1763,23 @@ def resolve_broker_context(payload, user, db, require_credentials=False):
         raise HTTPException(status_code=400, detail=f"Broker/data source '{code}' is not configured or enabled")
     connection = None
     if payload.connection_id is not None:
-        connection = db.query(BrokerConnection).filter(
-            BrokerConnection.id == payload.connection_id, BrokerConnection.user_id == user.id,
-            BrokerConnection.is_active == 1).first()
+        rows = _user_connections(db, user, code)
+        connection = next((r for r in rows if r.id == payload.connection_id), None)
         if not connection:
             raise HTTPException(status_code=404, detail="Selected broker connection not found or disabled")
-        if connection.broker_code != code:
-            raise HTTPException(status_code=400, detail="Connection does not belong to the selected broker")
+        if not _connection_is_active(connection):
+            raise HTTPException(status_code=400,
+                                detail=f"The connection '{connection.label or connection.broker_code}' "
+                                       f"is switched off. Enable it in Broker Settings.")
     else:
-        connection = db.query(BrokerConnection).filter(
-            BrokerConnection.user_id == user.id, BrokerConnection.broker_code == code,
-            BrokerConnection.is_active == 1).order_by(BrokerConnection.created_at).first()
+        connection, _ = _pick_connection(db, user, code)
     api_key = connection.api_key if connection else (user.api_key if (user.broker_name or 'Binance') == code else '')
     api_secret = connection.api_secret if connection else (user.api_secret if (user.broker_name or 'Binance') == code else '')
     passphrase = connection.passphrase if connection else ''
     testnet = bool(connection.is_testnet) if connection else bool(payload.testnet)
     if require_credentials and (not api_key or not api_secret):
-        raise HTTPException(status_code=400, detail=f"API keys not configured for {code}. Add a connection in Broker Settings.")
+        raise HTTPException(status_code=400,
+                            detail=_credentials_problem(db, user, code, payload.connection_id))
     return code, definition, api_key or '', api_secret or '', passphrase or '', testnet, connection
 
 
@@ -2228,6 +2290,98 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
 # see app/core/rate_limit.py). Broker payloads are normalized by
 # app/services/broker_account.py so both venues render the same way.
 # ===========================================================================
+def _canonical_broker_code(db, value: Optional[str]) -> Optional[str]:
+    """Resolve any spelling of an integration to its registry code.
+
+    A saved connection can carry the canonical code (``Binance``), the code in
+    another case, or the *display name* the dropdown shows (``Binance Futures``)
+    — hand-edited rows and rows seeded by scripts use all three. Comparing that
+    column literally is why a connection that is clearly in the database still
+    reads as "API keys not configured", so every lookup resolves first.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    normalized = normalize_source(text)
+    row = db.query(BrokerDefinition).filter(
+        func.lower(BrokerDefinition.code) == normalized.lower()).first()
+    if row:
+        return row.code
+    row = db.query(BrokerDefinition).filter(
+        func.lower(BrokerDefinition.name) == text.lower()).first()
+    return row.code if row else normalized
+
+
+def _connection_is_active(row) -> bool:
+    """``is_active`` is treated as ON unless it is explicitly 0.
+
+    The column default only applies to rows written through SQLAlchemy, so a
+    connection inserted straight into the database carries NULL — which must
+    not silently disable the credentials someone just added.
+    """
+    value = getattr(row, 'is_active', None)
+    if value is None:
+        return True
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _user_connections(db, user, code: str):
+    """This account's saved connections that belong to ``code``."""
+    rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).all()
+    matched = [r for r in rows if _canonical_broker_code(db, r.broker_code) == code]
+    matched.sort(key=lambda r: (r.created_at or datetime.min, r.id or 0))
+    return matched
+
+
+def _credentials_problem(db, user, code: str, connection_id: Optional[int] = None) -> str:
+    """Say *which* of the possible causes applies, instead of one generic line.
+
+    The same 400 used to cover five different situations (no row, row saved
+    under the display name, row with ``is_active`` NULL, row switched off, keys
+    saved on a different login), none of which the user could tell apart from
+    the message alone.
+    """
+    rows = _user_connections(db, user, code)
+    if connection_id is not None:
+        rows = [r for r in rows if r.id == connection_id]
+        if not rows:
+            return (f"No broker connection #{connection_id} for {code} on the account "
+                    f"'{user.username}'. Connections are saved per login, so keys added "
+                    f"while signed in as another account are not shared.")
+    usable = [r for r in rows if _connection_is_active(r)]
+    if not usable:
+        if rows:
+            labels = ", ".join(f"'{r.label or r.broker_code}'" for r in rows)
+            return (f"The {code} connection {labels} on the account '{user.username}' is "
+                    f"switched off. Turn it back on in Broker Settings → Broker connections.")
+        return (f"No API keys for {code} on the account '{user.username}'. The Exchange "
+                f"Registry only registers the integration (adapter kind and URLs) and holds "
+                f"no credentials — add the API key and secret under 'Add broker connection' "
+                f"in Broker Settings.")
+    blank = [r for r in usable if not (r.api_key and r.api_secret)]
+    if blank:
+        labels = ", ".join(f"'{r.label or r.broker_code}'" for r in blank)
+        return (f"The {code} connection {labels} on the account '{user.username}' has no API "
+                f"secret saved. Edit that connection and re-enter the secret — secrets are "
+                f"never returned by the API, so an edit keeps the stored one unless a new "
+                f"one is typed in.")
+    return f"API keys not configured for {code} on the account '{user.username}'."
+
+
+def _pick_connection(db, user, code: str, connection_id: Optional[int] = None):
+    """The connection to trade with, or ``(None, problem)`` when there is none."""
+    rows = _user_connections(db, user, code)
+    if connection_id is not None:
+        rows = [r for r in rows if r.id == connection_id]
+    usable = [r for r in rows if _connection_is_active(r) and r.api_key and r.api_secret]
+    if usable:
+        return usable[0], None
+    return None, _credentials_problem(db, user, code, connection_id)
+
+
 def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None,
                  require_credentials: bool = True):
     """Build a BrokerClient from a broker code + the user's credentials."""
@@ -2237,19 +2391,14 @@ def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None
         BrokerDefinition.code == code, BrokerDefinition.enabled == 1).first()
     if not definition:
         raise HTTPException(status_code=400, detail=f"Broker '{code}' is not configured or enabled")
-    query = db.query(BrokerConnection).filter(
-        BrokerConnection.user_id == user.id, BrokerConnection.broker_code == code,
-        BrokerConnection.is_active == 1)
-    if connection_id is not None:
-        query = query.filter(BrokerConnection.id == connection_id)
-    connection = query.order_by(BrokerConnection.created_at).first()
+    connection, problem = _pick_connection(db, user, code, connection_id)
     api_key = (connection.api_key if connection else None) or (user.api_key or '')
     api_secret = (connection.api_secret if connection else None) or (user.api_secret or '')
     passphrase = (connection.passphrase if connection else None) or ''
     testnet = bool(connection.is_testnet) if connection else False
     if require_credentials and (not api_key or not api_secret):
-        raise HTTPException(status_code=400,
-                            detail=f"API keys not configured for {code}. Add them in Broker Settings.")
+        raise HTTPException(status_code=400, detail=problem or
+                            f"API keys not configured for {code}. Add them in Broker Settings.")
     client = BrokerClient(api_key, api_secret, code, passphrase, testnet, definition)
     return client, definition, (connection.id if connection else None)
 
