@@ -431,6 +431,191 @@ db.close()
 check("background job seeded the requested range", bg_candles == 120, f"candles={bg_candles}")  # 5 days x 24h
 
 
+# ===========================================================================
+print("\n========== DELTA EXCHANGE: same guarantees, Delta paths ==========")
+
+# Earlier sections patched fetch_klines with the Binance script; restore the
+# REAL fetch_klines so the Delta sections exercise the genuine Delta adapter
+# (fetch_klines → _delta_fetch → _delta_fetch_one).
+DataSyncService.fetch_klines = classmethod(REAL_FETCH)
+
+# ---------------------------------------------------------------------------
+print("\n== Delta adapter classifies transient vs permanent failures ==")
+REAL_DELTA_ONE = DataSyncService._delta_fetch_one.__func__
+one_behaviour = {"mode": "transport"}
+
+def scripted_delta_one(cls, host, params):
+    mode = one_behaviour["mode"]
+    if mode == "transport":
+        return [], None, "request failed after 5 attempts: ConnectionError"
+    if mode == "429":
+        return [], 429, "HTTP 429 Too many requests"
+    if mode == "400":
+        return [], 400, "HTTP 400 Invalid resolution"
+    if mode == "200-empty":
+        return [], 200, ""
+    return [], 200, ""
+
+DataSyncService._delta_fetch_one = classmethod(scripted_delta_one)
+try:
+    for mode, expect_transient in [("transport", True), ("429", True), ("400", False), ("200-empty", False)]:
+        one_behaviour["mode"] = mode
+        try:
+            DataSyncService.fetch_klines("Delta", "BTCUSDT", "1h", limit=10)
+            check(f"Delta {mode} raises", False, "no exception")
+        except TransientMarketDataError as exc:
+            check(f"Delta {mode} → transient", expect_transient, str(exc)[:80])
+            check(f"Delta {mode} message keeps diagnostics", "Delta Exchange returned 0 candles" in str(exc))
+        except MarketDataError as exc:
+            check(f"Delta {mode} → permanent", not expect_transient, str(exc)[:80])
+            if mode == "200-empty":
+                check("Delta 200-empty keeps the pre-listing marker",
+                      "HTTP 200 (empty result)" in str(exc), str(exc)[:160])
+
+    # A permanent answer on one host wins even if another host has transport trouble.
+    def mixed_delta_one(cls, host, params):
+        return ([], 400, "HTTP 400 Illegal characters") if host.endswith("/a") else ([], None, "request failed")
+    DataSyncService._delta_fetch_one = classmethod(mixed_delta_one)
+    saved_hosts = list(DataSyncService.DELTA_HOSTS)
+    DataSyncService.DELTA_HOSTS = ["http://host/a", "http://host/b"]
+    try:
+        try:
+            DataSyncService.fetch_klines("Delta", "BTCUSDT", "1h", limit=10)
+            check("Delta mixed 400+transport → permanent", False, "no exception")
+        except TransientMarketDataError:
+            check("Delta mixed 400+transport → permanent", False, "classified transient")
+        except MarketDataError as exc:
+            check("Delta mixed 400+transport → permanent", "HTTP 400" in str(exc))
+    finally:
+        DataSyncService.DELTA_HOSTS = saved_hosts
+finally:
+    DataSyncService._delta_fetch_one = classmethod(REAL_DELTA_ONE)
+
+
+# ---------------------------------------------------------------------------
+print("\n== Delta full-history: pre-listing empties + mid-range retries ==")
+REAL_DELTA_FETCH = DataSyncService._delta_fetch.__func__
+# Product lists on 15 Jan: the first window (1–10 Jan) is entirely pre-listing
+# and must advance as an empty page; the second window spans the listing and
+# returns a partial page, exactly like the real exchange.
+LISTING = datetime(2020, 1, 15)
+delta_glitch = {"attempts": {}}
+delta_mark_symbols = []
+
+def scripted_delta_fetch(cls, symbol, interval, start_time=None, end_time=None, limit=1000, hosts=None):
+    is_mark = str(symbol).upper().startswith("MARK:")
+    if is_mark:
+        delta_mark_symbols.append(str(symbol).upper())
+    step = timedelta(seconds=cls._interval_seconds(interval))
+    start = cls._as_datetime(start_time)
+    stop = cls._as_datetime(end_time)
+    if not is_mark:
+        if stop < LISTING:
+            # Faithful pre-listing window: the real adapter raises exactly this
+            # message when every host answers HTTP 200 with zero candles.
+            raise MarketDataError(
+                f"Delta Exchange returned 0 candles for {symbol} {interval}: "
+                f"mock → HTTP 200 (empty result)")
+        start = max(start, LISTING)
+        key = (str(symbol), start)
+        delta_glitch["attempts"][key] = delta_glitch["attempts"].get(key, 0) + 1
+        if start == datetime(2020, 1, 21) and delta_glitch["attempts"][key] == 1:
+            raise TransientMarketDataError("request failed after 5 attempts: ReadTimeout")
+    rows, cursor = [], start
+    while cursor <= stop and len(rows) < int(limit):
+        rows.append({"event_time": cursor, "open": 300.0, "high": 302.0, "low": 299.0,
+                     "close": 301.0, "volume": 5.0})
+        cursor += step
+    return rows
+
+DataSyncService._delta_fetch = classmethod(scripted_delta_fetch)
+try:
+    dsummary = DataSyncService.seed_market_data(
+        source="Delta", symbol="BTCUSDT", intervals=["1d"],
+        start_date="2020-01-01", end_date="2020-02-15", limit=10, fetch_all=True,
+    )[0]
+finally:
+    DataSyncService._delta_fetch = classmethod(REAL_DELTA_FETCH)
+
+expected_delta = (datetime(2020, 2, 16) - LISTING).days  # 32 inclusive daily candles
+check("Delta range completes through pre-listing empties and a mid-range hiccup",
+      dsummary["status"] == "completed" and dsummary["total"] == expected_delta,
+      f"status={dsummary.get('status')} total={dsummary.get('total')} err={dsummary.get('error')}")
+check("Delta first stored candle is the listing candle",
+      dsummary.get("first") == LISTING, str(dsummary.get("first")))
+check("Delta pre-listing window advanced as an empty page",
+      (dsummary.get("empty_pages") or 0) >= 1, str(dsummary.get("empty_pages")))
+db = SessionLocal()
+drows = [r.event_time for r in db.query(Klines).filter_by(
+    source="Delta", symbol="BTCUSDT", interval="1d").order_by(Klines.event_time).all()]
+db.close()
+check("Delta candles form a clean grid with no duplicates", len(drows) == expected_delta
+      and len(set(drows)) == len(drows), f"rows={len(drows)}")
+
+
+# ---------------------------------------------------------------------------
+print("\n== Delta mark-price backfill pages the MARK: perpetual series ==")
+DataSyncService._delta_fetch = classmethod(scripted_delta_fetch)
+try:
+    dmark = DataSyncService.sync_mark_prices(
+        "Delta", "BTCUSDT", ["1d"], start_time="2020-01-15", end_time="2020-01-24", limit=3)
+finally:
+    DataSyncService._delta_fetch = classmethod(REAL_DELTA_FETCH)
+dmentry = dmark[0]
+check("Delta mark backfill paged the range (3-candle pages)",
+      dmentry["fetched"] == 10 and dmentry["total"] == 10 and not dmentry.get("error"),
+      f"fetched={dmentry.get('fetched')} total={dmentry.get('total')}")
+check("Delta mark series requested the MARK: perpetual symbol",
+      delta_mark_symbols and all(s.startswith("MARK:") for s in delta_mark_symbols),
+      str(delta_mark_symbols[:3]))
+db = SessionLocal()
+dmarked = db.query(Klines).filter(
+    Klines.source == "Delta", Klines.symbol == "BTCUSDT", Klines.interval == "1d",
+    Klines.event_time >= datetime(2020, 1, 15), Klines.event_time <= datetime(2020, 1, 24),
+    Klines.mark_close.isnot(None)).count()
+db.close()
+check("Delta mark prices written on every candle of the range", dmarked == 10, f"marked={dmarked}")
+
+
+# ---------------------------------------------------------------------------
+print("\n== Delta background seed endpoint ==")
+DataSyncService._delta_fetch = classmethod(scripted_delta_fetch)
+try:
+    r = client.post("/admin/market-data/seed", headers=H, json={
+        "source": "Delta", "symbol": "BTCUSDT", "intervals": ["1d"], "limit": 5,
+        "start_date": "2020-03-01", "end_date": "2020-03-15", "fetch_all": True,
+        "background": True, "include_mark_price": True})
+    d = r.json()
+    check("Delta background seed accepted immediately",
+          r.status_code == 200 and d["background"] is True and "started" in d["status"], str(d)[:200])
+    deadline = _time.time() + 30
+    dfinal = None
+    while _time.time() < deadline:
+        state = client.get("/admin/market-data/seed-job", headers=H).json()
+        if not state.get("running"):
+            dfinal = state.get("last")
+            break
+        _time.sleep(0.2)
+    check("Delta background job finished", dfinal is not None and dfinal.get("status") == "Seed completed",
+          str(dfinal)[:300])
+    check("Delta background job included the paged mark series",
+          any((m.get("total") or 0) > 0 and not m.get("error")
+              for m in (dfinal or {}).get("mark_price", {}).get("summary", [])),
+          str((dfinal or {}).get("mark_price"))[:200])
+    rows = client.get("/admin/market-data/progress", headers=H).json()
+    check("Delta background job left durable completed cursors",
+          any(row.get("source") == "Delta" and row.get("status") == "completed"
+              and row.get("interval") == "1d" for row in rows))
+finally:
+    DataSyncService._delta_fetch = classmethod(REAL_DELTA_FETCH)
+
+db = SessionLocal()
+dbg = db.query(Klines).filter_by(source="Delta", symbol="BTCUSDT", interval="1d").filter(
+    Klines.event_time >= datetime(2020, 3, 1), Klines.event_time <= datetime(2020, 3, 15)).count()
+db.close()
+check("Delta background job seeded the requested range", dbg == 15, f"candles={dbg}")
+
+
 print(f"\n{'=' * 60}\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + ", ".join(FAIL))

@@ -423,6 +423,11 @@ class DataSyncService:
                         # OHLCV seed of the same range.
                         cursor = cls._as_datetime(start_time)
                         range_end = cls._as_datetime(end_time) if end_time else datetime.utcnow()
+                        # A date-only end string (YYYY-MM-DD) is inclusive
+                        # through that day — the same rule as the traded-OHLCV
+                        # seed — so the mark series covers the final day too.
+                        if isinstance(end_time, str) and len(end_time) == 10:
+                            range_end += timedelta(days=1) - timedelta(microseconds=1)
                         window_span = timedelta(seconds=interval_seconds * max(0, page_limit - 1))
                         inserted = updated = fetched = 0
                         first = last = None
