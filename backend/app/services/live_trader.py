@@ -16,6 +16,67 @@ from app.core.indicators import compute_indicators
 _FILL_PRICE_KEYS = ("avgPrice", "average_fill_price", "avg_fill_price", "price", "limit_price")
 
 
+def price_note(mark_price=None, fill_price=None, reference_price=None, use_mark=False):
+    """Human-readable price for a live log line.
+
+    The mark price is simply *not available* sometimes (public endpoint down,
+    venue without a premium-index call), so every branch here has to survive a
+    ``None`` instead of blowing up mid-tick: an exception thrown while building
+    a log string would abort the rest of the tick, after the order had already
+    been sent to the exchange.
+    """
+    if use_mark and mark_price:
+        base = f"mark {float(mark_price):,.2f}"
+        return f"{base} (filled {float(fill_price):,.2f})" if fill_price else base
+    if fill_price:
+        return f"filled {float(fill_price):,.2f}"
+    if mark_price:
+        return f"mark {float(mark_price):,.2f}"
+    if reference_price:
+        return f"{float(reference_price):,.2f}"
+    return "price unavailable"
+
+
+# Signed size / entry price keys seen in Binance and Delta position payloads.
+_SIZE_KEYS = ("positionAmt", "position_amt", "size", "quantity", "qty")
+_ENTRY_KEYS = ("entryPrice", "entry_price", "avg_entry_price", "average_entry_price")
+
+
+def parse_open_position(rows, contract_value: float = 1.0):
+    """Read a venue's open-position payload into one plain description.
+
+    Returns ``{"direction": ±1, "size_btc": float, "entry_price": float|None}``
+    for the first non-flat position, or ``None`` when the account is flat (or
+    the venue returned an error object). Used to stop the worker stacking a
+    second order on top of a position the exchange already holds.
+    """
+    if not isinstance(rows, list):
+        return None
+    cv = float(contract_value or 1.0) or 1.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = next((row.get(k) for k in _SIZE_KEYS if row.get(k) not in (None, "")), None)
+        try:
+            size = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if not size:
+            continue
+        entry = next((row.get(k) for k in _ENTRY_KEYS if row.get(k) not in (None, "", "0")), None)
+        try:
+            entry_price = float(entry) if entry is not None else None
+        except (TypeError, ValueError):
+            entry_price = None
+        return {
+            "direction": 1 if size > 0 else -1,
+            # Binance USDS-M reports BTC directly; Delta reports contracts.
+            "size_btc": abs(size) * cv,
+            "entry_price": entry_price,
+        }
+    return None
+
+
 def extract_fill_price(response):
     """Best-effort average fill price from a broker order response.
 
@@ -119,6 +180,23 @@ class LiveTradeService:
         # a stale reduce-only stop can reopen the other side of the book.
         self.cancel_legs_on_exit = True
         self.last_order_error = None
+        # ---- Entry gating: ONE order per signal candle -----------------
+        # This worker polls every 60 seconds, but an entry condition (a custom
+        # rule set especially) can stay TRUE for many 1h candles. Without these
+        # guards every tick re-read the same signal and sent another real order,
+        # so a single live run stacked a new position on the exchange once a
+        # minute for as long as the signal held.
+        self._last_bar_time = None        # candle this worker last processed
+        self._acted_signal_bar = None     # candle whose signal already traded
+        self._bars_since_exit = None      # candles since the last close
+        self.skipped_entries = 0          # entries held back by the guards
+        self.last_skip_reason = None
+        self._last_skip_notice = None     # de-duplicates the "held back" log
+        # A position already on the exchange (previous run, restart, or a manual
+        # order placed in the terminal) must never be doubled up.
+        self.sync_exchange_positions = True
+        self.exchange_position = None
+        self.exchange_position_known = True
 
     async def start(self):
         self.is_running = True
@@ -129,6 +207,8 @@ class LiveTradeService:
             print("   Skip-new-trade windows: " + "; ".join(self.window_guard.describe()))
         else:
             print("   Skip-new-trade windows: off")
+        print(f"   Entry policy: one order per signal candle · one position at a time · "
+              f"{int(getattr(self.config, 'cooldown_bars', 0) or 0)}-candle cooldown after an exit")
         while self.is_running:
             try:
                 await self.tick()
@@ -170,9 +250,21 @@ class LiveTradeService:
         self.mark_price_basis = bool(use_mark)
         self.last_checked = datetime.utcnow().isoformat(timespec="seconds")
 
+        # ---- Candle clock ---------------------------------------------
+        # This worker polls every 60s, so one 1h candle is normally seen dozens
+        # of times. Everything measured in *candles* — the holding-time clock,
+        # one entry per signal, the post-exit cooldown — keys off this flag.
+        new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        if new_bar:
+            self._last_bar_time = current_time
+            if self._bars_since_exit is not None:
+                self._bars_since_exit += 1
+
+        # ---- Manage open positions ------------------------------------
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
-                                           trade_price_usd=trade_price, mark_price_usd=mark_price)
+                                           trade_price_usd=trade_price, mark_price_usd=mark_price,
+                                           advance_bar=new_bar)
             if result:
                 side = "SELL" if result.direction == 1 else "BUY"
                 response = self.broker.place_order(self.contract_symbol, side, "MARKET",
@@ -186,7 +278,10 @@ class LiveTradeService:
                     filled = extract_fill_price(response)
                     if filled:
                         result.exit_trade_price = float(filled)
-                    exit_note = (f"mark {result.exit_mark_price:,.2f} (filled {result.exit_trade_price:,.2f})"
+                    # Restart the post-exit cooldown in candles, not in ticks.
+                    self._bars_since_exit = 0
+                    exit_note = (price_note(result.exit_mark_price, result.exit_trade_price,
+                                            result.exit_price, True)
                                  if result.mark_price_basis else f"{result.exit_price:,.2f}")
                     print(f"🔴 [{self.strategy_id}] LIVE {self.broker_name} close: {result.exit_reason} at {exit_note}")
                     if result.exit_detail:
@@ -208,54 +303,173 @@ class LiveTradeService:
         elif self._last_block_notice:
             self._last_block_notice = None
 
-        if last_sig != 0:
-            ind_slice = df_1h_with_ind.iloc[-50:]
-            if self.validator.validate_signal(last_sig, current_price, current_price, ind_slice).passed:
-                if blocked_window:
-                    print(f"⏸ [{self.strategy_id}] LIVE entry skipped by trading window: {blocked_window.describe()}")
-                    return
-                margin_inr = self.initial_capital * (self.margin_pct / 100.0)
-                notional_usd = margin_inr / self.conversion_rate * self.config.leverage
-                lots = float(np.floor((notional_usd / decision_price) / self.config.lot_size_btc) * self.config.lot_size_btc)
-                if lots <= 0:
-                    return
-                side = "BUY" if last_sig == 1 else "SELL"
-                # Open the OMS trade first so the entry can be bracketed with
-                # the same stop-loss / take-profit levels the strategy uses.
-                planned = self.oms.create_order("BTCUSDT", last_sig, decision_price, current_atr, current_time,
-                                                margin_inr, self.conversion_rate,
-                                                trade_price_usd=trade_price,
-                                                mark_price_usd=mark_price, mark_price_basis=use_mark)
-                if planned is None:
-                    return
-                lots = float(planned.lots)
-                if self.bracket_orders:
-                    res = self.broker.place_bracket_order(
-                        self.contract_symbol, side, lots, price=None,
-                        stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
-                        trigger_method="mark_price" if use_mark else "last_traded_price",
-                        size_in_btc=True)
-                else:
-                    res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots,
-                                                  size_in_btc=True)
-                self._record_order(res, leg="entry")
-                if "error" not in res:
-                    filled = extract_fill_price(res if not res.get("_bracket") else (res.get("entry") or res))
-                    if filled:
-                        planned.entry_trade_price = float(filled)
-                    price_note = (f"mark {mark_price:,.2f} (filled {filled:,.2f})" if filled
-                                  else (f"mark {mark_price:,.2f}" if use_mark else f"{current_price:,.2f}"))
-                    protection = ""
-                    if self.bracket_orders:
-                        protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}"
-                                      f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
-                    print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {price_note} ({lots} BTC){protection}")
-                else:
-                    # No order left the building: roll the OMS trade back so the
-                    # local book does not drift away from the exchange.
-                    self.oms.active_trades.pop("BTCUSDT", None)
-                    self.last_order_error = res.get("error")
-                    print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
+        # ---- Exchange-side reality check -------------------------------
+        # Whatever the local book says, a position already on the venue (an
+        # earlier run of this strategy, a worker restart, or a manual order sent
+        # from the terminal) means no new entry may go out on top of it.
+        if self.oms.active_trades:
+            # We opened and manage it ourselves — nothing to reconcile.
+            self.exchange_position, self.exchange_position_known = None, True
+        elif self.sync_exchange_positions:
+            self.exchange_position, self.exchange_position_known = self._read_exchange_position()
+
+        # ---- New entries -----------------------------------------------
+        if last_sig == 0:
+            return
+        if blocked_window:
+            print(f"⏸ [{self.strategy_id}] LIVE entry skipped by trading window: {blocked_window.describe()}")
+            return
+        ind_slice = df_1h_with_ind.iloc[-50:]
+        if not self.validator.validate_signal(last_sig, current_price, current_price, ind_slice).passed:
+            return
+
+        # One order per signal candle, one position at a time, and a cooldown
+        # after an exit — the same three rules the backtest engine applies.
+        hold = self._entry_hold_reason(last_sig, current_time)
+        if hold:
+            self.skipped_entries += 1
+            self.last_skip_reason = hold
+            notice = f"{current_time}::{hold}"
+            if self._last_skip_notice != notice:
+                print(f"⏸ [{self.strategy_id}] LIVE entry held back: {hold}")
+                self._last_skip_notice = notice
+            return
+        self._last_skip_notice = None
+
+        # Close-&-reverse (config ``allow_reverse``): flatten the open position
+        # first, then take the opposite signal below. Skipping this step would
+        # either ignore the configured behaviour or stack a second position.
+        open_trade = self.oms.active_trades.get("BTCUSDT")
+        if open_trade is not None and getattr(self.config, "allow_reverse", False) \
+                and open_trade.direction != last_sig:
+            if not self._close_for_reverse(open_trade, decision_price, trade_price,
+                                           mark_price, current_time):
+                return
+
+        margin_inr = self.initial_capital * (self.margin_pct / 100.0)
+        notional_usd = margin_inr / self.conversion_rate * self.config.leverage
+        lots = float(np.floor((notional_usd / decision_price) / self.config.lot_size_btc) * self.config.lot_size_btc)
+        if lots <= 0:
+            return
+        side = "BUY" if last_sig == 1 else "SELL"
+        # Open the OMS trade first so the entry can be bracketed with
+        # the same stop-loss / take-profit levels the strategy uses.
+        planned = self.oms.create_order("BTCUSDT", last_sig, decision_price, current_atr, current_time,
+                                        margin_inr, self.conversion_rate,
+                                        trade_price_usd=trade_price,
+                                        mark_price_usd=mark_price, mark_price_basis=use_mark)
+        if planned is None:
+            return
+        lots = float(planned.lots)
+        if self.bracket_orders:
+            res = self.broker.place_bracket_order(
+                self.contract_symbol, side, lots, price=None,
+                stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
+                trigger_method="mark_price" if use_mark else "last_traded_price",
+                size_in_btc=True)
+        else:
+            res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots,
+                                          size_in_btc=True)
+        self._record_order(res, leg="entry")
+        if "error" not in res:
+            # This candle's signal is spent: the remaining ticks of the same
+            # 1h candle must not send another order.
+            self._acted_signal_bar = current_time
+            filled = extract_fill_price(res if not res.get("_bracket") else (res.get("entry") or res))
+            if filled:
+                planned.entry_trade_price = float(filled)
+            entry_note = price_note(mark_price, filled, current_price, use_mark)
+            protection = ""
+            if self.bracket_orders:
+                protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}"
+                              f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
+            print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
+        else:
+            # No order left the building: roll the OMS trade back so the
+            # local book does not drift away from the exchange.
+            self.oms.active_trades.pop("BTCUSDT", None)
+            self.last_order_error = res.get("error")
+            print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
+
+    # ------------------------------------------------------------------
+    # Entry gating
+    # ------------------------------------------------------------------
+    def _entry_hold_reason(self, signal, current_time):
+        """Why no new order may go out this tick; ``None`` means go ahead.
+
+        A signal can stay TRUE for many 1h candles and this worker ticks every
+        60 seconds, so without these checks the same signal would fire a fresh
+        order once a minute for as long as the condition held.
+        """
+        if self._acted_signal_bar is not None and current_time == self._acted_signal_bar:
+            return f"the signal on this candle ({current_time}) was already traded"
+        open_trade = self.oms.active_trades.get("BTCUSDT")
+        if open_trade is not None:
+            if getattr(self.config, "allow_reverse", False) and open_trade.direction != signal:
+                # Configured close-&-reverse: the caller flattens first and then
+                # opens the other side in the same tick.
+                return None
+            if getattr(self.config, "allow_overlap", False):
+                # The worker can only manage one position per contract, so the
+                # documented backtest "overlap" mode is refused here rather than
+                # leaving an unmanaged position on the exchange.
+                return ("overlapping entries are not supported live — this worker "
+                        "manages one position per contract")
+            side = "LONG" if open_trade.direction == 1 else "SHORT"
+            return (f"position already open ({side} {open_trade.lots:.4f} BTC) — "
+                    f"waiting for it to close")
+        if not self.exchange_position_known:
+            return (f"could not read the open position on {self.broker_name} — "
+                    f"entry held until the venue can be read")
+        pos = self.exchange_position
+        if pos:
+            side = "LONG" if pos["direction"] == 1 else "SHORT"
+            return (f"{self.broker_name} already holds a position "
+                    f"({side} {pos['size_btc']:.4f} BTC) that this instance did not open")
+        cooldown = int(getattr(self.config, "cooldown_bars", 0) or 0)
+        if self._bars_since_exit is not None and self._bars_since_exit <= cooldown:
+            return (f"post-exit cooldown — {self._bars_since_exit}/{cooldown} "
+                    f"candles since the last close")
+        return None
+
+    def _read_exchange_position(self):
+        """Position the venue holds for this contract.
+
+        Returns ``(position, known)``. ``known`` is False when the venue could
+        not be read at all, and the worker then holds new entries instead of
+        risking a second order on a position it cannot see.
+        """
+        try:
+            rows = self.broker.get_positions(self.symbol)
+            if isinstance(rows, dict) and rows.get("error"):
+                print(f"[{self.strategy_id}] position check failed: {rows['error']}")
+                return None, False
+            instrument = self.broker.get_instrument(self.symbol) or {}
+            contract_value = float(instrument.get("contract_value") or 1.0) or 1.0
+            return parse_open_position(rows, contract_value), True
+        except Exception as exc:
+            print(f"[{self.strategy_id}] position check failed: {exc}")
+            return None, False
+
+    def _close_for_reverse(self, trade, price, trade_price, mark_price, current_time):
+        """Flatten the open position so the opposite signal can be taken."""
+        side = "SELL" if trade.direction == 1 else "BUY"
+        response = self.broker.place_order(self.contract_symbol, side, "MARKET",
+                                           trade.lots, size_in_btc=True)
+        if "error" not in response and self.cancel_legs_on_exit:
+            self._cancel_protection_legs()
+        self._record_order(response, leg="exit")
+        if "error" in response:
+            # The old position is still on: never open the other side on top.
+            self.last_order_error = response.get("error")
+            print(f"❌ [{self.strategy_id}] LIVE close-&-reverse failed: {response['error']} — entry not sent")
+            return False
+        self.oms.close_trade("BTCUSDT", float(price), current_time, "REV",
+                             "Close & reverse — opposite signal",
+                             trade_price_usd=trade_price, mark_price_usd=mark_price)
+        self._bars_since_exit = 0
+        print(f"🔁 [{self.strategy_id}] LIVE close-&-reverse at {float(price):,.2f}")
+        return True
 
     # ------------------------------------------------------------------
     # Local audit trail + bracket cleanup

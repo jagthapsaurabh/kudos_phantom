@@ -101,6 +101,17 @@ class PaperTradeService:
         self.window_guard = TradingWindowGuard(self.trading_windows)
         self.blocked_entries = 0
         self._last_block_notice = None   # de-duplicates "entries paused" logs
+        # ---- Entry gating: ONE entry per signal candle ----------------
+        # The worker ticks every 60s while an entry condition can stay TRUE for
+        # many 1h candles. Without these guards every tick re-read the same
+        # signal and replaced the open trade, so a session churned a "new"
+        # position every minute and its equity curve meant nothing.
+        self._last_bar_time = None        # candle this worker last processed
+        self._acted_signal_bar = None     # candle whose signal already traded
+        self._bars_since_exit = None      # candles since the last close
+        self.skipped_entries = 0          # entries held back by the guards
+        self.last_skip_reason = None
+        self._last_skip_notice = None     # de-duplicates the "held back" log
         self.last_checked = None
         # Live log buffer: list of {"ts": ISO, "level": "info|warn|error|trade", "msg": str}
         self.logs: list = []
@@ -255,32 +266,27 @@ class PaperTradeService:
         current_time = df_1h.index[-1]
         trade_event = False  # a fill this tick forces an immediate DB snapshot
 
+        # ---- Candle clock -------------------------------------------
+        # This worker ticks every 60s, so one 1h candle is seen many times.
+        # Everything measured in candles (holding time, one entry per signal,
+        # post-exit cooldown) keys off this flag instead of the tick count.
+        new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        if new_bar:
+            self._last_bar_time = current_time
+            if self._bars_since_exit is not None:
+                self._bars_since_exit += 1
+
         # ---- Manage open positions ----------------------------------
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
                                            trade_price_usd=trade_price,
-                                           mark_price_usd=mark_price)
+                                           mark_price_usd=mark_price,
+                                           advance_bar=new_bar)
             if result:
                 trade_event = True
-                price_diff = (result.exit_price - result.entry_price) * result.direction
-                gross_pnl = (result.lots * price_diff) * self.conversion_rate
-                taker = float(getattr(self.config, "taker_fee_bps", 0.0))
-                maker = float(getattr(self.config, "maker_fee_bps", 0.0))
-                entry_fee = result.notional_usd * taker / 10000 * self.conversion_rate
-                exit_fee = result.notional_usd * (maker if result.exit_reason == "TP" else taker) / 10000 * self.conversion_rate
-                pnl_inr = gross_pnl - entry_fee - exit_fee
-                self.equity_inr += pnl_inr
-                self._record_closed(result, pnl_inr, entry_fee + exit_fee, gross_pnl)
-                exit_price_note = (f"mark {result.exit_mark_price:,.2f} (traded {result.exit_trade_price:,.2f})"
-                                   if getattr(result, 'mark_price_basis', False) else f"{result.exit_price:,.2f}")
-                self._log("trade", f"✖ Closed {symbol} ({result.exit_reason}) — exit {exit_price_note} | "
-                                    f"SL {result.sl_entry:,.2f} → {result.sl:,.2f} | TP {result.tp:,.2f} | "
-                                    f"Trail {result.trail_stop:,.2f} | ATR {result.atr_at_entry:,.2f} | "
-                                    f"Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | "
-                                    f"Equity ₹{self.equity_inr:,.2f}")
-                if result.exit_detail:
-                    self._log("info", f"Exit condition: {result.exit_detail}")
-                print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason} @ {result.exit_price:.2f}, Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
+                # Restart the post-exit cooldown in candles, not in ticks.
+                self._bars_since_exit = 0
+                self._book_close(result)
 
         # ---- New entries --------------------------------------------
         # "Skip new trades" schedule: an existing position keeps running (its
@@ -307,22 +313,50 @@ class PaperTradeService:
                                   f"({blocked_window.describe()})")
                 print(f"⏸ [{self.strategy_id}] Entry skipped by trading window: {blocked_window.describe()}")
             elif validation.passed:
-                margin_inr = self.equity_inr * (self.margin_pct / 100.0)
-                new_trade = self.oms.create_order(
-                    "BTCUSDT", last_sig, decision_price, current_atr, current_time, margin_inr,
-                    self.conversion_rate, trade_price_usd=trade_price, mark_price_usd=mark_price,
-                    mark_price_basis=use_mark)
-                if new_trade is None:
-                    self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
+                # One entry per signal candle, one position at a time, and a
+                # cooldown after an exit — the same three rules the backtest
+                # engine applies. This worker ticks every 60s, so without them a
+                # condition that stays TRUE would "open" a new position every
+                # minute and silently replace the one already running.
+                hold = self._entry_hold_reason(last_sig, current_time)
+                if hold:
+                    self.skipped_entries += 1
+                    self.last_skip_reason = hold
+                    notice = f"{current_time}::{hold}"
+                    if self._last_skip_notice != notice:
+                        self._log("info", f"Signal {last_sig} held back — {hold}")
+                        self._last_skip_notice = notice
                 else:
-                    trade_event = True
-                    side = "LONG" if last_sig == 1 else "SHORT"
-                    price_note = (f"mark {mark_price:,.2f} (traded {trade_price:,.2f})" if use_mark
-                                  else f"{current_price:,.2f}")
-                    self._log("trade", f"🚀 Opened {side} BTCUSDT @ {price_note} | SL {new_trade.sl:,.2f} | "
-                                        f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
-                                        f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
-                    print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {decision_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
+                    self._last_skip_notice = None
+                    open_trade = self.oms.active_trades.get("BTCUSDT")
+                    if open_trade is not None and getattr(self.config, "allow_reverse", False) \
+                            and open_trade.direction != last_sig:
+                        closed = self.oms.close_trade(
+                            "BTCUSDT", decision_price, current_time, "REV",
+                            "Close & reverse — opposite signal",
+                            trade_price_usd=trade_price, mark_price_usd=mark_price)
+                        self._bars_since_exit = 0
+                        self._book_close(closed)
+                        trade_event = True
+                    margin_inr = self.equity_inr * (self.margin_pct / 100.0)
+                    new_trade = self.oms.create_order(
+                        "BTCUSDT", last_sig, decision_price, current_atr, current_time, margin_inr,
+                        self.conversion_rate, trade_price_usd=trade_price, mark_price_usd=mark_price,
+                        mark_price_basis=use_mark)
+                    if new_trade is None:
+                        self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
+                    else:
+                        trade_event = True
+                        # This candle's signal is spent — the remaining ticks of
+                        # the same 1h candle must not open another position.
+                        self._acted_signal_bar = current_time
+                        side = "LONG" if last_sig == 1 else "SHORT"
+                        price_note = (f"mark {mark_price:,.2f} (traded {trade_price:,.2f})" if use_mark
+                                      else f"{current_price:,.2f}")
+                        self._log("trade", f"🚀 Opened {side} BTCUSDT @ {price_note} | SL {new_trade.sl:,.2f} | "
+                                            f"TP {new_trade.tp:,.2f} | Trail act {new_trade.trail_activation:,.2f} | "
+                                            f"ATR {current_atr:,.2f} | {new_trade.lots:.4f} BTC | Margin ₹{new_trade.margin_inr:,.0f}")
+                        print(f"🚀 [{self.strategy_id}] Paper Trade Opened: {side} at {decision_price} (SL {new_trade.sl:.2f}, TP {new_trade.tp:.2f})")
             else:
                 self._log("warn", f"Signal {last_sig} rejected: {validation.reason}")
                 print(f"⚠️ [{self.strategy_id}] Signal {last_sig} failed validation: {validation.reason}")
@@ -338,6 +372,64 @@ class PaperTradeService:
         self._record_equity_point()
         self._tick_count += 1
         self._persist_history(force=trade_event)
+
+    # ------------------------------------------------------------------
+    # Trade management helpers
+    # ------------------------------------------------------------------
+    def _book_close(self, result):
+        """Apply a closed trade to equity, the closed-trade list and the log.
+
+        Shared by the stop/target loop and by close-&-reverse, so both book PnL
+        and fees exactly the same way. Returns the net PnL in INR.
+        """
+        price_diff = (result.exit_price - result.entry_price) * result.direction
+        gross_pnl = (result.lots * price_diff) * self.conversion_rate
+        taker = float(getattr(self.config, "taker_fee_bps", 0.0))
+        maker = float(getattr(self.config, "maker_fee_bps", 0.0))
+        entry_fee = result.notional_usd * taker / 10000 * self.conversion_rate
+        exit_fee = result.notional_usd * (maker if result.exit_reason == "TP" else taker) / 10000 * self.conversion_rate
+        pnl_inr = gross_pnl - entry_fee - exit_fee
+        self.equity_inr += pnl_inr
+        self._record_closed(result, pnl_inr, entry_fee + exit_fee, gross_pnl)
+        exit_price_note = (f"mark {result.exit_mark_price:,.2f} (traded {result.exit_trade_price:,.2f})"
+                           if getattr(result, 'mark_price_basis', False) else f"{result.exit_price:,.2f}")
+        self._log("trade", f"✖ Closed {result.symbol} ({result.exit_reason}) — exit {exit_price_note} | "
+                            f"SL {result.sl_entry:,.2f} → {result.sl:,.2f} | TP {result.tp:,.2f} | "
+                            f"Trail {result.trail_stop:,.2f} | ATR {result.atr_at_entry:,.2f} | "
+                            f"Net PnL ₹{pnl_inr:+,.2f} | Fees ₹{entry_fee + exit_fee:,.2f} | "
+                            f"Equity ₹{self.equity_inr:,.2f}")
+        if result.exit_detail:
+            self._log("info", f"Exit condition: {result.exit_detail}")
+        print(f"[{self.strategy_id}] Trade Closed: {result.exit_reason} @ {result.exit_price:.2f}, "
+              f"Net PnL: ₹{pnl_inr:.2f}, Equity: ₹{self.equity_inr:.2f}")
+        return pnl_inr
+
+    def _entry_hold_reason(self, signal, current_time):
+        """Why no new position may be opened this tick; ``None`` means go ahead.
+
+        A signal can stay TRUE for many 1h candles and this worker ticks every
+        60 seconds, so without these checks the same signal would replace the
+        open trade once a minute for as long as the condition held.
+        """
+        if self._acted_signal_bar is not None and current_time == self._acted_signal_bar:
+            return f"the signal on this candle ({current_time}) was already traded"
+        open_trade = self.oms.active_trades.get("BTCUSDT")
+        if open_trade is not None:
+            if getattr(self.config, "allow_reverse", False) and open_trade.direction != signal:
+                # Configured close-&-reverse: the caller flattens first, then
+                # opens the other side in the same tick.
+                return None
+            if getattr(self.config, "allow_overlap", False):
+                return ("overlapping entries are not supported — this worker "
+                        "manages one position per contract")
+            side = "LONG" if open_trade.direction == 1 else "SHORT"
+            return (f"position already open ({side} {open_trade.lots:.4f} BTC) — "
+                    f"waiting for it to close")
+        cooldown = int(getattr(self.config, "cooldown_bars", 0) or 0)
+        if self._bars_since_exit is not None and self._bars_since_exit <= cooldown:
+            return (f"post-exit cooldown — {self._bars_since_exit}/{cooldown} "
+                    f"candles since the last close")
+        return None
 
     def _fetch_mark_price(self):
         """Current mark + last price of the BTC perpetual on this source.

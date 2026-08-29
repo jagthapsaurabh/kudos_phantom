@@ -3,6 +3,7 @@ import { Play, StopCircle, Activity, AlertCircle, TrendingUp, Wallet, Terminal, 
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -311,12 +312,11 @@ const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) 
                 ⏱ {describeSchedule(inst.trading_windows).join(' · ')}
               </span>
             )}
-            {(inst.blocked_entries || 0) > 0 && (
-              <span className="rounded border border-red-900/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300"
-                    title="New entries skipped by your trading windows">
-                {inst.blocked_entries} skipped
-              </span>
-            )}
+            <EntryGuardBadges
+              blocked={inst.blocked_entries || 0}
+              held={inst.skipped_entries || 0}
+              reason={inst.last_skip_reason}
+            />
           </div>
         </div>
         <button onClick={(e) => { e.stopPropagation(); onDelete(inst.instance_key, strategyName); }}

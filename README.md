@@ -66,6 +66,27 @@ ticket accepts either unit and converts using the contract specification read fr
 instance that sent it) and every fill (`broker_fills`) is mirrored locally, deduplicated on the
 exchange trade id, so history survives the exchange's own window.
 
+**When a live run sends an order.** The live worker polls every 60 seconds, but an entry condition —
+a custom rule set especially — can stay TRUE for many 1h candles. A run therefore applies the same
+three gates the backtest engine uses, so pressing **Start Instance** can never machine-gun the
+exchange:
+
+* **one order per signal candle** — once a candle's signal has been traded, the remaining ticks of
+  that candle send nothing;
+* **one position at a time** — a new entry is refused while a position is open (the documented
+  `allow_reverse` still closes and flips; `allow_overlap` is refused live because the worker manages
+  one position per contract);
+* **`cooldown_bars` after a close** — counted in candles, not in ticks, and the holding-time clock
+  (`timeout_bars`) is too, so a position is closed after 72 *hours*, not 72 minutes;
+* **the venue is believed over the local book** — if the exchange already holds a position (an
+  earlier run, a worker restart, or a manual order from the terminal) no entry goes out on top of it,
+  and if the position cannot be read at all the entry is held rather than guessed.
+
+Refusals are counted, not silent: `skipped_entries` + `last_skip_reason` and `exchange_position` are
+returned by `GET /live-trade/status` and `GET /paper-trade/status`, and the instance card shows a
+**held** badge (tooltip = the exact reason) plus a **VENUE LONG/SHORT** badge for a position the
+instance did not open itself.
+
 **Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
 
 | Venue | Documented limit | Enforced |
@@ -253,9 +274,10 @@ python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
 python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
+python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 216 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 235 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

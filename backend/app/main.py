@@ -1931,6 +1931,11 @@ def get_paper_status(user=Depends(get_current_user)):
                 "trading_windows": windows.summary() if windows else None,
                 "entry_paused": bool(windows.is_blocked(datetime.utcnow())) if windows else False,
                 "blocked_entries": int(getattr(service, 'blocked_entries', 0) or 0),
+                # Entry gating: signals the worker refused because a position is
+                # already open, the candle was already traded, or a cooldown is
+                # running. Surfaced so "why is it not trading?" is answerable.
+                "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
+                "last_skip_reason": getattr(service, 'last_skip_reason', None),
             })
     return status_list
 
@@ -2056,6 +2061,15 @@ def get_live_status(user=Depends(get_current_user)):
                 "trading_windows": getattr(service, 'window_guard', None).summary() if getattr(service, 'window_guard', None) else None,
                 "entry_paused": bool(getattr(service, 'window_guard', None).is_blocked(datetime.utcnow())) if getattr(service, 'window_guard', None) else False,
                 "blocked_entries": int(getattr(service, 'blocked_entries', 0) or 0),
+                # Entry gating: signals refused because a position is already
+                # open (here or on the venue), the candle was already traded, or
+                # a post-exit cooldown is running.
+                "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
+                "last_skip_reason": getattr(service, 'last_skip_reason', None),
+                # What the venue itself reports for this contract, so a position
+                # this instance did not open is visible instead of silent.
+                "exchange_position": getattr(service, 'exchange_position', None),
+                "last_order_error": getattr(service, 'last_order_error', None),
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list

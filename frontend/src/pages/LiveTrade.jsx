@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -309,11 +310,13 @@ const LiveTrade = () => {
                           ⏱ {describeSchedule(inst.trading_windows).join(' · ')}
                         </span>
                       )}
-                      {(inst.blocked_entries || 0) > 0 && (
-                        <span className="rounded border border-red-900/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300">
-                          {inst.blocked_entries} skipped
-                        </span>
-                      )}
+                      <EntryGuardBadges
+                        blocked={inst.blocked_entries || 0}
+                        held={inst.skipped_entries || 0}
+                        reason={inst.last_skip_reason}
+                        position={inst.exchange_position}
+                        broker={inst.broker_name || 'the broker'}
+                      />
                     </div>
                   </div>
                   <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">

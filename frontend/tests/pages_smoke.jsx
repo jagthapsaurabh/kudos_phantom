@@ -16,6 +16,7 @@ globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ([]) });
 import Backtest from '../src/pages/Backtest.jsx';
 import PaperTrade from '../src/pages/PaperTrade.jsx';
 import LiveTrade from '../src/pages/LiveTrade.jsx';
+import EntryGuardBadges from '../src/components/EntryGuardBadges.jsx';
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = '') => {
@@ -52,6 +53,29 @@ check('PaperTrade keeps the start button', paper.includes('Start Instance'));
 const live = renderToString(React.createElement(LiveTrade));
 check('LiveTrade shows the pricing &amp; windows button', live.includes('Windows'));
 check('LiveTrade keeps the start button', live.includes('Start Instance'));
+
+// Entry-guard badges: the counters that make "the worker deliberately sent no
+// order this tick" visible instead of looking like a dead strategy.
+// react-dom/server splits adjacent text nodes with `<!-- -->` markers, so the
+// rendered markup is flattened before asserting on the visible strings.
+const flat = (html) => html.replace(/<!--[^>]*-->/g, '');
+const badges = flat(renderToString(React.createElement(EntryGuardBadges, {
+  blocked: 3,
+  held: 12,
+  reason: 'position already open (LONG 0.0060 BTC) — waiting for it to close',
+  position: { direction: 1, size_btc: 0.012 },
+  broker: 'Delta',
+})));
+check('guard badges show both counters', badges.includes('3 skipped') && badges.includes('12 held'));
+check('the hold reason is the tooltip', badges.includes('position already open'));
+check('a venue position is shown with its size',
+  badges.includes('VENUE LONG 0.0120') && badges.includes('Delta'), badges);
+const shortBadges = flat(renderToString(React.createElement(EntryGuardBadges, {
+  held: 4, position: { direction: -1, size_btc: 0.004 },
+})));
+check('a short venue position is labelled', shortBadges.includes('VENUE SHORT 0.0040'), shortBadges);
+check('no badges when nothing was refused',
+  renderToString(React.createElement(EntryGuardBadges, {})).trim() === '');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
