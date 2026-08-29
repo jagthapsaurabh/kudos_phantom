@@ -23,6 +23,22 @@ venue reports about the remaining budget so the UI can show it.
 
 Failures are returned — not raised — as ``{"error": "..."}`` so a trading loop
 keeps running after a rejected order.
+
+**Credential health.** A key the venue does not recognise fails *every* signed
+endpoint with the same answer (Delta ``invalid_api_key`` / HTTP 401, Binance
+``-2015``), while public market data keeps working — so a dead key looks exactly
+like a live connection that happens to show no account. The client counts those
+rejections and publishes the tally (:meth:`BrokerClient.credential_health`); it
+does **not** refuse calls on its own, because that is the caller's trade-off:
+a per-request terminal poll wants every panel's real venue error, while a
+60-second trading loop plus a 25-second heartbeat ack would otherwise spend
+~40 calls/minute of a fixed 5-minute weight quota on requests that cannot
+succeed — quota that also gates the orders which *could* succeed once the key is
+fixed. Long-lived loops therefore hold off while
+:meth:`BrokerClient.signed_calls_held` says so, and use the one call that ends
+each backoff window as the probe that notices a replaced key. The tally clears
+itself as soon as any signed call is accepted, which is what makes a credential
+reload take effect without a restart.
 """
 
 from __future__ import annotations
@@ -30,7 +46,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -40,6 +58,33 @@ from app.core.mark_price import MarkPriceQuote, perpetual_symbol
 from app.core.rate_limit import (
     RateLimitConfig, RateLimitExceeded, default_config_for, get_limiter,
 )
+
+
+# Auth-level rejections, worded as each venue actually words them. Anything
+# outside this list is an endpoint problem, not a key problem, and must NOT
+# silence the whole signed surface.
+AUTH_REJECTION_MARKERS = (
+    "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
+    "api-key format", "-2015", "unauthorized",
+)
+
+# How many *consecutive* signed-call rejections count as "the key is dead".
+# One is not enough: a sub-account key that is not permitted to list the
+# parent's accounts answers 401 invalid_api_key on GET /v2/sub_accounts and is
+# otherwise perfectly tradeable, and the next accepted call proves it. Two in a
+# row with nothing accepted between is the wall.
+AUTH_LATCH_STRIKES = 2
+
+# Backoff while the key is rejected: 5s, 10s, 20s … capped below Delta's
+# 5-minute weight window so a re-probe always happens within one window.
+AUTH_BACKOFF_BASE_SECONDS = 5.0
+AUTH_BACKOFF_CAP_SECONDS = 300.0
+
+
+def is_auth_rejection(text: Any) -> bool:
+    """True when ``text`` is a venue saying "I do not accept this API key"."""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in AUTH_REJECTION_MARKERS)
 
 
 class BrokerClient:
@@ -119,6 +164,107 @@ class BrokerClient:
         self.limiter = get_limiter(self.limiter_key, self.rate_limit_config)
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
         self._last_error: Optional[str] = None
+        # ---- Credential latch (see the module docstring) --------------------
+        # Short fingerprint of the key material this client signs with, so a
+        # reload can tell "the operator saved a new key" from "same key, still
+        # rejected" without the secret ever leaving the client.
+        self.key_fingerprint = hashlib.sha256(
+            f"{self.api_key}|{self.api_secret}".encode()).hexdigest()[:8]
+        self._auth_lock = threading.RLock()
+        self.auth_error: Optional[str] = None
+        self.auth_failures = 0
+        self.auth_rejected_at: Optional[float] = None   # epoch, for display
+        self._auth_retry_at = 0.0                        # monotonic deadline
+        self.auth_held_calls = 0                         # signed calls a caller skipped
+
+    # ------------------------------------------------------------------
+    # Credential health (auth latch)
+    # ------------------------------------------------------------------
+    def _note_signed_result(self, error_text: Optional[str]) -> None:
+        """Record what the venue said to a *signed* call.
+
+        Any answer that is not an auth rejection proves the key is accepted —
+        including a 400 about the order itself — so the tally is cleared. The
+        client only *reports*: blocking is the caller's decision, because a
+        per-request client (the terminal's snapshot) has no budget to protect
+        and needs the venue's real error in every panel, while a worker loop
+        has everything to lose from polling a dead key once a minute forever.
+        """
+        with self._auth_lock:
+            if error_text and is_auth_rejection(error_text):
+                self.auth_failures += 1
+                self.auth_error = str(error_text)[:300]
+                if self.auth_rejected_at is None:
+                    self.auth_rejected_at = time.time()
+                if self.auth_failures >= AUTH_LATCH_STRIKES:
+                    # 5s, 10s, 20s … capped. Keyed off the failure count, so a
+                    # reload that lands a working key resets the whole ladder.
+                    delay = min(AUTH_BACKOFF_BASE_SECONDS * (2 ** (self.auth_failures - AUTH_LATCH_STRIKES)),
+                                AUTH_BACKOFF_CAP_SECONDS)
+                    self._auth_retry_at = time.monotonic() + delay
+                return
+            if self.auth_error or self.auth_failures:
+                self.auth_error = None
+                self.auth_failures = 0
+                self.auth_rejected_at = None
+                self._auth_retry_at = 0.0
+
+    def credential_health(self) -> Dict[str, Any]:
+        """How this client's credentials stand right now.
+
+        ``state`` is ``"ok"``, ``"suspect"`` (rejected once — could be that one
+        endpoint's permissions, not the key) or ``"rejected"`` (rejected
+        repeatedly with nothing accepted in between). ``retry_in_seconds`` is
+        how long a caller should wait before spending another signed call.
+        Public market data is never part of any of this — a dead key still has a
+        live chart, which is exactly why the failure is easy to miss.
+        """
+        with self._auth_lock:
+            rejected = self.auth_failures >= AUTH_LATCH_STRIKES
+            wait_for = max(0.0, self._auth_retry_at - time.monotonic()) if rejected else 0.0
+            return {
+                "state": ("rejected" if rejected
+                          else "suspect" if self.auth_failures else "ok"),
+                "error": self.auth_error,
+                "consecutive_rejections": int(self.auth_failures),
+                "strikes": AUTH_LATCH_STRIKES,
+                "rejected_at": (datetime.utcfromtimestamp(self.auth_rejected_at).isoformat(timespec="seconds")
+                                if self.auth_rejected_at else None),
+                "retry_in_seconds": round(wait_for, 1),
+                "held_calls": int(self.auth_held_calls),
+                "key": self.key_fingerprint,
+                "environment": "testnet" if self.testnet else "production",
+                "base_url": self.trading_url,
+                "backing_off": wait_for > 0,
+            }
+
+    def signed_calls_held(self) -> tuple:
+        """``(held, seconds_left)`` — should a caller skip signed work for now?
+
+        True only while the key is rejected *and* the backoff window is still
+        open, so the one call that ends the window is the probe that notices a
+        replaced key.
+        """
+        health = self.credential_health()
+        return (health["state"] == "rejected" and health["retry_in_seconds"] > 0), \
+            float(health["retry_in_seconds"] or 0.0)
+
+    def note_signed_call_held(self, reason: str = "") -> None:
+        """Count a signed call a caller skipped because the key is rejected."""
+        with self._auth_lock:
+            self.auth_held_calls += 1
+            if reason:
+                self._last_error_note = str(reason)[:300]
+
+    def clear_auth_latch(self) -> None:
+        """Drop the latch: the credential material changed under this client."""
+        with self._auth_lock:
+            self.auth_error = None
+            self.auth_failures = 0
+            self.auth_rejected_at = None
+            self._auth_retry_at = 0.0
+            self.auth_held_calls = 0
+
 
     # ------------------------------------------------------------------
     # Symbols & instruments
@@ -237,14 +383,27 @@ class BrokerClient:
         return None, {"error": last_error or f"{self.broker_name} request failed"}
 
     def _json_body(self, response, error):
-        """Parse a response body, mapping any failure to an ``error`` dict."""
+        """Parse a response body, mapping any failure to an ``error`` dict.
+
+        Signed calls additionally feed the credential latch (see
+        :meth:`_note_signed_result`); public calls never do, so a dead key
+        cannot take the market-data path down with it.
+        """
+        signed = bool(getattr(response, "_phantom_signed", False))
         if error:
+            if signed:
+                self._note_signed_result(str(error.get("error") or ""))
             return error
         try:
             payload = response.json()
         except ValueError:
             body = (response.text or "").strip().replace("\n", " ")[:300]
-            return {"error": f"{self.broker_name} returned a non-JSON body (HTTP {response.status_code}): {body}"}
+            out = {"error": f"{self.broker_name} returned a non-JSON body (HTTP {response.status_code}): {body}"}
+            if signed:
+                # A proxy/error page is still an HTTP answer: treat an auth
+                # status as a rejection, anything else as "the key is fine".
+                self._note_signed_result(out["error"] if response.status_code in (401, 403) else None)
+            return out
         if response.status_code not in (200, 201):
             message = ""
             if isinstance(payload, dict):
@@ -252,9 +411,17 @@ class BrokerClient:
                            or payload.get("error") or "")
                 if isinstance(message, dict):
                     message = json.dumps(message)
-            return {"error": f"{self.broker_name} HTTP {response.status_code}: {message or str(payload)[:200]}"}
+            out = {"error": f"{self.broker_name} HTTP {response.status_code}: {message or str(payload)[:200]}"}
+            if signed:
+                self._note_signed_result(out["error"])
+            return out
         if isinstance(payload, dict) and payload.get("error"):
-            return {"error": f"{self.broker_name}: {payload['error']}"}
+            out = {"error": f"{self.broker_name}: {payload['error']}"}
+            if signed:
+                self._note_signed_result(out["error"])
+            return out
+        if signed:
+            self._note_signed_result(None)
         return payload
 
     # ------------------------------------------------------------------
@@ -275,6 +442,21 @@ class BrokerClient:
         else:
             response, error = self._throttled_request(method, url, params={**params, "signature": signature},
                                                       headers=headers, weight=weight, is_order=is_order)
+        return self._mark_signed(response, error)
+
+    def _mark_signed(self, response, error):
+        """Tag a signed call's response so :meth:`_json_body` feeds the latch.
+
+        Transport failures are deliberately NOT fed to it: "the box could not
+        reach the venue" is not evidence about the key, in either direction, and
+        clearing a rejection tally on a network blip would hide a dead key for
+        another window.
+        """
+        if response is not None:
+            try:
+                response._phantom_signed = True
+            except (AttributeError, TypeError):  # a response object that refuses attributes
+                pass
         return response, error
 
     # ------------------------------------------------------------------
@@ -299,7 +481,7 @@ class BrokerClient:
         response, error = self._throttled_request(method, url, params=query or None,
                                                   data=body_text or None, headers=headers,
                                                   weight=weight, is_order=is_order)
-        return response, error
+        return self._mark_signed(response, error)
 
     def _delta_result(self, payload):
         """Unwrap Delta's ``{"success": true, "result": ...}`` envelope."""
@@ -1116,7 +1298,14 @@ class BrokerClient:
             elif isinstance(lev, dict):
                 errors.append(str(lev.get("error")))
             if errors:
-                out["error"] = "; ".join(errors)[:300]
+                # A dead key fails every account endpoint with the same string;
+                # repeating it per endpoint buries the one line that matters.
+                unique = list(dict.fromkeys(errors))
+                out["error"] = "; ".join(unique)[:300]
+                if len(unique) == 1 and is_auth_rejection(unique[0]):
+                    out["error"] = (f"{unique[0]} — every account endpoint answered "
+                                    f"the same way, so this is the key/environment, "
+                                    f"not the margin settings")
             return out
         return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
 
@@ -1161,6 +1350,9 @@ class BrokerClient:
         snapshot.update({
             "broker": self.broker_name,
             "limits": self.rate_limit_config.as_dict(),
+            # Weight spent on signed calls *while the key is rejected* is the
+            # number that explains a quota nobody used — surface the reason.
+            "credential_health": self.credential_health(),
         })
         return snapshot
 

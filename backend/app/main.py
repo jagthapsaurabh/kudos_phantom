@@ -838,6 +838,72 @@ def _fetch_connection_settings(db, connection):
     return settings
 
 
+def _live_instances_on_connection(connection, user_id=None) -> list:
+    """Running live instances that trade on this saved connection.
+
+    Matched by ``connection_id`` because two connections can carry keys for the
+    same venue — and the same sub-account — and only the id says which one an
+    instance was started with. An instance with *no* connection id (started on
+    the legacy per-account keys) is included too: a connection saved for that
+    venue and login is exactly what its credential reload picks up.
+    """
+    if connection is None:
+        return []
+    code = normalize_source(getattr(connection, "broker_code", "") or "")
+    own_id = getattr(connection, "id", None)
+    out = []
+    for key, service in list(live_trade_instances.items()):
+        service_connection = getattr(service, "connection_id", None)
+        if service_connection == own_id:
+            out.append((key, service))
+            continue
+        if service_connection is None and normalize_source(getattr(service, "broker_name", "")) == code \
+                and (user_id is None or getattr(service, "user_id", None) == user_id):
+            out.append((key, service))
+    return out
+
+
+def _adopt_credentials_sync(service) -> dict:
+    """Re-read the saved connection into one running instance (blocking half)."""
+    try:
+        result = service.reload_credentials(force=True)
+    except Exception as exc:
+        result = {"reloaded": False, "verified": False,
+                  "reason": f"credential reload failed: {exc.__class__.__name__}: {exc}"}
+    creds = result.get("credentials") or {}
+    return {"reloaded": bool(result.get("reloaded")),
+            "verified": bool(result.get("verified")),
+            "reason": result.get("reason"),
+            "state": creds.get("state"),
+            "error": result.get("error") or creds.get("error")}
+
+
+async def _adopt_saved_credentials(connection, user_id=None) -> dict:
+    """Hand newly saved credentials to the instances already trading on them.
+
+    This is why "restart the live instance" is no longer part of fixing a key:
+    the instance re-reads its own connection row and swaps the client — with it
+    the account it queues on, the rate-limit budget and the deadman switch — so
+    the next tick resumes by itself. Blocking in the request thread would stall
+    the loop, and the heartbeat has to be re-armed *on* that loop, hence the
+    split between to_thread and the awaited resume.
+    """
+    instances = _live_instances_on_connection(connection)
+    out = {"notified": len(instances), "reloaded": 0, "verified": 0, "instances": []}
+    for key, service in instances:
+        entry = await asyncio.to_thread(_adopt_credentials_sync, service)
+        if entry.get("verified"):
+            try:
+                await service.credentials_recovered()
+            except Exception as exc:
+                entry["resume_error"] = f"{exc.__class__.__name__}: {exc}"
+        entry["instance_key"] = key
+        out["instances"].append(entry)
+        out["reloaded"] += int(bool(entry.get("reloaded")))
+        out["verified"] += int(bool(entry.get("verified")))
+    return out
+
+
 @app.get('/broker-connections')
 def list_broker_connections(user=Depends(get_current_user), db=Depends(get_db)):
     rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).order_by(BrokerConnection.created_at).all()
@@ -911,7 +977,7 @@ def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[
 
 
 @app.post('/broker-connections')
-def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+async def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
     # Accept any spelling the UI or a script may send (code, case, or the
     # display name) and store the canonical registry code, so a saved row always
     # matches what the live call looks up.
@@ -920,33 +986,82 @@ def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
         raise HTTPException(status_code=400, detail='API key and secret are required')
-    row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label, api_key=payload.api_key,
-                           api_secret=payload.api_secret, passphrase=payload.passphrase,
+    # Keys are stored as pasted apart from surrounding whitespace: a trailing
+    # newline from a terminal paste is invisible in the UI and is a different
+    # key as far as the venue is concerned.
+    row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
+                           api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
+                           passphrase=(payload.passphrase or '').strip() or None,
                            is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
     db.add(row); db.commit(); db.refresh(row)
     # Read margin mode / leverage / sub-accounts from the venue right away so
     # the connection card shows what the account actually is (and a bad key
     # is visible immediately instead of surfacing later as a 401 wall).
-    _fetch_connection_settings(db, row)
+    await asyncio.to_thread(_fetch_connection_settings, db, row)
     db.refresh(row)
-    return _connection_dict(row)
+    out = _connection_dict(row)
+    # An instance started on the legacy per-account keys has no connection of
+    # its own: this row is exactly what its reload picks up, so hand it over
+    # now instead of waiting for that instance to time out on a dead key.
+    out['live_instances'] = await _adopt_saved_credentials(row, user.id)
+    return out
 
 
 @app.put('/broker-connections/{connection_id}')
-def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+async def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
     row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
     row.broker_code = _canonical_broker_code(db, payload.broker_code); row.label = payload.label
-    # Empty secrets mean "keep the existing secret" in the edit form.
-    if payload.api_key: row.api_key = payload.api_key
-    if payload.api_secret: row.api_secret = payload.api_secret
-    if payload.passphrase is not None: row.passphrase = payload.passphrase
+    # Empty secrets mean "keep the existing secret" in the edit form — the API
+    # never returns one, so an edit form cannot round-trip it.
+    if payload.api_key: row.api_key = payload.api_key.strip()
+    if payload.api_secret: row.api_secret = payload.api_secret.strip()
+    if payload.passphrase is not None: row.passphrase = (payload.passphrase or '').strip() or None
     row.is_testnet = int(payload.is_testnet); row.is_active = int(payload.is_active)
     db.commit(); db.refresh(row)
     # Credentials or environment may have changed: re-read the account details.
-    _fetch_connection_settings(db, row)
+    await asyncio.to_thread(_fetch_connection_settings, db, row)
     db.refresh(row)
-    return _connection_dict(row)
+    out = _connection_dict(row)
+    # The fix for a rejected key is now this request, not a process restart:
+    # every instance trading on this connection swaps its client in place.
+    out['live_instances'] = await _adopt_saved_credentials(row, user.id)
+    return out
+
+
+@app.post('/broker-connections/{connection_id}/probe')
+async def probe_broker_connection(connection_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Ask each Delta India environment whether it accepts this connection's key.
+
+    'invalid_api_key' on every signed call is the same answer to four different
+    questions, and the only one that cannot be read off the key is which
+    environment it belongs to — production keys and demo/testnet keys live in
+    separate stores. So sign one ``GET /v2/wallet/balances`` per host and report
+    what came back, which is also the difference between 'create a new key' and
+    'flip one toggle'.
+
+    Note this probes from the **server**, which is the machine whose IP a
+    whitelisted key trusts; a probe from anywhere else can 401 a good key.
+    """
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id,
+                                            BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    if not (row.api_key and row.api_secret):
+        raise HTTPException(status_code=400, detail='This connection has no key/secret pair to probe')
+    code = _canonical_broker_code(db, row.broker_code)
+    definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
+    from .services.delta_key_probe import probe_connection
+    result = await asyncio.to_thread(
+        probe_connection, row.api_key, row.api_secret, bool(row.is_testnet),
+        row.label or code, (definition.kind if definition else 'generic'), code)
+    out = {'connection_id': row.id, 'label': row.label or code, 'broker': code,
+           'is_testnet': bool(row.is_testnet), **result}
+    # A probe that lands is also a working key: refresh the cached account
+    # details and let any instance holding entries off it right away.
+    if result.get('accepted'):
+        await asyncio.to_thread(_fetch_connection_settings, db, row)
+        out['live_instances'] = await _adopt_saved_credentials(row, user.id)
+    return out
 
 
 @app.post('/broker-connections/{connection_id}/refresh')
@@ -2214,7 +2329,8 @@ def start_live_trade(
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label, heartbeat=heartbeat_on)
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -2228,7 +2344,8 @@ def start_live_trade(
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label, heartbeat=heartbeat_on)
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
         else:
             service = LiveTradeService(strategy_id, payload, api_key, api_secret, initial_capital=capital,
                                        margin_pct=margin_pct, is_custom=True, broker_name=source,
@@ -2236,7 +2353,8 @@ def start_live_trade(
                                        trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label, heartbeat=heartbeat_on)
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
     else:
         service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
@@ -2244,12 +2362,18 @@ def start_live_trade(
                                    trading_windows=window_config, use_mark_price=use_mark,
                                    user_id=user.id, instance_key=instance_key,
                                    price_feed=feed_mode, tick_interval=feed_interval,
-                                   account_label=account_label, heartbeat=heartbeat_on)
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
             "contract": contract_label(source, "BTCUSDT"),
             "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
+            # Which saved connection the instance will sign with, so a key
+            # replaced later can be handed back to *this* instance, and so the
+            # operator can see at start whether the venue accepts it at all.
+            "connection_id": (connection.id if connection else None),
+            "account_label": account_label,
             "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
             "trading_windows": service.window_guard.summary(),
             "heartbeat": bool(getattr(service, "heartbeat_enabled", False)),
@@ -2535,9 +2659,55 @@ def get_live_status(user=Depends(get_current_user)):
                               else {"enabled": bool(getattr(service, "heartbeat_enabled", False)),
                                     "created": False, "stale": True}),
                 "testnet": bool(getattr(getattr(service, "broker", None), "testnet", False)),
+                # Credential state of THIS instance: "ok", or "rejected" with the
+                # venue's own error, the backoff clock, how many entries were held
+                # and the reload counter. Without it a dead key shows up as a
+                # running-but-empty terminal, which reads like a strategy problem.
+                "credentials": service.credentials_status(),
+                "connection_id": getattr(service, "connection_id", None),
                 "is_running": service.is_running, "active_trades": active_trades
             })
     return status_list
+
+
+class LiveReloadCredentialsRequest(BaseModel):
+    instance_key: str
+    # Optionally point the instance at a different saved connection first — the
+    # recovery path when the connection it started on was deleted and re-added.
+    connection_id: Optional[int] = None
+
+
+@app.post("/live-trade/reload-credentials")
+async def reload_live_credentials(payload: LiveReloadCredentialsRequest,
+                                  user=Depends(get_current_user), db=Depends(get_db)):
+    """Re-read a running instance's saved broker connection and swap it in.
+
+    The alternative was a stop/start, which loses the instance's local book (an
+    open trade it has been marking to market, its resting-leg ids, its cooldown
+    clock) to fix nothing but credentials. Swapping the client keeps all of that
+    and moves the account it queues on, its rate-limit budget and its deadman
+    switch to the new key in the same step.
+
+    Force-reloading is always safe: a key that is *not* re-saved simply fails
+    the probe again and the instance goes back to holding entries.
+    """
+    key = payload.instance_key
+    if f"_{user.username}_" not in key:
+        raise HTTPException(status_code=403, detail="Not your instance")
+    service = live_trade_instances.get(key)
+    if service is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if payload.connection_id is not None:
+        row = db.query(BrokerConnection).filter(
+            BrokerConnection.id == payload.connection_id,
+            BrokerConnection.user_id == user.id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Broker connection not found")
+        service.connection_id = row.id
+    result = await asyncio.to_thread(service.reload_credentials, True)
+    if (result.get("credentials") or {}).get("state") == "ok":
+        await service.credentials_recovered()
+    return {"instance_key": key, **result}
 
 # --- DATA ENDPOINTS ---
 @app.get("/klines")

@@ -72,6 +72,13 @@ class DeadmanSwitch:
         self.enabled = False
         self.acks = 0
         self.failures = 0
+        # Acks deliberately not attempted while the key is rejected — not
+        # failures, and not life either. Counted so the two stay tellable apart.
+        self.skipped = 0
+        # Stood down on purpose (not a crash): the bot parked the switch while
+        # it cannot reach the account, so `failures` stops climbing.
+        self.stood_down = False
+        self.stood_down_reason: Optional[str] = None
         self.last_ack_at: Optional[float] = None
         self.next_expiry: Optional[str] = None
         self.process_enabled: Optional[str] = None
@@ -154,6 +161,15 @@ class DeadmanSwitch:
 
     async def stop(self) -> None:
         self._stopping = True
+        await self._cancel_loop()
+        # Always try to disable so a clean stop is not treated as a crash.
+        try:
+            await asyncio.to_thread(self.disable)
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+
+    async def _cancel_loop(self) -> None:
+        """Stop the ack loop without touching the venue-side registration."""
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
@@ -161,26 +177,87 @@ class DeadmanSwitch:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        # Always try to disable so a clean stop is not treated as a crash.
+
+    async def stand_down(self, reason: str = "") -> Dict[str, Any]:
+        """Park the switch on purpose, without a restart.
+
+        The deadman switch exists to cancel this bot's orders when the *process*
+        dies. While the venue is rejecting the API key the ack cannot land at
+        all, so the loop would only rack up a failure every 25 seconds against a
+        beat the exchange can never be told about. Standing down sends one
+        graceful ``ttl=0`` (a planned pause, not a crash), stops the loop, and
+        remembers why — :meth:`resume` picks the beat back up as soon as the
+        credentials work again.
+        """
+        if not self.stood_down and self._task is None and not self.created:
+            return {}
+        self._stopping = True
+        await self._cancel_loop()
+        self.stood_down = True
+        self.stood_down_reason = str(reason or "")[:300] or None
+        self.enabled = False
+        # ``created`` deliberately stays True: the switch is still registered
+        # venue-side, and its resting cancel_orders action keeps protecting any
+        # orders this account already holds.
         try:
-            await asyncio.to_thread(self.disable)
+            result = await asyncio.to_thread(lambda: self.acknowledge(ttl_ms=0))
         except Exception as exc:
+            # Best effort — with a dead key this is rejected, and the switch
+            # simply goes unhealthy on its own.
             self.last_error = f"{type(exc).__name__}: {exc}"
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    async def resume(self) -> None:
+        """Restart the ack loop after a stand-down (credentials recovered)."""
+        if self._task is not None and not self._task.done():
+            return
+        self.stood_down = False
+        self.stood_down_reason = None
+        self._stopping = False
+        # ``_run`` starts with create(), which is idempotent venue-side
+        # ("already exists" counts as success) and doubles as the probe that
+        # the new key is accepted.
+        self._task = asyncio.ensure_future(self._run())
+
+    def _acks_held(self) -> tuple:
+        """``(held, seconds)`` when the venue rejects this client's API key.
+
+        The switch exists to notice a *dead process*, and it can only be kept
+        honest by calls the account accepts. With a rejected key every ack is
+        guaranteed to fail — so the loop idles instead of converting a known
+        credential problem into an ever-climbing failure counter (and burning the
+        weight the orders that would fix it need).
+        """
+        try:
+            return self.client.signed_calls_held()
+        except Exception:
+            return False, 0.0
 
     async def _run(self) -> None:
-        try:
-            await asyncio.to_thread(self.create)
-        except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            self.failures += 1
         while not self._stopping:
-            try:
-                await asyncio.to_thread(self.acknowledge)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.failures += 1
-                self.last_error = f"{type(exc).__name__}: {exc}"
+            held, wait_for = self._acks_held()
+            if held:
+                self.skipped += 1
+                try:
+                    await asyncio.sleep(min(max(wait_for, 1.0), self.ack_interval))
+                except asyncio.CancelledError:
+                    break
+                continue
+            if not self.created:
+                try:
+                    await asyncio.to_thread(self.create)
+                except Exception as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.failures += 1
+            else:
+                try:
+                    await asyncio.to_thread(self.acknowledge)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.failures += 1
+                    self.last_error = f"{type(exc).__name__}: {exc}"
             try:
                 await asyncio.sleep(self.ack_interval)
             except asyncio.CancelledError:
@@ -197,10 +274,15 @@ class DeadmanSwitch:
             "created": bool(self.created),
             "acks": int(self.acks),
             "failures": int(self.failures),
+            "skipped_acks": int(self.skipped),
             "ttl_ms": int(self.ttl_ms),
             "ack_interval": float(self.ack_interval),
             "age_seconds": age,
             "stale": bool(stale) if self.created else True,
+            # A deliberate pause is not a dead bot: the UI renders this instead
+            # of a STALE alarm when the ack loop was parked on purpose.
+            "stood_down": bool(self.stood_down),
+            "stood_down_reason": self.stood_down_reason,
             "process_enabled": self.process_enabled,
             "next_expiry": self.next_expiry,
             "product_symbols": list(self.product_symbols),

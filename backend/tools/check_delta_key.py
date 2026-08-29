@@ -47,26 +47,13 @@ def probe(api_key: str, api_secret: str, base_url: str, testnet: bool) -> tuple:
 
     state is one of "ok" (key accepted), "auth" (host answered and rejected
     the key), "unreachable" (never got an HTTP answer — local network issue,
-    says nothing about the key).
+    says nothing about the key). The probe itself lives in
+    :mod:`app.services.delta_key_probe` so this script and the terminal's
+    **Check key** button can never drift apart.
     """
-    client = BrokerClient(api_key, api_secret, "Delta", testnet=testnet)
-    # Belt and braces: force the host we were asked about.
-    client.trading_url = client.market_url = base_url
-    payload = client.get_account_balance()
-    if isinstance(payload, dict) and payload.get("error"):
-        detail = str(payload["error"])
-        if "request failed" in detail or "non-JSON body" in detail:
-            # Transport-level failure (SSL/timeout/DNS) — not an auth verdict.
-            if any(tok in detail for tok in ("SSLError", "ConnectionError",
-                                             "Timeout", "Max retries",
-                                             "Failed to resolve")):
-                return "unreachable", detail
-        if "HTTP 401" in detail or "invalid_api_key" in detail:
-            return "auth", detail
-        return "auth", detail
-    if isinstance(payload, dict) and payload.get("success") is False:
-        return "auth", str(payload)
-    return "ok", "wallet balances OK (signed call accepted)"
+    from app.services.delta_key_probe import probe_host
+    row = probe_host(api_key, api_secret, base_url, testnet)
+    return row["state"], row["detail"]
 
 
 def creds_from_db(label: str):
@@ -145,11 +132,13 @@ def main() -> int:
         print(f"  MISMATCH: the connection is flagged is_testnet={int(flagged_testnet)} "
               f"but the key only works on {name}.")
         print("  Fix: edit the connection in Broker Settings and set the Testnet toggle "
-              f"to {'ON' if testnet else 'OFF'}, then stop and restart the live instance.")
+              f"to {'ON' if testnet else 'OFF'} — saving re-points every running instance, "
+              "so no restart is needed (Live Trade → Reload keys forces it immediately).")
     else:
-        print("  The connection's testnet flag matches the key. If the live instance still "
-              "401s, it was started with older credentials — stop it and start it again "
-              "(credentials are read once, at instance start).")
+        print("  The connection's testnet flag matches the key. If a live instance still 401s "
+              "while this probe succeeds, it holds older credentials: Live Trade → Reload keys "
+              "(POST /live-trade/reload-credentials) re-reads the saved row, or wait for the "
+              "worker's own retry window.")
 
     if args.heartbeat_id:
         client = BrokerClient(api_key, api_secret, "Delta", testnet=testnet)

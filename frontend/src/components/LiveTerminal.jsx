@@ -750,9 +750,22 @@ const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initi
           <div>
             <div className="font-bold">API key rejected by the exchange</div>
             <div className="mt-1 text-xs leading-relaxed">{data.auth_error}</div>
-            <a href="/broker" className="mt-2 inline-flex items-center gap-1 rounded-lg border border-red-700 bg-red-900/30 px-3 py-1.5 text-[11px] font-bold text-red-200 transition hover:bg-red-900/50">
-              Open Broker Settings
-            </a>
+            {/* The quota line is the proof this is the key and not the account:
+                the weight was spent on calls the venue never even authorised. */}
+            {(data.rate_limits?.credential_health?.state === 'rejected') && (
+              <div className="mt-1 text-[10px] text-red-400/90">
+                Signed calls are being held for {Math.round(data.rate_limits.credential_health.retry_in_seconds || 0)}s
+                · {data.rate_limits.credential_health.error}
+              </div>
+            )}
+            <div className="mt-2 flex items-center gap-2">
+              <a href="/broker" className="inline-flex items-center gap-1 rounded-lg border border-red-700 bg-red-900/30 px-3 py-1.5 text-[11px] font-bold text-red-200 transition hover:bg-red-900/50">
+                Replace the key in Broker Settings
+              </a>
+              <a href="/live" className="inline-flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-1.5 text-[11px] font-bold text-gray-300 transition hover:border-blue-500 hover:text-white">
+                Reload keys on the instance
+              </a>
+            </div>
           </div>
         </div>
       ) : Object.keys(data.errors || {}).length > 0 && (

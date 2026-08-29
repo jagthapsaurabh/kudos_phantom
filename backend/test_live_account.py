@@ -844,9 +844,12 @@ check("all-auth failure collapses into one plain-language verdict",
       and "rejected this API key" in authdead["auth_error"]
       and "invalid_api_key" in authdead["auth_error"],
       str(authdead.get("auth_error"))[:200])
-check("the verdict points at Broker Settings and an instance restart",
-      "Broker Settings" in authdead["auth_error"] and "restart" in authdead["auth_error"],
-      str(authdead.get("auth_error"))[:200])
+check("the verdict points at the fix that exists: replace the key, reload, no restart",
+      "Broker Settings" in authdead["auth_error"]
+      and "Replace the key" in authdead["auth_error"]
+      and "Reload keys" in authdead["auth_error"]
+      and "no longer needs a restart" in authdead["auth_error"],
+      str(authdead.get("auth_error"))[:240])
 check("one mixed failure must not claim the key is bad",
       broker_account._is_auth_rejection("fills endpoint throttled") is False
       and broker_account._is_auth_rejection('Delta HTTP 401: {"code": "invalid_api_key"}') is True
