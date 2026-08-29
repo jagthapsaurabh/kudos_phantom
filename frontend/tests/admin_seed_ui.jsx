@@ -47,6 +47,7 @@ check('off-grid column in status table', /th[^>]*>Off-grid</.test(html));
 // Binance full-history mode explains the fetch (1500-candle windows, upsert,
 // repair-first) instead of only the generic daily-refresh note.
 check('Binance history mode explainer present', html.includes('Binance full-history mode') || html.includes('straight from Binance'));
+check('long-range reliability explained (background + retries)', /background/.test(html) && /retries|resumes/.test(html));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

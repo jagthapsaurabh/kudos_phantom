@@ -17,6 +17,11 @@ sys.path.insert(0, '.')
 # to check the seeder, which used to wipe the developer's real seeded market
 # data (backend/trading_system.db) and leave every backtest failing with
 # "Insufficient data in DB for the selected date range".
+# This suite exercises error classification and host fallback, not backoff;
+# disable the (real-sleep) retry layers so dead-host sections stay instant.
+os.environ["SEED_REQUEST_RETRIES"] = "0"
+os.environ["SEED_WINDOW_RETRIES"] = "0"
+
 TESTDB = "/tmp/delta_paper_test.db"
 if os.path.exists(TESTDB):
     os.unlink(TESTDB)

@@ -563,6 +563,7 @@ export const SeedDataTab = () => {
   const [limit, setLimit] = useState(1000);
   const [status, setStatus] = useState([]);
   const [progress, setProgress] = useState([]);
+  const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
   const [file, setFile] = useState(null);
@@ -589,6 +590,29 @@ export const SeedDataTab = () => {
     }
   };
   useEffect(() => { load(); }, []);
+
+  // Long seeds run in a server-side worker; poll its state so the progress
+  // table below updates live and the final counts refresh when it finishes.
+  const jobWasRunning = React.useRef(false);
+  useEffect(() => {
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_URL}/admin/market-data/seed-job`, { headers: authHeaders() });
+        const data = await res.json().catch(() => ({}));
+        setJob(data);
+        if (data?.running) {
+          jobWasRunning.current = true;
+          const pr = await fetch(`${API_URL}/admin/market-data/progress`, { headers: authHeaders() }).then(r => r.json()).catch(() => []);
+          if (Array.isArray(pr)) setProgress(pr);
+        } else if (jobWasRunning.current) {
+          jobWasRunning.current = false;
+          await load();
+        }
+      } catch { /* polling is best-effort */ }
+    }, 10000);
+    return () => clearInterval(id);
+  }, []);
+  const backgroundRunning = !!job?.running;
 
   const applyBinancePreset = () => {
     setSource('Binance');
@@ -659,6 +683,9 @@ export const SeedDataTab = () => {
     setMsg(null);
     setTestResult(null);
     const requestIntervals = isDeltaSource ? DELTA_INTERVALS : intervals;
+    // Long full-history walks run server-side: the request returns at once
+    // and the seed keeps going (resumable cursor) even if this page closes.
+    const longJob = isDeltaSource || fetchAll;
     try {
       const res = await fetch(`${API_URL}/admin/market-data/seed`, {
         method: 'POST',
@@ -670,14 +697,23 @@ export const SeedDataTab = () => {
           start_date: isDeltaSource ? (start || '2020-01-01') : (start || null),
           end_date: isDeltaSource ? (end || today()) : (end || null),
           limit: Number(limit),
-          fetch_all: isDeltaSource || fetchAll,
+          fetch_all: longJob,
           repair,
           include_mark_price: includeMarkPrice,
+          background: longJob,
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Seed failed');
-      setMsg(formatSummary(data, 'Seed completed'));
+      if (data.background) {
+        const already = /already/.test(data.status || '');
+        setJob({ ...(data.job || {}), running: !already });
+        setMsg({ ok: true, text: already
+          ? `${data.status}. Watch the Historical seed progress table below — it refreshes every 10 s.`
+          : `${data.status}: the server fetches the range in batches and this page can even be closed. Watch the Historical seed progress table below — it refreshes every 10 s.` });
+      } else {
+        setMsg(formatSummary(data, 'Seed completed'));
+      }
       await load();
     } catch (error) {
       setMsg({ ok: false, text: error.message });
@@ -779,12 +815,22 @@ export const SeedDataTab = () => {
             <p className="mt-2 max-w-4xl text-xs text-gray-500">Seed OHLCV candles separately for each exchange. Existing candles are upserted by source, symbol, interval and timestamp. Volume is required for every candle.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={applyBinancePreset} disabled={busy} className="rounded-lg border border-yellow-700/60 bg-yellow-900/20 px-3 py-2 text-xs font-bold text-yellow-300 transition hover:bg-yellow-900/40 disabled:opacity-50" title="Fetch clean 15m, 1h, 4h and 1d candles live from Binance, 1 Jan 2020 → today, repairing corrupt rows first">Binance 2020 → today</button>
-            <button type="button" onClick={applyDeltaPreset} disabled={busy} className="rounded-lg border border-orange-800/60 bg-orange-900/20 px-3 py-2 text-xs font-bold text-orange-300 transition hover:bg-orange-900/40 disabled:opacity-50">Delta 2020 → today</button>
-            <button type="button" disabled={busy} onClick={repairNow} className="rounded-lg border border-red-800/60 bg-red-900/20 px-3 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/40 disabled:opacity-50" title="Delete duplicate and off-grid candles for the selected source without fetching">Repair existing candles</button>
-            <button type="button" onClick={syncNow} disabled={busy} className="flex items-center gap-2 rounded-lg border border-blue-800/60 bg-blue-900/20 px-3 py-2 text-xs font-bold text-blue-300 transition hover:bg-blue-900/40 disabled:opacity-50"><RefreshCw size={13} /> Run daily refresh now</button>
+            <button type="button" onClick={applyBinancePreset} disabled={busy || backgroundRunning} className="rounded-lg border border-yellow-700/60 bg-yellow-900/20 px-3 py-2 text-xs font-bold text-yellow-300 transition hover:bg-yellow-900/40 disabled:opacity-50" title="Fetch clean 15m, 1h, 4h and 1d candles live from Binance, 1 Jan 2020 → today, repairing corrupt rows first">Binance 2020 → today</button>
+            <button type="button" onClick={applyDeltaPreset} disabled={busy || backgroundRunning} className="rounded-lg border border-orange-800/60 bg-orange-900/20 px-3 py-2 text-xs font-bold text-orange-300 transition hover:bg-orange-900/40 disabled:opacity-50">Delta 2020 → today</button>
+            <button type="button" disabled={busy || backgroundRunning} onClick={repairNow} className="rounded-lg border border-red-800/60 bg-red-900/20 px-3 py-2 text-xs font-bold text-red-300 transition hover:bg-red-900/40 disabled:opacity-50" title="Delete duplicate and off-grid candles for the selected source without fetching">Repair existing candles</button>
+            <button type="button" onClick={syncNow} disabled={busy || backgroundRunning} className="flex items-center gap-2 rounded-lg border border-blue-800/60 bg-blue-900/20 px-3 py-2 text-xs font-bold text-blue-300 transition hover:bg-blue-900/40 disabled:opacity-50"><RefreshCw size={13} /> Run daily refresh now</button>
           </div>
         </div>
+
+        {backgroundRunning && (
+          <div className="mt-5 flex items-center gap-3 rounded-xl border border-blue-800/50 bg-blue-900/15 p-4 text-xs text-blue-200">
+            <RefreshCw size={16} className="animate-spin text-blue-400" />
+            <div>
+              <div className="font-bold">Background seed running{job?.source ? ` — ${job.source} ${job.symbol || ''} ${(job.intervals || []).join(', ')}` : ''}</div>
+              <div className="mt-1 text-blue-300/80">The range is fetched in batches with automatic retries; an interrupted range resumes at its cursor. The tables below refresh every 10 s.</div>
+            </div>
+          </div>
+        )}
 
         {isDeltaSource ? (
           <div className="mt-5 rounded-xl border border-orange-800/50 bg-orange-900/15 p-4 text-xs text-orange-200">
@@ -794,11 +840,11 @@ export const SeedDataTab = () => {
         ) : fetchAll ? (
           <div className="mt-5 rounded-xl border border-yellow-800/50 bg-yellow-900/10 p-4 text-xs text-yellow-200">
             <div className="font-bold">Binance full-history mode</div>
-            <p className="mt-1 text-yellow-300/80">Clean candles are fetched live from Binance (Binance Futures API) and every candle is upserted — never duplicated. The backend splits the 1 Jan 2020 → today range into safe 1,500-candle windows, resumes after interruptions, and includes the daily (1d) candles. Keep <span className="font-bold">Repair first</span> checked to delete any duplicate or off-grid candles the legacy CSV imports left behind before fetching.</p>
+            <p className="mt-1 text-yellow-300/80">Clean candles are fetched live from Binance (Binance Futures API) and every candle is upserted — never duplicated. The backend splits the 1 Jan 2020 → today range into safe 1,500-candle windows and includes the daily (1d) candles. The seed runs on the server in the background (this page can even be closed), retries timeouts and rate limits automatically, and resumes an interrupted range at its cursor instead of restarting. Keep <span className="font-bold">Repair first</span> checked to delete any duplicate or off-grid candles the legacy CSV imports left behind before fetching.</p>
           </div>
         ) : (
           <div className="mt-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
-            <span className="font-bold text-blue-300">Tip:</span> use the <span className="font-bold text-yellow-300">Binance 2020 → today</span> preset to fetch clean 15m, 1h, 4h and daily (1d) candles straight from Binance for the full history — the reliable replacement for corrupt CSV imports. The API also refreshes every source once per day.
+            <span className="font-bold text-blue-300">Tip:</span> use the <span className="font-bold text-yellow-300">Binance 2020 → today</span> preset to fetch clean 15m, 1h, 4h and daily (1d) candles straight from Binance for the full history — the reliable replacement for corrupt CSV imports. Long seeds run on the server in the background, in batches with automatic retries, so a long range never breaks mid-fetch. The API also refreshes every source once per day.
           </div>
         )}
 
@@ -840,7 +886,7 @@ export const SeedDataTab = () => {
           </div>
 
           <div className="flex flex-wrap gap-2 md:col-span-4">
-            <button disabled={busy} className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-bold transition hover:bg-blue-500 disabled:opacity-50">{busy ? 'Working…' : isDeltaSource ? 'Seed Delta history' : fetchAll ? 'Seed full history' : 'Fetch & seed OHLCV'}</button>
+            <button disabled={busy || backgroundRunning} className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-bold transition hover:bg-blue-500 disabled:opacity-50">{busy ? 'Working…' : backgroundRunning ? 'Seed running…' : isDeltaSource ? 'Seed Delta history' : fetchAll ? 'Seed full history' : 'Fetch & seed OHLCV'}</button>
             <button type="button" disabled={busy} onClick={testSource} className="rounded-lg bg-gray-700 px-5 py-2.5 text-sm font-bold transition hover:bg-gray-600 disabled:opacity-50" title="Probe one safe 1h request before a long seed">Test connection</button>
           </div>
         </form>

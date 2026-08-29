@@ -33,6 +33,10 @@ port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{port}"
 
+# Keep the dead-host sections fast: no adapter-level retries in this suite.
+os.environ["SEED_REQUEST_RETRIES"] = "0"
+os.environ["SEED_WINDOW_RETRIES"] = "0"
+
 from app.services.data_sync import DataSyncService
 from app.services.broker_client import BrokerClient
 DataSyncService.DELTA_HOSTS = [BASE]

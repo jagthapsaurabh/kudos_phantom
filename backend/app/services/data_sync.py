@@ -19,6 +19,12 @@ class MarketDataError(RuntimeError):
     pass
 
 
+class TransientMarketDataError(MarketDataError):
+    """A transport/exchange hiccup worth retrying (timeout, connection reset,
+    HTTP 429/5xx) rather than aborting a long seed."""
+
+
+
 class DataSyncService:
     TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
     # The Delta public OHLC endpoint is capped at 2,000 candles per request.
@@ -33,6 +39,18 @@ class DataSyncService:
     DELTA_MAX_CANDLES = 2000
     BINANCE_MAX_CANDLES = 1500
     SEED_PAGE_SLEEP_SECONDS = float(os.getenv("SEED_PAGE_SLEEP_SECONDS", "0.10"))
+    # A 2020 → today walk is thousands of requests, and any single one can
+    # time out or get rate-limited mid-flight. Two layers keep the range from
+    # "breaking": every HTTP request retries transient failures with growing
+    # backoff, and the window loop retries a whole window (same cursor) before
+    # giving up. Giving up never loses progress — the durable cursor means a
+    # re-run continues where the range stopped.
+    REQUEST_RETRIES = int(os.getenv("SEED_REQUEST_RETRIES", "4"))
+    REQUEST_BACKOFF_SECONDS = float(os.getenv("SEED_REQUEST_BACKOFF_SECONDS", "1.0"))
+    WINDOW_RETRIES = int(os.getenv("SEED_WINDOW_RETRIES", "3"))
+    WINDOW_BACKOFF_SECONDS = float(os.getenv("SEED_WINDOW_BACKOFF_SECONDS", "5.0"))
+    TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+    RETRY_SLEEP_CAP_SECONDS = 60.0
     # Full-history seeds default to 1 Jan 2020 for every adapter. Binance's
     # BTCUSDT perpetual lists in 2019, so a 2020 start always has candles;
     # Delta's pre-listing windows simply come back empty. An explicit
@@ -172,6 +190,38 @@ class DataSyncService:
         return None, f"unexpected payload type: {str(payload)[:200]}"
 
     @classmethod
+    def _get_with_retry(cls, url, params, timeout=20, headers=None):
+        """GET that retries transient failures instead of failing a long seed.
+
+        Retries connection errors, timeouts and HTTP 429/5xx with growing
+        backoff (honouring Retry-After when the exchange sends it). Once the
+        attempts are exhausted the caller gets a TransientMarketDataError so
+        the window loop can retry the whole window, and a permanent failure
+        stays a plain MarketDataError.
+        """
+        attempt = 0
+        while True:
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            except requests.RequestException as exc:
+                if attempt < cls.REQUEST_RETRIES:
+                    time.sleep(min(cls.REQUEST_BACKOFF_SECONDS * (2 ** attempt), cls.RETRY_SLEEP_CAP_SECONDS))
+                    attempt += 1
+                    continue
+                raise TransientMarketDataError(
+                    f"request failed after {attempt + 1} attempts: {exc.__class__.__name__}: {exc}") from exc
+            if response.status_code in cls.TRANSIENT_HTTP_STATUSES and attempt < cls.REQUEST_RETRIES:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = max(float(retry_after), 0.5)
+                except (TypeError, ValueError):
+                    delay = cls.REQUEST_BACKOFF_SECONDS * (2 ** attempt)
+                time.sleep(min(delay, cls.RETRY_SLEEP_CAP_SECONDS))
+                attempt += 1
+                continue
+            return response
+
+    @classmethod
     def _delta_fetch_one(cls, host, params):
         """Try one Delta host. Returns (rows, status_code, note).
 
@@ -184,17 +234,15 @@ class DataSyncService:
         url = f"{base}/history/candles" if base.endswith("/v2") else f"{base}/v2/history/candles"
         headers = {"Accept": "application/json", "User-Agent": "PHANTOM-Trading-Tool/1.0"}
         try:
-            response = None
-            for attempt in range(3):
-                response = requests.get(url, params=params, headers=headers, timeout=20)
-                if response.status_code != 429 or attempt == 2:
-                    break
-                reset_ms = response.headers.get("X-RATE-LIMIT-RESET", "")
-                try:
-                    wait_seconds = max(float(reset_ms) / 1000.0, 0.5)
-                except (TypeError, ValueError):
-                    wait_seconds = 1.0
-                time.sleep(min(wait_seconds, 30.0))
+            # Retries (timeouts, resets, 429/5xx with Retry-After) live in the
+            # shared _get_with_retry helper, so a long Delta history walk
+            # survives exchange hiccups instead of aborting the range. A
+            # transport failure is returned as a note so the remaining hosts
+            # are still tried.
+            try:
+                response = cls._get_with_retry(url, params, timeout=20, headers=headers)
+            except TransientMarketDataError as exc:
+                return [], None, str(exc)
             if response.status_code != 200:
                 body = (response.text or "").strip().replace("\n", " ")[:300]
                 return [], response.status_code, f"HTTP {response.status_code} {body}".strip()
@@ -233,16 +281,21 @@ class DataSyncService:
             "end": int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp()) if end_time else now,
         }
         attempts = []
+        statuses = []
         for host in (hosts or cls.DELTA_HOSTS):
             rows, status, note = cls._delta_fetch_one(host, params)
             if rows:
                 return rows
+            statuses.append(status)
             attempts.append(f"{host} → HTTP {status if status is not None else 'n/a'}"
                             + (f" ({note})" if note else " (empty result)"))
-        raise MarketDataError(
-            f"Delta Exchange returned 0 candles for {params['symbol']} {params['resolution']}: "
-            + " | ".join(attempts)
-        )
+        detail = (f"Delta Exchange returned 0 candles for {params['symbol']} {params['resolution']}: "
+                  + " | ".join(attempts))
+        # Every host failing with a transport error or a rate-limit/server
+        # status is a transient condition — let the window loop retry it.
+        if statuses and all(status is None or status in cls.TRANSIENT_HTTP_STATUSES for status in statuses):
+            raise TransientMarketDataError(detail)
+        raise MarketDataError(detail)
 
     @classmethod
     def fetch_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
@@ -260,10 +313,13 @@ class DataSyncService:
             if end_time:
                 params["endTime"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
             try:
-                response = requests.get(url, params=params, timeout=20)
+                response = cls._get_with_retry(url, params, timeout=20)
                 if response.status_code != 200:
                     body = (response.text or "").strip().replace("\n", " ")[:300]
-                    raise MarketDataError(f"Binance-compatible data request failed: HTTP {response.status_code} {body}".strip())
+                    message = f"Binance-compatible data request failed: HTTP {response.status_code} {body}".strip()
+                    if response.status_code in cls.TRANSIENT_HTTP_STATUSES:
+                        raise TransientMarketDataError(message)
+                    raise MarketDataError(message)
                 raw = response.json()
                 if not isinstance(raw, list):
                     raise MarketDataError(f"Binance-compatible data request failed: {str(raw)[:300]}")
@@ -312,10 +368,13 @@ class DataSyncService:
                 params["startTime"] = int(cls._as_datetime(start_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
             if end_time:
                 params["endTime"] = int(cls._as_datetime(end_time).replace(tzinfo=timezone.utc).timestamp() * 1000)
-            response = requests.get(f"{base}/fapi/v1/markPriceKlines", params=params, timeout=20)
+            response = cls._get_with_retry(f"{base}/fapi/v1/markPriceKlines", params, timeout=20)
             if response.status_code != 200:
                 body = (response.text or "").strip().replace("\n", " ")[:300]
-                raise MarketDataError(f"Binance mark-price request failed: HTTP {response.status_code} {body}".strip())
+                message = f"Binance mark-price request failed: HTTP {response.status_code} {body}".strip()
+                if response.status_code in cls.TRANSIENT_HTTP_STATUSES:
+                    raise TransientMarketDataError(message)
+                raise MarketDataError(message)
             return [{"event_time": pd.to_datetime(k[0], unit="ms").to_pydatetime(),
                      "open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4])} for k in response.json()]
@@ -353,12 +412,55 @@ class DataSyncService:
             for interval in intervals:
                 entry = {"source": source, "symbol": symbol, "interval": interval}
                 try:
-                    rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
-                                                 end_time, limit, definition=definition)
-                    result = upsert_mark_rows(db, rows, source, symbol, interval) if rows else {
-                        "inserted": 0, "updated": 0, "total": 0}
-                    db.commit()
-                    entry.update(result, fetched=len(rows))
+                    interval_seconds = cls._interval_seconds(interval)
+                    page_limit = cls._page_limit(source, limit, definition)
+                    if start_time:
+                        # Full-history mark backfill: page the whole range like
+                        # the traded-OHLCV seed instead of fetching a single
+                        # page (one page covers only the first `limit` candles
+                        # of a 2020 → today range). Mark rows whose candle is
+                        # not seeded yet are skipped, so this runs after the
+                        # OHLCV seed of the same range.
+                        cursor = cls._as_datetime(start_time)
+                        range_end = cls._as_datetime(end_time) if end_time else datetime.utcnow()
+                        window_span = timedelta(seconds=interval_seconds * max(0, page_limit - 1))
+                        inserted = updated = fetched = 0
+                        first = last = None
+                        window_attempts = 0
+                        while cursor < range_end:
+                            window_end = min(range_end, cursor + window_span)
+                            try:
+                                rows = cls.fetch_mark_klines(source, symbol, interval, cursor,
+                                                             window_end, page_limit, definition=definition)
+                                window_attempts = 0
+                            except TransientMarketDataError:
+                                window_attempts += 1
+                                if window_attempts <= cls.WINDOW_RETRIES:
+                                    time.sleep(min(cls.WINDOW_BACKOFF_SECONDS * (2 ** (window_attempts - 1)),
+                                                   cls.RETRY_SLEEP_CAP_SECONDS))
+                                    continue
+                                raise
+                            if rows:
+                                result = upsert_mark_rows(db, rows, source, symbol, interval)
+                                db.commit()
+                                inserted += result["inserted"]
+                                updated += result["updated"]
+                                fetched += len(rows)
+                                first = first or rows[0]["event_time"]
+                                last = rows[-1]["event_time"]
+                            cursor = cls._next_grid_time(window_end, interval_seconds)
+                            if cls.SEED_PAGE_SLEEP_SECONDS > 0:
+                                time.sleep(cls.SEED_PAGE_SLEEP_SECONDS)
+                        entry.update(inserted=inserted, updated=updated,
+                                     total=inserted + updated, fetched=fetched,
+                                     first=first, last=last)
+                    else:
+                        rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
+                                                     end_time, limit, definition=definition)
+                        result = upsert_mark_rows(db, rows, source, symbol, interval) if rows else {
+                            "inserted": 0, "updated": 0, "total": 0}
+                        db.commit()
+                        entry.update(result, fetched=len(rows))
                 except MarketDataError as exc:
                     db.rollback()
                     entry.update(inserted=0, updated=0, total=0, fetched=0, error=str(exc))
@@ -863,6 +965,7 @@ class DataSyncService:
             pages = progress_state['pages']
             empty_pages = progress_state['empty_pages']
             max_pages = 10000
+            window_attempts = 0
             while pages < max_pages and cursor < end:
                 window_end = min(end, cursor + window_span)
                 attempted_page = []
@@ -871,6 +974,24 @@ class DataSyncService:
                         source, symbol, interval, cursor, window_end, page_limit,
                         definition=definition,
                     )
+                    window_attempts = 0
+                except TransientMarketDataError as exc:
+                    # Timeouts / resets / 429 / 5xx are retried at the same
+                    # cursor so an hours-long walk shrugs off exchange hiccups
+                    # instead of dying mid-range. The adapter has already
+                    # retried the single request; this retries the window.
+                    window_attempts += 1
+                    if window_attempts <= cls.WINDOW_RETRIES:
+                        time.sleep(min(cls.WINDOW_BACKOFF_SECONDS * (2 ** (window_attempts - 1)),
+                                       cls.RETRY_SLEEP_CAP_SECONDS))
+                        continue
+                    error = (f"{exc} — {cls.WINDOW_RETRIES + 1} window attempts failed; progress is "
+                             f"saved, re-run the same seed to resume from {cursor:%Y-%m-%d %H:%M} UTC")
+                    cls._mark_seed_progress_failed(
+                        source, definition_key, symbol, interval,
+                        requested_start, end, error,
+                    )
+                    break
                 except MarketDataError as exc:
                     detail = str(exc)
                     # A Delta product can have no candles before its listing
@@ -880,10 +1001,10 @@ class DataSyncService:
                     if kind == 'delta' and 'HTTP 200 (empty result)' in detail:
                         attempted_page = []
                     else:
-                        error = detail
+                        error = f"{detail} — progress is saved; re-run the same seed to resume"
                         cls._mark_seed_progress_failed(
                             source, definition_key, symbol, interval,
-                            requested_start, end, detail,
+                            requested_start, end, error,
                         )
                         break
                 except Exception as exc:

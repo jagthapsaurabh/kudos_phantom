@@ -210,6 +210,227 @@ check("post-repair reseed leaves a clean grid series",
       off_grid == 0 and total == extended["total"], f"total={total}")
 
 
+# ---------------------------------------------------------------------------
+print("\n== transient request retries (adapter level) ==")
+import requests as requests_module
+from app.services.data_sync import TransientMarketDataError
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, headers=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else []
+        self.headers = headers or {}
+        self.text = text
+    def json(self):
+        return self._payload
+
+real_get = requests_module.get
+DataSyncService.REQUEST_RETRIES = 3
+DataSyncService.REQUEST_BACKOFF_SECONDS = 0.0
+get_calls = {"n": 0}
+
+def flaky_get(url, params=None, timeout=None, headers=None, **kw):
+    get_calls["n"] += 1
+    if get_calls["n"] <= 2:
+        raise requests_module.exceptions.Timeout("read timed out")
+    return FakeResponse(200, payload=[[1577836800000, "1", "2", "0.5", "1.5", "10"]])
+
+requests_module.get = flaky_get
+try:
+    rows = DataSyncService.fetch_klines("Binance", "BTCUSDT", "1h", limit=10)
+    check("timeout then success: retried and returned candles",
+          len(rows) == 1 and get_calls["n"] == 3, f"calls={get_calls['n']}")
+finally:
+    requests_module.get = real_get
+
+get_calls["n"] = 0
+def always_429(url, params=None, timeout=None, headers=None, **kw):
+    get_calls["n"] += 1
+    return FakeResponse(429, payload={}, headers={"Retry-After": "0"}, text="rate limited")
+requests_module.get = always_429
+try:
+    try:
+        DataSyncService.fetch_klines("Binance", "BTCUSDT", "1h", limit=10)
+        check("persistent 429 raises TransientMarketDataError", False)
+    except TransientMarketDataError as exc:
+        check("persistent 429 raises TransientMarketDataError", "HTTP 429" in str(exc))
+    check("429 retried per REQUEST_RETRIES then gave up",
+          get_calls["n"] == DataSyncService.REQUEST_RETRIES + 1, f"calls={get_calls['n']}")
+finally:
+    requests_module.get = real_get
+
+get_calls["n"] = 0
+def bad_request(url, params=None, timeout=None, headers=None, **kw):
+    get_calls["n"] += 1
+    return FakeResponse(400, payload={"code": -1100}, text="bad symbol")
+requests_module.get = bad_request
+try:
+    try:
+        DataSyncService.fetch_klines("Binance", "BTCUSDT", "1h", limit=10)
+        check("permanent 400 is not retried", False)
+    except MarketDataError as exc:
+        check("permanent 400 is not retried", "HTTP 400" in str(exc))
+    check("permanent 400 answered after one call", get_calls["n"] == 1)
+finally:
+    requests_module.get = real_get
+
+
+# ---------------------------------------------------------------------------
+print("\n== window retries carry a long range past exchange hiccups ==")
+DataSyncService.WINDOW_RETRIES = 2
+DataSyncService.WINDOW_BACKOFF_SECONDS = 0.0
+glitch = {"left": 2}
+
+def glitchy_fetch(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+                  start_time=None, end_time=None, limit=1000, definition=None):
+    if glitch["left"] > 0 and start_time and cls._as_datetime(start_time) >= datetime(2020, 2, 1):
+        glitch["left"] -= 1
+        raise TransientMarketDataError("request failed after 4 attempts: ReadTimeout")
+    return scripted_fetch(cls, source, symbol, interval, start_time, end_time, limit, definition)
+
+DataSyncService.fetch_klines = classmethod(glitchy_fetch)
+try:
+    summary = DataSyncService.seed_market_data(
+        source="Binance", symbol="BTCUSDT", intervals=["1d"],
+        start_date="2020-01-01", end_date="2020-03-01", limit=20, fetch_all=True,
+    )[0]
+finally:
+    DataSyncService.fetch_klines = classmethod(scripted_fetch)
+expected_leap = (datetime(2020, 3, 2) - datetime(2020, 1, 1)).days  # 61 inclusive daily candles
+check("transient mid-range failures retried at the same window",
+      summary["status"] == "completed" and summary["total"] == expected_leap,
+      f"status={summary.get('status')} total={summary.get('total')}")
+
+
+# ---------------------------------------------------------------------------
+print("\n== exhausted retries keep progress and tell the admin to re-run ==")
+persistent = {"starts": []}
+
+def dying_fetch(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+                start_time=None, end_time=None, limit=1000, definition=None):
+    start = cls._as_datetime(start_time)
+    persistent["starts"].append(start)
+    if start >= datetime(2021, 1, 20):
+        raise TransientMarketDataError("request failed after 4 attempts: ConnectionError")
+    return scripted_fetch(cls, source, symbol, interval, start_time, end_time, limit, definition)
+
+# Fresh range (2021) so the durable cursor of the completed 2020 range above
+# cannot satisfy this request as "already completed".
+DataSyncService.fetch_klines = classmethod(dying_fetch)
+try:
+    failed = DataSyncService.seed_market_data(
+        source="Binance", symbol="BTCUSDT", intervals=["1d"],
+        start_date="2021-01-01", end_date="2021-03-01", limit=20, fetch_all=True,
+    )[0]
+finally:
+    DataSyncService.fetch_klines = classmethod(scripted_fetch)
+check("exhausted retries mark the range failed", failed["status"] == "failed" and failed.get("error"),
+      f"status={failed.get('status')} error={failed.get('error')}")
+check("failure message says the range resumes on re-run", "re-run the same seed" in (failed.get("error") or ""))
+db = SessionLocal()
+kept = db.query(Klines).filter_by(source="Binance", symbol="BTCUSDT", interval="1d").filter(
+    Klines.event_time >= datetime(2021, 1, 1), Klines.event_time < datetime(2021, 1, 20)).distinct().count()
+db.close()
+check("windows committed before the failure are kept", kept >= 19, f"kept={kept}")
+
+# Re-running with the exchange healthy resumes at the cursor and completes.
+expected_2021 = (datetime(2021, 3, 2) - datetime(2021, 1, 1)).days  # 60 inclusive daily candles
+resumed = DataSyncService.seed_market_data(
+    source="Binance", symbol="BTCUSDT", intervals=["1d"],
+    start_date="2021-01-01", end_date="2021-03-01", limit=20, fetch_all=True,
+)[0]
+check("re-run after failure resumes and completes",
+      resumed["status"] == "completed" and resumed["total"] == expected_2021,
+      f"status={resumed.get('status')} total={resumed.get('total')}")
+
+
+# ---------------------------------------------------------------------------
+print("\n== mark-price backfill pages the whole range ==")
+mark_pages = {"n": 0}
+REAL_MARK_FETCH = DataSyncService.fetch_mark_klines.__func__
+
+def scripted_mark(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+                  start_time=None, end_time=None, limit=1000, definition=None):
+    mark_pages["n"] += 1
+    step = timedelta(seconds=cls._interval_seconds(interval))
+    rows, cursor, stop = [], cls._as_datetime(start_time), cls._as_datetime(end_time)
+    while cursor <= stop and len(rows) < int(limit):
+        rows.append({"event_time": cursor, "open": 200.0, "high": 201.0,
+                     "low": 199.0, "close": 200.5})
+        cursor += step
+    return rows
+
+DataSyncService.fetch_mark_klines = classmethod(scripted_mark)
+try:
+    mark_summary = DataSyncService.sync_mark_prices(
+        "Binance", "BTCUSDT", ["1d"], start_time="2020-01-01", end_time="2020-01-09", limit=3)
+finally:
+    DataSyncService.fetch_mark_klines = classmethod(REAL_MARK_FETCH)
+mentry = mark_summary[0]
+check("mark backfill split the range into pages",
+      mark_pages["n"] == 3 and mentry["fetched"] == 9 and not mentry.get("error"),
+      f"pages={mark_pages['n']} fetched={mentry.get('fetched')}")
+db = SessionLocal()
+marked = db.query(Klines).filter(
+    Klines.source == "Binance", Klines.symbol == "BTCUSDT", Klines.interval == "1d",
+    Klines.event_time >= datetime(2020, 1, 1), Klines.event_time <= datetime(2020, 1, 9),
+    Klines.mark_close.isnot(None)).count()
+db.close()
+check("mark prices written across every candle of the range", marked == 9, f"marked={marked}")
+
+
+# ---------------------------------------------------------------------------
+print("\n== background seed endpoint (long ranges never hold the request) ==")
+import asyncio
+import bcrypt as _bcrypt
+from app.database.models import User
+from fastapi.testclient import TestClient
+import app.main as main
+
+async def _no_sync():
+    await asyncio.sleep(3600)
+main.daily_sync_task = _no_sync
+
+db = SessionLocal()
+db.query(User).delete()
+db.add(User(username="admin", password_hash=_bcrypt.hashpw(b"admin123", _bcrypt.gensalt()).decode(),
+            role="admin", is_active=1, can_paper=1, can_live=0,
+            initial_capital=20000.0, margin_deployment_pct=25.0, virtual_balance=20000.0))
+db.commit()
+db.close()
+
+client = TestClient(main.app)
+token = client.post("/token", data={"username": "admin", "password": "admin123"}).json()["access_token"]
+H = {"Authorization": f"Bearer {token}"}
+
+r = client.post("/admin/market-data/seed", headers=H, json={
+    "source": "Binance", "symbol": "BTCUSDT", "intervals": ["1h"], "limit": 50,
+    "start_date": "2020-01-01", "end_date": "2020-01-05", "fetch_all": True, "background": True})
+d = r.json()
+check("background seed accepted immediately",
+      r.status_code == 200 and d["background"] is True and "started" in d["status"], str(d)[:200])
+
+import time as _time
+deadline = _time.time() + 30
+final = None
+while _time.time() < deadline:
+    state = client.get("/admin/market-data/seed-job", headers=H).json()
+    if not state.get("running"):
+        final = state.get("last")
+        break
+    _time.sleep(0.2)
+check("background job finished", final is not None and final.get("status") == "Seed completed",
+      str(final)[:200])
+rows = client.get("/admin/market-data/progress", headers=H).json()
+check("background job left durable completed cursors",
+      any(row.get("status") == "completed" and row.get("interval") == "1h" for row in rows))
+db = SessionLocal()
+bg_candles = db.query(Klines).filter_by(source="Binance", symbol="BTCUSDT", interval="1h").filter(
+    Klines.event_time >= datetime(2020, 1, 1), Klines.event_time <= datetime(2020, 1, 5, 23)).count()
+db.close()
+check("background job seeded the requested range", bg_candles == 120, f"candles={bg_candles}")  # 5 days x 24h
+
+
 print(f"\n{'=' * 60}\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED: " + ", ".join(FAIL))
