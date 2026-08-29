@@ -19,6 +19,8 @@ import PaperTrade from '../src/pages/PaperTrade.jsx';
 import LiveTrade, { FeedBadge, HeartbeatBadge } from '../src/pages/LiveTrade.jsx';
 import EntryGuardBadges from '../src/components/EntryGuardBadges.jsx';
 import ConnectionCheck from '../src/components/ConnectionCheck.jsx';
+import PhantomStrategy from '../src/pages/PhantomStrategy.jsx';
+import StrategyFlowTab from '../src/pages/StrategyFlowTab.jsx';
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = '') => {
@@ -36,6 +38,40 @@ for (const [name, Comp] of [['Backtest', Backtest], ['PaperTrade', PaperTrade], 
   check(`${name} renders`, html.length > 200);
   check(`${name} has the run/instance controls`, /Start|Start Instance|Run Backtest/i.test(html));
 }
+
+// ---------------------------------------------------------------- strategy --
+// The Kudos Strategy page: the shell renders with all three tabs, and the
+// flow tab documents the registry / connection / adapter pipeline.
+let strategyHtml = '';
+try {
+  strategyHtml = renderToString(React.createElement(PhantomStrategy));
+  check('PhantomStrategy renders', strategyHtml.length > 200);
+} catch (e) {
+  check('PhantomStrategy renders', false, e.message);
+}
+check('Kudos Strategy lists all three tabs',
+  strategyHtml.includes('Strategy Rules') && strategyHtml.includes('Strategy Explained')
+  && strategyHtml.includes('Data &amp; Broker Flow'));
+
+let flowHtml = '';
+try {
+  flowHtml = renderToString(React.createElement(StrategyFlowTab));
+  check('StrategyFlowTab renders', flowHtml.length > 2000);
+} catch (e) {
+  check('StrategyFlowTab renders', false, e.message);
+}
+check('flow tab explains the registry is not API keys',
+  flowHtml.includes('not your API keys'));
+check('flow tab documents the Add Integration fields',
+  flowHtml.includes('Code') && flowHtml.includes('Display name')
+  && flowHtml.includes('Adapter kind') && flowHtml.includes('Market data URL'));
+check('flow tab documents all three adapter kinds',
+  flowHtml.includes('Binance-compatible') && flowHtml.includes('Delta-compatible')
+  && flowHtml.includes('Generic'));
+check('flow tab explains per-venue rate limits',
+  flowHtml.includes('Quota / 5 min') && flowHtml.includes('Orders / minute'));
+check('flow tab maps the venue symbol difference',
+  flowHtml.includes('BTCUSDT') && flowHtml.includes('BTCUSD'));
 
 // Backtest must show the new perpetual + window controls.
 const html = renderToString(React.createElement(Backtest));

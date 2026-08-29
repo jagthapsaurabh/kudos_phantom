@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { API_URL } from '../api';
-import { BookOpen, Calculator } from 'lucide-react';
+import { BookOpen, Calculator, Plug } from 'lucide-react';
 import StrategyExplainedTab from './StrategyExplainedTab';
+import StrategyFlowTab from './StrategyFlowTab';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -115,6 +116,7 @@ const PhantomStrategy = () => {
   const tabs = [
     { id: 'rules', label: 'Strategy Rules', icon: <BookOpen size={16} /> },
     { id: 'explained', label: 'Strategy Explained', icon: <Calculator size={16} /> },
+    { id: 'flow', label: 'Data & Broker Flow', icon: <Plug size={16} /> },
   ];
 
   return (
@@ -124,7 +126,7 @@ const PhantomStrategy = () => {
           <h1 className="text-2xl sm:text-3xl font-extrabold text-blue-400 tracking-tight flex items-center gap-3">
             <BookOpen size={28} /> Kudos Strategy
           </h1>
-          <p className="text-gray-500 text-sm mt-1">How Kudos v3 enters, manages and exits positions — plus a formula-by-formula deep dive.</p>
+          <p className="text-gray-500 text-sm mt-1">How Kudos v3 enters, manages and exits positions — the formulas behind every knob, and how a venue goes from a registry entry to live orders.</p>
         </div>
       </header>
 
@@ -139,6 +141,7 @@ const PhantomStrategy = () => {
 
       {tab === 'rules' && <StrategyRulesTab profile={champion?.profile} champion={champion} />}
       {tab === 'explained' && <StrategyExplainedTab champion={champion} />}
+      {tab === 'flow' && <StrategyFlowTab />}
     </div>
   );
 };

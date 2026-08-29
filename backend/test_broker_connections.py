@@ -32,7 +32,7 @@ from sqlalchemy import text                                          # noqa: E40
 
 from app.main import app, _live_client                               # noqa: E402
 from app.database.models import (SessionLocal, User, BrokerDefinition,  # noqa: E402
-                                 BrokerConnection)
+                                 BrokerConnection, FeeSetting)
 
 PASS, FAIL = [], []
 
@@ -50,9 +50,11 @@ db = SessionLocal()
 BrokerDefinition.__table__.create(bind=db.get_bind(), checkfirst=True)
 User.__table__.create(bind=db.get_bind(), checkfirst=True)
 BrokerConnection.__table__.create(bind=db.get_bind(), checkfirst=True)
+FeeSetting.__table__.create(bind=db.get_bind(), checkfirst=True)
 db.query(BrokerConnection).delete()
 db.query(User).delete()
 db.query(BrokerDefinition).delete()
+db.query(FeeSetting).delete()
 db.add(BrokerDefinition(code="Binance", name="Binance Futures", kind="binance",
                         is_builtin=1, enabled=1))
 db.add(BrokerDefinition(code="Delta", name="Delta Exchange", kind="delta",
@@ -230,6 +232,28 @@ check("snapshot refuses with 400", r.status_code == 400, r.text[:200])
 detail = r.json().get("detail", "")
 check("the 400 explains the Registry/connection split",
       "Exchange Registry" in detail and "Add broker connection" in detail, detail)
+
+# ===========================================================================
+section("7. the registry is one row per venue, whatever the spelling")
+# ===========================================================================
+# Connections and instance settings resolve codes case-insensitively
+# (func.lower), so "bybit" and "Bybit" would be two rows fighting over one
+# identity. The create endpoint has to reject the second spelling.
+make_user("admin")
+db.query(User).filter(User.username == "admin").update({"role": "admin"})
+db.commit()
+admin_headers = login("admin")
+r = client.post("/admin/brokers", headers=admin_headers,
+                json={"code": "Bybit", "name": "Bybit Futures", "kind": "binance"})
+check("admin registers a new venue", r.status_code == 200 and r.json().get("code") == "Bybit",
+      r.text[:200])
+r = client.post("/admin/brokers", headers=admin_headers,
+                json={"code": "bybit", "name": "Bybit duplicate"})
+check("the same code in another case is rejected",
+      r.status_code == 400 and "already exists" in r.json().get("detail", ""), r.text[:200])
+r = client.post("/admin/brokers", headers={"Authorization": "Bearer someone_else"},
+                json={"code": "OKX", "name": "OKX"})
+check("non-admins cannot touch the registry", r.status_code in (401, 403), r.text[:200])
 
 # ===========================================================================
 print(f"\n{'=' * 62}")
