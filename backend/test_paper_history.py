@@ -80,6 +80,7 @@ check("login admin", r.status_code == 200, r.text[:200])
 H = {"Authorization": f"Bearer {r.json()['access_token']}"}
 r = client.post("/token", data={"username": "client2", "password": "client123"})
 H2 = {"Authorization": f"Bearer {r.json()['access_token']}"}
+MAIN_USER = "admin"   # the H token's login, for privacy checks
 
 print("\n== start a paper instance -> history row created ==", flush=True)
 def _start():
@@ -129,9 +130,28 @@ check("symbol restored on the next snapshot",
 check("status endpoint exposes session_id",
       client.get("/paper-trade/status", headers=H).json()[0].get("session_id") == svc.session_id)
 
-print("\n== a closed trade is persisted while running ==", flush=True)
+print("\n== execution overlay: open trade, closed trade, survived session ==", flush=True)
 tr = svc.oms.create_order("BTCUSDT", 1, 67000.0, atr_usd=400.0,
                           timestamp=datetime.utcnow(), margin_inr=5000.0, conversion_rate=85.0)
+r = client.get("/trade-executions", headers=H)
+ex = r.json()
+sess_open = next((s for s in ex.get("sessions", []) if s.get("key") == f"paper:{instance_key}"), None)
+check("open position appears on /trade-executions while running",
+      r.status_code == 200 and sess_open is not None, str(ex)[:250])
+open_trade = (sess_open or {}).get("trades", [{}])[0]
+check("the open execution carries entry candle + live SL/TP/trail levels",
+      open_trade.get("status") == "open" and open_trade.get("entry_time")
+      and open_trade.get("sl") is not None and open_trade.get("tp") is not None
+      and open_trade.get("trail_stop") is not None,
+      str(open_trade)[:250])
+check("a running session is not double-listed from its saved row",
+      sum(1 for s in ex.get("sessions", []) if s.get("instance_key") == instance_key) == 1,
+      str([s.get("key") for s in ex.get("sessions", [])]))
+r = client.get("/trade-executions", headers=H2)
+check("another user's executions stay private", r.status_code == 200
+      and all(f"_{MAIN_USER}_" not in (s.get("instance_key") or "")
+              for s in r.json().get("sessions", [])), "")
+
 # Arm the trailing stop above the mock's last 1h close (67099) so the tick exits.
 tr.trail_activation = 66000.0
 tr.trail_stop = 67150.0
@@ -139,6 +159,16 @@ tr.peak_price = 67200.0
 asyncio.run(svc.tick())
 check("tick closed the trade", not svc.oms.active_trades, str(list(svc.oms.active_trades)))
 check("equity curve sampled", len(svc.equity_history) >= 2, str(svc.equity_history[:2]))
+r = client.get("/trade-executions", headers=H)
+sess_closed = next((s for s in r.json().get("sessions", []) if s.get("key") == f"paper:{instance_key}"), None)
+closed_exec = next((t for t in (sess_closed or {}).get("trades", []) if t.get("status") == "closed"), None)
+check("closed execution lands on /trade-executions",
+      closed_exec is not None, str((sess_closed or {}).get("trades"))[:250])
+check("the closed execution carries exit candle, stop plan and PnL",
+      closed_exec and closed_exec.get("exit_time") and closed_exec.get("entry_time")
+      and closed_exec.get("sl") is not None and closed_exec.get("tp") is not None
+      and isinstance(closed_exec.get("pnl"), (int, float)) and closed_exec.get("reason"),
+      str(closed_exec)[:250])
 
 row = client.get("/paper-trade/history", headers=H).json()[0]
 check("persisted closed_trade_count == 1", row.get("closed_trade_count") == 1, str(row)[:300])
@@ -161,6 +191,11 @@ hist = r.json()
 check("session still in history after stop", len(hist) == 1, str(hist)[:300])
 row = hist[0]
 check("history status == stopped", row.get("status") == "stopped", str(row)[:200])
+r = client.get("/trade-executions", headers=H)
+hist_sess = next((s for s in r.json().get("sessions", []) if s.get("key") == f"history:{row['id']}"), None)
+check("stopped session's executions still served from history",
+      hist_sess is not None and any(t.get("status") == "closed" for t in hist_sess.get("trades", [])),
+      str(r.json().get("sessions"))[:250])
 check("stopped_at stamped", row.get("stopped_at") is not None, str(row.get("stopped_at")))
 check("closed trades survived the stop", row.get("closed_trade_count") == 1, str(row)[:200])
 check("roi computed", row.get("roi") is not None, str(row.get("roi")))

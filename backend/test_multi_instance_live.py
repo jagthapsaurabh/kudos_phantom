@@ -348,6 +348,18 @@ check("the instance cleared its own leg list after exiting",
       exiter.protection_leg_ids == [], exiter.protection_leg_ids)
 check("no stale error was recorded for a clean exit",
       exiter.last_order_error is None, exiter.last_order_error)
+# The closed trade is kept (same dict shape as the paper worker's) so the
+# market chart can plot which candle the entry/exit landed on + the stop plan.
+check("the exit was recorded for the chart overlay",
+      len(exiter.closed_trades) == 1, str(exiter.closed_trades)[:200])
+ct = exiter.closed_trades[0] if exiter.closed_trades else {}
+check("the recorded trade carries the entry/exit candles and the stop plan",
+      ct.get("entry_time") and ct.get("exit_time") and ct.get("sl") is not None
+      and ct.get("tp") is not None and ct.get("lots") is not None
+      and bool(ct.get("reason")),
+      str({k: ct.get(k) for k in ("entry_time", "exit_time", "sl", "tp", "reason", "lots")}))
+check("the recorded trade carries a PnL on the pricing basis",
+      isinstance(ct.get("pnl"), (int, float)) and ct["pnl"] != 0, str(ct.get("pnl")))
 COORDINATOR.unregister(exiter)
 
 section("5b. the pre-fix behaviour would have wiped the account")

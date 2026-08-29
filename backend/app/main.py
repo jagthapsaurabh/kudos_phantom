@@ -20,6 +20,7 @@ from .services.data_sync import DataSyncService
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
     MarketTick, MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
+    PaperSession,
 )
 import bcrypt
 from passlib.context import CryptContext
@@ -2295,6 +2296,171 @@ def _shared_account_status(service):
         "note": ("one netted position per account — only one strategy can hold a "
                  "trade at a time; the rest wait their turn"),
     }
+
+
+@app.get("/trade-executions")
+def trade_executions(user=Depends(get_current_user), db=Depends(get_db)):
+    """Executed trades for the market-chart overlay.
+
+    Which candle each entry/exit actually landed on, with the full stop plan
+    (SL at entry, SL in force at exit, TP, trailing stop) and PnL, from:
+
+    * running live instances  — the open position (live SL/TP levels) plus the
+      trades closed since the instance started
+    * running paper instances — same, from the worker's own book
+    * saved paper sessions    — trades that survived the instance (History),
+      including the positions still open when it stopped
+
+    Backtest runs keep their own deep link (`/chart?run=<id>`) because their
+    trade rows carry the full entry-condition breakdown already.
+    Times are IST-offset ISO strings; the chart converts to candle UNIX time.
+    """
+    from .services.paper_history import MAX_SAVED_LOG_LINES  # noqa: F401  (import guard)
+
+    def _open_trade_dict(symbol, trade, status="open"):
+        current = getattr(trade, "current_price", None) or trade.peak_price or trade.entry_price
+        return {
+            "symbol": symbol, "direction": int(trade.direction),
+            "status": status,
+            "entry": float(trade.entry_price),
+            "exit": None,
+            "current": float(current) if current is not None else None,
+            "sl": float(trade.sl) if getattr(trade, "sl", None) else None,
+            "sl_plan": float(trade.sl_entry) if getattr(trade, "sl_entry", None) else None,
+            "tp": float(trade.tp) if getattr(trade, "tp", None) else None,
+            "trail_stop": float(trade.trail_stop) if getattr(trade, "trail_stop", None) else None,
+            "trail_activation": float(trade.trail_activation) if getattr(trade, "trail_activation", None) else None,
+            "atr_at_entry": float(trade.atr_at_entry) if getattr(trade, "atr_at_entry", None) else None,
+            "peak_price": float(trade.peak_price) if getattr(trade, "peak_price", None) else None,
+            "lots": float(getattr(trade, "lots", 0.0) or 0.0),
+            "margin_inr": float(trade.margin_inr) if getattr(trade, "margin_inr", None) else None,
+            "notional_usd": float(trade.notional_usd) if getattr(trade, "notional_usd", None) else None,
+            "entry_time": _to_ist(trade.entry_time),
+            "exit_time": None,
+            "exit_price": None, "pnl": None, "fees": None, "reason": None,
+            "bars_held": int(trade.bars_held or 0),
+            "entry_trade_price": getattr(trade, "entry_trade_price", None),
+            "entry_mark_price": getattr(trade, "entry_mark_price", None),
+            "mark_price_basis": bool(getattr(trade, "mark_price_basis", False)),
+        }
+
+    def _closed_trade_dict(t, symbol=None):
+        return {
+            "symbol": t.get("symbol") or symbol or "BTCUSDT",
+            "direction": int(t.get("direction") or 1),
+            "status": "closed",
+            "entry": t.get("entry"),
+            "exit": t.get("exit"),
+            "current": None,
+            "sl": t.get("sl_final") if t.get("sl_final") is not None else t.get("sl"),
+            "sl_plan": t.get("sl"),
+            "tp": t.get("tp"),
+            "trail_stop": t.get("trail_stop"),
+            "trail_activation": t.get("trail_activation"),
+            "atr_at_entry": t.get("atr_at_entry"),
+            "peak_price": t.get("peak_price"),
+            "lots": t.get("lots"),
+            "margin_inr": t.get("margin_inr"),
+            "notional_usd": t.get("notional_usd"),
+            "entry_time": t.get("entry_time"),
+            "exit_time": t.get("exit_time"),
+            "exit_price": t.get("exit"),
+            "pnl": t.get("pnl"),
+            "fees": t.get("fees"),
+            "reason": t.get("reason"),
+            "exit_detail": t.get("exit_detail"),
+            "bars_held": t.get("bars_held"),
+            "entry_trade_price": t.get("entry_trade_price"),
+            "entry_mark_price": t.get("entry_mark_price"),
+            "mark_price_basis": bool(t.get("mark_price_basis")),
+        }
+
+    out = []
+
+    # ---- Running live instances --------------------------------------
+    for key, svc in live_trade_instances.items():
+        if f"_{user.username}_" not in key:
+            continue
+        trades = []
+        for symbol, trade in (getattr(svc, "oms", None) and svc.oms.active_trades or {}).items():
+            trades.append(_open_trade_dict(symbol, trade))
+        for t in (getattr(svc, "closed_trades", None) or []):
+            trades.append(_closed_trade_dict(t))
+        out.append({
+            "source": "live", "kind": "live", "key": f"live:{key}",
+            "instance_key": key, "session_id": None,
+            "label": f"{getattr(svc, 'account_label', 'Primary')} · {svc.strategy_id}",
+            "broker": svc.broker_name, "strategy_id": svc.strategy_id,
+            "status": "running", "symbol": getattr(svc, "symbol", None) or "BTCUSDT",
+            "trades": trades,
+        })
+
+    # ---- Running paper instances -------------------------------------
+    for key, svc in paper_trade_instances.items():
+        if f"_{user.username}_" not in key:
+            continue
+        trades = []
+        for symbol, trade in (getattr(svc, "oms", None) and svc.oms.active_trades or {}).items():
+            trades.append(_open_trade_dict(symbol, trade))
+        for t in (getattr(svc, "closed_trades", None) or []):
+            trades.append(_closed_trade_dict(t))
+        out.append({
+            "source": "paper", "kind": "paper", "key": f"paper:{key}",
+            "instance_key": key, "session_id": getattr(svc, "session_id", None),
+            "label": f"{svc.strategy_name or svc.strategy_id} · paper",
+            "broker": getattr(svc, "broker_name", None), "strategy_id": svc.strategy_id,
+            "status": "running", "symbol": getattr(svc, "symbol", None) or "BTCUSDT",
+            "trades": trades,
+        })
+
+    # ---- Saved paper sessions (History; survives stop + restart) ------
+    try:
+        rows = db.query(PaperSession).filter(PaperSession.user_id == user.id) \
+            .order_by(PaperSession.created_at.desc()).limit(30).all()
+    except Exception:
+        rows = []
+    running_keys = set(paper_trade_instances.keys())
+    for row in rows:
+        # A session still running in this process is reported from the live
+        # worker above; listing its saved snapshot too would double every trade.
+        if row.instance_key in running_keys:
+            continue
+        closed = []
+        for t in (row.closed_trades or []):
+            if isinstance(t, dict):
+                closed.append(_closed_trade_dict(t, symbol=row.symbol))
+        open_positions = []
+        for t in (row.open_positions or []):
+            if isinstance(t, dict):
+                open_positions.append({
+                    "symbol": t.get("symbol") or row.symbol,
+                    "direction": int(t.get("direction") or 1),
+                    "status": "open",
+                    "entry": t.get("entry"), "exit": None,
+                    "current": t.get("current"),
+                    "sl": t.get("sl"), "sl_plan": t.get("sl"),
+                    "tp": t.get("tp"), "trail_stop": t.get("trail_stop"),
+                    "trail_activation": None, "atr_at_entry": None,
+                    "peak_price": None,
+                    "lots": t.get("lots"), "margin_inr": t.get("margin_inr"),
+                    "notional_usd": None,
+                    "entry_time": t.get("entry_time"), "exit_time": None,
+                    "exit_price": None, "pnl": t.get("pnl"), "fees": None,
+                    "reason": None, "bars_held": t.get("bars_held"),
+                    "entry_trade_price": None, "entry_mark_price": None,
+                    "mark_price_basis": False,
+                    "unrealised": True,
+                })
+        out.append({
+            "source": "paper", "kind": "history", "key": f"history:{row.id}",
+            "instance_key": row.instance_key, "session_id": row.id,
+            "label": f"{row.strategy_name or row.strategy_id} · {row.status}",
+            "broker": row.broker_name, "strategy_id": row.strategy_id,
+            "status": row.status, "symbol": row.symbol or "BTCUSDT",
+            "trades": open_positions + closed,
+        })
+
+    return {"sessions": out}
 
 
 @app.get("/live-trade/status")

@@ -81,7 +81,40 @@ const markerBase = () => ({
   data: {},
 });
 
-export const buildOverlayMarkers = ({ signals = [], trades = [] } = {}) => {
+// Nearest strategy signal at or before an execution's entry (within 3h).
+// Paper/live trade records carry the numbers but not the setup/trend context;
+// the signals overlay has exactly that, so the execution tooltip can say
+// "LONG REV ↑ · 4h UP" on the entry candle the trade actually filled on.
+export const joinSignalContext = (executions = [], signals = []) => {
+  const sorted = (signals || [])
+    .map(s => ({ ...s, t: toUnix(s.time) }))
+    .filter(s => s.t != null)
+    .sort((a, b) => a.t - b.t);
+  const at = (i) => (i >= 0 && i < sorted.length ? sorted[i] : null);
+  return (executions || []).map((e) => {
+    const et = toUnix(e.entry_time);
+    if (et == null || !sorted.length) return { ...e, context: null };
+    let lo = 0, hi = sorted.length - 1, idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid].t <= et) { idx = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    const sig = at(idx);
+    if (!sig || et - sig.t > 3 * 3600) return { ...e, context: null };
+    return {
+      ...e,
+      context: {
+        setup: setupShort(sig.setup),
+        trend: (sig.trend_label === 'UP' || sig.trend === 1) ? 'UP'
+          : (sig.trend_label === 'DOWN' || sig.trend === -1) ? 'DOWN' : '',
+        candle: sig.candle_type || '',
+        rsi: sig.rsi14 ?? null,
+      },
+    };
+  });
+};
+
+export const buildOverlayMarkers = ({ signals = [], trades = [], executions = [] } = {}) => {
   const byTime = new Map();
   const put = (time, marker) => {
     const t = toUnix(time);
@@ -170,6 +203,64 @@ export const buildOverlayMarkers = ({ signals = [], trades = [] } = {}) => {
           label: `OUT${reason ? ` ${reason}` : ''}`.trim(),
           price: trade.exit_price ?? null,
           reason,
+        },
+      });
+    }
+  }
+
+  // Executed trades (paper / live): the entry marker lands on the candle the
+  // order actually filled on, the exit marker on the closing candle, and the
+  // full stop plan + P&L rides along in `data` for the hover tooltip and the
+  // click-to-select flow. `exec_id` links the marker back to the trade.
+  for (const trade of executions || []) {
+    const long = Number(trade.direction) === 1;
+    const side = long ? 'LONG' : 'SHORT';
+    const ctx = trade.context || null;
+    const status = trade.status === 'open' ? 'OPEN' : 'CLOSED';
+    const entTime = toUnix(trade.entry_time);
+    if (entTime != null) {
+      const label = `IN · ${side}${ctx ? ` ${ctx.setup}${ctx.trend === 'UP' ? ' ↑' : ctx.trend === 'DOWN' ? ' ↓' : ''}` : ''} · ${status}`;
+      put(trade.entry_time, {
+        kind: 'entry',
+        position: long ? 'belowBar' : 'aboveBar',
+        color: trade.status === 'open' ? '#a78bfa' : '#38bdf8',
+        shape: 'circle',
+        tooltip: label,
+        data: {
+          side, kind: 'entry', label, status,
+          price: trade.entry ?? null,
+          exec_id: trade.exec_id ?? null,
+          sl: trade.sl ?? null, tp: trade.tp ?? null,
+          trail_stop: trade.trail_stop ?? null,
+          pnl: trade.pnl ?? null, reason: trade.reason || null,
+          lots: trade.lots ?? null, bars: trade.bars_held ?? null,
+          source: trade.source_label || '',
+          setup: ctx?.setup || '', trend: ctx?.trend || '',
+          candle: ctx?.candle || '', rsi: ctx?.rsi ?? null,
+        },
+      });
+    }
+    const exTime = toUnix(trade.exit_time);
+    if (trade.status !== 'open' && exTime != null) {
+      const reason = trade.reason || '';
+      const pnl = trade.pnl != null ? ` ${Number(trade.pnl) >= 0 ? '+' : ''}${Math.round(Number(trade.pnl))}` : '';
+      const label = `OUT${reason ? ` ${reason}` : ''}${pnl}`;
+      put(trade.exit_time, {
+        kind: 'exit',
+        position: long ? 'aboveBar' : 'belowBar',
+        color: '#f59e0b',
+        shape: 'square',
+        tooltip: label,
+        data: {
+          side, kind: 'exit', label, status: 'CLOSED',
+          price: trade.exit ?? null,
+          exec_id: trade.exec_id ?? null,
+          sl: trade.sl ?? null, tp: trade.tp ?? null,
+          trail_stop: trade.trail_stop ?? null,
+          pnl: trade.pnl ?? null, reason,
+          lots: trade.lots ?? null, bars: trade.bars_held ?? null,
+          source: trade.source_label || '',
+          setup: ctx?.setup || '', trend: ctx?.trend || '',
         },
       });
     }
