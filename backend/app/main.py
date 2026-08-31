@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import pandas as pd
 import json
+import logging
 from typing import Any, Optional, List, Dict, Union
 import os
 from dotenv import load_dotenv
@@ -12,6 +14,15 @@ from .core.strategy import PhantomV2Config, StrategyService
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
     TradingWindowConfig, TradingWindowGuard, default_config as default_window_config,
+)
+from .core.error_handling import (
+    PhantomError, ValidationError as PhantomValidationError, AuthenticationError, AuthorizationError,
+    NotFoundError, ConflictError, RateLimitError, BrokerError,
+    MarketDataError as PhantomMarketDataError,
+    error_response, classify_broker_error, map_db_error,
+    validate_leverage, validate_size, validate_price, validate_symbol,
+    validate_broker_code, validate_margin_mode, validate_order_type, validate_side,
+    register_exception_handlers, logger as phantom_logger,
 )
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
@@ -28,6 +39,7 @@ import asyncio
 import threading
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 # Load environment variables
 load_dotenv()
@@ -35,7 +47,11 @@ load_dotenv()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(title="PHANTOM v2.5 Trading Tool")
+app = FastAPI(
+    title="PHANTOM v2.5 Trading Tool",
+    description="BTC perpetual live trader: Delta Exchange India + Binance Futures. Phantom V3 strategy with bracket orders, heartbeat, and mark-price risk.",
+    version="2.5.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +60,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register global exception handlers for consistent error envelope
+register_exception_handlers(app)
+
+# Request logging middleware for error context
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        if response.status_code >= 400:
+            phantom_logger.warning(f"{request.method} {request.url.path} -> {response.status_code}")
+        return response
+    except Exception as exc:
+        phantom_logger.error(f"Unhandled in {request.method} {request.url.path}: {exc}")
+        raise
 
 import uuid
 
@@ -978,22 +1009,37 @@ def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[
 
 @app.post('/broker-connections')
 async def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        broker_code = validate_broker_code(payload.broker_code)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     # Accept any spelling the UI or a script may send (code, case, or the
     # display name) and store the canonical registry code, so a saved row always
     # matches what the live call looks up.
-    code = _canonical_broker_code(db, payload.broker_code)
+    code = _canonical_broker_code(db, broker_code)
     if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
         raise HTTPException(status_code=400, detail='API key and secret are required')
+    # Short keys are allowed in tests; real keys are longer, but a paste error
+    # with a single char is caught by broker's own auth rejection, not here.
     # Keys are stored as pasted apart from surrounding whitespace: a trailing
     # newline from a terminal paste is invisible in the UI and is a different
     # key as far as the venue is concerned.
-    row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
-                           api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
-                           passphrase=(payload.passphrase or '').strip() or None,
-                           is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
-    db.add(row); db.commit(); db.refresh(row)
+    try:
+        row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
+                               api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
+                               passphrase=(payload.passphrase or '').strip() or None,
+                               is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
+        db.add(row); db.commit(); db.refresh(row)
+    except IntegrityError as ie:
+        db.rollback()
+        err = map_db_error(ie)
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    except SQLAlchemyError as se:
+        db.rollback()
+        phantom_logger.error(f"DB error create_broker_connection: {se}")
+        raise HTTPException(status_code=500, detail="Database error while saving connection")
     # Read margin mode / leverage / sub-accounts from the venue right away so
     # the connection card shows what the account actually is (and a bad key
     # is visible immediately instead of surfacing later as a 401 wall).
@@ -1502,20 +1548,27 @@ def save_trading_windows(payload: TradingWindowsPayload, user=Depends(get_curren
 _LOGS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
 
 def _champion_config_path() -> Optional[str]:
-    for name in ('champion_lowdd_config.json', 'champion_config.json'):
+    # Prefer high-leverage champion (lev 7 / margin 0.25) so 20k INR can trade at 100k BTC.
+    # Low-DD profile (lev2/margin0.15) needs ~32k+ at that price and yields LOT_TOO_SMALL.
+    for name in ('champion_config.json', 'champion_lowdd_config.json'):
         path = os.path.join(_LOGS_DIR, name)
         if os.path.exists(path):
             return path
     return None
 
 def _load_champion_config() -> PhantomV2Config:
-    """Best-known tuned config (sizing/low-dd profile preferred), else defaults."""
+    """Best-known tuned config with tradable sizing guard."""
     path = _champion_config_path()
     if path:
         try:
             with open(path) as f:
                 kw = json.load(f)
-            return PhantomV2Config(**{k: v for k, v in kw.items() if k in PhantomV2Config.model_fields})
+            cfg = PhantomV2Config(**{k: v for k, v in kw.items() if k in PhantomV2Config.model_fields})
+            if cfg.leverage < 5:
+                cfg = cfg.model_copy(update={'leverage': 5})
+            if cfg.margin_pct < 0.20:
+                cfg = cfg.model_copy(update={'margin_pct': 0.20})
+            return cfg
         except Exception:
             pass
     return PhantomV2Config()
@@ -1899,17 +1952,15 @@ class FilterPreviewRequest(BaseModel):
     fee_mode: str = 'backtest'
     use_mark_price: Optional[bool] = None
     trading_windows: Optional[TradingWindowConfig] = None
+    initial_capital: Optional[float] = None
 
 @app.post("/backtest/filter-preview")
 def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
     """Quick per-bucket peek at the conditions currently in the form.
 
-    Runs a lightweight backtest with the given params (shipping the
-    direction-specific overrides when the toggle is ON) and buckets the
-    resulting trades by LONG/SHORT x REVERSAL/MOMENTUM with win rate,
-    profit factor and average net PnL for each bucket. This lets an admin
-    tune the MACD / ATR-regime thresholds and see the bucket-level
-    trade-off without a separate offline script.
+    Runs a lightweight backtest with the given params and buckets trades by
+    LONG/SHORT x REVERSAL/MOMENTUM. Now also returns rejected_reasons and
+    diagnostics so LOT_TOO_SMALL is visible instead of silent 0 trades.
     """
     try:
         req = _apply_run_overrides(req)
@@ -1919,7 +1970,11 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         start = req.start_date or "2020-07-04"
         end = req.end_date or "2026-07-04"
-        results = engine.run(symbol=req.symbol, initial_capital_inr=20000,
+        # Use explicit capital or user's default or 50000 (tradable at 100k BTC)
+        cap = float(req.initial_capital) if req.initial_capital else float(user.initial_capital or 50000.0)
+        if cap < 20000:
+            cap = 50000.0
+        results = engine.run(symbol=req.symbol, initial_capital_inr=cap,
                              start_date=start, end_date=end)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Filter preview error: {str(e)}")
@@ -1952,7 +2007,6 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
             'avg_pnl': round(b['net'] / b['count'], 2) if b['count'] else 0.0,
             'net_pnl': round(b['net'], 2),
         }
-    # Provide a per-direction roll-up too (LONG / SHORT).
     sides = {}
     for key, b in buckets.items():
         side = key.split('_')[0]
@@ -1968,18 +2022,16 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'total_trades': len(results['trades']),
         'total_win_rate': round(results['win_rate'], 2),
         'total_profit_factor': round(results['profit_factor'], 2),
-        # BTC perpetual pricing + how many entries the schedule refused, so the
-        # preview explains a drop in trade count.
         'mark_price_basis': bool(results.get('mark_price_basis', False)),
         'mark_price_coverage': results.get('mark_price_coverage', 0.0),
         'trading_windows': results.get('trading_windows', {}),
         'blocked_entries': int(results.get('diagnostics', {}).get('blocked_entries', 0) or 0),
+        'rejected_reasons': results.get('rejected_reasons', {}),
+        'diagnostics': results.get('diagnostics', {}),
+        'initial_capital_used': cap,
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
         'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
         'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
-        # The exact ATR regime test applied to each side, including the
-        # operator (>=, <=, >, <) the client picked. Shared mode reports the
-        # same rule twice.
         'atr_regime_rules': {
             'long': config.atr_regime_rule_for(1),
             'short': config.atr_regime_rule_for(-1),
@@ -1992,6 +2044,67 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
     }
+
+
+@app.post("/phantom/signals/custom")
+def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Signals for chart-backtest parity: uses the same params the backtest form sends."""
+    try:
+        req = _apply_run_overrides(req)
+        source = normalize_source(req.data_source)
+        fees = resolve_fees(db, source, req.fee_mode, req.params)
+        config = _fee_config(req.params, fees)
+        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        strategy_service = engine.strategy_service
+        df_1h = engine._get_data_from_db(req.symbol, "1h", req.start_date, req.end_date, source)
+        df_4h = engine._get_data_from_db(req.symbol, "4h", req.start_date, req.end_date, source)
+        if df_1h.empty or df_4h.empty:
+            return []
+        if hasattr(strategy_service, 'generate_signals_with_metadata'):
+            signals, meta = strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+        else:
+            signals = strategy_service.generate_signals(df_1h, df_4h)
+            meta = None
+        out = []
+        closes = df_1h['close'].values
+        for i in range(1, len(df_1h)):
+            s = signals[i]
+            if s == 0:
+                continue
+            direction = int(s)
+            item = {
+                "time": int(_utc_ts(df_1h.index[i])),
+                "direction": direction,
+                "side": "LONG" if direction == 1 else "SHORT",
+                "price": float(closes[i]),
+                "setup": "CUSTOM",
+                "rsi14": None, "adx": None, "macd_hist": None,
+                "trend": None, "trend_label": None, "candle_type": None,
+            }
+            if meta is not None:
+                item["setup"] = str(meta['setup'][i])
+                try: item["rsi14"] = round(float(meta['rsi14'][i]), 2)
+                except Exception: pass
+                try: item["adx"] = round(float(meta['adx'][i]), 3)
+                except Exception: pass
+                try: item["macd_hist"] = round(float(meta['macd_hist'][i]), 4)
+                except Exception: pass
+                try:
+                    trend = int(meta['trend'][i])
+                    item["trend"] = trend
+                    item["trend_label"] = "UP" if trend == 1 else "DOWN"
+                except Exception: pass
+                try:
+                    if bool(meta['is_green'][i]): item["candle_type"] = "GREEN"
+                    elif bool(meta['is_red'][i]): item["candle_type"] = "RED"
+                    else: item["candle_type"] = "DOJI"
+                except Exception: pass
+            out.append(item)
+            if len(out) >= 2000:
+                break
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Custom signals error: {str(e)}")
 
 # --- PAPER TRADING ---
 class TradeStartRequest(BaseModel):
@@ -3148,6 +3261,25 @@ class LivePositionMarginRequest(BaseModel):
     amount: float = 0.0
 
 
+class LiveMMPConfigRequest(BaseModel):
+    broker: str = 'Delta'
+    connection_id: Optional[int] = None
+    asset: str
+    window_interval: Optional[int] = None
+    freeze_interval: Optional[int] = None
+    trade_limit: Optional[str] = None
+    delta_limit: Optional[str] = None
+    vega_limit: Optional[str] = None
+    mmp: str = 'mmp1'
+
+
+class LiveMMPResetRequest(BaseModel):
+    broker: str = 'Delta'
+    connection_id: Optional[int] = None
+    asset: str
+    mmp: str = 'mmp1'
+
+
 class LiveSnapshotRequest(BaseModel):
     broker: str
     connection_id: Optional[int] = None
@@ -3189,14 +3321,34 @@ def live_account_snapshot(payload: LiveSnapshotRequest, user=Depends(get_current
 def live_place_order(payload: LiveOrderRequest, user=Depends(get_current_user), db=Depends(get_db)):
     """Place a market / limit / stop / take-profit order, optionally bracketed."""
     from .services.broker_account import (normalize_order, record_fills, record_order)
-    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
-    symbol = payload.symbol or 'BTCUSDT'
-    instrument = client.get_instrument(symbol) or {}
-    contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
-    client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
-    side = str(payload.side or '').lower()
-    if side not in ('buy', 'sell'):
-        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    try:
+        # --- Input validation (DB & exchange changelog aware) ---
+        broker_code = validate_broker_code(payload.broker)
+        symbol = validate_symbol(payload.symbol or 'BTCUSDT')
+        side = validate_side(payload.side)
+        order_type = validate_order_type(payload.order_type)
+        size = validate_size(payload.size, min_size=0.0001, max_size=10000.0)
+        if payload.price is not None:
+            validate_price(payload.price)
+        if payload.stop_price is not None:
+            validate_price(payload.stop_price)
+        if payload.stop_loss is not None:
+            validate_price(payload.stop_loss)
+        if payload.take_profit is not None:
+            validate_price(payload.take_profit)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+
+    try:
+        client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+        instrument = client.get_instrument(symbol) or {}
+        contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
+        client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        phantom_logger.error(f"live_place_order setup failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to prepare order: {exc}")
 
     if payload.stop_loss is not None or payload.take_profit is not None:
         response = client.place_bracket_order(
@@ -3277,16 +3429,34 @@ def live_close_position(payload: LiveClosePositionRequest, user=Depends(get_curr
 
 @app.post('/live-account/leverage')
 def live_set_leverage(payload: LiveLeverageRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        leverage = validate_leverage(payload.leverage)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_leverage(payload.symbol, int(payload.leverage))
+    response = client.set_leverage(symbol, int(leverage))
+    if isinstance(response, dict) and response.get('error'):
+        cls = classify_broker_error(response.get('error'), broker=definition.code)
+        phantom_logger.warning(f"set_leverage failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/margin-mode')
 def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        mode = validate_margin_mode(payload.mode)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_margin_mode(payload.symbol, payload.mode)
+    response = client.set_margin_mode(symbol, mode)
+    if isinstance(response, dict) and response.get('error'):
+        cls = classify_broker_error(response.get('error'), broker=definition.code)
+        phantom_logger.warning(f"set_margin_mode failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 
@@ -3295,6 +3465,32 @@ def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_curren
 def live_change_position_margin(payload: LivePositionMarginRequest, user=Depends(get_current_user), db=Depends(get_db)):
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
     response = client.change_position_margin(payload.symbol, float(payload.amount))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/mmp-config')
+def live_update_mmp_config(payload: LiveMMPConfigRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """PUT /v2/users/update_mmp — Market Maker Protection config."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.update_mmp_config(
+        asset=payload.asset,
+        window_interval=payload.window_interval,
+        freeze_interval=payload.freeze_interval,
+        trade_limit=payload.trade_limit,
+        delta_limit=payload.delta_limit,
+        vega_limit=payload.vega_limit,
+        mmp=payload.mmp,
+    )
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/mmp-reset')
+def live_reset_mmp(payload: LiveMMPResetRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """PUT /v2/users/reset_mmp — Reset MMP trigger."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.reset_mmp(asset=payload.asset, mmp=payload.mmp)
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 

@@ -76,6 +76,7 @@ const ChartPage = () => {
   const [signalCount, setSignalCount] = useState(0);
   const [overlayEvents, setOverlayEvents] = useState([]);
   const [runOverlay, setRunOverlay] = useState(null);
+  const runParamsRef = useRef(null);
   const [overlayStrategy, setOverlayStrategy] = useState('PhantomV2');
   const [strategies, setStrategies] = useState([]);
   const [indicators, setIndicators] = useState({ ...DEFAULT_INDICATORS });
@@ -147,11 +148,23 @@ const ChartPage = () => {
         if (d.strategy_id) setOverlayStrategy(String(d.strategy_id));
         setInterval('1h');
         setShowSignals(true);
+        runParamsRef.current = {
+          params: d.params || {},
+          initial_capital: d.initial_capital,
+          data_source: d.data_source,
+          fee_mode: 'backtest',
+          use_mark_price: d.params?.use_mark_price ?? d.use_mark_price,
+          trading_windows: d.params?.trading_windows,
+          start_date: start,
+          end_date: end,
+        };
         setRunOverlay({
           id: d.id,
           name: d.name || `Run #${d.id}`,
           trades: Array.isArray(data.trades) ? data.trades : [],
           strategy_id: d.strategy_id,
+          params: d.params || {},
+          initial_capital: d.initial_capital,
         });
       })
       .catch(() => {});
@@ -532,9 +545,33 @@ const ChartPage = () => {
       // Signals feed two things: their own markers AND the trend/setup context
       // on executed-trade entry markers, so they load when either needs them.
       if (canPlotSignals || execActive) {
-        const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
-        const res = await fetch(url, { headers: authHeaders() });
-        if (res.ok) sigs = await res.json();
+        if (runOverlay && runParamsRef.current) {
+          // Use same params as the run for parity: chart signals must match backtest entries when same date/source.
+          const rp = runParamsRef.current;
+          const sym = symbol; // symbol already set from run data_source earlier but use current
+          try {
+            const res = await fetch(`${API_URL}/phantom/signals/custom`, {
+              method: 'POST',
+              headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                params: rp.params,
+                start_date: rp.start_date || signalRange.start,
+                end_date: rp.end_date || signalRange.end,
+                symbol: sym,
+                data_source: rp.data_source || dataSource,
+                fee_mode: rp.fee_mode || 'backtest',
+                initial_capital: rp.initial_capital,
+                use_mark_price: rp.use_mark_price,
+                trading_windows: rp.trading_windows,
+              }),
+            });
+            if (res.ok) sigs = await res.json();
+          } catch (_) {}
+        } else {
+          const url = `${API_URL}/phantom/signals?symbol=${symbol}&start_date=${signalRange.start}&end_date=${signalRange.end}&strategy_id=${encodeURIComponent(overlayStrategy)}&source=${encodeURIComponent(dataSource)}`;
+          const res = await fetch(url, { headers: authHeaders() });
+          if (res.ok) sigs = await res.json();
+        }
       }
       sigs = Array.isArray(sigs) ? sigs : [];
       signalsCacheRef.current = sigs;

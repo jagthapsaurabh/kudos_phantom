@@ -25,17 +25,56 @@ class BacktestEngine:
         data = query.order_by(Klines.event_time.asc()).all()
         db.close()
 
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame([
-            {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume,
-             # Mark price of the BTC perpetual for the same bar (NULL until the
-             # mark series is seeded for this source).
-             'mark_open': getattr(k, 'mark_open', None), 'mark_high': getattr(k, 'mark_high', None),
-             'mark_low': getattr(k, 'mark_low', None), 'mark_close': getattr(k, 'mark_close', None)}
-            for k in data
-        ])
-        df.set_index('event_time', inplace=True)
-        return df
+        if data:
+            df = pd.DataFrame([
+                {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume,
+                 'mark_open': getattr(k, 'mark_open', None), 'mark_high': getattr(k, 'mark_high', None),
+                 'mark_low': getattr(k, 'mark_low', None), 'mark_close': getattr(k, 'mark_close', None)}
+                for k in data
+            ])
+            df.set_index('event_time', inplace=True)
+            return df
+
+        # Fallback: when DB is empty (e.g. sandbox or recent date not seeded yet),
+        # fetch from the venue's public API so chart signals and backtest use the
+        # same candles. This fixes \"chart shows 5 signals for 28 Aug 2026 but
+        # backtest shows 0 trades\" when the DB has no 2026 data but /klines does.
+        try:
+            from ..services.data_sync import DataSyncService
+            from datetime import datetime as _dt
+            # Parse start/end which may be strings like \"2026-08-28\"
+            s_dt = None
+            e_dt = None
+            if start_date:
+                try:
+                    s_dt = _dt.strptime(str(start_date)[:10], \"%Y-%m-%d\")
+                except Exception:
+                    s_dt = None
+            if end_date:
+                try:
+                    e_dt = _dt.strptime(str(end_date)[:10], \"%Y-%m-%d\") + pd.Timedelta(days=1)
+                except Exception:
+                    e_dt = None
+            # Fetch enough candles to cover the range; for a single-day window
+            # like 28 Aug 2026, 500 1h candles covers ~20 days.
+            limit = 1000 if (s_dt or e_dt) else 500
+            rows = DataSyncService.fetch_klines(source or self.data_source, symbol, interval,
+                                                start_time=s_dt, end_time=e_dt, limit=limit)
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(rows)
+            # Ensure event_time column exists
+            if 'event_time' not in df.columns:
+                return pd.DataFrame()
+            df['event_time'] = pd.to_datetime(df['event_time'])
+            df.set_index('event_time', inplace=True)
+            # Ensure required columns
+            for col in ('open', 'high', 'low', 'close', 'volume'):
+                if col not in df.columns:
+                    df[col] = 0.0
+            return df.sort_index()
+        except Exception:
+            return pd.DataFrame()
 
     # ------------------------------------------------------------------
     # Helpers
