@@ -58,9 +58,33 @@ This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-
 - **Entry bracket via POST /v2/orders/bracket** (our live_trader): {product_id/product_symbol, size, side, order_type, limit_price?, bracket_stop_trigger_method, stop_loss_order:{order_type, stop_price, trail_amount}, take_profit_order:{order_type, stop_price}, client_order_id}
 - **Position bracket via POST /v2/orders/bracket** (MCP): {product_id/product_symbol, stop_loss_order, take_profit_order, bracket_stop_trigger_method} — no size/side, closes entire position.
 
+## Error Handling (added 2026-08-31)
+
+### Server-Side
+- **Central module** `app/core/error_handling.py`: `PhantomError` hierarchy, `error_response` envelope `{error, detail (legacy compat), code, timestamp, details, hint}`, validators (`validate_leverage 1-125`, `validate_size >0 per Delta 15.04.26`, `validate_price >0`, `validate_symbol`, `validate_broker_code`, `validate_margin_mode`, `validate_order_type`, `validate_side`), `map_db_error` (UNIQUE → 409 Conflict, FK → 400, NOT NULL → 400), `classify_broker_error` (auth/rate_limit/margin/size/price with hints), global FastAPI handlers + request logging middleware.
+- **Live endpoints**: `POST /live-account/orders` validates broker/symbol/side/order_type/size/price/stop_loss/take_profit, `POST /live-account/leverage` validates leverage/symbol/broker, `POST /live-account/margin-mode` validates margin_mode/symbol/broker, logs broker error category on failure.
+- **Broker connections**: `POST /broker-connections` validates broker_code, requires key/secret, maps `IntegrityError` via `map_db_error` to 409 envelope, `SQLAlchemyError` to 500.
+- **Broker client** `broker_client.py`: `AUTH_REJECTION_MARKERS`, `AUTH_LATCH_STRIKES=2`, backoff 5s→300s, `_throttled_request` with RateLimiter + 429 Retry-After, `_json_body` returns `{error}`, `credential_health`, `signed_calls_held`.
+
+### Client-Side
+- **api.js**: request interceptor adds Bearer + `X-Request-ID`, response interceptor handles 401 (dispatch `auth:expired`, clear storage, redirect after 800ms), 429 (dispatch `api:rate-limited` with Retry-After), 403 (dispatch `api:forbidden`), 5xx logs to console.
+- **Toast system**: `hooks/useToast.js` (`addToast`, `toastFromError` parsing new envelope + legacy `detail` + network), `components/ToastContainer.jsx` (bottom-right, code/hint/details), `main.jsx` GlobalToastListener for interceptor events.
+- **ErrorBoundary**: `components/ErrorBoundary.jsx` class component, `getDerivedStateFromError`, `componentDidCatch`, red card UI with Try Again + Reload, wraps entire app and TradingPage.
+- **TradingPage**: removed `mockTrades`, wired real `GET /paper-trade/status` and `/live-trade/status` + `/strategies` + `/paper-trade/history`, aggregated trades, account summary, `useToast` + `ToastContainer`, loading states, empty states, no mock data.
+
+### DB-Level
+- **Constraints**: `uq_user_broker_label`, `uq_fee_broker_mode`, `uq_market_data_seed_progress_range`, `uq_broker_fill_trade`, `username UNIQUE`, `code UNIQUE` (case-insensitive check in API).
+- **Indexes**: composite `ix_source_symbol_interval_time` for klines, `ix_market_ticks_source_symbol_time`, per-table `user_id`, `broker_code`, `symbol`.
+- **Orphans**: FK checks via `scripts/db_integrity_check.py` (connections, strategies, runs, trades, sessions, orders, fills), misconfigured active connections with no key.
+- **Seed durability**: `MarketDataSeedProgress` cursor advanced in same transaction as candles, resumable, stuck >2h flagged, zero progress >30min flagged.
+- **Klines repair**: `repair_klines` removes duplicate timestamps (legacy batch) + off-grid timestamps (legacy CSV), `data_health()` reports `duplicate_rows` + `misaligned_rows`, admin endpoints `POST /admin/market-data/repair` and `seed?repair=true`.
+- **Integrity script**: `backend/scripts/db_integrity_check.py` — checks unique, orphans, indexes, seed progress, klines health, NOT NULL; `--fix` auto-fixes stuck seeds + deactivates bad connections; exit 0 clean / 1 issues / 2 error.
+
 ## Test
 
-- `test_live_account.py` mocks both Binance fapi and Delta /v2 on one port, covers rate limits, instruments, sizing, order lifecycle, 429 retry, normalized schema, account snapshot, auth-error verdict, account settings (cross vs isolated), local audit, HTTP API. 166 PASS.
+- Backend 16 suites, 1022 PASS 0 FAIL (verified 2026-08-31): `test_live_account.py` 166, `test_broker_connections.py` 40, `test_api_e2e.py` 47, etc. Includes 429 retry, auth latch, rate limits, normalized schema, account snapshot, credential probe.
+- Frontend 7 suites, 345 PASS 0 FAIL (verified 2026-08-31): `broker_keys_ui`, `terminal_ui`, `pages_smoke`, `trade_log_ui`, `trading_windows_ui`, `admin_seed_ui`, `chart_overlay` — all components resolve imports, no mock trades.
+- `ERROR_HANDLING.md` documents server/client/DB error handling, testing checklist, future improvements.
 
 ## Key Provided
 

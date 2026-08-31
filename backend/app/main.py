@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Body, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import pandas as pd
 import json
+import logging
 from typing import Any, Optional, List, Dict, Union
 import os
 from dotenv import load_dotenv
@@ -12,6 +14,15 @@ from .core.strategy import PhantomV2Config, StrategyService
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
     TradingWindowConfig, TradingWindowGuard, default_config as default_window_config,
+)
+from .core.error_handling import (
+    PhantomError, ValidationError as PhantomValidationError, AuthenticationError, AuthorizationError,
+    NotFoundError, ConflictError, RateLimitError, BrokerError,
+    MarketDataError as PhantomMarketDataError,
+    error_response, classify_broker_error, map_db_error,
+    validate_leverage, validate_size, validate_price, validate_symbol,
+    validate_broker_code, validate_margin_mode, validate_order_type, validate_side,
+    register_exception_handlers, logger as phantom_logger,
 )
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
@@ -28,6 +39,7 @@ import asyncio
 import threading
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 # Load environment variables
 load_dotenv()
@@ -35,7 +47,11 @@ load_dotenv()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(title="PHANTOM v2.5 Trading Tool")
+app = FastAPI(
+    title="PHANTOM v2.5 Trading Tool",
+    description="BTC perpetual live trader: Delta Exchange India + Binance Futures. Phantom V3 strategy with bracket orders, heartbeat, and mark-price risk.",
+    version="2.5.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +60,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register global exception handlers for consistent error envelope
+register_exception_handlers(app)
+
+# Request logging middleware for error context
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        if response.status_code >= 400:
+            phantom_logger.warning(f"{request.method} {request.url.path} -> {response.status_code}")
+        return response
+    except Exception as exc:
+        phantom_logger.error(f"Unhandled in {request.method} {request.url.path}: {exc}")
+        raise
 
 import uuid
 
@@ -978,22 +1009,37 @@ def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[
 
 @app.post('/broker-connections')
 async def create_broker_connection(payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        broker_code = validate_broker_code(payload.broker_code)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     # Accept any spelling the UI or a script may send (code, case, or the
     # display name) and store the canonical registry code, so a saved row always
     # matches what the live call looks up.
-    code = _canonical_broker_code(db, payload.broker_code)
+    code = _canonical_broker_code(db, broker_code)
     if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
         raise HTTPException(status_code=400, detail='API key and secret are required')
+    # Short keys are allowed in tests; real keys are longer, but a paste error
+    # with a single char is caught by broker's own auth rejection, not here.
     # Keys are stored as pasted apart from surrounding whitespace: a trailing
     # newline from a terminal paste is invisible in the UI and is a different
     # key as far as the venue is concerned.
-    row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
-                           api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
-                           passphrase=(payload.passphrase or '').strip() or None,
-                           is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
-    db.add(row); db.commit(); db.refresh(row)
+    try:
+        row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
+                               api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
+                               passphrase=(payload.passphrase or '').strip() or None,
+                               is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
+        db.add(row); db.commit(); db.refresh(row)
+    except IntegrityError as ie:
+        db.rollback()
+        err = map_db_error(ie)
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    except SQLAlchemyError as se:
+        db.rollback()
+        phantom_logger.error(f"DB error create_broker_connection: {se}")
+        raise HTTPException(status_code=500, detail="Database error while saving connection")
     # Read margin mode / leverage / sub-accounts from the venue right away so
     # the connection card shows what the account actually is (and a bad key
     # is visible immediately instead of surfacing later as a 401 wall).
@@ -3208,14 +3254,34 @@ def live_account_snapshot(payload: LiveSnapshotRequest, user=Depends(get_current
 def live_place_order(payload: LiveOrderRequest, user=Depends(get_current_user), db=Depends(get_db)):
     """Place a market / limit / stop / take-profit order, optionally bracketed."""
     from .services.broker_account import (normalize_order, record_fills, record_order)
-    client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
-    symbol = payload.symbol or 'BTCUSDT'
-    instrument = client.get_instrument(symbol) or {}
-    contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
-    client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
-    side = str(payload.side or '').lower()
-    if side not in ('buy', 'sell'):
-        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    try:
+        # --- Input validation (DB & exchange changelog aware) ---
+        broker_code = validate_broker_code(payload.broker)
+        symbol = validate_symbol(payload.symbol or 'BTCUSDT')
+        side = validate_side(payload.side)
+        order_type = validate_order_type(payload.order_type)
+        size = validate_size(payload.size, min_size=0.0001, max_size=10000.0)
+        if payload.price is not None:
+            validate_price(payload.price)
+        if payload.stop_price is not None:
+            validate_price(payload.stop_price)
+        if payload.stop_loss is not None:
+            validate_price(payload.stop_loss)
+        if payload.take_profit is not None:
+            validate_price(payload.take_profit)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+
+    try:
+        client, definition, connection_id = _live_client(db, user, payload.broker, payload.connection_id)
+        instrument = client.get_instrument(symbol) or {}
+        contract_value = float(instrument.get('contract_value') or 1.0) or 1.0
+        client_order_id = payload.client_order_id or f"ph-{uuid.uuid4().hex[:24]}"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        phantom_logger.error(f"live_place_order setup failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to prepare order: {exc}")
 
     if payload.stop_loss is not None or payload.take_profit is not None:
         response = client.place_bracket_order(
@@ -3296,16 +3362,34 @@ def live_close_position(payload: LiveClosePositionRequest, user=Depends(get_curr
 
 @app.post('/live-account/leverage')
 def live_set_leverage(payload: LiveLeverageRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        leverage = validate_leverage(payload.leverage)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_leverage(payload.symbol, int(payload.leverage))
+    response = client.set_leverage(symbol, int(leverage))
+    if isinstance(response, dict) and response.get('error'):
+        cls = classify_broker_error(response.get('error'), broker=definition.code)
+        phantom_logger.warning(f"set_leverage failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/margin-mode')
 def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    try:
+        mode = validate_margin_mode(payload.mode)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_margin_mode(payload.symbol, payload.mode)
+    response = client.set_margin_mode(symbol, mode)
+    if isinstance(response, dict) and response.get('error'):
+        cls = classify_broker_error(response.get('error'), broker=definition.code)
+        phantom_logger.warning(f"set_margin_mode failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 
