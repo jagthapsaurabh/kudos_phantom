@@ -88,4 +88,12 @@ This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-
 
 ## Key Provided
 
-- `axvjY1xAZy9ToImAbySqLoRswwTLKo` — sandbox egress blocks live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and signing matches official client. Production vs testnet host mismatch returns InvalidApiKey — ensure `https://api.india.delta.exchange` for production keys, `https://cdn-ind.testnet.deltaex.org` for demo keys.
+- `axvjY1xAZy9ToImAbySqLoRswwTLKo` — sandbox egress blocks live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and signing matches official client.
+- **Delta runs four separate key stores** (India production/testnet, Global production/testnet); the
+  live report showed the connection on India testnet with `invalid_api_key`, which is the *same*
+  answer for: an India production key on testnet, a Global key on India, a half-pasted key, or a
+  rotated key. `delta_key_probe` now signs all four hosts, `connection_test.run_connection_test` +
+  `tools/test_connection.py --apply` repoint the saved connection at the environment that accepts
+  it (no restart), and **DeltaGlobal** is a built-in broker with its own hosts so a Global key has a
+  first-class adapter. Run the check **on the trading server** (a whitelisted key 401s from any
+  other egress IP), then apply the verdict there.

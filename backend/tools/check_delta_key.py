@@ -12,8 +12,10 @@ reverse) return InvalidApiKey.
 
 The probe signs ``GET /v2/wallet/balances`` — the key ping recommended
 after the 19.08.26 changelog locked /v2/profile out of API-key access —
-against BOTH Delta India hosts using the same BrokerClient the live
-trader uses, then prints a verdict.
+against ALL FOUR Delta hosts (India production/testnet, Global
+production/testnet) using the same BrokerClient the live trader uses,
+then prints a verdict. India and Global keep separate key stores, so a
+key rejected by every India host can still be perfectly live on Global.
 
 Run on the trading server (not from a laptop with a different egress IP):
 
@@ -42,17 +44,19 @@ PRODUCTION = BrokerClient.DELTA_PRODUCTION
 TESTNET = BrokerClient.DELTA_TESTNET
 
 
-def probe(api_key: str, api_secret: str, base_url: str, testnet: bool) -> tuple:
+def probe(api_key: str, api_secret: str, base_url: str, testnet: bool,
+          broker_code: str = "Delta") -> tuple:
     """Return (state, detail) for a signed wallet-balance ping on one host.
 
-    state is one of "ok" (key accepted), "auth" (host answered and rejected
-    the key), "unreachable" (never got an HTTP answer — local network issue,
-    says nothing about the key). The probe itself lives in
-    :mod:`app.services.delta_key_probe` so this script and the terminal's
-    **Check key** button can never drift apart.
+    state is one of "ok" (key accepted), "permission" (host knows the key but
+    the endpoint permission is missing — still identifies the environment),
+    "auth" (host answered and rejected the key), "unreachable" (never got an
+    HTTP answer — local network issue, says nothing about the key). The probe
+    itself lives in :mod:`app.services.delta_key_probe` so this script and the
+    terminal's **Check key** button can never drift apart.
     """
     from app.services.delta_key_probe import probe_host
-    row = probe_host(api_key, api_secret, base_url, testnet)
+    row = probe_host(api_key, api_secret, base_url, testnet, broker_code)
     return row["state"], row["detail"]
 
 
@@ -87,7 +91,9 @@ def main() -> int:
 
     if args.label:
         api_key, api_secret, flagged_testnet, row = creds_from_db(args.label)
-        print(f"connection {args.label!r}: api_key={api_key[:6]}...{api_key[-4:] if len(api_key) > 10 else ''} "
+        flagged_broker = str(row.broker_code or "Delta")
+        print(f"connection {args.label!r}: broker={flagged_broker} "
+              f"api_key={api_key[:6]}...{api_key[-4:] if len(api_key) > 10 else ''} "
               f"is_testnet={int(flagged_testnet)}")
     else:
         api_key = args.api_key
@@ -95,20 +101,22 @@ def main() -> int:
         if not api_secret:
             raise SystemExit("--api-secret (or DELTA_API_SECRET) is required with --api-key")
         flagged_testnet = None
+        flagged_broker = "Delta"
 
     print()
     verdict = None
     saw_auth_rejection = False
-    for name, url, testnet in (("PRODUCTION", PRODUCTION, False),
-                               ("TESTNET", TESTNET, True)):
-        state, detail = probe(api_key, api_secret, url, testnet)
+    for host in BrokerClient.delta_hosts():
+        state, detail = probe(api_key, api_secret, host["url"], host["testnet"],
+                              host.get("broker_code", "Delta"))
         mark = {"ok": "ACCEPTS the key",
+                "permission": "knows the key, but a permission is missing",
                 "auth": "rejects the key",
                 "unreachable": "UNREACHABLE (network — no verdict)"}[state]
-        print(f"  {name:10s} {url}")
+        print(f"  {host['name']:16s} {host['url']}")
         print(f"             -> {mark}: {detail}")
-        if state == "ok":
-            verdict = (name, url, testnet)
+        if state in ("ok", "permission"):
+            verdict = (host["name"], host["url"], host["testnet"], host["broker_code"])
         elif state == "auth":
             saw_auth_rejection = True
 
@@ -118,30 +126,32 @@ def main() -> int:
             print("VERDICT: no host answered — fix network/DNS from this machine first;\n"
                   "       this run says nothing about the key itself.")
         else:
-            print("VERDICT: rejected by the host(s) that answered — the key is dead\n"
-                  "       (deleted, regenerated, copy/paste damage, or it belongs to Delta\n"
-                  "       global rather than Delta India). Create a fresh key in the panel\n"
+            print("VERDICT: rejected by every Delta host that answered — the key is dead\n"
+                  "       (deleted, regenerated, copy/paste damage) or it belongs to a\n"
+                  "       Delta store this tool cannot see. Create a fresh key in the panel\n"
                   "       of the environment you want to trade.")
         return 1
 
-    name, url, testnet = verdict
-    print(f"VERDICT: this is a {name} key ({url}).")
+    name, url, testnet, broker_code = verdict
+    print(f"VERDICT: this is a {name} key ({url}). Link your connection to broker "
+          f"'{broker_code}', testnet={'ON' if testnet else 'OFF'}.")
     if flagged_testnet is None:
         return 0
-    if flagged_testnet != testnet:
-        print(f"  MISMATCH: the connection is flagged is_testnet={int(flagged_testnet)} "
-              f"but the key only works on {name}.")
-        print("  Fix: edit the connection in Broker Settings and set the Testnet toggle "
-              f"to {'ON' if testnet else 'OFF'} — saving re-points every running instance, "
-              "so no restart is needed (Live Trade → Reload keys forces it immediately).")
+    if (flagged_testnet != testnet) or (broker_code.lower() != str(flagged_broker or "").lower()):
+        print(f"  MISMATCH: the connection is {flagged_broker} "
+              f"is_testnet={int(flagged_testnet)}, the key only works on {name}.")
+        print("  Fix: run tools/test_connection.py --label '<label>' --apply, or edit the "
+              f"connection in Broker Settings to broker '{broker_code}' with the Testnet "
+              f"toggle {'ON' if testnet else 'OFF'} — saving re-points every running "
+              "instance, so no restart is needed.")
     else:
-        print("  The connection's testnet flag matches the key. If a live instance still 401s "
-              "while this probe succeeds, it holds older credentials: Live Trade → Reload keys "
-              "(POST /live-trade/reload-credentials) re-reads the saved row, or wait for the "
-              "worker's own retry window.")
+        print("  The connection's broker + testnet flag match the key. If a live instance "
+              "still 401s while this probe succeeds, it holds older credentials: Live "
+              "Trade → Reload keys (POST /live-trade/reload-credentials) re-reads the "
+              "saved row, or wait for the worker's own retry window.")
 
     if args.heartbeat_id:
-        client = BrokerClient(api_key, api_secret, "Delta", testnet=testnet)
+        client = BrokerClient(api_key, api_secret, broker_code, testnet=testnet)
         payload = client.create_heartbeat(args.heartbeat_id,
                                           product_symbols=["BTCUSD"],
                                           config=[{"action": "cancel_orders",

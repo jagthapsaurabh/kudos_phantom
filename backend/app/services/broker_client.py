@@ -104,11 +104,23 @@ class BrokerClient:
     DEFAULTS = {
         "Binance": {"kind": "binance", "market": "https://fapi.binance.com", "trading": "https://fapi.binance.com"},
         "Delta": {"kind": "delta", "market": "https://api.india.delta.exchange", "trading": "https://api.india.delta.exchange"},
+        # Delta Exchange *Global* (docs-global.delta.exchange) is a separate
+        # key store with its own hosts. A key made on www/global.delta.exchange
+        # is InvalidApiKey on every India host — the two are never shared.
+        "DeltaGlobal": {"kind": "delta", "market": "https://api.delta.exchange", "trading": "https://api.delta.exchange"},
     }
-    # Official Delta Exchange India environments (docs.delta.exchange).
-    # Production keys on the testnet host (or the reverse) return InvalidApiKey.
+    # Official Delta Exchange environments (docs.delta.exchange / docs-global).
+    # Production keys on the testnet host (or the reverse) return InvalidApiKey,
+    # and India keys never validate on the Global hosts.
     DELTA_PRODUCTION = "https://api.india.delta.exchange"
     DELTA_TESTNET = "https://cdn-ind.testnet.deltaex.org"
+    DELTA_GLOBAL_PRODUCTION = "https://api.delta.exchange"
+    DELTA_GLOBAL_TESTNET = "https://testnet-api.delta.exchange"
+    # Which host family a Delta broker code belongs to.
+    DELTA_FAMILIES = {
+        "Delta": ("india", DELTA_PRODUCTION, DELTA_TESTNET),
+        "DeltaGlobal": ("global", DELTA_GLOBAL_PRODUCTION, DELTA_GLOBAL_TESTNET),
+    }
     DELTA_WS = {
         "production": {
             # Changelog 17.04.26: public channels live on public-socket;
@@ -132,6 +144,35 @@ class BrokerClient:
         "CONTRACT_PRICE": "CONTRACT_PRICE", "CONTRACT": "CONTRACT_PRICE",
         "LAST_TRADED_PRICE": "CONTRACT_PRICE", "LAST": "CONTRACT_PRICE",
     }
+
+    @classmethod
+    def delta_hosts(cls) -> List[Dict[str, Any]]:
+        """Every Delta REST environment, for a key check.
+
+        Delta India and Delta Global keep **separate key stores**, and each has
+        its own production and testnet (demo) host. ``invalid_api_key`` on one
+        host says nothing until the other three have answered: the key usually
+        exists — just on a different host. The order is India first because that
+        is the adapter's original target; the *verdict* (not the order) decides
+        what the operator does.
+        """
+        return [
+            {"name": "INDIA-PRODUCTION", "url": cls.DELTA_PRODUCTION, "testnet": False,
+             "broker_code": "Delta", "site": "india.delta.exchange"},
+            {"name": "INDIA-TESTNET", "url": cls.DELTA_TESTNET, "testnet": True,
+             "broker_code": "Delta", "site": "testnet.delta.exchange"},
+            {"name": "GLOBAL-PRODUCTION", "url": cls.DELTA_GLOBAL_PRODUCTION, "testnet": False,
+             "broker_code": "DeltaGlobal", "site": "global.delta.exchange"},
+            {"name": "GLOBAL-TESTNET", "url": cls.DELTA_GLOBAL_TESTNET, "testnet": True,
+             "broker_code": "DeltaGlobal", "site": "demo-global.delta.exchange"},
+        ]
+
+    @classmethod
+    def delta_family(cls, broker_code: Optional[str], testnet: bool = False) -> str:
+        """REST base URL for a Delta broker code + production/testnet flag."""
+        text = str(broker_code or "Delta")
+        family = cls.DELTA_FAMILIES.get(text, cls.DELTA_FAMILIES["Delta"])
+        return family[2] if testnet else family[1]
 
     # Binance order types the terminal can send.
     BINANCE_ORDER_TYPES = {
@@ -158,9 +199,15 @@ class BrokerClient:
             self.market_url = "https://testnet.binancefuture.com"
             self.trading_url = "https://testnet.binancefuture.com"
         elif self.testnet and self.kind == "delta":
-            # Demo account at demo.delta.exchange → testnet REST host.
-            self.market_url = self.DELTA_TESTNET
-            self.trading_url = self.DELTA_TESTNET
+            # Demo account → the testnet REST host of the SAME family. A
+            # DeltaGlobal connection must never be switched to the India
+            # testnet host (and vice versa): the key stores are separate.
+            family = self.DELTA_FAMILIES.get(self.broker_name)
+            if family is None and definition is not None:
+                family = self.DELTA_FAMILIES.get(str(getattr(definition, "code", "") or ""))
+            testnet_url = family[2] if family else self.DELTA_TESTNET
+            self.market_url = testnet_url
+            self.trading_url = testnet_url
         # Backwards-compatible alias used by the original Binance client.
         self.base_url = self.trading_url
         # One limiter per broker (+ credentials) shared by every caller, so the
@@ -637,7 +684,8 @@ class BrokerClient:
         if self.kind == "delta":
             from app.services.data_sync import DataSyncService
             return DataSyncService.fetch_mark_klines(self.broker_name, perp, interval,
-                                                     start_time, end_time, limit)
+                                                     start_time, end_time, limit,
+                                                     definition=self.definition)
         return []
 
     # ==================================================================

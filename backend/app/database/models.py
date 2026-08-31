@@ -485,7 +485,12 @@ def _seed_reference_data():
     try:
         builtins = [
             ('Binance', 'Binance Futures', 'binance', 'https://fapi.binance.com', 'https://fapi.binance.com', 'Built-in Binance Futures adapter'),
-            ('Delta', 'Delta Exchange', 'delta', 'https://api.india.delta.exchange', 'https://api.india.delta.exchange', 'Built-in Delta Exchange adapter'),
+            ('Delta', 'Delta Exchange', 'delta', 'https://api.india.delta.exchange', 'https://api.india.delta.exchange', 'Built-in Delta Exchange (India) adapter'),
+            # Delta Exchange Global (www/global.delta.exchange) keeps a SEPARATE
+            # key store from India (docs-global.delta.exchange). A key created on
+            # the Global site is InvalidApiKey on the India host and vice versa,
+            # so it is its own integration, not a URL override of `Delta`.
+            ('DeltaGlobal', 'Delta Exchange Global', 'delta', 'https://api.delta.exchange', 'https://api.delta.exchange', 'Built-in Delta Exchange (Global) adapter'),
         ]
         for code, name, kind, market, trading, notes in builtins:
             row = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
@@ -494,7 +499,7 @@ def _seed_reference_data():
                                         trading_api_url=trading, enabled=1, is_builtin=1, notes=notes))
         taker = float(os.getenv('TAKER_FEE_BPS', '5.9'))
         maker = float(os.getenv('MAKER_FEE_BPS', '2.36'))
-        for code in ('Binance', 'Delta'):
+        for code in ('Binance', 'Delta', 'DeltaGlobal'):
             for mode in ('backtest', 'paper', 'live'):
                 if not db.query(FeeSetting).filter_by(broker_code=code, mode=mode).first():
                     db.add(FeeSetting(broker_code=code, mode=mode, taker_fee_bps=taker,

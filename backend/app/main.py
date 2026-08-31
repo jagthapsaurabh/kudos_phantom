@@ -1110,6 +1110,47 @@ async def probe_broker_connection(connection_id: int, user=Depends(get_current_u
     return out
 
 
+@app.post('/broker-connections/{connection_id}/test')
+async def test_broker_connection(connection_id: int, request: Request,
+                                 user=Depends(get_current_user), db=Depends(get_db)):
+    """Read-only full connection battery: the answer to "why is everything
+    signed rejected while seeds work?".
+
+    Public market data (seeds, candles, tickers) needs no API key, so a venue
+    can look half-alive while every account/order call 401s. This endpoint runs
+    the same battery as ``tools/test_connection.py`` and returns a step-by-step
+    report + the environment the key actually belongs to. It never places,
+    edits or cancels an order.
+
+    ``?apply=true`` additionally repoints the saved connection at the detected
+    environment (broker code + testnet flag) — the fix the report describes —
+    and hands the new credentials to any running instances, no restart needed.
+    """
+    from .services.connection_test import run_connection_test
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id,
+                                            BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    if not (row.api_key and row.api_secret):
+        raise HTTPException(status_code=400, detail='This connection has no key/secret pair to test')
+    code = _canonical_broker_code(db, row.broker_code)
+    result = await asyncio.to_thread(
+        run_connection_test, row.api_key, row.api_secret, code,
+        bool(row.is_testnet), row.id, row.label or code)
+    detected = result.get('detected')
+    if detected and request.query_params.get('apply') == 'true':
+        row.broker_code = detected['broker_code']
+        row.is_testnet = int(bool(detected['testnet']))
+        db.commit()
+        db.refresh(row)
+        await asyncio.to_thread(_fetch_connection_settings, db, row)
+        result['applied'] = {'applied': True, 'broker_code': row.broker_code,
+                             'is_testnet': bool(row.is_testnet),
+                             'label': row.label or row.broker_code,
+                             'base_url': detected.get('base_url', '')}
+        result['live_instances'] = await _adopt_saved_credentials(row, user.id)
+    return result
+
+
 @app.post('/broker-connections/{connection_id}/refresh')
 def refresh_broker_connection(connection_id: int, user=Depends(get_current_user), db=Depends(get_db)):
     """Re-read account details (margin mode, leverage, sub-accounts) from the venue.

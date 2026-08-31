@@ -344,9 +344,13 @@ def all_snapshots() -> Dict[str, dict]:
 VENUE_DEFAULTS: Dict[str, RateLimitConfig] = {
     # 10 000 weight per fixed 5-minute window; ~33/s sustained. Stay well under.
     # Delta publishes no order-specific cap, only the shared weight quota.
+    # DeltaGlobal shares the published quota with Delta India.
     "Delta": RateLimitConfig(requests_per_second=20.0, requests_per_minute=1200.0,
                              weight_per_5min=10000.0, orders_per_minute=None,
                              orders_per_10s=None),
+    "DeltaGlobal": RateLimitConfig(requests_per_second=20.0, requests_per_minute=1200.0,
+                                   weight_per_5min=10000.0, orders_per_minute=None,
+                                   orders_per_10s=None),
     # 2 400 weight/minute, 1 200 orders/minute.
     "Binance": RateLimitConfig(requests_per_second=20.0, requests_per_minute=1200.0,
                                weight_per_5min=None, orders_per_minute=1200.0,

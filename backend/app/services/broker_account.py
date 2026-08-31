@@ -489,12 +489,14 @@ def _auth_error_verdict(source: str, errors: Dict[str, str],
         f"{source} rejected this API key on every authenticated call "
         f"({texts[0]}). The key does not work on the environment this "
         "connection points at: it was regenerated or revoked, pasted "
-        "incompletely, or it is a production key on a testnet connection "
-        "(or the reverse). Replace the key on this connection in Broker "
-        "Settings — 'Check key' there says which environment accepts it — "
-        "and running live instances re-read the saved credentials by "
-        "themselves (or use 'Reload keys' on the instance), so a key fix "
-        "no longer needs a restart."
+        "incompletely, it is a production key on a testnet connection "
+        "(or the reverse), or it belongs to the other Delta market (India "
+        "vs Global keep separate key stores). Replace the key in Broker "
+        "Settings, or run 'Test connection' on the connection there — it "
+        "says which environment accepts the key and offers 'Use this "
+        "environment' — and running live instances re-read the saved "
+        "credentials by themselves (or use 'Reload keys' on the instance), "
+        "so a key fix no longer needs a restart."
     )
 
 
