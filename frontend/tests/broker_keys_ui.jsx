@@ -153,7 +153,22 @@ check('a Delta production connection hides the align action (already there)',
   !alignedCard.includes('Align to India production'));
 const noAlignProp = render(React.createElement(ConnectionCard, { ...cardProps, keysOpen: false }));
 check('without a handler the align action is not offered (older surfaces)',
-  !noAlignProp.includes('Align to India production'));
+  !noAlignProp.includes('Align to India production</button>'));
+
+// ---- The official key/API rule is shown on misaligned Delta rows ---------
+const globalCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+  c: { ...CONNECTIONS[0], broker_code: 'DeltaGlobal', is_testnet: false },
+}));
+check('a Global connection names api.delta.exchange and says it is not used here',
+  globalCard.includes('api.delta.exchange') && globalCard.includes('not used by this deployment'),
+  globalCard.slice(0, 400));
+const demoCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+}));
+check('a testnet connection states the production-only rule for India keys',
+  demoCard.includes('api.india.delta.exchange') && demoCard.includes('production keys work only'),
+  demoCard.slice(0, 400));
 
 // ------------------------------------------------------- Instance badges ----
 console.log('\n== live instance: credential state + parked deadman switch ==');

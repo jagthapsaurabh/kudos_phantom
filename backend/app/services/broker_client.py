@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -220,6 +221,47 @@ class BrokerClient:
         return (text in cls.DELTA_FAMILIES
                 or (text.lower() in ("delta", "delta exchange", "deltaglobal",
                                      "delta global")))
+
+    # This deployment trades Delta **India** (www.delta.exchange account).
+    # Official rule, as quoted by the operator:
+    #   * keys created on the Delta India account → production API only
+    #     (https://api.india.delta.exchange);
+    #   * keys created on the Demo account (demo.delta.exchange) → testnet API
+    #     only (https://cdn-ind.testnet.deltaex.org);
+    #   * https://api.delta.exchange belongs to Delta GLOBAL and is not used
+    #     here — India keys are rejected there and Global keys are rejected
+    #     here.
+    # ``DELTA_DEPLOYMENT_FAMILY=global`` opts a box back into the Global
+    # market; the default (and this system's choice) is ``india``.
+    DELTA_DEPLOYMENT_FAMILY_DEFAULT = "india"
+    DELTA_FAMILY_RULE = (
+        "https://api.delta.exchange belongs to Delta Global and is not used by "
+        "this deployment. API keys created on the Delta India account "
+        "(www.delta.exchange) work only with the production API "
+        "https://api.india.delta.exchange; keys created on the Demo account "
+        "(demo.delta.exchange) work only with the testnet API "
+        "https://cdn-ind.testnet.deltaex.org. Use the 'Delta' (India) "
+        "integration and 'Align to India production' for this connection.")
+
+    @classmethod
+    def delta_deployment_family(cls) -> str:
+        """``india`` (default) or ``global`` — which Delta market this box trades."""
+        value = str(os.getenv("DELTA_DEPLOYMENT_FAMILY",
+                              cls.DELTA_DEPLOYMENT_FAMILY_DEFAULT)).strip().lower()
+        return value if value in ("india", "global") else cls.DELTA_DEPLOYMENT_FAMILY_DEFAULT
+
+    @classmethod
+    def delta_family_allowed(cls, broker_code: Optional[str]) -> bool:
+        """True when the deployment family permits this Delta broker code.
+
+        India-only boxes refuse DeltaGlobal (the Global adapter), which is the
+        rail that makes ``api.delta.exchange`` unreachable through the app:
+        a Global connection cannot even be created here.
+        """
+        code = str(broker_code or "")
+        if "global" in code.lower():
+            return cls.delta_deployment_family() == "global"
+        return True
 
     # Binance order types the terminal can send.
     BINANCE_ORDER_TYPES = {

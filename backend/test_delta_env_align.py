@@ -236,11 +236,11 @@ try:
           g.broker_code == "Delta" and g.is_testnet == 0, str((g.broker_code, g.is_testnet)))
 
     sys.argv = ["align_delta_env.py", "--label", "NishKudos global",
-                "--environment", "GLOBAL_TESTNET", "--apply", "--json"]
+                "--environment", "INDIA_TESTNET", "--apply", "--json"]
     rc = tool.main()
     db.refresh(g)
     check("--apply writes the named environment onto the row",
-          rc == 0 and g.broker_code == "DeltaGlobal" and g.is_testnet == 1,
+          rc == 0 and g.broker_code == "Delta" and g.is_testnet == 1,
           str((g.broker_code, g.is_testnet)))
 
     sys.argv = ["align_delta_env.py", "--all-delta",
@@ -266,6 +266,14 @@ try:
     except SystemExit as exc:
         check("missing label exits nonzero", exc.code != 0, str(exc.code))
 
+    sys.argv = ["align_delta_env.py", "--all-delta", "--environment", "GLOBAL_TESTNET"]
+    try:
+        tool.main()
+        check("the CLI refuses the Global family on an India box", False, "no SystemExit")
+    except SystemExit as exc:
+        check("the CLI refuses the Global family on an India box",
+              exc.code != 0 and "Global" in str(exc), str(exc))
+
     # --verify makes one signed probe on the target host (faked here).
     from app.services import delta_key_probe as probe_mod
     probe_calls = []
@@ -279,16 +287,89 @@ try:
     probe_mod.probe_host = fake_probe
     try:
         sys.argv = ["align_delta_env.py", "--label", "NishKudos global",
-                    "--environment", "GLOBAL_TESTNET", "--apply",
+                    "--environment", "INDIA_TESTNET", "--apply",
                     "--verify", "--json"]
         rc = tool.main()
         check("--verify probes the target host once after applying",
-              rc == 0 and probe_calls == [("https://testnet-api.delta.exchange", True, "DeltaGlobal")],
+              rc == 0 and probe_calls == [("https://cdn-ind.testnet.deltaex.org", True, "Delta")],
               str(probe_calls))
     finally:
         probe_mod.probe_host = original_probe_host
 finally:
     sys.argv = saved_argv
+
+# ===========================================================================
+section("5. deployment rail: India box refuses the Delta Global family")
+# ===========================================================================
+# Default DELTA_DEPLOYMENT_FAMILY is india. The official rule (India keys →
+# production API only; api.delta.exchange = Global) is enforced at the door.
+check("deployment family defaults to india",
+      BrokerClient.delta_deployment_family() == "india",
+      BrokerClient.delta_deployment_family())
+check("the rule text names both hosts and the Global exclusion",
+      "api.delta.exchange" in BrokerClient.DELTA_FAMILY_RULE
+      and "api.india.delta.exchange" in BrokerClient.DELTA_FAMILY_RULE
+      and "cdn-ind.testnet.deltaex.org" in BrokerClient.DELTA_FAMILY_RULE
+      and "not used by this deployment" in BrokerClient.DELTA_FAMILY_RULE,
+      BrokerClient.DELTA_FAMILY_RULE)
+
+rail_user = make_user("rail_delta")
+rheaders = login("rail_delta")
+
+r = client.post("/broker-connections", headers=rheaders, json={
+    "broker_code": "DeltaGlobal", "label": "would be global",
+    "api_key": "K", "api_secret": "S"})
+check("creating a DeltaGlobal connection is refused with the rule",
+      r.status_code == 400 and "api.delta.exchange" in r.json().get("detail", ""),
+      r.text[:300])
+
+r = client.post("/broker-connections", headers=rheaders, json={
+    "broker_code": "Delta", "label": "india row", "api_key": "K", "api_secret": "S"})
+india_row = r.json()
+check("creating a Delta (India) connection still works",
+      r.status_code == 200 and india_row.get("broker_code") == "Delta", r.text[:300])
+
+rail_global = add_connection(rail_user.id, "DeltaGlobal", "legacy global row", testnet=1)
+r = client.put(f"/broker-connections/{india_row['id']}", headers=rheaders, json={
+    "broker_code": "DeltaGlobal", "label": "india row", "api_key": "", "api_secret": "",
+    "passphrase": None, "is_testnet": False, "is_active": True})
+check("switching a row ONTO DeltaGlobal is refused",
+      r.status_code == 400 and "api.delta.exchange" in r.json().get("detail", ""),
+      r.text[:300])
+db.refresh(rail_global)
+r = client.put(f"/broker-connections/{rail_global.id}", headers=rheaders, json={
+    "broker_code": "DeltaGlobal", "label": "legacy global row", "api_key": "",
+    "api_secret": "", "passphrase": None, "is_testnet": False, "is_active": True})
+check("an existing DeltaGlobal row stays editable (align/delete paths open)",
+      r.status_code == 200, r.text[:300])
+
+r = client.post(f"/broker-connections/{india_row['id']}/align", headers=rheaders,
+                json={"environment": "GLOBAL_PRODUCTION"})
+check("aligning a row ONTO Global is refused with the rule",
+      r.status_code == 400 and "api.delta.exchange" in r.json().get("detail", ""),
+      r.text[:300])
+r = client.post("/broker-connections/align-delta", headers=rheaders,
+                json={"environment": "GLOBAL_TESTNET"})
+check("bulk-aligning ONTO Global is refused too",
+      r.status_code == 400, r.text[:300])
+
+# A Global-market box opts out of the rail with DELTA_DEPLOYMENT_FAMILY=global.
+os.environ["DELTA_DEPLOYMENT_FAMILY"] = "global"
+try:
+    check("the env flag flips the deployment family",
+          BrokerClient.delta_deployment_family() == "global")
+    r = client.post("/broker-connections", headers=rheaders, json={
+        "broker_code": "DeltaGlobal", "label": "global box row",
+        "api_key": "K", "api_secret": "S"})
+    check("on a global box the Global adapter is accepted",
+          r.status_code == 200 and r.json().get("broker_code") == "DeltaGlobal",
+          r.text[:300])
+    r = client.post(f"/broker-connections/{india_row['id']}/align", headers=rheaders,
+                    json={"environment": "GLOBAL_PRODUCTION"})
+    check("on a global box aligning onto Global is accepted",
+          r.status_code == 200, r.text[:300])
+finally:
+    os.environ["DELTA_DEPLOYMENT_FAMILY"] = "india"
 
 # ===========================================================================
 print(f"\n{'=' * 62}\n  {len(PASS)} PASS / {len(FAIL)} FAIL\n{'=' * 62}")

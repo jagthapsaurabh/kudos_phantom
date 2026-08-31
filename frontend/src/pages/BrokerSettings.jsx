@@ -266,6 +266,18 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
     </div>
   )}
 
+  {isDeltaFamily(c) && !isIndiaProduction(c) && (
+    <div className="mt-1.5 rounded-lg border border-amber-800/60 bg-amber-900/10 p-2 text-[10px] leading-relaxed text-amber-300">
+      {c?.broker_code === 'DeltaGlobal'
+        ? <><b>This connection points at Delta Global</b> (<span className="font-mono">api.delta.exchange</span>) —
+           that host is not used by this deployment: India keys are rejected there and Global keys are
+           rejected by India. Use <b>Align to India production</b> below, then paste the India key.</>
+        : <>This connection is flagged <b>testnet/demo</b>. India production keys work only on{' '}
+           <span className="font-mono">api.india.delta.exchange</span> — use <b>Align to India production</b> below
+           (demo keys stay on testnet).</>}
+    </div>
+  )}
+
   <div className="mt-2 flex flex-wrap gap-1.5">
     <button onClick={onProbe} disabled={probing}
             className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40 disabled:opacity-40">
@@ -697,8 +709,19 @@ const BrokerSettings = () => {
             <div>
               <label className={lbl}>Exchange / broker</label>
               <select className={field} value={form.broker_code} onChange={e => setForm({ ...form, broker_code: e.target.value })}>
-                {definitions.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}
+                {definitions.map(d => <option key={d.code} value={d.code}>{d.name}{d.code === 'DeltaGlobal' ? ' (Global · api.delta.exchange — not for India keys)' : ''}</option>)}
               </select>
+              {form.broker_code === 'DeltaGlobal' && (
+                <p className="mt-2 rounded-lg border border-amber-800/60 bg-amber-900/10 p-2 text-[11px] leading-relaxed text-amber-300">
+                  <b>Delta Global is not used by this deployment.</b> API keys created on the
+                  Delta India account (www.delta.exchange) work <b>only</b> with the production API{' '}
+                  <span className="font-mono">https://api.india.delta.exchange</span>; keys from the Demo
+                  account work only with the testnet API{' '}
+                  <span className="font-mono">https://cdn-ind.testnet.deltaex.org</span>. Choose{' '}
+                  <b>Delta Exchange</b> (India) for those keys — <b>Align to India production</b> repoints
+                  an existing Global connection.
+                </p>
+              )}
             </div>
             <div><label className={lbl}>Connection label</label><input className={field} placeholder="Primary, Delta live…" value={form.label} onChange={e => setForm({ ...form, label: e.target.value })} /></div>
             <div><label className={lbl}>API key *</label><input required className={field} type="password" value={form.api_key} onChange={e => setForm({ ...form, api_key: e.target.value })} /></div>

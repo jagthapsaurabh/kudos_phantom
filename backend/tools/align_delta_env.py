@@ -121,6 +121,12 @@ def main() -> int:
     if target is None:
         known = ", ".join(h["name"] for h in BrokerClient.delta_hosts())
         raise SystemExit(f"unknown Delta environment {args.environment!r}; use one of: {known}")
+    # Deployment rail: this box trades Delta India, so the Global family
+    # (https://api.delta.exchange) is refused with the official key/API rule.
+    if target["broker_code"] == "DeltaGlobal" \
+            and not BrokerClient.delta_family_allowed("DeltaGlobal"):
+        raise SystemExit(f"{target['name']} is Delta Global — "
+                         f"{BrokerClient.DELTA_FAMILY_RULE}")
 
     rows, db = delta_connection_rows()
     if args.label:

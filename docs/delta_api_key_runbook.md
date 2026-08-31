@@ -112,6 +112,17 @@ Fixing the key is usually routine, but do it with the position **flat** when you
 
 ## Which environment is which
 
+The official rule, enforced by the app on this box (`DELTA_DEPLOYMENT_FAMILY=india`, the default):
+
+* **Delta India account keys** (www.delta.exchange) → used **only** with the production API
+  `https://api.india.delta.exchange`.
+* **Demo account keys** (demo.delta.exchange) → used **only** with the testnet API
+  `https://cdn-ind.testnet.deltaex.org`.
+* **`https://api.delta.exchange` belongs to Delta Global and is not used here.** On an India box
+  the app refuses to create/switch/align a connection onto DeltaGlobal with a 400 carrying this
+  rule; the read-only key check still signs one call per environment so it can *report* a Global
+  key (re-create such a key on India instead).
+
 **This deployment trades Delta India production** — the first row is where every Delta connection
 must point:
 

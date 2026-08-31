@@ -1018,6 +1018,11 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
     # display name) and store the canonical registry code, so a saved row always
     # matches what the live call looks up.
     code = _canonical_broker_code(db, broker_code)
+    # Deployment rail: this box trades Delta India, so the Global adapter
+    # (https://api.delta.exchange) is refused at the door with the official
+    # key/API rule — an India key would be rejected there anyway.
+    if not BrokerClient.delta_family_allowed(code):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
     if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
@@ -1058,7 +1063,14 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
 async def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
     row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
-    row.broker_code = _canonical_broker_code(db, payload.broker_code); row.label = payload.label
+    code = _canonical_broker_code(db, payload.broker_code)
+    # Deployment rail: a row may stay on DeltaGlobal (the operator can still
+    # align or delete it), but it may not be *switched onto* the Global
+    # adapter on an India-only box.
+    if code == "DeltaGlobal" and BrokerClient.delta_deployment_family() == "india" \
+            and str(row.broker_code or "").lower() not in ("deltaglobal",):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
+    row.broker_code = code; row.label = payload.label
     # Empty secrets mean "keep the existing secret" in the edit form — the API
     # never returns one, so an edit form cannot round-trip it.
     if payload.api_key: row.api_key = payload.api_key.strip()
@@ -1189,6 +1201,11 @@ def _align_connection_to_environment(db, row: BrokerConnection,
                             detail=f"Connection '{row.label or code}' is a {code} "
                                    "connection — only Delta (India) and DeltaGlobal "
                                    "connections have named environments to align.")
+    # Deployment rail: aligning *onto* the Global family is refused on an
+    # India-only box; aligning off it (the fix) stays allowed.
+    if env["broker_code"] == "DeltaGlobal" \
+            and not BrokerClient.delta_family_allowed("DeltaGlobal"):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
     row.broker_code = env["broker_code"]
     row.is_testnet = int(bool(env["testnet"]))
     db.commit()
@@ -1212,6 +1229,9 @@ async def align_all_delta_connections(payload: DeltaEnvironmentAlignPayload,
     instances on the repointed rows are handed the change immediately.
     """
     target = _resolve_delta_environment(payload.environment)
+    if target["broker_code"] == "DeltaGlobal" \
+            and not BrokerClient.delta_family_allowed("DeltaGlobal"):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
     rows = db.query(BrokerConnection).filter(
         BrokerConnection.user_id == user.id).all()
     delta_rows = [r for r in rows if BrokerClient.is_delta_broker(
