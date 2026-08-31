@@ -62,10 +62,16 @@ from app.core.rate_limit import (
 
 # Auth-level rejections, worded as each venue actually words them. Anything
 # outside this list is an endpoint problem, not a key problem, and must NOT
-# silence the whole signed surface.
+# silence the whole signed surface. Includes Delta India taxonomy:
+# SignatureExpired, InvalidApiKey, UnauthorizedApiAccess, ip_not_whitelisted,
+# Signature Mismatch, plus Binance -2015.
 AUTH_REJECTION_MARKERS = (
     "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
     "api-key format", "-2015", "unauthorized",
+    "signatureexpired", "signature expired",
+    "unauthorizedapiaccess", "unauthorized_api_access",
+    "ip_not_whitelisted", "ip not whitelisted",
+    "signature mismatch", "signature_mismatch",
 )
 
 # How many *consecutive* signed-call rejections count as "the key is dead".
@@ -1040,6 +1046,68 @@ class BrokerClient:
             return self._delta_result(self._json_body(response, error))
         return {"error": f"No cancel adapter installed for '{self.broker_name}'"}
 
+    # ---- Batch orders (official: POST/PUT/DELETE /v2/orders/batch) ----
+    def batch_create_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+        if self.kind != "delta":
+            return {"error": "Batch orders only supported on Delta Exchange."}
+        if not orders:
+            return {"error": "orders list required"}
+        perp = self.perpetual_symbol(symbol) if symbol else None
+        body: Dict[str, Any] = {"orders": orders}
+        # Official batch requires product_id or product_symbol at top level
+        if symbol:
+            try:
+                inst = self.get_instrument(symbol) or {}
+                pid = inst.get("product_id")
+                if pid:
+                    body["product_id"] = int(pid)
+            except Exception:
+                pass
+        if "product_id" not in body and perp:
+            body["product_symbol"] = perp
+        response, error = self._delta_request("POST", "/v2/orders/batch", body=body, weight=25, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
+    def batch_edit_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+        if self.kind != "delta":
+            return {"error": "Batch orders only supported on Delta Exchange."}
+        if not orders:
+            return {"error": "orders list required"}
+        perp = self.perpetual_symbol(symbol) if symbol else None
+        body: Dict[str, Any] = {"orders": orders}
+        if symbol:
+            try:
+                inst = self.get_instrument(symbol) or {}
+                pid = inst.get("product_id")
+                if pid:
+                    body["product_id"] = int(pid)
+            except Exception:
+                pass
+        if "product_id" not in body and perp:
+            body["product_symbol"] = perp
+        response, error = self._delta_request("PUT", "/v2/orders/batch", body=body, weight=25, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
+    def batch_cancel_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+        if self.kind != "delta":
+            return {"error": "Batch orders only supported on Delta Exchange."}
+        if not orders:
+            return {"error": "orders list required"}
+        perp = self.perpetual_symbol(symbol) if symbol else None
+        body: Dict[str, Any] = {"orders": orders}
+        if symbol:
+            try:
+                inst = self.get_instrument(symbol) or {}
+                pid = inst.get("product_id")
+                if pid:
+                    body["product_id"] = int(pid)
+            except Exception:
+                pass
+        if "product_id" not in body and perp:
+            body["product_symbol"] = perp
+        response, error = self._delta_request("DELETE", "/v2/orders/batch", body=body, weight=25, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
     def edit_bracket_order(self, order_id, symbol: Optional[str] = None,
                            stop_loss_price: Optional[float] = None,
                            take_profit_price: Optional[float] = None,
@@ -1051,6 +1119,15 @@ class BrokerClient:
         perp = self.perpetual_symbol(symbol) if symbol else None
         if perp:
             body["product_symbol"] = perp
+        # Official docs require product_id; include it when we know it
+        if symbol:
+            try:
+                inst = self.get_instrument(symbol) or {}
+                pid = inst.get("product_id")
+                if pid:
+                    body["product_id"] = int(pid)
+            except Exception:
+                pass
         if stop_loss_price is not None:
             sl_leg: Dict[str, Any] = {"order_type": "market_order",
                                       "stop_price": str(stop_loss_price)}
@@ -1074,6 +1151,15 @@ class BrokerClient:
             body: Dict[str, Any] = {"id": int(order_id)}
             if perp:
                 body["product_symbol"] = perp
+            # Official requires product_id or product_symbol; include both when possible
+            if symbol:
+                try:
+                    inst = self.get_instrument(symbol) or {}
+                    pid = inst.get("product_id")
+                    if pid:
+                        body["product_id"] = int(pid)
+                except Exception:
+                    pass
             if price is not None:
                 limit = self._delta_limit_price(price)
                 if limit is None:
@@ -1097,15 +1183,16 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else ([payload] if payload.get("error") is None else payload)
         if self.kind == "delta":
-            # Official uses product_id filter; keep product_symbol as fallback
-            # because Delta accepts both. Resolve product_id from instrument
-            # cache when we have a symbol.
+            # Docs & official test.py use product_ids (plural) for active orders.
+            # Send both product_ids and product_id for backward compat with
+            # older deployments/mocks that still filter on singular.
             query: Dict[str, Any] = {}
             if symbol:
                 try:
                     instrument = self.get_instrument(symbol) or {}
                     pid = instrument.get("product_id")
                     if pid:
+                        query["product_ids"] = int(pid)
                         query["product_id"] = int(pid)
                 except Exception:
                     pass
@@ -1132,17 +1219,19 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else payload
         if self.kind == "delta":
+            # Official test.py uses product_ids for history & fills; send both
+            # singular/plural for backward compat with older mocks.
             query: Dict[str, Any] = {"page_size": min(max(1, int(limit)), 100)}
-            # Prefer product_id when we can resolve it, keep product_symbol as fallback
             if symbol:
                 try:
                     inst = self.get_instrument(symbol) or {}
                     pid = inst.get("product_id")
                     if pid:
+                        query["product_ids"] = int(pid)
                         query["product_id"] = int(pid)
                 except Exception:
                     pass
-            if "product_id" not in query and perp:
+            if "product_ids" not in query and perp:
                 query["product_symbol"] = perp
             if start_time is not None:
                 query["start_time"] = int(pd.Timestamp(start_time).timestamp())
@@ -1163,9 +1252,20 @@ class BrokerClient:
             response, error = self._binance_request("GET", "/fapi/v1/order", params, weight=1)
             return self._json_body(response, error)
         if self.kind == "delta":
+            # Docs: GET /v2/orders/{order_id} and GET /v2/orders/client_order_id/{client_oid}
+            # Legacy query form /v2/orders/client?client_order_id=... kept as fallback for mocks.
             if client_order_id:
-                response, error = self._delta_request("GET", "/v2/orders/client",
-                                                      query={"client_order_id": client_order_id}, weight=5)
+                response, error = self._delta_request(
+                    "GET", f"/v2/orders/client_order_id/{client_order_id}", weight=5)
+                payload = self._json_body(response, error)
+                result = self._delta_result(payload)
+                if isinstance(payload, dict) and payload.get("error") and (
+                        "unmocked" in str(payload.get("error")).lower() or "404" in str(payload.get("error"))):
+                    response, error = self._delta_request(
+                        "GET", "/v2/orders/client", query={"client_order_id": client_order_id}, weight=5)
+                    payload = self._json_body(response, error)
+                    result = self._delta_result(payload)
+                return result
             else:
                 response, error = self._delta_request("GET", f"/v2/orders/{order_id}", weight=5)
             payload = self._json_body(response, error)
@@ -1190,16 +1290,18 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else payload
         if self.kind == "delta":
+            # Official test.py uses product_ids for fills; send both for compat.
             query: Dict[str, Any] = {"page_size": min(max(1, int(limit)), 100)}
             if symbol:
                 try:
                     inst = self.get_instrument(symbol) or {}
                     pid = inst.get("product_id")
                     if pid:
+                        query["product_ids"] = int(pid)
                         query["product_id"] = int(pid)
                 except Exception:
                     pass
-            if "product_id" not in query and perp:
+            if "product_ids" not in query and perp:
                 query["product_symbol"] = perp
             if start_time is not None:
                 query["start_time"] = int(pd.Timestamp(start_time).timestamp())
@@ -1226,14 +1328,16 @@ class BrokerClient:
             # Official: GET /v2/positions/margined?product_ids=84 or
             # GET /v2/positions?product_id=84. Use margined endpoint with
             # product_ids when we can resolve product_id, else fall back to
-            # product_symbol for backward compat with older mocks.
+            # product_symbol for backward compat with older mocks. Send both
+            # plural and singular for compatibility.
             query: Dict[str, Any] = {}
             if symbol:
                 try:
                     instrument = self.get_instrument(symbol) or {}
                     pid = instrument.get("product_id")
                     if pid:
-                        query["product_ids"] = str(int(pid))
+                        query["product_ids"] = int(pid)
+                        query["product_id"] = int(pid)
                 except Exception:
                     pass
             if not query and perp:
@@ -1511,7 +1615,8 @@ class BrokerClient:
             return out
         return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
 
-    def set_margin_mode(self, symbol: str, mode: str = "isolated"):
+    def set_margin_mode(self, symbol: str, mode: str = "isolated",
+                        subaccount_user_id: Optional[str] = None):
         perp = self.perpetual_symbol(symbol)
         if self.kind == "binance":
             response, error = self._binance_request("POST", "/fapi/v1/marginType",
@@ -1521,10 +1626,13 @@ class BrokerClient:
         if self.kind == "delta":
             # Margin mode on Delta India is an ACCOUNT-level setting
             # (docs: PUT /v2/users/margin_mode, body {"margin_mode":
-            # "isolated"|"portfolio"|"cross"}). The legacy per-position
-            # POST /v2/positions/margin_mode is no longer in the docs — kept
-            # as a fallback in case a deployment still routes it.
-            body = {"margin_mode": str(mode).lower()}
+            # "isolated"|"portfolio"|"cross", "subaccount_user_id": "..."}).
+            # The legacy per-position POST /v2/positions/margin_mode is no
+            # longer in the docs — kept as a fallback in case a deployment
+            # still routes it.
+            body: Dict[str, Any] = {"margin_mode": str(mode).lower()}
+            if subaccount_user_id:
+                body["subaccount_user_id"] = str(subaccount_user_id)
             response, error = self._delta_request("PUT", "/v2/users/margin_mode",
                                                   body=body, weight=5, is_order=True)
             payload = self._json_body(response, error)
@@ -1542,6 +1650,86 @@ class BrokerClient:
                 return result2 if isinstance(result2, dict) and result2 else {"ok": True}
             return result if isinstance(result, dict) else {"error": str(result)}
         return {"error": f"No margin-mode adapter installed for '{self.broker_name}'"}
+
+    # ---- Additional authenticated endpoints (wallet, subaccounts, prefs, margin) ----
+    def get_wallet_transactions(self, asset_id: Optional[int] = None, limit: int = 100):
+        if self.kind != "delta":
+            return {"error": f"No wallet adapter for '{self.broker_name}'"}
+        query: Dict[str, Any] = {"page_size": min(max(1, int(limit)), 100)}
+        if asset_id is not None:
+            query["asset_id"] = int(asset_id)
+        response, error = self._delta_request("GET", "/v2/wallet/transactions", query=query, weight=10)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_subaccounts(self):
+        if self.kind != "delta":
+            return {"error": f"No subaccount adapter for '{self.broker_name}'"}
+        response, error = self._delta_request("GET", "/v2/sub_accounts", weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_trading_preferences(self):
+        if self.kind != "delta":
+            return {"error": f"No trading-preferences adapter for '{self.broker_name}'"}
+        response, error = self._delta_request("GET", "/v2/users/trading_preferences", weight=3)
+        return self._delta_result(self._json_body(response, error))
+
+    def update_trading_preferences(self, prefs: Dict[str, Any]):
+        if self.kind != "delta":
+            return {"error": f"No trading-preferences adapter for '{self.broker_name}'"}
+        response, error = self._delta_request("PUT", "/v2/users/trading_preferences", body=prefs or {}, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def set_auto_topup(self, symbol: str, auto_topup: bool):
+        if self.kind != "delta":
+            return {"error": "Auto-topup only supported on Delta Exchange."}
+        try:
+            inst = self.get_instrument(symbol) or {}
+            pid = inst.get("product_id")
+        except Exception:
+            pid = None
+        if not pid:
+            return {"error": "product_id unknown — auto_topup needs instrument"}
+        body = {"product_id": int(pid), "auto_topup": bool(auto_topup)}
+        response, error = self._delta_request("PUT", "/v2/positions/auto_topup", body=body, weight=10, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_position(self, symbol: str):
+        """Real-time position (GET /v2/positions?product_id=) per docs."""
+        if self.kind != "delta":
+            return self.get_positions(symbol)
+        try:
+            inst = self.get_instrument(symbol) or {}
+            pid = inst.get("product_id")
+        except Exception:
+            pid = None
+        query: Dict[str, Any] = {}
+        if pid:
+            query["product_id"] = int(pid)
+        else:
+            query["product_symbol"] = self.perpetual_symbol(symbol)
+        response, error = self._delta_request("GET", "/v2/positions", query=query, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_margined_position(self, symbol: str):
+        """Margined position (GET /v2/positions/margined) — includes liquidation price."""
+        return self.get_positions(symbol)
+
+    def close_all_positions(self, product_ids: Optional[List[int]] = None,
+                            close_all_portfolio: bool = True,
+                            close_all_isolated: bool = True,
+                            user_id: Optional[int] = None):
+        if self.kind != "delta":
+            return {"error": "close_all only supported on Delta Exchange."}
+        body: Dict[str, Any] = {
+            "close_all_portfolio": bool(close_all_portfolio),
+            "close_all_isolated": bool(close_all_isolated),
+        }
+        if product_ids:
+            body["product_ids"] = [int(x) for x in product_ids]
+        if user_id is not None:
+            body["user_id"] = int(user_id)
+        response, error = self._delta_request("POST", "/v2/positions/close_all", body=body, weight=20, is_order=True)
+        return self._delta_result(self._json_body(response, error))
 
     # ==================================================================
     # Rate limits
