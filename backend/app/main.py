@@ -1548,20 +1548,27 @@ def save_trading_windows(payload: TradingWindowsPayload, user=Depends(get_curren
 _LOGS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
 
 def _champion_config_path() -> Optional[str]:
-    for name in ('champion_lowdd_config.json', 'champion_config.json'):
+    # Prefer high-leverage champion (lev 7 / margin 0.25) so 20k INR can trade at 100k BTC.
+    # Low-DD profile (lev2/margin0.15) needs ~32k+ at that price and yields LOT_TOO_SMALL.
+    for name in ('champion_config.json', 'champion_lowdd_config.json'):
         path = os.path.join(_LOGS_DIR, name)
         if os.path.exists(path):
             return path
     return None
 
 def _load_champion_config() -> PhantomV2Config:
-    """Best-known tuned config (sizing/low-dd profile preferred), else defaults."""
+    """Best-known tuned config with tradable sizing guard."""
     path = _champion_config_path()
     if path:
         try:
             with open(path) as f:
                 kw = json.load(f)
-            return PhantomV2Config(**{k: v for k, v in kw.items() if k in PhantomV2Config.model_fields})
+            cfg = PhantomV2Config(**{k: v for k, v in kw.items() if k in PhantomV2Config.model_fields})
+            if cfg.leverage < 5:
+                cfg = cfg.model_copy(update={'leverage': 5})
+            if cfg.margin_pct < 0.20:
+                cfg = cfg.model_copy(update={'margin_pct': 0.20})
+            return cfg
         except Exception:
             pass
     return PhantomV2Config()
@@ -1945,17 +1952,15 @@ class FilterPreviewRequest(BaseModel):
     fee_mode: str = 'backtest'
     use_mark_price: Optional[bool] = None
     trading_windows: Optional[TradingWindowConfig] = None
+    initial_capital: Optional[float] = None
 
 @app.post("/backtest/filter-preview")
 def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
     """Quick per-bucket peek at the conditions currently in the form.
 
-    Runs a lightweight backtest with the given params (shipping the
-    direction-specific overrides when the toggle is ON) and buckets the
-    resulting trades by LONG/SHORT x REVERSAL/MOMENTUM with win rate,
-    profit factor and average net PnL for each bucket. This lets an admin
-    tune the MACD / ATR-regime thresholds and see the bucket-level
-    trade-off without a separate offline script.
+    Runs a lightweight backtest with the given params and buckets trades by
+    LONG/SHORT x REVERSAL/MOMENTUM. Now also returns rejected_reasons and
+    diagnostics so LOT_TOO_SMALL is visible instead of silent 0 trades.
     """
     try:
         req = _apply_run_overrides(req)
@@ -1965,7 +1970,11 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         start = req.start_date or "2020-07-04"
         end = req.end_date or "2026-07-04"
-        results = engine.run(symbol=req.symbol, initial_capital_inr=20000,
+        # Use explicit capital or user's default or 50000 (tradable at 100k BTC)
+        cap = float(req.initial_capital) if req.initial_capital else float(user.initial_capital or 50000.0)
+        if cap < 20000:
+            cap = 50000.0
+        results = engine.run(symbol=req.symbol, initial_capital_inr=cap,
                              start_date=start, end_date=end)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Filter preview error: {str(e)}")
@@ -1998,7 +2007,6 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
             'avg_pnl': round(b['net'] / b['count'], 2) if b['count'] else 0.0,
             'net_pnl': round(b['net'], 2),
         }
-    # Provide a per-direction roll-up too (LONG / SHORT).
     sides = {}
     for key, b in buckets.items():
         side = key.split('_')[0]
@@ -2014,18 +2022,16 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'total_trades': len(results['trades']),
         'total_win_rate': round(results['win_rate'], 2),
         'total_profit_factor': round(results['profit_factor'], 2),
-        # BTC perpetual pricing + how many entries the schedule refused, so the
-        # preview explains a drop in trade count.
         'mark_price_basis': bool(results.get('mark_price_basis', False)),
         'mark_price_coverage': results.get('mark_price_coverage', 0.0),
         'trading_windows': results.get('trading_windows', {}),
         'blocked_entries': int(results.get('diagnostics', {}).get('blocked_entries', 0) or 0),
+        'rejected_reasons': results.get('rejected_reasons', {}),
+        'diagnostics': results.get('diagnostics', {}),
+        'initial_capital_used': cap,
         'use_direction_conditions': req.params.entry_conditions.use_direction_conditions,
         'use_direction_macd_hist': req.params.entry_conditions.use_direction_macd_hist,
         'use_direction_atr_floor': req.params.entry_conditions.use_direction_atr_floor,
-        # The exact ATR regime test applied to each side, including the
-        # operator (>=, <=, >, <) the client picked. Shared mode reports the
-        # same rule twice.
         'atr_regime_rules': {
             'long': config.atr_regime_rule_for(1),
             'short': config.atr_regime_rule_for(-1),
@@ -2038,6 +2044,67 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
     }
+
+
+@app.post("/phantom/signals/custom")
+def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Signals for chart-backtest parity: uses the same params the backtest form sends."""
+    try:
+        req = _apply_run_overrides(req)
+        source = normalize_source(req.data_source)
+        fees = resolve_fees(db, source, req.fee_mode, req.params)
+        config = _fee_config(req.params, fees)
+        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        strategy_service = engine.strategy_service
+        df_1h = engine._get_data_from_db(req.symbol, "1h", req.start_date, req.end_date, source)
+        df_4h = engine._get_data_from_db(req.symbol, "4h", req.start_date, req.end_date, source)
+        if df_1h.empty or df_4h.empty:
+            return []
+        if hasattr(strategy_service, 'generate_signals_with_metadata'):
+            signals, meta = strategy_service.generate_signals_with_metadata(df_1h, df_4h)
+        else:
+            signals = strategy_service.generate_signals(df_1h, df_4h)
+            meta = None
+        out = []
+        closes = df_1h['close'].values
+        for i in range(1, len(df_1h)):
+            s = signals[i]
+            if s == 0:
+                continue
+            direction = int(s)
+            item = {
+                "time": int(_utc_ts(df_1h.index[i])),
+                "direction": direction,
+                "side": "LONG" if direction == 1 else "SHORT",
+                "price": float(closes[i]),
+                "setup": "CUSTOM",
+                "rsi14": None, "adx": None, "macd_hist": None,
+                "trend": None, "trend_label": None, "candle_type": None,
+            }
+            if meta is not None:
+                item["setup"] = str(meta['setup'][i])
+                try: item["rsi14"] = round(float(meta['rsi14'][i]), 2)
+                except Exception: pass
+                try: item["adx"] = round(float(meta['adx'][i]), 3)
+                except Exception: pass
+                try: item["macd_hist"] = round(float(meta['macd_hist'][i]), 4)
+                except Exception: pass
+                try:
+                    trend = int(meta['trend'][i])
+                    item["trend"] = trend
+                    item["trend_label"] = "UP" if trend == 1 else "DOWN"
+                except Exception: pass
+                try:
+                    if bool(meta['is_green'][i]): item["candle_type"] = "GREEN"
+                    elif bool(meta['is_red'][i]): item["candle_type"] = "RED"
+                    else: item["candle_type"] = "DOJI"
+                except Exception: pass
+            out.append(item)
+            if len(out) >= 2000:
+                break
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Custom signals error: {str(e)}")
 
 # --- PAPER TRADING ---
 class TradeStartRequest(BaseModel):

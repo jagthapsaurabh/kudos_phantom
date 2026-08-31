@@ -391,7 +391,9 @@ const Backtest = () => {
     atr_regime_ratio: 0.5, enable_momentum_entry: true, cooldown_bars: 0,
     stop_loss_atr: 1.2, take_profit_atr: 14.0, trail_activation_atr: 0.8,
     trail_distance_atr: 0.3, breakeven_atr: 0.75,
-    leverage: 2, margin_pct: 0.15,
+    // Tradable defaults: at 100k BTC, 50k INR * 0.25 * 7 /85 = 1029 USD = 0.01 BTC > 0.001 min lot.
+    // Previous 20k*0.15*2 gave 0.0007 BTC -> LOT_TOO_SMALL -> 0 trades.
+    leverage: 7, margin_pct: 0.25,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
     // BTC perpetual: risk is managed on the exchange MARK price; the traded
     // price is recorded next to it (both are stored for every trade).
@@ -423,8 +425,9 @@ const Backtest = () => {
   const [expandedTrade, setExpandedTrade] = useState(null);
   const [runName, setRunName] = useState('');
   const [confirm, setConfirm] = useState(null); // { type, runId, ... }
-  const [capital, setCapital] = useState(20000); // starting capital for the run (default = admin set)
+  const [capital, setCapital] = useState(50000); // tradable default; previous 20k was untradable at 100k BTC with low lev
   const [overlayCandles, setOverlayCandles] = useState([]);
+  const [overlaySignals, setOverlaySignals] = useState([]);
   const [overlayLoading, setOverlayLoading] = useState(false);
   const [dataSource, setDataSource] = useState('Binance');
   const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
@@ -640,20 +643,38 @@ const Backtest = () => {
   }, [results, sectionVisibility.equity]);
 
   useEffect(() => {
-    if (!results) { setOverlayCandles([]); return undefined; }
+    if (!results) { setOverlayCandles([]); setOverlaySignals([]); return undefined; }
     const start = results.start_date ? String(results.start_date).slice(0, 10) : null;
     const end = results.end_date ? String(results.end_date).slice(0, 10) : null;
     const source = results.data_source || 'Binance';
     const symbol = perpetualFor(source);
-    const params = new URLSearchParams({ symbol, interval: '1h', limit: '50000', source });
-    if (start) params.set('start_date', start);
-    if (end) params.set('end_date', end);
+    const q = new URLSearchParams({ symbol, interval: '1h', limit: '50000', source });
+    if (start) q.set('start_date', start);
+    if (end) q.set('end_date', end);
     setOverlayLoading(true);
-    fetch(`${API_URL}/klines?${params.toString()}`)
-      .then(r => (r.ok ? r.json() : []))
-      .then(data => setOverlayCandles(Array.isArray(data) ? data : []))
-      .catch(() => setOverlayCandles([]))
-      .finally(() => setOverlayLoading(false));
+    const klinesPromise = fetch(`${API_URL}/klines?${q.toString()}`)
+      .then(r => (r.ok ? r.json() : [])).then(d => Array.isArray(d) ? d : []).catch(() => []);
+    // Fetch signals for the same params that produced the backtest so chart vs backtest parity is visible.
+    const runParams = results.params || params;
+    const signalsPromise = fetch(`${API_URL}/phantom/signals/custom`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        params: runParams,
+        start_date: start,
+        end_date: end,
+        symbol,
+        data_source: source,
+        fee_mode: 'backtest',
+        initial_capital: results.initial_capital || capital,
+        use_mark_price: !!runParams.use_mark_price,
+        trading_windows: runParams.trading_windows,
+      }),
+    }).then(r => (r.ok ? r.json() : [])).then(d => Array.isArray(d) ? d : []).catch(() => []);
+    Promise.all([klinesPromise, signalsPromise]).then(([candles, signals]) => {
+      setOverlayCandles(candles);
+      setOverlaySignals(signals);
+    }).finally(() => setOverlayLoading(false));
     return undefined;
   }, [results]);
 
@@ -798,6 +819,7 @@ const Backtest = () => {
           end_date: dates.end,
           data_source: dataSource,
           fee_mode: 'backtest',
+          initial_capital: parseFloat(capital),
           use_mark_price: !!params.use_mark_price,
           trading_windows: params.trading_windows,
         }),
@@ -1281,7 +1303,7 @@ const Backtest = () => {
       {preview && (
         <SectionCard
           title="Filter Preview — per bucket"
-          subtitle={`${preview.total_trades} trades · WR ${preview.total_win_rate}% · PF ${preview.total_profit_factor}`}
+          subtitle={`${preview.total_trades} trades · WR ${preview.total_win_rate}% · PF ${preview.total_profit_factor} · cap ₹${preview.initial_capital_used || capital}`}
           icon={Activity}
           collapsed={!sectionVisibility.preview}
           onToggle={() => toggleSection('preview')}
@@ -1298,8 +1320,31 @@ const Backtest = () => {
           className="mb-8 border-blue-800/40"
         >
           <p className="mb-4 text-xs text-gray-500">
-            Buckets reflect the conditions currently set in the configuration form.
+            Buckets reflect the conditions currently set in the configuration form. Uses same data source as chart (DB → remote fallback).
           </p>
+          {preview.rejected_reasons && Object.keys(preview.rejected_reasons).length > 0 && (
+            <div className="mb-4 rounded-xl border border-red-900/50 bg-red-900/20 p-3">
+              <div className="mb-2 text-[10px] font-bold uppercase text-red-300">Rejected / Filtered — why trades = 0?</div>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(preview.rejected_reasons).map(([reason, count]) => (
+                  <span key={reason} className={`rounded border px-2 py-1 font-mono text-[10px] ${reason==='LOT_TOO_SMALL' ? 'border-red-700 bg-red-900/40 text-red-200' : 'border-gray-700 bg-gray-900 text-gray-300'}`}>
+                    {reason}: {count}
+                  </span>
+                ))}
+              </div>
+              {preview.rejected_reasons.LOT_TOO_SMALL > 0 && (
+                <div className="mt-2 text-[11px] text-red-200">
+                  LOT_TOO_SMALL means notional below 0.001 BTC min lot. Fix: increase capital to 50000-100000, leverage to 7, margin to 0.25. At 100k BTC price, 20k*0.15*2/85=70 USD =0.0007 BTC &lt;0.001.
+                </div>
+              )}
+              {preview.blocked_entries > 0 && <div className="mt-1 text-[10px] text-amber-300">Blocked by trading windows: {preview.blocked_entries}</div>}
+            </div>
+          )}
+          {preview.diagnostics && (
+            <div className="mb-4 rounded border border-gray-700 bg-gray-900 p-2 text-[10px] font-mono text-gray-400">
+              signals {preview.diagnostics.total_signals} → {preview.diagnostics.signals_in_range} in range · cooldown {preview.diagnostics.cooldown_skipped} · window {preview.diagnostics.window_blocked} · trades {preview.diagnostics.trades_entered}
+            </div>
+          )}
           {preview.atr_regime_rules && (
             <div className="mb-4 flex flex-wrap gap-2 text-[10px]">
               {['long', 'short'].map(side => (
@@ -1422,12 +1467,12 @@ const Backtest = () => {
               <span className="flex items-center gap-1"><span className="text-sky-400">●</span> IN fill</span>
               <span className="flex items-center gap-1"><span className="text-amber-400">■</span> OUT exit</span>
               {overlayLoading && <span className="animate-pulse text-gray-500">Loading candles…</span>}
-              {!overlayLoading && <span className="text-gray-600">{overlayCandles.length} candles</span>}
+              {!overlayLoading && <span className="text-gray-600">{overlayCandles.length} candles · {overlaySignals.length} raw signals · {results.trades?.length||0} trades</span>}
             </div>
             {overlayLoading && !overlayCandles.length ? (
               <div className="flex h-48 items-center justify-center text-sm text-gray-500">Loading market candles…</div>
             ) : (
-              <MarketOverlayChart candles={overlayCandles} trades={results.trades || []} height={420} />
+              <MarketOverlayChart candles={overlayCandles} trades={results.trades || []} signals={overlaySignals} height={420} />
             )}
           </SectionCard>
 
