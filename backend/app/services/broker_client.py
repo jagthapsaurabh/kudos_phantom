@@ -704,6 +704,126 @@ class BrokerClient:
         self._instrument_cache[key] = instrument
         return instrument
 
+    # ---- Public market data (MCP: 14 tools, no key) ----
+    def get_ticker(self, symbol: str):
+        """GET /v2/tickers/{symbol} — 24h ticker (MCP: get_ticker)."""
+        if self.kind != "delta":
+            return {"error": "Ticker only for Delta in this client"}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/tickers/{self.perpetual_symbol(symbol)}", weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def list_tickers(self, contract_types: Optional[List[str]] = None,
+                     underlying_asset_symbols: Optional[List[str]] = None):
+        """GET /v2/tickers — filtered tickers (MCP: list_tickers)."""
+        query: Dict[str, Any] = {}
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if underlying_asset_symbols:
+            query["underlying_asset_symbols"] = ",".join(underlying_asset_symbols)
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/tickers", params=query or None, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_product(self, symbol: str):
+        """GET /v2/products/{symbol} — single product spec (MCP: get_product)."""
+        if self.kind != "delta":
+            return self.get_instrument(symbol)
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/products/{self.perpetual_symbol(symbol)}", weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def list_products(self, contract_types: Optional[List[str]] = None,
+                      states: Optional[List[str]] = None,
+                      expiry: Optional[str] = None,
+                      page_size: int = 100, after: Optional[str] = None):
+        """GET /v2/products with filters (MCP: list_products)."""
+        query: Dict[str, Any] = {}
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if states:
+            query["states"] = ",".join(states)
+        if expiry:
+            query["expiry"] = str(expiry)
+        query["page_size"] = int(page_size)
+        if after:
+            query["after"] = str(after)
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/products", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_orderbook(self, symbol: str, depth: int = 10):
+        """GET /v2/l2orderbook/{symbol} (MCP: get_orderbook)."""
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/l2orderbook/{self.perpetual_symbol(symbol)}",
+                                                  params={"depth": int(depth)}, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_recent_trades(self, symbol: str):
+        """GET /v2/trades/{symbol} (MCP: get_recent_trades)."""
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/trades/{self.perpetual_symbol(symbol)}", weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_candles(self, symbol: str, resolution: str, start: int, end: int):
+        """GET /v2/history/candles (MCP: get_candles)."""
+        query = {"symbol": self.perpetual_symbol(symbol), "resolution": str(resolution),
+                 "start": int(start), "end": int(end)}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/history/candles", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_mark_price_history(self, symbol: str, start: int, end: int, resolution: str = "1m"):
+        """GET /v2/history/mark_prices (MCP: get_mark_price_history)."""
+        query = {"symbol": self.perpetual_symbol(symbol), "start": int(start), "end": int(end), "resolution": str(resolution)}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/history/mark_prices", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_oi_history(self, symbol: str, start: int, end: int, resolution: str = "1h"):
+        """GET /v2/history/open_interest (MCP: get_oi_history)."""
+        query = {"symbol": self.perpetual_symbol(symbol), "start": int(start), "end": int(end), "resolution": str(resolution)}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/history/open_interest", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_funding_history(self, symbol: str, start: int, end: int, resolution: str = "1h"):
+        """GET /v2/history/funding (MCP: get_funding_history)."""
+        query = {"symbol": self.perpetual_symbol(symbol), "start": int(start), "end": int(end), "resolution": str(resolution)}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/history/funding", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_options_chain(self, underlying: str, expiry_date: str):
+        """MCP: get_options_chain — underlying + expiry DD-MM-YYYY."""
+        query = {"underlying_asset_symbol": str(underlying), "expiry_date": str(expiry_date)}
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/tickers", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_indices(self):
+        """GET /v2/indices (MCP: get_indices)."""
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/indices", weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_settlement_prices(self, contract_types: Optional[List[str]] = None, page_size: int = 100, after: Optional[str] = None):
+        """MCP: get_settlement_prices — list_products states=expired."""
+        query: Dict[str, Any] = {"states": "expired", "page_size": int(page_size)}
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if after:
+            query["after"] = str(after)
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/products", params=query, weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
+    def get_reference_data(self):
+        """GET /v2/assets — merged assets (MCP: get_reference_data)."""
+        response, error = self._throttled_request("GET", f"{self.market_url}/v2/assets", weight=3)
+        payload = self._json_body(response, error)
+        return self._delta_result(payload)
+
     def get_products(self, contract_types: Optional[str] = "perpetual_futures"):
         """``GET /v2/products`` — contract specs (tick size, margin, lot size).
 
@@ -755,7 +875,15 @@ class BrokerClient:
                     reduce_only: bool = False, client_order_id: Optional[str] = None,
                     time_in_force: str = "GTC", post_only: bool = False,
                     working_type: str = "MARK_PRICE", stop_side: Optional[str] = None,
-                    trail_amount: Optional[float] = None, size_in_btc: bool = False):
+                    trail_amount: Optional[float] = None, size_in_btc: bool = False,
+                    # Entry-order bracket (MCP: place_order with bracket_* creates entry bracket)
+                    bracket_stop_loss_price: Optional[str] = None,
+                    bracket_stop_loss_limit_price: Optional[str] = None,
+                    bracket_take_profit_price: Optional[str] = None,
+                    bracket_take_profit_limit_price: Optional[str] = None,
+                    bracket_trail_amount: Optional[str] = None,
+                    bracket_stop_trigger_method: Optional[str] = None,
+                    mmp: Optional[str] = None):
         """Place an order. ``qty`` is in the venue's own units unless
         ``size_in_btc`` is set, in which case it is converted for you.
 
@@ -776,7 +904,14 @@ class BrokerClient:
         if self.kind == "delta":
             return self._delta_place_order(perp, side, order_type, size, price, stop_price,
                                            reduce_only, client_order_id, time_in_force,
-                                           post_only, stop_side, trail_amount)
+                                           post_only, stop_side, trail_amount,
+                                           bracket_stop_loss_price=bracket_stop_loss_price,
+                                           bracket_stop_loss_limit_price=bracket_stop_loss_limit_price,
+                                           bracket_take_profit_price=bracket_take_profit_price,
+                                           bracket_take_profit_limit_price=bracket_take_profit_limit_price,
+                                           bracket_trail_amount=bracket_trail_amount,
+                                           bracket_stop_trigger_method=bracket_stop_trigger_method,
+                                           mmp=mmp)
         return {"error": f"No order adapter installed for '{self.broker_name}'"}
 
     def _binance_place_order(self, symbol, side, order_type, size, price, stop_price,
@@ -811,7 +946,14 @@ class BrokerClient:
 
     def _delta_place_order(self, symbol, side, order_type, size, price, stop_price,
                            reduce_only, client_order_id, time_in_force, post_only,
-                           stop_side, trail_amount, size_in_btc: bool = False):
+                           stop_side, trail_amount, size_in_btc: bool = False,
+                           bracket_stop_loss_price: Optional[str] = None,
+                           bracket_stop_loss_limit_price: Optional[str] = None,
+                           bracket_take_profit_price: Optional[str] = None,
+                           bracket_take_profit_limit_price: Optional[str] = None,
+                           bracket_trail_amount: Optional[str] = None,
+                           bracket_stop_trigger_method: Optional[str] = None,
+                           mmp: Optional[str] = None):
         size = self.base_to_venue_size(size, symbol) if size_in_btc else float(size)
         # Include product_id when we know it — official client uses product_id
         # but product_symbol is accepted and keeps older mocks working.
@@ -870,6 +1012,24 @@ class BrokerClient:
             body["reduce_only"] = "true"
         if post_only:
             body["post_only"] = "true"
+        if mmp:
+            body["mmp"] = str(mmp)
+        # Entry-order bracket (MCP: place_order with bracket_* creates entry bracket)
+        # Official MCP trading docs: bracket_stop_loss_price, bracket_take_profit_price, etc.
+        # are top-level fields on POST /v2/orders. They create an entry order whose id
+        # is later used by edit_bracket_order.
+        if bracket_stop_loss_price is not None:
+            body["bracket_stop_loss_price"] = str(bracket_stop_loss_price)
+        if bracket_stop_loss_limit_price is not None:
+            body["bracket_stop_loss_limit_price"] = str(bracket_stop_loss_limit_price)
+        if bracket_take_profit_price is not None:
+            body["bracket_take_profit_price"] = str(bracket_take_profit_price)
+        if bracket_take_profit_limit_price is not None:
+            body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
+        if bracket_trail_amount is not None:
+            body["bracket_trail_amount"] = str(bracket_trail_amount)
+        if bracket_stop_trigger_method is not None:
+            body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if client_order_id:
             body["client_order_id"] = str(client_order_id)[:32]
         response, error = self._delta_request("POST", "/v2/orders", body=body,
@@ -953,6 +1113,40 @@ class BrokerClient:
                     "note": "Binance has no native bracket order; protection legs placed as reduce-only stops."}
         return {"error": f"No bracket-order adapter installed for '{self.broker_name}'"}
 
+    # MCP trading: place_bracket_order attaches TP/SL to an open position (no size/side)
+    # POST /v2/orders/bracket {product_id, product_symbol, stop_loss_order, take_profit_order, bracket_stop_trigger_method}
+    def place_position_bracket(self, symbol: Optional[str] = None,
+                               product_id: Optional[int] = None,
+                               stop_loss_order: Optional[Dict[str, Any]] = None,
+                               take_profit_order: Optional[Dict[str, Any]] = None,
+                               bracket_stop_trigger_method: str = "mark_price"):
+        """MCP-aligned position bracket (attach SL/TP to open position)."""
+        if self.kind != "delta":
+            return {"error": "Position bracket only supported on Delta Exchange."}
+        body: Dict[str, Any] = {}
+        if product_id is not None:
+            body["product_id"] = int(product_id)
+        elif symbol:
+            try:
+                inst = self.get_instrument(symbol) or {}
+                pid = inst.get("product_id")
+                if pid:
+                    body["product_id"] = int(pid)
+            except Exception:
+                pass
+            if "product_id" not in body:
+                body["product_symbol"] = self.perpetual_symbol(symbol)
+        if stop_loss_order:
+            body["stop_loss_order"] = stop_loss_order
+        if take_profit_order:
+            body["take_profit_order"] = take_profit_order
+        if bracket_stop_trigger_method:
+            body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
+        if not body.get("stop_loss_order") and not body.get("take_profit_order"):
+            return {"error": "At least one of stop_loss_order or take_profit_order required"}
+        response, error = self._delta_request("POST", "/v2/orders/bracket", body=body, weight=20, is_order=True)
+        return self._delta_result(self._json_body(response, error))
+
     def cancel_order(self, order_id, symbol: Optional[str] = None,
                      client_order_id: Optional[str] = None):
         perp = self.perpetual_symbol(symbol) if symbol else None
@@ -1015,7 +1209,11 @@ class BrokerClient:
                 return self._delta_result(self._json_body(response, error))
         return {"error": f"No cancel adapter installed for '{self.broker_name}'"}
 
-    def cancel_all_orders(self, symbol: Optional[str] = None):
+    def cancel_all_orders(self, symbol: Optional[str] = None,
+                          contract_types: Optional[List[str]] = None,
+                          cancel_limit_orders: Optional[bool] = None,
+                          cancel_stop_orders: Optional[bool] = None,
+                          cancel_reduce_only_orders: Optional[bool] = None):
         perp = self.perpetual_symbol(symbol) if symbol else None
         if self.kind == "binance":
             params = {"symbol": perp} if perp else {}
@@ -1023,9 +1221,9 @@ class BrokerClient:
                                                     weight=1, is_order=True)
             return self._json_body(response, error)
         if self.kind == "delta":
-            # Official: DELETE /v2/orders/all with optional product_id filter.
-            # Keep product_symbol as well for backward compatibility — Delta
-            # accepts either.
+            # Official: DELETE /v2/orders/all with optional product_id filter + flags.
+            # MCP: cancel_all_orders {product_id, contract_types, cancel_limit_orders, ...}
+            # Docs: CancelAllFilterObject {product_id, contract_types, cancel_limit_orders, ...}
             instrument = None
             product_id = None
             if symbol:
@@ -1039,6 +1237,14 @@ class BrokerClient:
                 body["product_id"] = int(product_id)
             if perp:
                 body["product_symbol"] = perp
+            if contract_types:
+                body["contract_types"] = ",".join(contract_types) if isinstance(contract_types, (list, tuple)) else str(contract_types)
+            if cancel_limit_orders is not None:
+                body["cancel_limit_orders"] = bool(cancel_limit_orders)
+            if cancel_stop_orders is not None:
+                body["cancel_stop_orders"] = bool(cancel_stop_orders)
+            if cancel_reduce_only_orders is not None:
+                body["cancel_reduce_only_orders"] = bool(cancel_reduce_only_orders)
             # If we have nothing, send empty body which means cancel all.
             body = body or {}
             response, error = self._delta_request("DELETE", "/v2/orders/all", body=body,
@@ -1111,8 +1317,18 @@ class BrokerClient:
     def edit_bracket_order(self, order_id, symbol: Optional[str] = None,
                            stop_loss_price: Optional[float] = None,
                            take_profit_price: Optional[float] = None,
-                           trail_amount: Optional[float] = None):
-        """``PUT /v2/orders/bracket`` — adjust SL / TP / trail after entry."""
+                           trail_amount: Optional[float] = None,
+                           # MCP-aligned top-level bracket fields
+                           bracket_stop_loss_price: Optional[str] = None,
+                           bracket_stop_loss_limit_price: Optional[str] = None,
+                           bracket_take_profit_price: Optional[str] = None,
+                           bracket_take_profit_limit_price: Optional[str] = None,
+                           bracket_trail_amount: Optional[str] = None,
+                           bracket_stop_trigger_method: Optional[str] = None):
+        """``PUT /v2/orders/bracket`` — adjust SL / TP / trail after entry.
+        Supports both legacy (stop_loss_price/take_profit_price) and MCP-aligned
+        bracket_* top-level fields. MCP: edit_bracket_order {id, bracket_stop_loss_price, ...}
+        """
         if self.kind != "delta":
             return {"error": "Editing a bracket is only supported on Delta Exchange."}
         body: Dict[str, Any] = {"id": int(order_id)}
@@ -1128,6 +1344,7 @@ class BrokerClient:
                     body["product_id"] = int(pid)
             except Exception:
                 pass
+        # Legacy form (used by live_trader)
         if stop_loss_price is not None:
             sl_leg: Dict[str, Any] = {"order_type": "market_order",
                                       "stop_price": str(stop_loss_price)}
@@ -1139,13 +1356,29 @@ class BrokerClient:
         if take_profit_price is not None:
             body["take_profit_order"] = {"order_type": "market_order",
                                          "stop_price": str(take_profit_price)}
+        # MCP-aligned top-level fields (preferred for entry-order brackets)
+        if bracket_stop_loss_price is not None:
+            body["bracket_stop_loss_price"] = str(bracket_stop_loss_price)
+        if bracket_stop_loss_limit_price is not None:
+            body["bracket_stop_loss_limit_price"] = str(bracket_stop_loss_limit_price)
+        if bracket_take_profit_price is not None:
+            body["bracket_take_profit_price"] = str(bracket_take_profit_price)
+        if bracket_take_profit_limit_price is not None:
+            body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
+        if bracket_trail_amount is not None:
+            body["bracket_trail_amount"] = str(bracket_trail_amount)
+        if bracket_stop_trigger_method is not None:
+            body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         response, error = self._delta_request("PUT", "/v2/orders/bracket", body=body,
                                               weight=10, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
     def edit_order(self, order_id, symbol: Optional[str] = None, price: Optional[float] = None,
                    size: Optional[float] = None, stop_price: Optional[float] = None,
-                   client_order_id: Optional[str] = None):
+                   client_order_id: Optional[str] = None,
+                   trail_amount: Optional[str] = None,
+                   post_only: Optional[bool] = None,
+                   mmp: Optional[str] = None):
         perp = self.perpetual_symbol(symbol) if symbol else None
         if self.kind == "delta":
             body: Dict[str, Any] = {"id": int(order_id)}
@@ -1170,6 +1403,12 @@ class BrokerClient:
                 body["size"] = int(round(size))
             if stop_price is not None:
                 body["stop_price"] = str(stop_price)
+            if trail_amount is not None:
+                body["trail_amount"] = str(trail_amount)
+            if post_only is not None:
+                body["post_only"] = "true" if post_only else "false"
+            if mmp is not None:
+                body["mmp"] = str(mmp)
             response, error = self._delta_request("PUT", "/v2/orders", body=body,
                                                   weight=10, is_order=True)
             return self._delta_result(self._json_body(response, error))
@@ -1311,6 +1550,159 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return self._delta_result(payload)
         return {"error": f"No fills adapter installed for '{self.broker_name}'"}
+
+    # ---- MCP-aligned account tools (product_ids as comma-joined list, microsecond timestamps) ----
+    def get_open_orders_mcp(self, product_ids: Optional[List[int]] = None,
+                            states: Optional[List[str]] = None,
+                            contract_types: Optional[List[str]] = None,
+                            page_size: int = 50, after: Optional[str] = None):
+        if self.kind != "delta":
+            return {"error": "Only Delta supports MCP open orders"}
+        query: Dict[str, Any] = {}
+        if product_ids:
+            query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
+        if states:
+            query["states"] = ",".join(states)
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        query["page_size"] = int(page_size)
+        if after:
+            query["after"] = str(after)
+        response, error = self._delta_request("GET", "/v2/orders", query=query, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_order_history_mcp(self, product_ids: Optional[List[int]] = None,
+                              contract_types: Optional[List[str]] = None,
+                              order_types: Optional[List[str]] = None,
+                              start_time_us: Optional[int] = None,
+                              end_time_us: Optional[int] = None,
+                              page_size: int = 50, after: Optional[str] = None):
+        if self.kind != "delta":
+            return {"error": "Only Delta supports MCP order history"}
+        query: Dict[str, Any] = {}
+        if product_ids:
+            query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if order_types:
+            query["order_types"] = ",".join(order_types)
+        if start_time_us is not None:
+            query["start_time"] = int(start_time_us)
+        if end_time_us is not None:
+            query["end_time"] = int(end_time_us)
+        query["page_size"] = int(page_size)
+        if after:
+            query["after"] = str(after)
+        response, error = self._delta_request("GET", "/v2/orders/history", query=query, weight=10)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_fills_mcp(self, product_ids: Optional[List[int]] = None,
+                      contract_types: Optional[List[str]] = None,
+                      start_time_us: Optional[int] = None,
+                      end_time_us: Optional[int] = None,
+                      page_size: int = 50, after: Optional[str] = None):
+        if self.kind != "delta":
+            return {"error": "Only Delta supports MCP fills"}
+        query: Dict[str, Any] = {}
+        if product_ids:
+            query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if start_time_us is not None:
+            query["start_time"] = int(start_time_us)
+        if end_time_us is not None:
+            query["end_time"] = int(end_time_us)
+        query["page_size"] = int(page_size)
+        if after:
+            query["after"] = str(after)
+        response, error = self._delta_request("GET", "/v2/fills", query=query, weight=10)
+        payload = self._json_body(response, error)
+        result = self._delta_result(payload)
+        # Flag default ~90-day window like MCP does when start_time_us omitted
+        if start_time_us is None and isinstance(result, dict):
+            result["notice"] = ("No start_time_us was given, so the API returned only its default recent window "
+                                "(~90 days). Older records are NOT included.")
+        return result
+
+    def get_wallet_transactions_mcp(self, asset_ids: Optional[List[int]] = None,
+                                    transaction_types: Optional[List[str]] = None,
+                                    start_time_us: Optional[int] = None,
+                                    end_time_us: Optional[int] = None,
+                                    page_size: int = 50,
+                                    after: Optional[str] = None,
+                                    before: Optional[str] = None):
+        if self.kind != "delta":
+            return {"error": "Only Delta supports wallet transactions"}
+        query: Dict[str, Any] = {}
+        if asset_ids:
+            query["asset_ids"] = ",".join(str(int(x)) for x in asset_ids)
+        if transaction_types:
+            query["transaction_types"] = ",".join(transaction_types)
+        if start_time_us is not None:
+            query["start_time"] = int(start_time_us)
+        if end_time_us is not None:
+            query["end_time"] = int(end_time_us)
+        query["page_size"] = int(page_size)
+        if after:
+            query["after"] = str(after)
+        if before:
+            query["before"] = str(before)
+        response, error = self._delta_request("GET", "/v2/wallet/transactions", query=query, weight=10)
+        payload = self._json_body(response, error)
+        result = self._delta_result(payload)
+        if start_time_us is None and isinstance(result, dict):
+            result["notice"] = ("No start_time_us was given, so the API returned only its default recent window "
+                                "(~90 days).")
+        return result
+
+    def bulk_fills_export(self, output_path: str,
+                          product_ids: Optional[List[int]] = None,
+                          contract_types: Optional[List[str]] = None,
+                          start_time_us: Optional[int] = None,
+                          end_time_us: Optional[int] = None):
+        """MCP bulk_fills_export: GET /v2/fills/history/download/csv → CSV file."""
+        if self.kind != "delta":
+            return {"error": "Only Delta supports bulk fills export"}
+        from pathlib import Path
+        raw = Path(output_path).expanduser()
+        resolved = (Path.cwd() / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        cwd = Path.cwd().resolve()
+        home = Path.home().resolve()
+        try:
+            is_inside = resolved.is_relative_to(cwd) or resolved.is_relative_to(home)
+        except AttributeError:
+            # Python <3.9 fallback
+            is_inside = str(resolved).startswith(str(cwd)) or str(resolved).startswith(str(home))
+        if not is_inside:
+            return {"error": f"output_path must be inside cwd ({cwd}) or home ({home}); got {resolved}"}
+        query: Dict[str, Any] = {}
+        if product_ids:
+            query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        if start_time_us is not None:
+            query["start_time"] = int(start_time_us)
+        if end_time_us is not None:
+            query["end_time"] = int(end_time_us)
+        response, error = self._delta_request("GET", "/v2/fills/history/download/csv", query=query or None, weight=20)
+        # _delta_request returns (response, error); response.content is bytes for CSV
+        if error:
+            return {"error": error}
+        if response is None:
+            return {"error": "No response from fills export"}
+        try:
+            content = response.content if hasattr(response, "content") else response
+            if isinstance(content, (bytes, bytearray)):
+                data = bytes(content)
+            else:
+                data = str(content).encode()
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_bytes(data)
+            row_count = max(0, data.decode(errors="ignore").count("\n") - 1)
+            return {"path": str(resolved), "row_count": row_count, "size_bytes": len(data),
+                    "notice": ("No start_time_us given, export covers last ~90 days" if start_time_us is None else None)}
+        except Exception as exc:
+            return {"error": f"Failed to write CSV: {exc}"}
 
     # ==================================================================
     # Positions & margin
@@ -1673,6 +2065,20 @@ class BrokerClient:
         response, error = self._delta_request("GET", "/v2/users/trading_preferences", weight=3)
         return self._delta_result(self._json_body(response, error))
 
+    def get_trading_stats(self):
+        """GET /v2/stats — account trading volume/stats (MCP: get_trading_stats)."""
+        if self.kind != "delta":
+            return {"error": f"No trading-stats adapter for '{self.broker_name}'"}
+        response, error = self._delta_request("GET", "/v2/stats", weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_profile(self):
+        """GET /v2/profile — blocked per changelog 19.08.26, kept for MCP parity."""
+        if self.kind != "delta":
+            return {"error": f"No profile adapter for '{self.broker_name}'"}
+        response, error = self._delta_request("GET", "/v2/profile", weight=5)
+        return self._delta_result(self._json_body(response, error))
+
     def update_trading_preferences(self, prefs: Dict[str, Any]):
         if self.kind != "delta":
             return {"error": f"No trading-preferences adapter for '{self.broker_name}'"}
@@ -1714,6 +2120,54 @@ class BrokerClient:
         """Margined position (GET /v2/positions/margined) — includes liquidation price."""
         return self.get_positions(symbol)
 
+    def get_margined_positions(self, product_ids: Optional[List[int]] = None,
+                               contract_types: Optional[List[str]] = None):
+        """MCP-aligned: GET /v2/positions/margined?product_ids=...&contract_types=...
+        product_ids max 10, comma-joined for query. Also patches short-option PnL like MCP."""
+        if self.kind != "delta":
+            return self.get_positions()
+        query: Dict[str, Any] = {}
+        if product_ids:
+            query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
+        if contract_types:
+            query["contract_types"] = ",".join(contract_types)
+        response, error = self._delta_request("GET", "/v2/positions/margined", query=query or None, weight=5)
+        payload = self._json_body(response, error)
+        result = self._delta_result(payload)
+        # Patch short-option unrealized_pnl like MCP's _patch_short_option_pnl (GH #9)
+        if isinstance(result, dict) and isinstance(result.get("result"), list):
+            for pos in result["result"]:
+                if not isinstance(pos, dict):
+                    continue
+                sym = str(pos.get("product_symbol") or "")
+                ctype = str(pos.get("contract_type") or "")
+                is_option = ctype in ("call_options", "put_options") or sym.startswith("C-") or sym.startswith("P-")
+                if not is_option:
+                    continue
+                try:
+                    size = int(pos.get("size", 0))
+                except Exception:
+                    continue
+                if size >= 0:
+                    continue
+                try:
+                    entry = float(pos["entry_price"])
+                    mark = float(pos["mark_price"])
+                    cv = float(pos.get("contract_value") or (pos.get("product") or {}).get("contract_value") or 0)
+                except Exception:
+                    continue
+                if cv:
+                    pos["unrealized_pnl"] = str((mark - entry) * size * cv)
+        return result
+
+    def get_positions_by_underlying(self, underlying_asset_symbol: str):
+        """MCP-aligned: GET /v2/positions?underlying_asset_symbol=BTC"""
+        if self.kind != "delta":
+            return {"error": "Only Delta supports underlying_asset_symbol filter"}
+        query = {"underlying_asset_symbol": str(underlying_asset_symbol)}
+        response, error = self._delta_request("GET", "/v2/positions", query=query, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
     def close_all_positions(self, product_ids: Optional[List[int]] = None,
                             close_all_portfolio: bool = True,
                             close_all_isolated: bool = True,
@@ -1730,6 +2184,49 @@ class BrokerClient:
             body["user_id"] = int(user_id)
         response, error = self._delta_request("POST", "/v2/positions/close_all", body=body, weight=20, is_order=True)
         return self._delta_result(self._json_body(response, error))
+
+    # ---- Market Maker Protection (MMP) — docs.delta.exchange/#update-mmp-config ----
+    # PUT /v2/users/update_mmp {asset, window_interval, freeze_interval, trade_limit, delta_limit, vega_limit, mmp}
+    # PUT /v2/users/reset_mmp {asset, mmp}
+    def update_mmp_config(self, asset: str,
+                          window_interval: Optional[int] = None,
+                          freeze_interval: Optional[int] = None,
+                          trade_limit: Optional[str] = None,
+                          delta_limit: Optional[str] = None,
+                          vega_limit: Optional[str] = None,
+                          mmp: str = "mmp1"):
+        """Update MMP config for an underlying asset. Only for MMP-enabled accounts."""
+        if self.kind != "delta":
+            return {"error": "MMP config only supported on Delta Exchange."}
+        body: Dict[str, Any] = {"asset": str(asset), "mmp": str(mmp)}
+        if window_interval is not None:
+            body["window_interval"] = int(window_interval)
+        if freeze_interval is not None:
+            body["freeze_interval"] = int(freeze_interval)
+        if trade_limit is not None:
+            body["trade_limit"] = str(trade_limit)
+        if delta_limit is not None:
+            body["delta_limit"] = str(delta_limit)
+        if vega_limit is not None:
+            body["vega_limit"] = str(vega_limit)
+        response, error = self._delta_request("PUT", "/v2/users/update_mmp", body=body, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def reset_mmp(self, asset: str, mmp: str = "mmp1"):
+        """Reset MMP trigger for an asset. Body {asset, mmp}."""
+        if self.kind != "delta":
+            return {"error": "MMP reset only supported on Delta Exchange."}
+        body = {"asset": str(asset), "mmp": str(mmp)}
+        response, error = self._delta_request("PUT", "/v2/users/reset_mmp", body=body, weight=5)
+        return self._delta_result(self._json_body(response, error))
+
+    def get_mmp_config(self):
+        """MMP config lives inside trading preferences (mmp_config)."""
+        prefs = self.get_trading_preferences()
+        if isinstance(prefs, dict) and prefs.get("mmp_config") is not None:
+            return prefs
+        # Fallback: return full preferences, caller can read mmp_config field
+        return prefs
 
     # ==================================================================
     # Rate limits

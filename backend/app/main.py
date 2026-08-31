@@ -3148,6 +3148,25 @@ class LivePositionMarginRequest(BaseModel):
     amount: float = 0.0
 
 
+class LiveMMPConfigRequest(BaseModel):
+    broker: str = 'Delta'
+    connection_id: Optional[int] = None
+    asset: str
+    window_interval: Optional[int] = None
+    freeze_interval: Optional[int] = None
+    trade_limit: Optional[str] = None
+    delta_limit: Optional[str] = None
+    vega_limit: Optional[str] = None
+    mmp: str = 'mmp1'
+
+
+class LiveMMPResetRequest(BaseModel):
+    broker: str = 'Delta'
+    connection_id: Optional[int] = None
+    asset: str
+    mmp: str = 'mmp1'
+
+
 class LiveSnapshotRequest(BaseModel):
     broker: str
     connection_id: Optional[int] = None
@@ -3295,6 +3314,32 @@ def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_curren
 def live_change_position_margin(payload: LivePositionMarginRequest, user=Depends(get_current_user), db=Depends(get_db)):
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
     response = client.change_position_margin(payload.symbol, float(payload.amount))
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/mmp-config')
+def live_update_mmp_config(payload: LiveMMPConfigRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """PUT /v2/users/update_mmp — Market Maker Protection config."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.update_mmp_config(
+        asset=payload.asset,
+        window_interval=payload.window_interval,
+        freeze_interval=payload.freeze_interval,
+        trade_limit=payload.trade_limit,
+        delta_limit=payload.delta_limit,
+        vega_limit=payload.vega_limit,
+        mmp=payload.mmp,
+    )
+    return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
+            "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/mmp-reset')
+def live_reset_mmp(payload: LiveMMPResetRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """PUT /v2/users/reset_mmp — Reset MMP trigger."""
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    response = client.reset_mmp(asset=payload.asset, mmp=payload.mmp)
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
 
