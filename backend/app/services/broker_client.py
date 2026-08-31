@@ -2278,6 +2278,50 @@ class BrokerClient:
             return result if isinstance(result, dict) else {"error": str(result)}
         return {"error": f"No margin-mode adapter installed for '{self.broker_name}'"}
 
+    def sync_margin_mode(self, reference_user_id, target_user_id,
+                         symbol: str = "BTCUSDT", dry_run: bool = False):
+        """Mirror one (sub)account's margin mode onto another (Delta India).
+
+        The flow Delta's own integration guidance spells out: list the
+        accounts under the main key (``GET /v2/sub_accounts``), read the
+        reference account's ``margin_mode``, then apply it to the target with
+        ``PUT /v2/users/margin_mode`` (``subaccount_user_id`` = target). The
+        listing must come from the **main/parent** key — a sub-account key
+        cannot list its parent's accounts, and the error says so instead of
+        guessing. Returns a structured result (never raises) so the terminal
+        can show exactly which step disagreed.
+        """
+        if self.kind != "delta":
+            return {"error": f"margin-mode sync is a Delta feature; "
+                             f"'{self.broker_name}' is a {self.kind} adapter"}
+        if dry_run:
+            return {"dry_run": True, "reference_user_id": str(reference_user_id),
+                    "target_user_id": str(target_user_id), "symbol": symbol}
+        settings = self.get_account_settings(symbol)
+        if isinstance(settings, dict) and settings.get("error"):
+            return {"error": settings["error"]}
+        accounts = (settings or {}).get("accounts") or []
+        reference = next((a for a in accounts
+                          if str(a.get("id")) == str(reference_user_id)), None)
+        if reference is None:
+            return {"error": f"reference account {reference_user_id} not found in "
+                             f"the sub-accounts list (this key lists "
+                             f"{[a.get('id') for a in accounts] or 'no accounts'}) — "
+                             f"the listing must be made with the main/parent API key",
+                    "accounts": accounts}
+        mode = reference.get("margin_mode")
+        if not mode:
+            return {"error": f"reference account {reference_user_id} reports no "
+                             f"margin_mode to mirror", "accounts": accounts}
+        result = self.set_margin_mode(symbol, mode,
+                                      subaccount_user_id=str(target_user_id))
+        rejected = isinstance(result, dict) and result.get("error")
+        return {"status": "rejected" if rejected else "ok",
+                "reference_user_id": str(reference_user_id),
+                "target_user_id": str(target_user_id),
+                "reference_account_name": reference.get("account_name"),
+                "margin_mode": mode, "result": result}
+
     # ---- Additional authenticated endpoints (wallet, subaccounts, prefs, margin) ----
     def get_wallet_transactions(self, asset_id: Optional[int] = None, limit: int = 100):
         if self.kind != "delta":

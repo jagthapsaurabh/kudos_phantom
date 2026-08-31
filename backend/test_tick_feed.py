@@ -45,7 +45,9 @@ from app.core.strategy import PhantomV2Config                        # noqa: E40
 from app.services.live_trader import LiveTradeService                # noqa: E402
 from app.services.tick_feed import (NullTickFeed, RestTickFeed,      # noqa: E402
                                     WebSocketTickFeed, build_tick_feed,
-                                    delta_subscribe, parse_binance, parse_delta)
+                                    delta_subscribe, delta_private_subscribe,
+                                    delta_key_auth,
+                                    parse_binance, parse_delta)
 
 PASS, FAIL = [], []
 
@@ -313,6 +315,15 @@ check("delta subscribes to ticker (changelog 17.04.26, not v2/ticker)",
       delta_feed.subscribe)
 check("delta_subscribe is a well-formed frame",
       delta_subscribe("BTCUSD")["type"] == "subscribe")
+check("private subscribe covers orders + positions + margins (Delta's mapping)",
+      {c["name"] for c in delta_private_subscribe(["BTCUSD"])["payload"]["channels"]}
+      == {"orders", "positions", "margins"},
+      str(delta_private_subscribe(["BTCUSD"])))
+_auth = delta_key_auth("K", "S")
+check("key-auth frame signs GET+timestamp+/live (private socket)",
+      _auth["type"] == "key-auth" and _auth["payload"]["api-key"] == "K"
+      and bool(_auth["payload"]["signature"]) and bool(_auth["payload"]["timestamp"]),
+      str(_auth))
 
 rest_built = build_tick_feed("rest", "Binance", "BTCUSDT", BinanceDef(), client=FakeClient())
 check("rest mode builds a polling feed", rest_built.kind == "rest")

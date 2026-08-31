@@ -168,6 +168,15 @@ accept the key; a freshly created key proves itself on the next signed call).
   testnet flag) with no probe, `tools/align_delta_env.py` does the same from the shell with
   `--apply --verify`, and Broker Settings exposes **Align to India production** on every Delta-family
   connection that is not there yet.
+- **Delta integration scripts conformance (2026-08-31).** Audited against Delta's four reference
+  scripts + endpoint/WS tables. Already conforming: order strings `market_order`/`limit_order`,
+  `DELETE /v2/orders` `{id, product_id}`, `DELETE /v2/orders/all` with product filter, public
+  candles chunked at 2000, public WS on `wss://public-socket.india.delta.exchange` with new channel
+  names, private-WS key-auth `HMAC("GET"+ts+"/live")`. Closed gaps: `BrokerClient.sync_margin_mode`
+  (reference→target mirror via `GET /v2/sub_accounts` + `PUT /v2/users/margin_mode`),
+  `POST /live-account/margin-mode-sync` + `subaccount_user_id` on `POST /live-account/margin-mode`,
+  and `delta_private_subscribe` now covers orders/positions/margins (fills stay on REST
+  `GET /v2/fills`, deliberately not duplicated).
 - **Deployment rail (2026-08-31).** `DELTA_DEPLOYMENT_FAMILY` (default `india`) enforces the
   official rule — India keys → `api.india.delta.exchange` only, Demo keys →
   `cdn-ind.testnet.deltaex.org` only, `api.delta.exchange` = Global, not used here. On an India box:

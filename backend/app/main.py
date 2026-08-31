@@ -3447,6 +3447,19 @@ class LiveMarginModeRequest(BaseModel):
     connection_id: Optional[int] = None
     symbol: str = 'BTCUSDT'
     mode: str = 'isolated'
+    # Delta India keeps margin mode per (sub)account: pass the target
+    # account's user id to set it there (default: this key's own account).
+    subaccount_user_id: Optional[str] = None
+
+
+class LiveMarginModeSyncRequest(BaseModel):
+    """Mirror a reference account's margin mode onto a target (sub)account."""
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    reference_user_id: str
+    target_user_id: str
+    dry_run: bool = False
 
 
 class LivePositionMarginRequest(BaseModel):
@@ -3648,12 +3661,38 @@ def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_curren
     except PhantomValidationError as ve:
         raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_margin_mode(symbol, mode)
+    response = client.set_margin_mode(symbol, mode,
+                                      subaccount_user_id=payload.subaccount_user_id)
     if isinstance(response, dict) and response.get('error'):
         cls = classify_broker_error(response.get('error'), broker=definition.code)
         phantom_logger.warning(f"set_margin_mode failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/margin-mode-sync')
+def live_sync_margin_mode(payload: LiveMarginModeSyncRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Mirror one (sub)account's margin mode onto another (Delta India).
+
+    The flow Delta's integration guidance spells out: list the accounts under
+    the main key, read the reference account's ``margin_mode``, apply it to
+    the target via ``PUT /v2/users/margin_mode``. Read-only with
+    ``dry_run`` — and the listing must come from the main/parent key, which
+    the error reports when it cannot.
+    """
+    try:
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    result = client.sync_margin_mode(payload.reference_user_id, payload.target_user_id,
+                                     symbol, payload.dry_run)
+    if isinstance(result, dict) and result.get('error'):
+        cls = classify_broker_error(result.get('error'), broker=definition.code)
+        phantom_logger.warning(f"margin-mode sync failed [{cls['category']}]: {result.get('error')}")
+    return {"status": result.get("status", "rejected"),
+            "response": result, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/position-margin')

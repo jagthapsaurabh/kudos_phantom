@@ -196,12 +196,19 @@ def delta_subscribe(symbol: str, include_candles: bool = True,
 
 
 def delta_private_subscribe(symbols: Optional[list] = None) -> Dict[str, Any]:
-    """Positions + orders private channels (after key-auth)."""
+    """Positions + orders + margins private channels (after key-auth).
+
+    Per Delta's channel mapping the live-trading private channels are
+    ``orders``, ``positions`` and ``margins`` (wallet/margin updates);
+    fills are consumed through REST ``GET /v2/fills`` by the trading loop,
+    so they are not duplicated here.
+    """
     wanted = list(symbols or ["all"])
     return {"type": "subscribe",
             "payload": {"channels": [
                 {"name": "orders", "symbols": wanted},
                 {"name": "positions", "symbols": wanted},
+                {"name": "margins", "symbols": wanted},
             ]}}
 
 

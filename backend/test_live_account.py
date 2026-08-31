@@ -1107,6 +1107,49 @@ check("POST /live-account/leverage", r.status_code == 200 and r.json()["response
 r = api.post("/live-account/margin-mode", headers=H, json={"broker": "Delta", "mode": "isolated"})
 check("POST /live-account/margin-mode", r.status_code == 200 and r.json()["status"] == "ok", r.text[:200])
 
+# ---- Margin-mode sync across (sub)accounts (Delta's guidance flow) -------
+# GET /v2/sub_accounts with the main key → read reference margin_mode →
+# PUT /v2/users/margin_mode {margin_mode, subaccount_user_id: target}.
+STATE["requests"].clear()
+sync_res = delta.sync_margin_mode("5112346", "5112347")
+check("sync_margin_mode mirrors the reference account's mode",
+      sync_res.get("status") == "ok" and sync_res.get("margin_mode") == "cross",
+      str(sync_res)[:250])
+put_body = next((r["body"] for r in STATE["requests"]
+                 if r["path"] == "/v2/users/margin_mode" and r["method"] == "PUT"), None)
+check("the sync applied the mode to the TARGET sub-account",
+      put_body == {"margin_mode": "cross", "subaccount_user_id": "5112347"},
+      str(put_body))
+check("dry_run performs no network call",
+      delta.sync_margin_mode("5112346", "5112347", dry_run=True).get("dry_run") is True)
+bad_sync = delta.sync_margin_mode("9999999", "5112347")
+check("an unknown reference says so and names the main-key requirement",
+      bad_sync.get("error") and "main/parent" in str(bad_sync.get("error")),
+      str(bad_sync)[:250])
+
+STATE["requests"].clear()
+r = api.post("/live-account/margin-mode", headers=H,
+             json={"broker": "Delta", "mode": "portfolio", "subaccount_user_id": "5112347"})
+check("POST /live-account/margin-mode can target a sub-account",
+      r.status_code == 200 and r.json()["status"] == "ok", r.text[:200])
+put_body2 = next((r_["body"] for r_ in STATE["requests"]
+                  if r_["path"] == "/v2/users/margin_mode" and r_["method"] == "PUT"), None)
+check("the targeted call carries the sub-account user id",
+      put_body2 == {"margin_mode": "portfolio", "subaccount_user_id": "5112347"},
+      str(put_body2))
+
+r = api.post("/live-account/margin-mode-sync", headers=H,
+             json={"broker": "Delta", "reference_user_id": "5112346",
+                   "target_user_id": "5112347"})
+check("POST /live-account/margin-mode-sync mirrors reference to target",
+      r.status_code == 200 and r.json()["status"] == "ok"
+      and r.json()["response"]["margin_mode"] == "cross", r.text[:300])
+r = api.post("/live-account/margin-mode-sync", headers=H,
+             json={"broker": "Delta", "reference_user_id": "5112346",
+                   "target_user_id": "5112347", "dry_run": True})
+check("the sync endpoint honours dry_run",
+      r.status_code == 200 and r.json()["response"].get("dry_run") is True, r.text[:300])
+
 r = api.post("/live-account/position-margin", headers=H,
              json={"broker": "Delta", "amount": 5.0})
 check("POST /live-account/position-margin", r.status_code == 200 and r.json()["status"] == "ok", r.text[:200])
