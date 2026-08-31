@@ -883,7 +883,8 @@ class BrokerClient:
                     bracket_take_profit_limit_price: Optional[str] = None,
                     bracket_trail_amount: Optional[str] = None,
                     bracket_stop_trigger_method: Optional[str] = None,
-                    mmp: Optional[str] = None):
+                    mmp: Optional[str] = None,
+                    dry_run: bool = False):
         """Place an order. ``qty`` is in the venue's own units unless
         ``size_in_btc`` is set, in which case it is converted for you.
 
@@ -898,6 +899,17 @@ class BrokerClient:
             return {"error": f"Order size too small: {qty} BTC is below {self.get_instrument(symbol).get('min_size')} "
                              f"{self.get_instrument(symbol).get('size_unit')}"}
         if self.kind == "binance":
+            if dry_run:
+                return {"dry_run": True, "broker": "Binance", "symbol": perp, "side": side,
+                        "order_type": order_type, "qty": size, "price": price,
+                        "stop_price": stop_price, "reduce_only": reduce_only,
+                        "client_order_id": client_order_id, "time_in_force": time_in_force,
+                        "post_only": post_only, "working_type": working_type,
+                        "trail_amount": trail_amount,
+                        "bracket": {"stop_loss_price": bracket_stop_loss_price,
+                                    "take_profit_price": bracket_take_profit_price,
+                                    "trail_amount": bracket_trail_amount,
+                                    "trigger_method": bracket_stop_trigger_method}}
             return self._binance_place_order(perp, side, order_type, size, price, stop_price,
                                              reduce_only, client_order_id, time_in_force,
                                              post_only, working_type, trail_amount)
@@ -911,7 +923,7 @@ class BrokerClient:
                                            bracket_take_profit_limit_price=bracket_take_profit_limit_price,
                                            bracket_trail_amount=bracket_trail_amount,
                                            bracket_stop_trigger_method=bracket_stop_trigger_method,
-                                           mmp=mmp)
+                                           mmp=mmp, dry_run=dry_run)
         return {"error": f"No order adapter installed for '{self.broker_name}'"}
 
     def _binance_place_order(self, symbol, side, order_type, size, price, stop_price,
@@ -953,7 +965,8 @@ class BrokerClient:
                            bracket_take_profit_limit_price: Optional[str] = None,
                            bracket_trail_amount: Optional[str] = None,
                            bracket_stop_trigger_method: Optional[str] = None,
-                           mmp: Optional[str] = None):
+                           mmp: Optional[str] = None,
+                           dry_run: bool = False):
         size = self.base_to_venue_size(size, symbol) if size_in_btc else float(size)
         # Include product_id when we know it — official client uses product_id
         # but product_symbol is accepted and keeps older mocks working.
@@ -1032,6 +1045,9 @@ class BrokerClient:
             body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if client_order_id:
             body["client_order_id"] = str(client_order_id)[:32]
+        if dry_run:
+            return {"dry_run": True, "method": "POST", "path": "/v2/orders",
+                    "body": body, "product_symbol": symbol}
         response, error = self._delta_request("POST", "/v2/orders", body=body,
                                               weight=10, is_order=True)
         return self._delta_result(self._json_body(response, error))
@@ -1042,7 +1058,8 @@ class BrokerClient:
                             take_profit_price: Optional[float] = None,
                             client_order_id: Optional[str] = None,
                             trigger_method: str = "mark_price", size_in_btc: bool = True,
-                            trail_amount: Optional[float] = None):
+                            trail_amount: Optional[float] = None,
+                            dry_run: bool = False):
         """Entry order with an attached stop-loss and take-profit.
 
         Delta supports this natively (``POST /v2/orders/bracket``) and cancels
@@ -1089,6 +1106,9 @@ class BrokerClient:
                                              "stop_price": str(take_profit_price)}
             if client_order_id:
                 body["client_order_id"] = str(client_order_id)[:32]
+            if dry_run:
+                return {"dry_run": True, "method": "POST", "path": "/v2/orders/bracket",
+                        "body": body, "product_symbol": perp}
             response, error = self._delta_request("POST", "/v2/orders/bracket", body=body,
                                                   weight=20, is_order=True)
             payload = self._json_body(response, error)
@@ -1096,6 +1116,11 @@ class BrokerClient:
                 payload["_bracket"] = True
             return payload
         if self.kind == "binance":
+            if dry_run:
+                return {"dry_run": True, "broker": "Binance", "symbol": perp, "side": side,
+                        "qty": size, "price": price, "stop_loss_price": stop_loss_price,
+                        "take_profit_price": take_profit_price, "client_order_id": client_order_id,
+                        "trigger_method": trigger_method, "trail_amount": trail_amount}
             entry = self.place_order(symbol, side, "market" if price is None else "limit",
                                      size, price=price, client_order_id=client_order_id)
             if isinstance(entry, dict) and entry.get("error"):
@@ -1119,7 +1144,8 @@ class BrokerClient:
                                product_id: Optional[int] = None,
                                stop_loss_order: Optional[Dict[str, Any]] = None,
                                take_profit_order: Optional[Dict[str, Any]] = None,
-                               bracket_stop_trigger_method: str = "mark_price"):
+                               bracket_stop_trigger_method: str = "mark_price",
+                               dry_run: bool = False):
         """MCP-aligned position bracket (attach SL/TP to open position)."""
         if self.kind != "delta":
             return {"error": "Position bracket only supported on Delta Exchange."}
@@ -1144,12 +1170,19 @@ class BrokerClient:
             body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if not body.get("stop_loss_order") and not body.get("take_profit_order"):
             return {"error": "At least one of stop_loss_order or take_profit_order required"}
+        if dry_run:
+            return {"dry_run": True, "method": "POST", "path": "/v2/orders/bracket", "body": body}
         response, error = self._delta_request("POST", "/v2/orders/bracket", body=body, weight=20, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
     def cancel_order(self, order_id, symbol: Optional[str] = None,
-                     client_order_id: Optional[str] = None):
+                     client_order_id: Optional[str] = None,
+                     dry_run: bool = False):
         perp = self.perpetual_symbol(symbol) if symbol else None
+        if dry_run:
+            # Dry-run: echo what would be cancelled without hitting venue
+            return {"dry_run": True, "order_id": order_id, "client_order_id": client_order_id,
+                    "product_symbol": perp, "symbol": symbol}
         if self.kind == "binance":
             params = {"symbol": perp or ""}
             if client_order_id:
@@ -1213,8 +1246,15 @@ class BrokerClient:
                           contract_types: Optional[List[str]] = None,
                           cancel_limit_orders: Optional[bool] = None,
                           cancel_stop_orders: Optional[bool] = None,
-                          cancel_reduce_only_orders: Optional[bool] = None):
+                          cancel_reduce_only_orders: Optional[bool] = None,
+                          dry_run: bool = False):
         perp = self.perpetual_symbol(symbol) if symbol else None
+        if dry_run:
+            return {"dry_run": True, "product_symbol": perp, "symbol": symbol,
+                    "contract_types": contract_types,
+                    "cancel_limit_orders": cancel_limit_orders,
+                    "cancel_stop_orders": cancel_stop_orders,
+                    "cancel_reduce_only_orders": cancel_reduce_only_orders}
         if self.kind == "binance":
             params = {"symbol": perp} if perp else {}
             response, error = self._binance_request("DELETE", "/fapi/v1/allOpenOrders", params,
@@ -1253,7 +1293,7 @@ class BrokerClient:
         return {"error": f"No cancel adapter installed for '{self.broker_name}'"}
 
     # ---- Batch orders (official: POST/PUT/DELETE /v2/orders/batch) ----
-    def batch_create_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+    def batch_create_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None, dry_run: bool = False):
         if self.kind != "delta":
             return {"error": "Batch orders only supported on Delta Exchange."}
         if not orders:
@@ -1271,10 +1311,12 @@ class BrokerClient:
                 pass
         if "product_id" not in body and perp:
             body["product_symbol"] = perp
+        if dry_run:
+            return {"dry_run": True, "method": "POST", "path": "/v2/orders/batch", "body": body}
         response, error = self._delta_request("POST", "/v2/orders/batch", body=body, weight=25, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
-    def batch_edit_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+    def batch_edit_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None, dry_run: bool = False):
         if self.kind != "delta":
             return {"error": "Batch orders only supported on Delta Exchange."}
         if not orders:
@@ -1291,10 +1333,12 @@ class BrokerClient:
                 pass
         if "product_id" not in body and perp:
             body["product_symbol"] = perp
+        if dry_run:
+            return {"dry_run": True, "method": "PUT", "path": "/v2/orders/batch", "body": body}
         response, error = self._delta_request("PUT", "/v2/orders/batch", body=body, weight=25, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
-    def batch_cancel_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None):
+    def batch_cancel_orders(self, symbol: Optional[str] = None, orders: Optional[List[Dict[str, Any]]] = None, dry_run: bool = False):
         if self.kind != "delta":
             return {"error": "Batch orders only supported on Delta Exchange."}
         if not orders:
@@ -1311,6 +1355,8 @@ class BrokerClient:
                 pass
         if "product_id" not in body and perp:
             body["product_symbol"] = perp
+        if dry_run:
+            return {"dry_run": True, "method": "DELETE", "path": "/v2/orders/batch", "body": body}
         response, error = self._delta_request("DELETE", "/v2/orders/batch", body=body, weight=25, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
@@ -1324,7 +1370,8 @@ class BrokerClient:
                            bracket_take_profit_price: Optional[str] = None,
                            bracket_take_profit_limit_price: Optional[str] = None,
                            bracket_trail_amount: Optional[str] = None,
-                           bracket_stop_trigger_method: Optional[str] = None):
+                           bracket_stop_trigger_method: Optional[str] = None,
+                           dry_run: bool = False):
         """``PUT /v2/orders/bracket`` — adjust SL / TP / trail after entry.
         Supports both legacy (stop_loss_price/take_profit_price) and MCP-aligned
         bracket_* top-level fields. MCP: edit_bracket_order {id, bracket_stop_loss_price, ...}
@@ -1369,6 +1416,8 @@ class BrokerClient:
             body["bracket_trail_amount"] = str(bracket_trail_amount)
         if bracket_stop_trigger_method is not None:
             body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
+        if dry_run:
+            return {"dry_run": True, "method": "PUT", "path": "/v2/orders/bracket", "body": body}
         response, error = self._delta_request("PUT", "/v2/orders/bracket", body=body,
                                               weight=10, is_order=True)
         return self._delta_result(self._json_body(response, error))
@@ -1378,7 +1427,8 @@ class BrokerClient:
                    client_order_id: Optional[str] = None,
                    trail_amount: Optional[str] = None,
                    post_only: Optional[bool] = None,
-                   mmp: Optional[str] = None):
+                   mmp: Optional[str] = None,
+                   dry_run: bool = False):
         perp = self.perpetual_symbol(symbol) if symbol else None
         if self.kind == "delta":
             body: Dict[str, Any] = {"id": int(order_id)}
@@ -1409,6 +1459,8 @@ class BrokerClient:
                 body["post_only"] = "true" if post_only else "false"
             if mmp is not None:
                 body["mmp"] = str(mmp)
+            if dry_run:
+                return {"dry_run": True, "method": "PUT", "path": "/v2/orders", "body": body}
             response, error = self._delta_request("PUT", "/v2/orders", body=body,
                                                   weight=10, is_order=True)
             return self._delta_result(self._json_body(response, error))
@@ -1558,6 +1610,8 @@ class BrokerClient:
                             page_size: int = 50, after: Optional[str] = None):
         if self.kind != "delta":
             return {"error": "Only Delta supports MCP open orders"}
+        if product_ids and len(product_ids) > 10:
+            return {"error": "product_ids max 10 (MCP limit)"}
         query: Dict[str, Any] = {}
         if product_ids:
             query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
@@ -1579,6 +1633,8 @@ class BrokerClient:
                               page_size: int = 50, after: Optional[str] = None):
         if self.kind != "delta":
             return {"error": "Only Delta supports MCP order history"}
+        if product_ids and len(product_ids) > 10:
+            return {"error": "product_ids max 10 (MCP limit)"}
         query: Dict[str, Any] = {}
         if product_ids:
             query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
@@ -1603,6 +1659,8 @@ class BrokerClient:
                       page_size: int = 50, after: Optional[str] = None):
         if self.kind != "delta":
             return {"error": "Only Delta supports MCP fills"}
+        if product_ids and len(product_ids) > 10:
+            return {"error": "product_ids max 10 (MCP limit)"}
         query: Dict[str, Any] = {}
         if product_ids:
             query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
@@ -1740,7 +1798,7 @@ class BrokerClient:
         return {"error": f"No position adapter installed for '{self.broker_name}'"}
 
     def close_position(self, symbol: str = "BTCUSDT", size: Optional[float] = None,
-                       size_in_btc: bool = True):
+                       size_in_btc: bool = True, dry_run: bool = False):
         """Market-close the open position for a contract (reduce-only).
 
         With ``size`` the close is partial (a reduce-only market order); without
@@ -1748,6 +1806,8 @@ class BrokerClient:
         endpoint.
         """
         perp = self.perpetual_symbol(symbol)
+        if dry_run:
+            return {"dry_run": True, "product_symbol": perp, "symbol": symbol, "size": size, "size_in_btc": size_in_btc}
         if self.kind == "binance":
             positions = self.get_positions(symbol)
             amount = 0.0
@@ -1798,7 +1858,7 @@ class BrokerClient:
                                            size_in_btc=size_in_btc)
         return {"error": f"No position adapter installed for '{self.broker_name}'"}
 
-    def change_position_margin(self, symbol: str, amount: float, symbol_arg=None):
+    def change_position_margin(self, symbol: str, amount: float, symbol_arg=None, dry_run: bool = False):
         """Add (positive) or remove (negative) isolated-margin from a position."""
         perp = self.perpetual_symbol(symbol)
         if self.kind == "binance":
@@ -1820,6 +1880,8 @@ class BrokerClient:
             else:
                 # Fallback for test mocks that expect product_symbol
                 body = {"product_symbol": perp, "delta_margin": str(float(amount))}
+            if dry_run:
+                return {"dry_run": True, "method": "POST", "path": "/v2/positions/change_margin", "body": body}
             response, error = self._delta_request("POST", "/v2/positions/change_margin", body=body,
                                                   weight=10, is_order=True)
             return self._delta_result(self._json_body(response, error))
@@ -1838,8 +1900,10 @@ class BrokerClient:
             return self._delta_result(payload)
         return {"error": f"No account adapter installed for '{self.broker_name}'"}
 
-    def set_leverage(self, symbol: str, leverage: int):
+    def set_leverage(self, symbol: str, leverage: int, dry_run: bool = False):
         perp = self.perpetual_symbol(symbol)
+        if dry_run:
+            return {"dry_run": True, "product_symbol": perp, "symbol": symbol, "leverage": int(leverage)}
         if self.kind == "binance":
             response, error = self._binance_request("POST", "/fapi/v1/leverage",
                                                     {"symbol": perp, "leverage": int(leverage)},
@@ -2008,8 +2072,11 @@ class BrokerClient:
         return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
 
     def set_margin_mode(self, symbol: str, mode: str = "isolated",
-                        subaccount_user_id: Optional[str] = None):
+                        subaccount_user_id: Optional[str] = None,
+                        dry_run: bool = False):
         perp = self.perpetual_symbol(symbol)
+        if dry_run:
+            return {"dry_run": True, "product_symbol": perp, "symbol": symbol, "mode": mode, "subaccount_user_id": subaccount_user_id}
         if self.kind == "binance":
             response, error = self._binance_request("POST", "/fapi/v1/marginType",
                                                     {"symbol": perp, "marginType": str(mode).upper()},
@@ -2085,7 +2152,7 @@ class BrokerClient:
         response, error = self._delta_request("PUT", "/v2/users/trading_preferences", body=prefs or {}, weight=5)
         return self._delta_result(self._json_body(response, error))
 
-    def set_auto_topup(self, symbol: str, auto_topup: bool):
+    def set_auto_topup(self, symbol: str, auto_topup: bool, dry_run: bool = False):
         if self.kind != "delta":
             return {"error": "Auto-topup only supported on Delta Exchange."}
         try:
@@ -2096,6 +2163,8 @@ class BrokerClient:
         if not pid:
             return {"error": "product_id unknown — auto_topup needs instrument"}
         body = {"product_id": int(pid), "auto_topup": bool(auto_topup)}
+        if dry_run:
+            return {"dry_run": True, "method": "PUT", "path": "/v2/positions/auto_topup", "body": body}
         response, error = self._delta_request("PUT", "/v2/positions/auto_topup", body=body, weight=10, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
@@ -2123,9 +2192,12 @@ class BrokerClient:
     def get_margined_positions(self, product_ids: Optional[List[int]] = None,
                                contract_types: Optional[List[str]] = None):
         """MCP-aligned: GET /v2/positions/margined?product_ids=...&contract_types=...
-        product_ids max 10, comma-joined for query. Also patches short-option PnL like MCP."""
+        product_ids max 10, comma-joined for query. Also patches short-option PnL like MCP.
+        Software need: BTC perpetual only — single product, but MCP caps at 10."""
         if self.kind != "delta":
             return self.get_positions()
+        if product_ids and len(product_ids) > 10:
+            return {"error": "product_ids max 10 (MCP limit)"}
         query: Dict[str, Any] = {}
         if product_ids:
             query["product_ids"] = ",".join(str(int(x)) for x in product_ids)
@@ -2171,7 +2243,8 @@ class BrokerClient:
     def close_all_positions(self, product_ids: Optional[List[int]] = None,
                             close_all_portfolio: bool = True,
                             close_all_isolated: bool = True,
-                            user_id: Optional[int] = None):
+                            user_id: Optional[int] = None,
+                            dry_run: bool = False):
         if self.kind != "delta":
             return {"error": "close_all only supported on Delta Exchange."}
         body: Dict[str, Any] = {
@@ -2182,6 +2255,8 @@ class BrokerClient:
             body["product_ids"] = [int(x) for x in product_ids]
         if user_id is not None:
             body["user_id"] = int(user_id)
+        if dry_run:
+            return {"dry_run": True, "method": "POST", "path": "/v2/positions/close_all", "body": body}
         response, error = self._delta_request("POST", "/v2/positions/close_all", body=body, weight=20, is_order=True)
         return self._delta_result(self._json_body(response, error))
 
@@ -2194,7 +2269,8 @@ class BrokerClient:
                           trade_limit: Optional[str] = None,
                           delta_limit: Optional[str] = None,
                           vega_limit: Optional[str] = None,
-                          mmp: str = "mmp1"):
+                          mmp: str = "mmp1",
+                          dry_run: bool = False):
         """Update MMP config for an underlying asset. Only for MMP-enabled accounts."""
         if self.kind != "delta":
             return {"error": "MMP config only supported on Delta Exchange."}
@@ -2209,14 +2285,18 @@ class BrokerClient:
             body["delta_limit"] = str(delta_limit)
         if vega_limit is not None:
             body["vega_limit"] = str(vega_limit)
+        if dry_run:
+            return {"dry_run": True, "method": "PUT", "path": "/v2/users/update_mmp", "body": body}
         response, error = self._delta_request("PUT", "/v2/users/update_mmp", body=body, weight=5)
         return self._delta_result(self._json_body(response, error))
 
-    def reset_mmp(self, asset: str, mmp: str = "mmp1"):
+    def reset_mmp(self, asset: str, mmp: str = "mmp1", dry_run: bool = False):
         """Reset MMP trigger for an asset. Body {asset, mmp}."""
         if self.kind != "delta":
             return {"error": "MMP reset only supported on Delta Exchange."}
         body = {"asset": str(asset), "mmp": str(mmp)}
+        if dry_run:
+            return {"dry_run": True, "method": "PUT", "path": "/v2/users/reset_mmp", "body": body}
         response, error = self._delta_request("PUT", "/v2/users/reset_mmp", body=body, weight=5)
         return self._delta_result(self._json_body(response, error))
 
