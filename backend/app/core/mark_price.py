@@ -36,12 +36,13 @@ import pandas as pd
 PERPETUAL_SYMBOLS = {
     "Binance": "BTCUSDT",
     "Delta": "BTCUSD",
+    "DeltaGlobal": "BTCUSD",  # Global lists the same BTCUSD perpetual
 }
 # Symbols the app may carry internally, mapped to each venue's perpetual.
 _PERPETUAL_ALIASES = {
-    "BTCUSDT": {"Binance": "BTCUSDT", "Delta": "BTCUSD"},
-    "BTCUSD": {"Binance": "BTCUSDT", "Delta": "BTCUSD"},
-    "BTC": {"Binance": "BTCUSDT", "Delta": "BTCUSD"},
+    "BTCUSDT": {"Binance": "BTCUSDT", "Delta": "BTCUSD", "DeltaGlobal": "BTCUSD"},
+    "BTCUSD": {"Binance": "BTCUSDT", "Delta": "BTCUSD", "DeltaGlobal": "BTCUSD"},
+    "BTC": {"Binance": "BTCUSDT", "Delta": "BTCUSD", "DeltaGlobal": "BTCUSD"},
 }
 DELTA_MARK_PREFIX = "MARK:"
 
@@ -71,7 +72,7 @@ def mark_symbol(source: Optional[str], symbol: str = "BTCUSDT") -> str:
     """Symbol used by the venue's *mark price* history endpoint."""
     venue = normalize_source_name(source)
     perp = perpetual_symbol(venue, symbol)
-    if venue == "Delta":
+    if venue in ("Delta", "DeltaGlobal"):
         return f"{DELTA_MARK_PREFIX}{perp}"
     return perp
 

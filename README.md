@@ -207,9 +207,15 @@ now a state, not a wall of identical errors:
   /live-trade/reload-credentials` forces one instance to re-read now. Both are on the UI: **Replace
   keys** on the connection card, **Reload keys** on the instance.
 * **Diagnosis in place** — `POST /broker-connections/{id}/probe` (**Check key**) signs one
-  `GET /v2/wallet/balances` against *both* Delta India hosts and says which one accepts the key, so
-  "production key on a testnet connection" is answered with a toggle instead of a new key. Same code
-  as `tools/check_delta_key.py`, run from the server when the key is IP-whitelisted.
+  `GET /v2/wallet/balances` against **all four** Delta environments (India production/testnet +
+  Global production/testnet — India and Global keep separate key stores) and says which one accepts
+  the key, so "production key on a testnet connection" or "India connection, Global key" is answered
+  with a repoint instead of a new key. `POST /broker-connections/{id}/test` (**Test connection**)
+  runs the full read-only battery — market data, clock skew, environment, signed calls, rate quota —
+  and offers **Use this environment** to apply the fix with no restart. Same code as
+  `tools/test_connection.py` (with `--apply`) and `tools/check_delta_key.py`, run from the server
+  when the key is IP-whitelisted. **Delta Exchange Global** is a built-in broker (`DeltaGlobal`)
+  with its own hosts, so a Global key is a first-class adapter, not a URL override of `Delta`.
 
 The operator-facing version of this page is **[docs/delta_api_key_runbook.md](docs/delta_api_key_runbook.md)**.
 

@@ -128,6 +128,28 @@ class DataSyncService:
         value = getattr(definition, "market_data_url", None) if definition is not None else None
         return (value or fallback).rstrip("/")
 
+    @staticmethod
+    def _delta_hosts_for(definition):
+        """Hosts the Delta adapter should fetch from for a given definition.
+
+        * ``Delta`` (built-in) — primary + CDN fallback (``DELTA_HOSTS``);
+        * ``DeltaGlobal`` (built-in) — its own host only: the Global key store
+          and API are separate from India, so the India CDN fallback must NEVER
+          cover a Global-source seed;
+        * custom Delta-compatible — the configured host only.
+        """
+        if definition is None:
+            return None
+        code = str(getattr(definition, "code", "") or "").lower()
+        if code == "deltaglobal":
+            url = getattr(definition, "market_data_url", None) or \
+                "https://api.delta.exchange"
+            return [str(url).rstrip("/")]
+        if not getattr(definition, "is_builtin", False):
+            url = getattr(definition, "market_data_url", None)
+            return [str(url).rstrip("/")] if url else None
+        return None
+
     @classmethod
     def _page_limit(cls, source, requested, definition=None):
         kind = cls._adapter_kind(source, definition)
@@ -332,14 +354,11 @@ class DataSyncService:
                 raise MarketDataError(f"Binance-compatible data request failed: {exc}") from exc
 
         if kind == "delta":
-            # Built-in Delta keeps the primary + CDN fallback. A custom
-            # Delta-compatible definition is restricted to its configured host.
-            custom_hosts = None
-            if definition is not None and not getattr(definition, "is_builtin", False):
-                configured_url = getattr(definition, "market_data_url", None)
-                if configured_url:
-                    custom_hosts = [configured_url.rstrip("/")]
-            return cls._delta_fetch(symbol, interval, start_time, end_time, limit, hosts=custom_hosts)
+            # Built-in Delta keeps the primary + CDN fallback; built-in
+            # DeltaGlobal and custom Delta-compatible definitions are
+            # restricted to their own hosts (separate key store / API).
+            return cls._delta_fetch(symbol, interval, start_time, end_time, limit,
+                                    hosts=cls._delta_hosts_for(definition))
 
         raise MarketDataError(f"No market-data adapter is installed for source '{source}'. Configure a Binance-compatible or Delta-compatible adapter first.")
 
@@ -379,13 +398,8 @@ class DataSyncService:
                      "open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4])} for k in response.json()]
         if kind == "delta":
-            custom_hosts = None
-            if definition is not None and not getattr(definition, "is_builtin", False):
-                configured_url = getattr(definition, "market_data_url", None)
-                if configured_url:
-                    custom_hosts = [configured_url.rstrip("/")]
             return cls._delta_fetch(mark_symbol(source, perp), interval, start_time,
-                                    end_time, limit, hosts=custom_hosts)
+                                    end_time, limit, hosts=cls._delta_hosts_for(definition))
         raise MarketDataError(
             f"No mark-price adapter is installed for source '{source}'. "
             f"Only Binance-compatible and Delta-compatible sources expose a mark price."

@@ -1,7 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { API_URL } from '../api';
-import { KeyRound, Plus, Trash2, ShieldCheck, RefreshCw, Wallet, Plug } from 'lucide-react';
+import { KeyRound, Plus, Trash2, ShieldCheck, RefreshCw, Wallet, Plug, Activity } from 'lucide-react';
 import ConnectionCheck from '../components/ConnectionCheck';
+
+/* Step chip colors shared by the Check-key / Test-connection panels. */
+const STEP_STYLE = {
+  ok: 'text-green-400',
+  permission: 'text-amber-400',
+  auth: 'text-red-400',
+  error: 'text-red-400',
+  unreachable: 'text-gray-500',
+  skipped: 'text-gray-500',
+};
+const STEP_LABEL = {
+  ok: 'ok',
+  permission: 'permission missing',
+  auth: 'rejected',
+  error: 'failed',
+  unreachable: 'unreachable',
+  skipped: 'skipped',
+};
 
 const auth = () => ({ Authorization: `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 const field = 'w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-white text-sm outline-none focus:border-blue-500';
@@ -185,7 +203,7 @@ const ExchangeRegistry = () => {
    directly rather than through the whole page. */
 export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggleKeys,
                    onSaveKeys, onProbe, probing, probeResult, onRefresh,
-                   onRemove }) => (
+                   onRemove, onTest, testing, testResult, onApplyEnv }) => (
   <div className="p-3 bg-gray-900 rounded-lg border border-gray-700">
   <div className="flex justify-between items-center gap-2">
     <div className="min-w-0">
@@ -238,10 +256,19 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
     </div>
   )}
 
-  <button onClick={onProbe} disabled={probing}
-          className="mt-2 rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40 disabled:opacity-40">
-    {probing ? 'Checking…' : 'Check key'}
-  </button>
+  <div className="mt-2 flex flex-wrap gap-1.5">
+    <button onClick={onProbe} disabled={probing}
+            className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40 disabled:opacity-40">
+      {probing ? 'Checking…' : 'Check key'}
+    </button>
+    {onTest && (
+      <button onClick={onTest} disabled={testing}
+              className="flex items-center gap-1 rounded border border-blue-800/60 bg-blue-900/20 px-2 py-1 text-[10px] font-bold text-blue-300 transition hover:bg-blue-900/40 disabled:opacity-40">
+        <Activity size={11} />
+        {testing ? 'Testing…' : 'Test connection'}
+      </button>
+    )}
+  </div>
   {probeResult && (
     <div className="mt-1.5 rounded-lg border border-gray-700 bg-gray-800/60 p-2 text-[10px] leading-relaxed text-gray-400">
       <div className={`font-bold ${probeResult.accepted ? 'text-green-400' : 'text-red-400'}`}>
@@ -249,13 +276,61 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
       </div>
       {(probeResult.rows || []).map(r => (
         <div key={r.name} className="mt-0.5 truncate" title={r.detail}>
-          <span className={r.state === 'ok' ? 'text-green-400' : r.state === 'unreachable' ? 'text-gray-500' : 'text-red-400'}>
-            {r.state === 'ok' ? 'accepts' : r.state === 'unreachable' ? 'unreachable' : 'rejects'}
+          <span className={r.state === 'ok' || r.state === 'permission' ? 'text-green-400' : r.state === 'unreachable' ? 'text-gray-500' : 'text-red-400'}>
+            {r.state === 'ok' ? 'accepts' : r.state === 'permission' ? 'knows key · missing permission' : r.state === 'unreachable' ? 'unreachable' : 'rejects'}
           </span>{' '}
           {r.name} <span className="text-gray-600">{r.base_url}</span>
         </div>
       ))}
       {probeResult.fix && <div className="mt-1 text-amber-300">{probeResult.fix}</div>}
+    </div>
+  )}
+
+  {testResult && (
+    <div className="mt-1.5 rounded-lg border border-gray-700 bg-gray-800/60 p-2 text-[10px] leading-relaxed text-gray-400">
+      <div className={`font-bold ${testResult.verdict?.ok ? 'text-green-400' : 'text-red-400'}`}>
+        {testResult.verdict?.message || 'Connection test finished.'}
+      </div>
+      <div className="mt-1 space-y-0.5">
+        {(testResult.steps || []).map(s => (
+          <div key={s.name || s.title} className="flex items-start gap-1.5">
+            <span className={`shrink-0 font-bold ${STEP_STYLE[s.state] || 'text-gray-400'}`}>
+              {STEP_LABEL[s.state] || s.state}
+            </span>
+            <span className="min-w-0">
+              <span className="text-gray-300">{s.title || s.name}</span>
+              {s.detail && <span className="text-gray-500"> — {s.detail}</span>}
+              {(s.rows || []).map(r => (
+                <span key={r.name} className="block truncate text-gray-600" title={r.detail}>
+                  · {r.name} {r.base_url} → {r.state === 'ok' ? 'accepts' : r.state === 'permission' ? 'missing permission' : r.state === 'unreachable' ? 'unreachable' : 'rejects'}
+                </span>
+              ))}
+            </span>
+          </div>
+        ))}
+      </div>
+      {(testResult.verdict?.problems || []).map(p => (
+        <div key={p} className="mt-1 text-red-300">· {p}</div>
+      ))}
+      {(testResult.verdict?.fixes || []).map(f => (
+        <div key={f} className="mt-0.5 text-amber-300">→ {f}</div>
+      ))}
+      {testResult.applied && (
+        <div className="mt-1 text-green-300">
+          Applied: connection now uses broker {testResult.applied.broker_code}
+          ({testResult.applied.is_testnet ? ' testnet/demo' : ' production'})
+          {testResult.live_instances?.reloaded ? ` · ${testResult.live_instances.reloaded} running instance(s) reloaded.` : ''}
+        </div>
+      )}
+      {onApplyEnv && testResult.detected &&
+        (testResult.detected.broker_code !== c.broker_code || testResult.detected.testnet !== !!c.is_testnet) && (
+        <button onClick={() => onApplyEnv(testResult.detected)}
+                disabled={busy}
+                className="mt-1.5 rounded border border-green-800/60 bg-green-900/20 px-2 py-1 text-[10px] font-bold text-green-300 transition hover:bg-green-900/40 disabled:opacity-40">
+          Use this environment ({testResult.detected.broker_code}
+          {testResult.detected.testnet ? ' · testnet/demo' : ''}) — no restart
+        </button>
+      )}
     </div>
   )}
   {c.account_settings && !c.account_settings.error && (
@@ -403,6 +478,42 @@ const BrokerSettings = () => {
     setProbing(null);
   };
 
+  /* ---- Full read-only connection test ----------------------------------- */
+  /* `POST /broker-connections/{id}/test` — same battery as the CLI tool:
+     market data, clock, all four Delta environments, signed calls, quota.
+     The report identifies the environment the key actually belongs to; the
+     "Use this environment" button repoints the saved connection (no restart). */
+  const [testing, setTesting] = useState(null);
+  const [testResults, setTestResults] = useState({});
+  const testConnection = async (id) => {
+    setTesting(id); setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/${id}/test`, { method: 'POST', headers: auth() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not run the connection test');
+      setTestResults(p => ({ ...p, [id]: data }));
+    } catch (e) { setMessage({ ok: false, text: `Connection test failed: ${e.message}` }); }
+    setTesting(null);
+  };
+  const applyTestedEnvironment = async (c, detected) => {
+    if (!detected) return;
+    setBusy(true); setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/${c.id}/test?apply=true`, { method: 'POST', headers: auth() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not update the connection');
+      setTestResults(p => ({ ...p, [c.id]: data }));
+      setMessage({
+        ok: !(data.account_settings || {}).error,
+        text: data.applied
+          ? `${data.label}: now points at ${data.applied.broker_code} (${data.applied.is_testnet ? 'testnet/demo' : 'production'}).${data.live_instances?.reloaded ? ` ${data.live_instances.reloaded} running instance(s) reloaded.` : ''}`
+          : 'Could not apply the detected environment.',
+      });
+      load();
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    setBusy(false);
+  };
+
   const refreshConnection = async (id) => {
     setBusy(true); setMessage(null);
     try {
@@ -481,6 +592,9 @@ const BrokerSettings = () => {
                               onToggleKeys={() => (keysFor === c.id ? setKeysFor(null) : startKeys(c))}
                               onSaveKeys={() => saveKeys(c)} onProbe={() => probeConnection(c.id)}
                               probing={probing === c.id} probeResult={probeResults[c.id]}
+                              onTest={() => testConnection(c.id)} testing={testing === c.id}
+                              testResult={testResults[c.id]}
+                              onApplyEnv={(detected) => applyTestedEnvironment(c, detected)}
                               onRefresh={() => refreshConnection(c.id)} onRemove={() => removeConnection(c.id)}
               />
             ))}

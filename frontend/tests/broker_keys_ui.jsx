@@ -98,6 +98,38 @@ check('the check result names both environments and the fix',
   probedText.includes('accepts TESTNET') && probedText.includes('rejects PRODUCTION')
   && probedText.includes('only works on TESTNET'), probedText.slice(0, 300));
 
+// ---- Full connection test (read-only battery) ------------------------------
+// The report a rejected-but-live key actually needs: market data fine, key
+// accepted by Delta Global production while the connection is Delta testnet.
+const tested = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false,
+  onTest: () => {}, testing: false, onApplyEnv: () => {},
+  testResult: {
+    detected: { broker_code: 'DeltaGlobal', testnet: false, name: 'GLOBAL-PRODUCTION',
+                base_url: 'https://api.delta.exchange' },
+    verdict: {
+      ok: false,
+      message: 'Connection test found issues — read the steps above.',
+      problems: ['The connection targets Delta Delta but the key belongs to Delta DeltaGlobal — India and Global keep separate key stores.'],
+      fixes: ['Repoint the connection to DeltaGlobal production (Test connection → Use this environment, or Edit in Broker Settings).'],
+    },
+    steps: [
+      { name: 'market_data', title: 'Public market data (no key needed)', state: 'ok', detail: 'public ticker answered in 12 ms' },
+      { name: 'clock', title: 'Server clock', state: 'ok', detail: 'local clock vs exchange: +0.40s' },
+      { name: 'environment', title: 'Which Delta environment accepts this key?', state: 'ok', detail: 'accepted by GLOBAL-PRODUCTION',
+        rows: [{ name: 'GLOBAL-PRODUCTION', base_url: 'https://api.delta.exchange', state: 'ok', detail: 'wallet balances OK' },
+               { name: 'INDIA-TESTNET', base_url: 'https://cdn-ind.testnet.deltaex.org', state: 'auth', detail: 'invalid_api_key' }] },
+      { name: 'balance', title: 'Account balance', state: 'ok', detail: 'signed call accepted' },
+    ],
+  },
+}));
+const testedText = tested.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ');
+check('the card offers a full connection test next to Check key', tested.includes('Test connection'));
+check('the report explains a key that is live but on the wrong Delta family',
+  testedText.includes('GLOBAL-PRODUCTION') && testedText.includes('separate key stores'));
+check('and offers the one-click repoint for running instances', testedText.includes('Use this environment'));
+check('the check key button remains for quick probes', tested.includes('Check key'));
+
 // ------------------------------------------------------- Instance badges ----
 console.log('\n== live instance: credential state + parked deadman switch ==');
 const rejected = {

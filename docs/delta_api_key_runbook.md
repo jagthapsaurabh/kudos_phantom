@@ -34,29 +34,40 @@ the first minute instead of the first trade.
 
 ## What you have to do
 
-1. **Broker Settings → the connection → Check key.** Two signed pings, one per Delta India
-   environment, and a verdict:
-   * *“accepted by PRODUCTION”* + *“the connection is flagged testnet”* → flip the toggle. That
-     mismatch is the whole bug; the key is fine.
+1. **Broker Settings → the connection → Check key** (quick) or **Test connection** (full
+   read-only battery: market data, clock, all four Delta environments, signed calls, rate quota).
+   The key is signed against **all four** Delta environments, and a verdict:
+   * *“accepted by INDIA-PRODUCTION”* + *“the connection is flagged testnet”* → flip the toggle.
+     That mismatch is the whole bug; the key is fine.
+   * *“accepted by GLOBAL-PRODUCTION / GLOBAL-TESTNET”* → the key lives on **Delta Global**;
+     India and Global keep separate key stores. Use **Use this environment** (or add a
+     connection for **Delta Exchange Global**) — the key is not dead, it is on the other market.
    * *“rejected by every host that answered”* → the key is dead: rotated, deleted, or pasted
      incompletely (Delta keys are long — check the **last** characters). Create a fresh one in the
      panel of the environment you actually trade.
+   * *“knows the key, permission missing”* → the key exists and is on the right environment but
+     lacks an endpoint permission; enable **Read Data / Trading** in API Management.
    * *“unreachable”* → nothing to conclude yet: DNS/SSL/egress on the box, not the key.
-2. **Broker Settings → Replace keys.** Paste key **and** secret (a blank secret keeps the stored
-   one — the API never returns it). Keys are trimmed of whitespace as saved; a newline from a
-   terminal paste is invisible in the UI and is a different key to the venue. Running instances are
-   handed the new key by that same save, and the response says how many took it.
+2. **Broker Settings → Replace keys** (or **Use this environment** from the test report, which
+   changes broker + environment and hands them to running instances in one click). Paste key
+   **and** secret (a blank secret keeps the stored one — the API never returns it). Keys are
+   trimmed of whitespace as saved; a newline from a terminal paste is invisible in the UI and is
+   a different key to the venue. Running instances are handed the new key by that same save, and
+   the response says how many took it.
 3. **Live Trade → Reload keys** on the instance, if you would rather not wait for the next retry
    window. It re-reads and probes immediately; a still-bad key just goes back to holding entries.
 4. Verify: the connection card shows the margin mode read back from the venue (not an error), and
    `GET /live-account/snapshot` returns a non-empty `balance` with `auth_error: null`.
 
-From the command line, the same probe as step 1 (run it **on the trading server** — a key with an IP
-whitelist 401s from any other egress IP, which is indistinguishable from a bad key):
+From the command line, the same battery as step 1 (run it **on the trading server** — a key with an
+IP whitelist 401s from any other egress IP, which is indistinguishable from a bad key):
 
 ```bash
-cd backend && ../.venv/bin/python tools/check_delta_key.py --label "Delta Nishant sir"
-# or:  --api-key KEY  --api-secret SECRET        (exit 0 = some host accepts it, 1 = none does)
+cd backend && ../.venv/bin/python tools/test_connection.py --label "NishKudos"
+# full report, read-only; --apply repoints the saved connection at the detected environment:
+cd backend && ../.venv/bin/python tools/test_connection.py --label "NishKudos" --apply --json
+# quick four-host key check only:
+cd backend && ../.venv/bin/python tools/check_delta_key.py --api-key KEY --api-secret SECRET
 ```
 
 ## Before you rotate a key on an account that is holding a position
@@ -86,11 +97,14 @@ Fixing the key is usually routine, but do it with the position **flat** when you
 
 ## Which environment is which
 
-| | REST host | Keys work on |
-| :--- | :--- | :--- |
-| Delta India **production** | `https://api.india.delta.exchange` | real-money keys from the live panel |
-| Delta India **testnet / demo** | `https://cdn-ind.testnet.deltaex.org` | keys from `demo.delta.exchange` only |
+| | REST host | Keys work on | App broker code |
+| :--- | :--- | :--- | :--- |
+| Delta India **production** | `https://api.india.delta.exchange` | real-money keys from the live panel | `Delta` |
+| Delta India **testnet / demo** | `https://cdn-ind.testnet.deltaex.org` | keys from `demo.delta.exchange` only | `Delta` (testnet ON) |
+| Delta **Global** production | `https://api.delta.exchange` | keys from `global.delta.exchange` / `www.delta.exchange` | `DeltaGlobal` |
+| Delta **Global** testnet / demo | `https://testnet-api.delta.exchange` | keys from `demo-global.delta.exchange` | `DeltaGlobal` (testnet ON) |
 
-The two key stores are separate: a production key on the testnet host and a demo key on production
-both answer `invalid_api_key`, and no amount of re-pasting fixes it — only the environment flag
-does. Delta **global** (`api.delta.exchange`) keys do not work on Delta India at all.
+The four key stores are separate: a production key on a testnet host, a demo key on production, or
+an India key on Global (and the reverse) all answer `invalid_api_key`, and no amount of re-pasting
+fixes it — only pointing the connection at the right environment does. That is why the check
+signs all four hosts before it is allowed to call a key dead.

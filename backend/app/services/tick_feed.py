@@ -474,6 +474,12 @@ def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
     if not venue_kind:
         venue_kind = "binance" if str(source).lower().startswith("binance") else (
             "delta" if "delta" in str(source).lower() else "")
+    # Delta Global's public socket endpoints are not published in the same way
+    # as India's, and its REST ticker is the same public data. Degrade to REST
+    # (still live, still faster than nothing) rather than point at the wrong
+    # venue's socket, whose channels could silently never deliver.
+    if str(getattr(definition, "code", "") or "").lower() == "deltaglobal":
+        venue_kind = "deltaglobal"
     contract = perpetual or symbol
     parser = PARSERS.get(venue_kind)
 
