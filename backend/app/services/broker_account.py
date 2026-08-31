@@ -21,6 +21,7 @@ broker account is always native currency).
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.mark_price import perpetual_symbol
 from app.database.models import BrokerFill, BrokerOrder, SessionLocal
+from app.services.broker_client import is_auth_rejection
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -461,15 +463,10 @@ def portfolio_risk(balance: dict, positions: List[dict]) -> dict:
 # "Invalid API-key"). A key rejected at the auth layer fails every signed
 # endpoint identically, so the snapshot collapses the wall of errors into one
 # verdict the terminal can render as a fix-it banner.
-_AUTH_REJECTION_MARKERS = (
-    "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
-    "api-key format", "-2015", "unauthorized",
-)
-
-
-def _is_auth_rejection(text: Any) -> bool:
-    lowered = str(text or "").lower()
-    return any(marker in lowered for marker in _AUTH_REJECTION_MARKERS)
+# The marker list lives with the client (it is what latches the credential
+# backoff); re-exported here so the snapshot verdict and the worker agree on
+# what "the key is bad" means.
+_is_auth_rejection = is_auth_rejection
 
 
 def _auth_error_verdict(source: str, errors: Dict[str, str],
@@ -493,9 +490,11 @@ def _auth_error_verdict(source: str, errors: Dict[str, str],
         f"({texts[0]}). The key does not work on the environment this "
         "connection points at: it was regenerated or revoked, pasted "
         "incompletely, or it is a production key on a testnet connection "
-        "(or the reverse). Update the key in Broker Settings — and restart "
-        "any running live-trade instance afterwards, because instances "
-        "read credentials once, at start."
+        "(or the reverse). Replace the key on this connection in Broker "
+        "Settings — 'Check key' there says which environment accepts it — "
+        "and running live instances re-read the saved credentials by "
+        "themselves (or use 'Reload keys' on the instance), so a key fix "
+        "no longer needs a restart."
     )
 
 
@@ -615,6 +614,117 @@ def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = Tr
         "rate_limits": client.rate_limit_usage(),
         "fetched_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Credential reload
+# ---------------------------------------------------------------------------
+def _connection_is_active(row) -> bool:
+    """``NULL`` counts as active: rows inserted outside SQLAlchemy never got
+    the column default, and treating them as switched off would hide a key the
+    operator can clearly see in the UI."""
+    return bool(getattr(row, "is_active", None) in (None, 1, True))
+
+
+def broker_code_aliases(broker_code: Any) -> List[str]:
+    """Every spelling of this venue that a saved row may carry.
+
+    Connections are stored under the canonical registry code, but hand-edited
+    and seeded rows have used the display name (``Delta Exchange``) — a reload
+    that only matched the exact code would silently keep trading on stale keys.
+    """
+    code = str(broker_code or "").strip()
+    full = {"delta": "Delta Exchange", "binance": "Binance Futures"}
+    bare = {"delta": "Delta", "binance": "Binance"}
+    lowered = code.lower()
+    out = [code]
+    for name in (bare.get(lowered), full.get(lowered), code.title()):
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def credential_fingerprint(api_key: str, api_secret: str) -> str:
+    """Stable, non-reversible fingerprint of one key/secret pair.
+
+    A reload has to distinguish "the operator saved a different key" from "same
+    key, still rejected" — which decides whether to swap the client or just keep
+    probing — without the secret itself ever being compared, logged or returned.
+    """
+    return hashlib.sha256(f"{api_key or ''}|{api_secret or ''}".encode()).hexdigest()[:8]
+
+
+def saved_credentials(user_id: Optional[int], broker_code: str,
+                      connection_id: Optional[int] = None) -> Dict[str, Any]:
+    """The key material a running instance *should* be using right now.
+
+    An instance builds its ``BrokerClient`` once, at start, so a key replaced in
+    Broker Settings is invisible to it until somebody re-reads this. Resolution
+    mirrors the API's own: the saved connection (``connection_id`` wins when the
+    instance was started against a specific one), else the legacy per-account
+    keys. Never raises — "nothing to reload" comes back as an ``error`` so the
+    worker keeps the client it has instead of trading with no credentials.
+    """
+    out = {"api_key": None, "api_secret": None, "passphrase": None,
+           "is_testnet": False, "connection_id": None, "label": None,
+           "source": "none", "error": "no database session"}
+    try:
+        from app.database.models import BrokerConnection, User
+        db = SessionLocal()
+        try:
+            row = None
+            if connection_id is not None:
+                row = db.query(BrokerConnection).filter(
+                    BrokerConnection.id == int(connection_id)).first()
+                if row is None:
+                    out["error"] = (f"broker connection #{connection_id} no longer exists — "
+                                    "this instance keeps the credentials it started with")
+                    return out
+                if not _connection_is_active(row):
+                    # Switching a connection off must not silently re-point a
+                    # running strategy at it; keep the status quo and say so.
+                    out["error"] = (f"the connection '{row.label or row.broker_code}' is switched "
+                                    "off — this instance keeps the credentials it started with")
+                    return out
+            if row is None and user_id is not None:
+                rows = db.query(BrokerConnection).filter(
+                    BrokerConnection.user_id == int(user_id),
+                    BrokerConnection.broker_code.in_(broker_code_aliases(broker_code))
+                ).order_by(BrokerConnection.created_at).all()
+                row = next((r for r in rows if r.api_key and r.api_secret
+                            and _connection_is_active(r)), None)
+                if row is None and rows:
+                    out["error"] = ("the saved connection has no usable key/secret or is "
+                                    "switched off — nothing to reload")
+                    return out
+            if row is not None:
+                return {
+                    "api_key": row.api_key, "api_secret": row.api_secret,
+                    "passphrase": getattr(row, "passphrase", None) or None,
+                    "is_testnet": bool(getattr(row, "is_testnet", 0)),
+                    "connection_id": row.id,
+                    "label": getattr(row, "label", None) or row.broker_code,
+                    "source": "connection", "error": None,
+                }
+            if user_id is not None:
+                user = db.query(User).filter(User.id == int(user_id)).first()
+                if user is not None and (user.broker_name or "Binance") == broker_code \
+                        and user.api_key and user.api_secret:
+                    return {
+                        "api_key": user.api_key, "api_secret": user.api_secret,
+                        "passphrase": None,
+                        "is_testnet": None,   # legacy keys carry no environment flag
+                        "connection_id": None,
+                        "label": "Legacy account", "source": "legacy_user", "error": None,
+                    }
+            out["error"] = (f"no {broker_code} connection saved on this login to reload — "
+                             "add or replace the key in Broker Settings")
+            return out
+        finally:
+            db.close()
+    except Exception as exc:
+        out["error"] = f"credential reload failed: {exc.__class__.__name__}: {exc}"
+        return out
 
 
 # ---------------------------------------------------------------------------

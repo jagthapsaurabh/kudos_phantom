@@ -42,6 +42,20 @@ export const FeedBadge = ({ feed }) => {
 // net is up when it is not.
 export const HeartbeatBadge = ({ heartbeat }) => {
   if (!heartbeat) return null;
+  // Parked on purpose (a rejected API key is the usual reason): the ack cannot
+  // land, and saying DEADMAN HELD instead of HEARTBEAT FAIL is the difference
+  // between "fix the key" and "the safety net broke". `created` staying true is
+  // what keeps the resting stop-loss / take-profit legs protecting the position.
+  if (heartbeat.stood_down) {
+    return (
+      <span className="rounded border border-amber-800/60 bg-amber-900/20 px-1.5 py-0.5 text-[9px] font-bold text-amber-300"
+            title={`Deadman switch is parked, not broken${heartbeat.stood_down_reason ? `: ${heartbeat.stood_down_reason}` : ''}. `
+                   + 'Acks resume automatically once the venue accepts the key again. '
+                   + `${heartbeat.created ? 'It stays registered venue-side, so its cancel_orders action is intact.' : 'Never armed — nothing was created while the key was rejected.'}`}>
+        DEADMAN HELD
+      </span>
+    );
+  }
   if (!heartbeat.enabled && !heartbeat.created) return null;
   const stale = heartbeat.stale || heartbeat.failures > 0;
   const label = stale ? 'HEARTBEAT FAIL' : 'DEADMAN ON';
@@ -50,13 +64,54 @@ export const HeartbeatBadge = ({ heartbeat }) => {
       + ` Open orders will be cancelled if the exchange does not hear from us.`
       + `${heartbeat.last_error ? `\nLast error: ${heartbeat.last_error}` : ''}`
     : `Deadman switch alive — ${heartbeat.acks} acks, TTL ${heartbeat.ttl_ms}ms.`
-      + ` Missed beat cancels open orders on ${ (heartbeat.product_symbols || []).join(', ') || 'the contract' }.`;
+      + ` Missed beat cancels open orders on ${ (heartbeat.product_symbols || []).join(', ') || 'the contract' }`
+      + `${heartbeat.skipped_acks ? `. ${heartbeat.skipped_acks} acks skipped while the key was rejected` : ''}.`;
   return (
     <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
         stale ? 'border-red-800/60 bg-red-900/20 text-red-300'
               : 'border-cyan-800/60 bg-cyan-900/20 text-cyan-300'}`}
           title={title}>
       {label}
+    </span>
+  );
+};
+
+// ---------- Credential badge ----------
+// The failure this badge exists for is the quiet one: every signed call answers
+// invalid_api_key while the public candles keep streaming, so the instance is
+// "running", the chart is moving, and nothing trades. The worker holds entries
+// and re-reads its saved connection on a backoff, which is a state the operator
+// has to be able to see — and act on without restarting the process.
+export const CredentialsBadge = ({ credentials, onReload, busy }) => {
+  const creds = credentials || {};
+  const rejected = creds.state === 'rejected';
+  const suspect = creds.state === 'suspect';
+  if (!rejected && !suspect) return null;
+  const wait = Number(creds.retry_in_seconds || 0);
+  const label = rejected ? 'KEY REJECTED' : 'KEY SUSPECT';
+  const title = rejected
+    ? `The venue rejects this API key on every signed call (${creds.error || 'no error text'}). `
+      + `New entries are held; positions already open keep being marked to market. `
+      + `It re-reads the key saved in Broker Settings in ${wait.toFixed(0)}s `
+      + `(${creds.entries_held || 0} tick${creds.entries_held === 1 ? '' : 's'} held so far, `
+      + `${creds.reloads || 0} reloads).${creds.environment === 'testnet' ? ' This connection points at the TESTNET — a production key 401s here.' : ''}`
+    : `One signed call was rejected (${creds.error || ''}) but the account still answers — `
+      + 'often a key permission on one endpoint, not a dead key.';
+  return (
+    <span className="flex items-center gap-1">
+      <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+          rejected ? 'border-red-800/60 bg-red-900/20 text-red-300'
+                   : 'border-amber-800/60 bg-amber-900/20 text-amber-300'}`}
+            title={title}>
+        {label}
+      </span>
+      {rejected && onReload && (
+        <button onClick={onReload} disabled={busy}
+                className="rounded border border-red-800/60 bg-red-900/20 px-1.5 py-0.5 text-[9px] font-bold text-red-300 transition hover:bg-red-900/40 disabled:opacity-40"
+                title="Re-read the key saved on this connection now instead of waiting for the next retry">
+          {busy ? 'Reloading…' : 'Reload keys'}
+        </button>
+      )}
     </span>
   );
 };
@@ -175,6 +230,32 @@ const LiveTrade = () => {
   };
 
   const requestStop = (instanceKey) => setConfirm({ instanceKey });
+
+  // Reload one instance's saved broker credentials without restarting it. The
+  // worker re-reads its connection row, swaps the client, and resumes on the
+  // next tick; this just skips the backoff wait after a key is fixed.
+  const [reloading, setReloading] = useState(null);
+  const [reloadNote, setReloadNote] = useState(null);
+  const reloadKeys = async (instanceKey) => {
+    setReloading(instanceKey); setReloadNote(null);
+    try {
+      const res = await fetch(`${API_URL}/live-trade/reload-credentials`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instance_key: instanceKey }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not reload credentials');
+      const state = (data.credentials || {}).state || 'unknown';
+      setReloadNote({ ok: state === 'ok',
+                      text: state === 'ok'
+                        ? `${instanceKey.split('_').pop()}: key accepted again — entries resume on the next tick.`
+                        : `${instanceKey.split('_').pop()}: still rejected (${data.credentials?.error || data.reason || 'no error'}). `
+                          + 'Replace the key on the connection in Broker Settings.' });
+      fetchStatus();
+    } catch (e) { setReloadNote({ ok: false, text: e.message }); }
+    setReloading(null);
+  };
 
   const stopTrade = async () => {
     if (!confirm) return;
@@ -438,7 +519,17 @@ const LiveTrade = () => {
                         shared={inst.shared_account}
                       />
                       <FeedBadge feed={inst.price_feed} />
+                      <CredentialsBadge credentials={inst.credentials}
+                                          busy={reloading === inst.instance_key}
+                                          onReload={() => reloadKeys(inst.instance_key)} />
                     </div>
+                    {inst.credentials && inst.credentials.state === 'rejected' && (
+                      <div className="mt-1 text-[9px] leading-snug text-red-300/90">
+                        {inst.credentials.entries_held || 0} entries held · deadman switch stood down ·
+                        re-reads the saved key in {Math.round(inst.credentials.retry_in_seconds || 0)}s —
+                        fix it in <a href="/broker" className="underline">Broker Settings</a>
+                      </div>
+                    )}
                   </div>
                   <button onClick={() => requestStop(inst.instance_key)} className="text-red-400 hover:text-red-300 p-1" title="Stop instance">
                     <StopCircle size={16} />
@@ -447,6 +538,11 @@ const LiveTrade = () => {
               ))}
               {myInstances.length === 0 && <p className="text-xs text-gray-500 text-center">No active instances for this strategy.</p>}
             </div>
+            {reloadNote && (
+              <p className={`mt-2 text-[10px] font-semibold ${reloadNote.ok ? 'text-green-400' : 'text-red-400'}`}>
+                {reloadNote.text}
+              </p>
+            )}
           </div>
         </div>
 

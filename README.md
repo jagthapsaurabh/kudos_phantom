@@ -179,6 +179,40 @@ entry, every saved connection (stored vs resolved code, masked key, secret prese
 testnet), a `ready` flag and a plain-language `problems` list. **Broker Settings** renders it as a
 *Ready to trade* / *Not ready* panel so the cause is visible without reading the database.
 
+### A key the venue rejects (and what the app does about it)
+
+`Delta HTTP 401: {"code": "invalid_api_key"}` on every signed call while the candles keep streaming
+is the failure mode this tool took hardest: public market data is unsigned, so a dead key left a
+live instance looking healthy — `is_running: true`, chart moving, no orders — while spending its
+fixed 5-minute weight budget on ~40 calls/minute that could only ever be rejected. The handling is
+now a state, not a wall of identical errors:
+
+* **Detection** — `BrokerClient` tallies consecutive signed-call rejections (`AUTH_REJECTION_MARKERS`).
+  Two in a row with nothing accepted between is `state: "rejected"`; one alone is `"suspect"`, because
+  a sub-account key that cannot list the parent's accounts 401s on `/v2/sub_accounts` only and is
+  otherwise perfectly tradeable. Any accepted signed call clears it, and a transport failure neither
+  adds nor clears — “the box could not reach the venue” says nothing about a key.
+* **Holding** — a live instance on a rejected key places no orders and holds new entries
+  (`entries_held`), while open positions keep being marked to market from public data. The client
+  only *reports*; refusing calls stays the caller's decision, so a per-request terminal poll still
+  gets the venue's real error in every panel.
+* **Standing down** — the Delta deadman switch cannot ack what it cannot sign, so it is parked with
+  one graceful `ttl=0` ("planned pause, not a crash") instead of a failure every 25 s. The exchange
+  therefore does not cancel the resting stop-loss / take-profit legs, and the switch re-arms itself
+  on the first accepted call.
+* **Recovery, no restart** — on each backoff window (5 s → 5 min) the instance re-reads its saved
+  connection and, when the key material changed, swaps the client along with the account it queues
+  on, its rate-limit budget and its heartbeat. `PUT /broker-connections/{id}` pushes the same swap to
+  every instance trading on that connection and reports how many took it; `POST
+  /live-trade/reload-credentials` forces one instance to re-read now. Both are on the UI: **Replace
+  keys** on the connection card, **Reload keys** on the instance.
+* **Diagnosis in place** — `POST /broker-connections/{id}/probe` (**Check key**) signs one
+  `GET /v2/wallet/balances` against *both* Delta India hosts and says which one accepts the key, so
+  "production key on a testnet connection" is answered with a toggle instead of a new key. Same code
+  as `tools/check_delta_key.py`, run from the server when the key is IP-whitelisted.
+
+The operator-facing version of this page is **[docs/delta_api_key_runbook.md](docs/delta_api_key_runbook.md)**.
+
 **Broker rate limits** (the ~20 req/s figure is a safe default, not a hard venue cap):
 
 | Venue | Documented limit | Enforced |
@@ -361,19 +395,21 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 cd backend
 python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 python test_atr_regime_op.py      # 32 checks: per-side ATR operator
-python test_paper_history.py      # 56 checks: paper history persistence
+python test_paper_history.py      # 63 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_seed_repair.py        # 57 checks: full-history seed + corrupt-candle repair
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
-python test_live_account.py       # 144 checks: rate limits, order lifecycle, terminal schema, live API
+python test_live_account.py       # 166 checks: rate limits, order lifecycle, terminal schema, live API
 python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
-python test_broker_connections.py # 37 checks: which saved credentials a live call uses, and why not
-python test_multi_instance_live.py # 92 checks: 3-4 live strategies sharing one broker account
+python test_broker_connections.py # 40 checks: which saved credentials a live call uses, and why not
+python test_delta_key_recovery.py # 73 checks: rejected API key — hold entries, park the deadman switch, reload credentials
+python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one broker account
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 289 checks: trade-log table + CSV export, trading windows, page smoke, live terminal
+cd frontend && npm test            # 345 checks: trade-log table + CSV export, trading windows, page
+                                   # smoke, live terminal, broker key replacement + credential badges
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

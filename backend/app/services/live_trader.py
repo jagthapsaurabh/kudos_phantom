@@ -1,7 +1,7 @@
 import asyncio
 import hashlib
 import time
-from typing import Dict
+from typing import Any, Dict
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -11,7 +11,7 @@ from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.paper_trader import _to_ist
-from app.services.broker_client import BrokerClient
+from app.services.broker_client import BrokerClient, is_auth_rejection
 from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
 from app.core.indicators import compute_indicators
@@ -239,7 +239,7 @@ class LiveTradeService:
                  definition=None, trading_windows=None, use_mark_price=None,
                  user_id=None, instance_key=None, bracket_orders=True,
                  price_feed="off", tick_interval=5.0, account_label=None,
-                 heartbeat=None):
+                 heartbeat=None, connection_id=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
         self.market_source = broker_name or "Binance"
@@ -306,6 +306,23 @@ class LiveTradeService:
         # "Primary"). With 3-4 runs on 3-4 sub-accounts this is the only way to
         # tell from the UI which instance is trading which account.
         self.account_label = account_label or "Primary"
+        # Which saved connection those credentials came from. A key replaced in
+        # Broker Settings is re-read through this id, so the instance adopts it
+        # without a restart — see :meth:`reload_credentials`.
+        self.connection_id = connection_id
+        # ---- Credential degradation ---------------------------------------
+        # "Every signed call 401s" is not a normal error: public market data
+        # keeps ticking, so the run *looks* alive while it cannot see or touch
+        # the account. Tracked here so the status API, the terminal and the
+        # heartbeat all say the same thing about it.
+        self.credentials_state = "ok"
+        self.credentials_error = None
+        self.credentials_since = None
+        self.entries_held_credentials = 0
+        self.credential_reloads = 0
+        self.credential_reload_result = None
+        self._credentials_notice = None
+        self.heartbeat_stood_down = False
         # Order ids of the stop-loss / take-profit legs this instance placed.
         # Exiting cancels exactly these and nothing else on the account.
         self.protection_leg_ids = []
@@ -359,6 +376,209 @@ class LiveTradeService:
         self.wallet_balance = None
         self._last_closed_candle = None
 
+    # ------------------------------------------------------------------
+    # Credentials: reject → hold → reload → resume
+    # ------------------------------------------------------------------
+    def _credential_health(self) -> dict:
+        """What the broker client thinks of this instance's key right now."""
+        try:
+            health = self.broker.credential_health()
+        except Exception:
+            health = {}
+        return health if isinstance(health, dict) else {}
+
+    def _credential_probe(self) -> dict:
+        """One signed call that settles whether the key works now.
+
+        Deliberately the wallet balance — the key ping the Delta changelog
+        (19.08.26) points at once ``/v2/profile`` stopped accepting API keys.
+        A success also clears the client's latch, which is what un-parks the
+        signed calls this instance needs.
+        """
+        try:
+            payload = self.broker.get_account_balance()
+        except Exception as exc:
+            payload = {"error": f"{exc.__class__.__name__}: {exc}"}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return {"verified": error is None, "error": str(error)[:300] if error else None}
+
+    def reload_credentials(self, force: bool = False, probe: bool = True) -> dict:
+        """Re-read this instance's saved connection and swap it in.
+
+        The venue account is the identity of everything the worker is keyed by —
+        which position it may hold (the shared-account coordinator), the
+        deadman switch, the rate-limit budget — so a swap has to move all three
+        together. If the saved key turns out to be byte-identical to the one in
+        use the client is left alone; the probe is still worth running, because a
+        key re-enabled or re-typed in the exchange's own panel changes without
+        anything changing here.
+        """
+        from app.services.broker_account import credential_fingerprint, saved_credentials
+
+        creds = saved_credentials(self.user_id, self.broker_name, self.connection_id)
+        out: Dict[str, Any] = {"reloaded": False, "reason": None, "source": creds.get("source"),
+                               "connection_id": creds.get("connection_id"),
+                               "label": creds.get("label")}
+        fingerprint = ""
+        if creds.get("api_key") and creds.get("api_secret"):
+            fingerprint = credential_fingerprint(creds["api_key"], creds["api_secret"])
+        out["fingerprint"] = fingerprint or None
+        if creds.get("error"):
+            out["reason"] = creds["error"]
+        elif fingerprint and fingerprint == self.broker.key_fingerprint and not force:
+            out["reason"] = "saved credentials are the ones already in use"
+        elif not (creds.get("api_key") and creds.get("api_secret")):
+            out["reason"] = "no complete key/secret pair saved on this connection"
+        else:
+            before = COORDINATOR.siblings(self)
+            COORDINATOR.unregister(self)
+            testnet = bool(creds["is_testnet"]) if creds.get("is_testnet") is not None \
+                else bool(getattr(self.broker, "testnet", False))
+            self.broker = BrokerClient(creds["api_key"], creds["api_secret"], self.broker_name,
+                                       creds.get("passphrase") or "", testnet, self.definition)
+            self.account_id = account_key(self.broker_name, creds["api_key"])
+            if creds.get("connection_id") is not None:
+                self.connection_id = creds["connection_id"]
+            if creds.get("label"):
+                self.account_label = creds["label"]
+            # The switch talks through the client, so it has to be re-pointed
+            # before anything tries to ack with it.
+            if self.heartbeat is not None:
+                self.heartbeat.client = self.broker
+            COORDINATOR.register(self)
+            self.credential_reloads += 1
+            out["reloaded"] = True
+            out["reason"] = (f"swapped in the credentials saved on connection "
+                             f"'{self.account_label}'")
+            out["siblings"] = len(COORDINATOR.siblings(self))
+            out["siblings_changed"] = len(before) != out["siblings"]
+            print(f"🔑 [{self.strategy_id}] credentials reloaded from {creds.get('source')} "
+                  f"'{self.account_label}' (key {fingerprint[:4]}…, {out['reason']})")
+        if probe:
+            out.update(self._credential_probe())
+            if out.get("verified"):
+                if self.last_order_error and is_auth_rejection(self.last_order_error):
+                    self.last_order_error = None
+        out["credentials"] = self.credentials_status()
+        return out
+
+    def credentials_status(self) -> dict:
+        """Credential block for ``/live-trade/status`` and the reload endpoint."""
+        health = self._credential_health()
+        # One rejection that the next call disproves stays a warning: the UI
+        # says "suspect" instead of announcing a dead key over a single
+        # endpoint-level permission error.
+        state = ("rejected" if self.credentials_state == "rejected"
+                 else "suspect" if health.get("state") == "suspect" else "ok")
+        return {
+            "state": state,
+            "error": self.credentials_error or health.get("error"),
+            "since": self.credentials_since or health.get("rejected_at"),
+            "environment": health.get("environment"),
+            "base_url": health.get("base_url"),
+            "key": getattr(self.broker, "key_fingerprint", None),
+            "connection_id": self.connection_id,
+            "connection_label": self.account_label,
+            "rejections": int(health.get("consecutive_rejections") or 0),
+            "retry_in_seconds": health.get("retry_in_seconds", 0),
+            "entries_held": int(self.entries_held_credentials or 0),
+            "reloads": int(self.credential_reloads or 0),
+            "last_reload": self.credential_reload_result,
+            "heartbeat_stood_down": bool(getattr(self.heartbeat, "stood_down", False))
+                                     if self.heartbeat is not None else False,
+        }
+
+    async def _hold_for_credentials(self) -> bool:
+        """True when this tick must not trade because the venue rejects the key.
+
+        Entry decisions need the account: the position check, the margin maths
+        and the bracket legs are all signed calls. So while the key is rejected
+        the worker marks positions to market off public data (still useful, and
+        it costs no quota), holds every new entry, parks the deadman switch
+        instead of racking up a failure every 25 seconds, and reloads the saved
+        credentials on each backoff window — which is how a replaced key takes
+        effect without restarting the process.
+        """
+        health = self._credential_health()
+        if health.get("state") != "rejected":
+            if self.credentials_state == "rejected":
+                await self.credentials_recovered()
+            return False
+
+        changed = self.credentials_state != "rejected"
+        self.credentials_state = "rejected"
+        self.credentials_error = health.get("error")
+        self.credentials_since = health.get("rejected_at") or self.credentials_since
+        self.entries_held_credentials += 1
+        await self._stand_down_heartbeat()
+
+        notice = f"{self.credentials_error}"
+        if changed or notice != self._credentials_notice:
+            wait_for = float(health.get("retry_in_seconds") or 0.0)
+            print(f"🔒 [{self.strategy_id}] {self.broker_name} rejected the API key "
+                  f"({self.credentials_error}) — new entries held, deadman switch stood down, "
+                  f"re-reading saved credentials in {wait_for:.0f}s")
+            self._credentials_notice = notice
+
+        if float(health.get("retry_in_seconds") or 0.0) > 0:
+            # Inside the backoff window: skip the signed work of this tick
+            # entirely (candles and the mark price above are public, so the
+            # position book stays current) and count it, not send it.
+            self._note_held_calls(health)
+            return True
+        result = self.reload_credentials(force=False)
+        self.credential_reload_result = {k: v for k, v in result.items()
+                                        if k not in ("credentials",)}
+        if result.get("verified"):
+            await self.credentials_recovered()
+            return False
+        self._note_held_calls(self._credential_health())
+        return True
+
+    def _note_held_calls(self, health: dict) -> None:
+        """Record the signed calls this tick skipped because of the key.
+
+        Without a counter here, "0 requests this minute" after a fix looks like
+        the strategy stopped trading; with it, the number says exactly how much
+        quota the dead key would otherwise have spent.
+        """
+        note = health.get("error") or "API key rejected"
+        try:
+            self.broker.note_signed_call_held(note)
+        except Exception:
+            pass
+
+    async def _stand_down_heartbeat(self) -> None:
+        """Park the ack loop while the account cannot be reached."""
+        if self.heartbeat is None or self.heartbeat.stood_down:
+            return
+        try:
+            await self.heartbeat.stand_down(
+                f"{self.broker_name} rejected the API key — acks could not land")
+            self.heartbeat_stood_down = True
+            print(f"⏸ [{self.strategy_id}] deadman switch stood down (not a crash): "
+                  f"resting orders keep their venue-side protection")
+        except Exception as exc:
+            print(f"[{self.strategy_id}] could not stand down the heartbeat: {exc}")
+
+    async def credentials_recovered(self) -> None:
+        """Come back up: resume acks, clear the degraded state, log it once."""
+        was_degraded = self.credentials_state == "rejected"
+        self.credentials_state = "ok"
+        self.credentials_error = None
+        self.credentials_since = None
+        self._credentials_notice = None
+        if self.heartbeat is not None and getattr(self.heartbeat, "stood_down", False):
+            try:
+                await self.heartbeat.resume()
+                self.heartbeat_stood_down = False
+            except Exception as exc:
+                print(f"[{self.strategy_id}] could not resume the heartbeat: {exc}")
+        if was_degraded:
+            held = int(self.entries_held_credentials or 0)
+            print(f"🔓 [{self.strategy_id}] credentials accepted again on {self.broker_name} — "
+                  f"entries resume (held back: {held} tick{'s' if held != 1 else ''})")
+
     async def start(self):
         self.is_running = True
         COORDINATOR.register(self)
@@ -379,13 +599,39 @@ class LiveTradeService:
             print("   Environment: TESTNET (demo.delta.exchange / testnet.binancefuture.com)")
         # ① Products API warmup (tick size, margin, lot size) + wallet.
         self._warmup()
+        # The wallet read above is the first signed call of the run, so a key
+        # that is already dead is known here — say so at start instead of
+        # letting the first tick explain it in the log.
+        if self._credential_health().get("state") == "rejected":
+            health = self._credential_health()
+            self.credentials_state = "rejected"
+            self.credentials_error = health.get("error")
+            self.credentials_since = health.get("rejected_at")
+            print(f"🔒 [{self.strategy_id}] {self.broker_name} rejected these API keys at "
+                  f"startup ({self.credentials_error}). Candles and mark price keep "
+                  f"running, but no order goes out and entries are held until a key "
+                  f"this environment accepts is saved (Broker Settings → Replace keys).")
         # ⚠ Heartbeat / Deadman Switch — parallel to the whole flow.
         if self.heartbeat_enabled and self._is_delta():
-            hid = f"phantom_{str(self.instance_key or self.strategy_id)[-24:]}"
-            self.heartbeat = DeadmanSwitch(
-                self.broker, hid, product_symbols=[self.contract_symbol])
-            await self.heartbeat.start()
-            print(f"   Deadman switch: ON · heartbeat {hid} · cancel_orders on 1 missed beat")
+            if self.credentials_state == "rejected":
+                # Creating it would fail and then rack up an ack failure every
+                # 25s forever; the switch is armed on the first accepted call.
+                self.heartbeat = DeadmanSwitch(
+                    self.broker, f"phantom_{str(self.instance_key or self.strategy_id)[-24:]}",
+                    product_symbols=[self.contract_symbol])
+                # Marked as deliberately parked, so the UI reads "stood down"
+                # rather than a stale-switch alarm for something never armed.
+                self.heartbeat.stood_down = True
+                self.heartbeat.stood_down_reason = "not armed: credentials rejected"
+                self.heartbeat_stood_down = True
+                print("   Deadman switch: HELD (credentials rejected — armed once a signed "
+                      "call is accepted)")
+            else:
+                hid = f"phantom_{str(self.instance_key or self.strategy_id)[-24:]}"
+                self.heartbeat = DeadmanSwitch(
+                    self.broker, hid, product_symbols=[self.contract_symbol])
+                await self.heartbeat.start()
+                print(f"   Deadman switch: ON · heartbeat {hid} · cancel_orders on 1 missed beat")
         else:
             print("   Deadman switch: off")
         try:
@@ -575,6 +821,14 @@ class LiveTradeService:
         # ---- Manage open positions ------------------------------------
         self._manage_open_positions(decision_price, current_atr, current_time,
                                     trade_price, mark_price, new_bar)
+
+        # ---- Credentials gate ------------------------------------------
+        # Public data (candles, mark price) is what the lines above needed, and
+        # it still works with a dead key. Everything below this point trades, so
+        # it needs the account — hold it, and use the wait to re-read whatever
+        # key is saved now instead of the one loaded at start.
+        if await self._hold_for_credentials():
+            return
 
         # "Skip new trades" schedule. A position already open keeps being
         # managed above — only a NEW entry is refused.
