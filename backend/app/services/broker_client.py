@@ -310,7 +310,7 @@ class BrokerClient:
         """String form of a limit price, or None when it must not be sent.
 
         Changelog 15.04.26: any ``limit_price`` ≤ 0 is rejected. If the field
-        is not required, omit it (do not send 0 / empty / \"None\").
+        is not required, omit it (do not send 0 / empty / "None").
         """
         number = BrokerClient._f(price)
         if number is None or number <= 0:
