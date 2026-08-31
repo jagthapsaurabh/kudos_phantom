@@ -47,11 +47,30 @@ DATABASE_URL=sqlite:///./trading_system.db
 # psycopg2 driver — already in requirements.txt):
 # DATABASE_URL=postgresql://user:pass@host:5432/dbname
 SECRET_KEY=phantom_secret_key_2026_xyz
+# Encrypts every API secret at rest with AES-256-GCM (see
+# backend/app/core/secrets.py). Generate once and keep it in a secrets
+# manager / server env — never in the database and never in git:
+#   python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"
+# Without it the app runs in plaintext developer mode; rows saved while it is
+# set cannot be decrypted without the SAME key, so back it up before rotating.
+SECRETS_ENCRYPTION_KEY=
 CORS_ORIGINS=http://your_server_ip:5173,http://your_server_ip
 CONVERSION_RATE=85.0
 TAKER_FEE_BPS=5.9
 MAKER_FEE_BPS=2.36
 ```
+
+> 🔐 **Live-trading network requirements** (per Delta's integration guidance):
+> * Serve the app over **HTTPS** (frontend → backend and backend → Delta are
+>   already TLS; terminate with Nginx/Caddy and proxy `/api` to port 8001).
+> * The **server's outbound IP** is what Delta whitelists — use a **static IP**
+>   on the VPS (IP *ranges* are not supported, and a dynamic IP will break
+>   order management when it changes). Whitelist that IP on **every API key**
+>   you use, including sub-account keys — the whitelist is per key, not per
+>   account.
+> * **API secrets are encrypted at rest** (`SECRETS_ENCRYPTION_KEY` above); the
+>   secret is decrypted only in memory at signing time and is never returned by
+>   the API or shipped to the browser.
 
 ### 3. Database Setup (CRITICAL)
 The system now includes a Factory Reset tool to ensure the database is perfectly seeded from CSVs.

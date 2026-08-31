@@ -74,7 +74,12 @@ def creds_from_db(label: str):
         if row is None:
             names = ", ".join(sorted({r.label or r.broker_code for r in rows})) or "none"
             raise SystemExit(f"no Delta connection labelled {label!r}. Saved: {names}")
-        return row.api_key, row.api_secret, bool(row.is_testnet), row
+        from app.core.secrets import decrypt_secret, SecretDecryptionError
+        try:
+            secret = decrypt_secret(row.api_secret)
+        except SecretDecryptionError as exc:
+            raise SystemExit(str(exc))
+        return row.api_key, secret, bool(row.is_testnet), row
     finally:
         db.close()
 

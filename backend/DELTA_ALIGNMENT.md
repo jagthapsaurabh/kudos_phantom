@@ -37,6 +37,23 @@ align actions below repoint saved connections at it **without needing the
 stored key to pass a probe first** (the probe-detection flow needs the venue to
 accept the key; a freshly created key proves itself on the next signed call).
 
+### Secrets at rest (per Delta's architecture guidance)
+
+* Signing happens **only** in the Python backend; the React frontend never sees
+  the API secret in any form — it talks to `/broker-connections`, `/live-*` and
+  the terminal endpoints with its own JWT, and every secret-holding response
+  returns `has_secret` / a masked key instead of secret material.
+* `app/core/secrets.py` encrypts the `api_secret` at rest with **AES-256-GCM**
+  (`enc:v1:` envelope) using `SECRETS_ENCRYPTION_KEY` from the environment
+  (32-byte base64). Rows written before encryption pass through and are
+  re-encrypted on the next save; decryption happens only in memory at signing
+  time (`_live_client`, connection probe/test, `saved_credentials`, the CLI
+  tools). A missing/rotated key fails loud (`SecretDecryptionError`) and live
+  instances fail secure — they keep the credentials they started with.
+* IP whitelisting is **per API key** (main and sub-account keys separately);
+  the server's static egress IP must be on every key in use, and the probe
+  runs from the trading box for exactly that reason.
+
 * UI: Broker Settings → the connection → **Align to India production** (or
   **Align all to India production** on the Saved connections header).
 * API: `POST /broker-connections/{id}/align {"environment":"INDIA_PRODUCTION"}`
@@ -158,6 +175,11 @@ accept the key; a freshly created key proves itself on the next signed call).
   (`BrokerClient.DELTA_FAMILY_RULE`), the CLI refuses Global targets, and Broker Settings shows the
   rule on Global/testnet rows + the Add-connection form. The read-only four-host probe still
   *reports* Global keys (so the operator re-creates the key on India) without ever trading there.
+- **Secrets encrypted at rest (2026-08-31).** AES-256-GCM via `app/core/secrets.py` +
+  `SECRETS_ENCRYPTION_KEY`; `GET /broker-settings` no longer returns even the masked secret
+  (`has_secret` instead); decrypt-only-at-signing across `_live_client`, probe/test endpoints,
+  `saved_credentials` and the CLI tools; `cryptography` added to requirements. Tests:
+  `test_secret_encryption.py` (22 checks, offline) + full backend/frontend sweep green.
   Tests: `test_delta_env_align.py` (41 checks, offline) + `broker_keys_ui` align/rule checks; the
   auth verdict in `broker_account.account_snapshot` names Check key / Test connection / Align as
   the three fix paths.

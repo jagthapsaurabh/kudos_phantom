@@ -162,3 +162,21 @@ The four key stores are separate: a production key on a testnet host, a demo key
 an India key on Global (and the reverse) all answer `invalid_api_key`, and no amount of re-pasting
 fixes it — only pointing the connection at the right environment does. That is why the check
 signs all four hosts before it is allowed to call a key dead.
+
+## Credentials & IP whitelisting (per Delta's integration guidance)
+
+* **Signing happens only on the backend.** The React app talks to this server's own endpoints with
+  its own login token; the API secret is decrypted in memory at signing time and is never returned
+  by the API (responses carry `has_secret` and a masked key), never logged, and never shipped to
+  the browser. Secrets are encrypted at rest with AES-256-GCM
+  (`SECRETS_ENCRYPTION_KEY` in the server environment — generate with
+  `python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"` and keep the
+  same key across restarts/rotations).
+* **IP whitelisting is per API key.** The trading server's outbound IP must be on the whitelist of
+  *every* key in use — the main-account key and any sub-account key separately; a sub-account key
+  whose own whitelist is empty still answers `ip_not_whitelisted_for_api_key` from a server that
+  works fine for the main key. Use a static IP on the VPS: Delta does not support ranges, and a
+  dynamic IP breaks order management when it changes. That is also why the key check must run on
+  the trading server itself.
+* **Separate keys per purpose.** Use different keys for testnet vs production and for each bot;
+  the app supports one key/secret per saved connection, so create a connection per key.

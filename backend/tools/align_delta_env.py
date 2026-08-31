@@ -89,11 +89,16 @@ def apply_row(db, row, target):
 
 def verify_key(row, target):
     """One signed ping on the target host with the stored key (report only)."""
+    from app.core.secrets import decrypt_secret, SecretDecryptionError
     from app.services.delta_key_probe import probe_host
     if not (row.api_key and row.api_secret):
         return {"state": "no_credentials",
                 "detail": "connection stores no key/secret — paste the new key first"}
-    result = probe_host(row.api_key, row.api_secret, target["url"],
+    try:
+        secret = decrypt_secret(row.api_secret)
+    except SecretDecryptionError as exc:
+        return {"state": "error", "detail": str(exc), "base_url": target["url"]}
+    result = probe_host(row.api_key, secret, target["url"],
                         bool(target["testnet"]), target["broker_code"])
     return {"state": result["state"], "detail": result["detail"],
             "base_url": result["base_url"]}

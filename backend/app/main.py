@@ -24,6 +24,7 @@ from .core.error_handling import (
     validate_broker_code, validate_margin_mode, validate_order_type, validate_side,
     register_exception_handlers, logger as phantom_logger,
 )
+from .core.secrets import encrypt_secret, decrypt_secret, SecretDecryptionError
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
 from .services.live_trader import LiveTradeService, COORDINATOR
@@ -824,6 +825,18 @@ def _mask(value):
     return value[:4] + ('•' * max(0, len(value) - 8)) + value[-4:] if len(value) > 8 else '••••••••'
 
 
+def _decrypt_secret(value):
+    """Decrypt a stored API secret, or fail loud with a fixable message.
+
+    API secrets are encrypted at rest (``app.core.secrets``); every read point
+    goes through here so the plaintext exists only in memory while signing.
+    """
+    try:
+        return decrypt_secret(value)
+    except SecretDecryptionError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def _connection_dict(row):
     # Account details as last read from the venue (margin mode / leverage /
     # sub-accounts). Parsed JSON so the UI never has to guess what mode a
@@ -855,7 +868,7 @@ def _fetch_connection_settings(db, connection):
     try:
         definition = db.query(BrokerDefinition).filter(
             BrokerDefinition.code == _canonical_broker_code(db, connection.broker_code)).first()
-        client = BrokerClient(connection.api_key, connection.api_secret,
+        client = BrokerClient(connection.api_key, _decrypt_secret(connection.api_secret),
                               connection.broker_code, connection.passphrase or '',
                               bool(connection.is_testnet), definition)
         settings = client.get_account_settings('BTCUSDT')
@@ -1034,7 +1047,8 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
     # key as far as the venue is concerned.
     try:
         row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
-                               api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
+                               api_key=payload.api_key.strip(),
+                               api_secret=encrypt_secret(payload.api_secret.strip()),
                                passphrase=(payload.passphrase or '').strip() or None,
                                is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
         db.add(row); db.commit(); db.refresh(row)
@@ -1074,7 +1088,7 @@ async def update_broker_connection(connection_id: int, payload: BrokerConnection
     # Empty secrets mean "keep the existing secret" in the edit form — the API
     # never returns one, so an edit form cannot round-trip it.
     if payload.api_key: row.api_key = payload.api_key.strip()
-    if payload.api_secret: row.api_secret = payload.api_secret.strip()
+    if payload.api_secret: row.api_secret = encrypt_secret(payload.api_secret.strip())
     if payload.passphrase is not None: row.passphrase = (payload.passphrase or '').strip() or None
     row.is_testnet = int(payload.is_testnet); row.is_active = int(payload.is_active)
     db.commit(); db.refresh(row)
@@ -1111,7 +1125,7 @@ async def probe_broker_connection(connection_id: int, user=Depends(get_current_u
     definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
     from .services.delta_key_probe import probe_connection
     result = await asyncio.to_thread(
-        probe_connection, row.api_key, row.api_secret, bool(row.is_testnet),
+        probe_connection, row.api_key, _decrypt_secret(row.api_secret), bool(row.is_testnet),
         row.label or code, (definition.kind if definition else 'generic'), code)
     out = {'connection_id': row.id, 'label': row.label or code, 'broker': code,
            'is_testnet': bool(row.is_testnet), **result}
@@ -1147,7 +1161,7 @@ async def test_broker_connection(connection_id: int, request: Request,
         raise HTTPException(status_code=400, detail='This connection has no key/secret pair to test')
     code = _canonical_broker_code(db, row.broker_code)
     result = await asyncio.to_thread(
-        run_connection_test, row.api_key, row.api_secret, code,
+        run_connection_test, row.api_key, _decrypt_secret(row.api_secret), code,
         bool(row.is_testnet), row.id, row.label or code)
     detected = result.get('detected')
     if detected and request.query_params.get('apply') == 'true':
@@ -2326,7 +2340,8 @@ def resolve_broker_context(payload, user, db, require_credentials=False):
     else:
         connection, _ = _pick_connection(db, user, code)
     api_key = connection.api_key if connection else (user.api_key if (user.broker_name or 'Binance') == code else '')
-    api_secret = connection.api_secret if connection else (user.api_secret if (user.broker_name or 'Binance') == code else '')
+    api_secret = (_decrypt_secret(connection.api_secret) if connection
+                  else (_decrypt_secret(user.api_secret) if (user.broker_name or 'Binance') == code else ''))
     passphrase = connection.passphrase if connection else ''
     testnet = bool(connection.is_testnet) if connection else bool(payload.testnet)
     if require_credentials and (not api_key or not api_secret):
@@ -3176,20 +3191,20 @@ def update_broker_settings(settings: BrokerSettingsUpdate, user=Depends(get_curr
                                                 BrokerConnection.user_id == user.id).first()
         if not row: raise HTTPException(status_code=404, detail="Broker connection not found")
         if settings.api_key: row.api_key = settings.api_key
-        if settings.api_secret: row.api_secret = settings.api_secret
+        if settings.api_secret: row.api_secret = encrypt_secret(settings.api_secret)
         row.broker_code = code; row.passphrase = settings.passphrase; row.is_testnet = int(settings.is_testnet)
     elif settings.api_key and settings.api_secret:
         row = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id,
                                                 BrokerConnection.broker_code == code).first()
         if row:
-            row.api_key = settings.api_key; row.api_secret = settings.api_secret
+            row.api_key = settings.api_key; row.api_secret = encrypt_secret(settings.api_secret)
             row.is_testnet = int(settings.is_testnet)
         else:
             db.add(BrokerConnection(user_id=user.id, broker_code=code, label='Primary',
-                                    api_key=settings.api_key, api_secret=settings.api_secret,
+                                    api_key=settings.api_key, api_secret=encrypt_secret(settings.api_secret),
                                     passphrase=settings.passphrase, is_testnet=int(settings.is_testnet), is_active=1))
         # Keep legacy columns synchronized for old workers and clients.
-        user.api_key = settings.api_key; user.api_secret = settings.api_secret; user.broker_name = code
+        user.api_key = settings.api_key; user.api_secret = encrypt_secret(settings.api_secret); user.broker_name = code
     user.initial_capital = settings.initial_capital
     user.margin_deployment_pct = settings.margin_pct
     user.broker_name = code
@@ -3205,7 +3220,10 @@ def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
     rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).all()
     return {
         "api_key": _mask(user.api_key),
-        "api_secret": _mask(user.api_secret),
+        # The secret is never returned, not even masked: anything that reaches
+        # the browser is reachable in dev tools, and Delta's guidance is that
+        # the React side must never see the secret in any form.
+        "has_secret": bool(user.api_secret),
         "broker_name": user.broker_name or 'Binance',
         "initial_capital": user.initial_capital,
         "margin_deployment_pct": user.margin_deployment_pct,
@@ -3364,7 +3382,8 @@ def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None
         raise HTTPException(status_code=400, detail=f"Broker '{code}' is not configured or enabled")
     connection, problem = _pick_connection(db, user, code, connection_id)
     api_key = (connection.api_key if connection else None) or (user.api_key or '')
-    api_secret = (connection.api_secret if connection else None) or (user.api_secret or '')
+    api_secret = (_decrypt_secret(connection.api_secret) if connection
+                  else _decrypt_secret(user.api_secret))
     passphrase = (connection.passphrase if connection else None) or ''
     testnet = bool(connection.is_testnet) if connection else False
     if require_credentials and (not api_key or not api_secret):
