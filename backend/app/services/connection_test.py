@@ -247,7 +247,11 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
     if detected is None:
         problems.append("No Delta environment accepted the key.")
         fixes.append("Re-create the key in the panel of the environment you want to trade, "
-                     "or paste it again in full (key AND secret, no stray characters).")
+                     "or paste it again in full (key AND secret, no stray characters). "
+                     "If you already know where the key belongs (e.g. it was just created "
+                     "on Delta India production), use 'Align to India production' on the "
+                     "connection — it repoints broker + environment without the key having "
+                     "to pass first.")
     else:
         family_mismatch = str(code).lower() != str(detected["broker_code"]).lower()
         env_mismatch = bool(testnet) != bool(detected["testnet"])

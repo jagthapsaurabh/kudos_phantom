@@ -174,6 +174,53 @@ class BrokerClient:
         family = cls.DELTA_FAMILIES.get(text, cls.DELTA_FAMILIES["Delta"])
         return family[2] if testnet else family[1]
 
+    # The four Delta environments under their canonical names, as used by the
+    # connection battery and the one-shot "align this connection" action. The
+    # deployment target for this system is INDIA-PRODUCTION (see
+    # backend/DELTA_ALIGNMENT.md), so that is the name operators will type.
+    DELTA_ENVIRONMENT_ALIASES = {
+        "INDIA-PRODUCTION": "INDIA-PRODUCTION",
+        "INDIA_PRODUCTION": "INDIA-PRODUCTION",
+        "INDIA PRODUCTION": "INDIA-PRODUCTION",
+        "INDIAPRODUCTION": "INDIA-PRODUCTION",
+        "INDIA": "INDIA-PRODUCTION",
+        "INDIA-TESTNET": "INDIA-TESTNET",
+        "INDIA_TESTNET": "INDIA-TESTNET",
+        "INDIA-DEMO": "INDIA-TESTNET",
+        "GLOBAL-PRODUCTION": "GLOBAL-PRODUCTION",
+        "GLOBAL_PRODUCTION": "GLOBAL-PRODUCTION",
+        "GLOBAL": "GLOBAL-PRODUCTION",
+        "GLOBAL-TESTNET": "GLOBAL-TESTNET",
+        "GLOBAL_TESTNET": "GLOBAL-TESTNET",
+        "GLOBAL-DEMO": "GLOBAL-TESTNET",
+    }
+
+    @classmethod
+    def delta_environment(cls, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Look a Delta environment up by its canonical name (case/_-tolerant).
+
+        Returns the same dict shape as :meth:`delta_hosts` — ``name``, ``url``,
+        ``testnet``, ``broker_code``, ``site`` — or ``None`` for an unknown
+        name, so callers get one obvious 400 instead of silently guessing.
+        """
+        if not name:
+            return None
+        canonical = cls.DELTA_ENVIRONMENT_ALIASES.get(str(name).strip().upper())
+        if canonical is None:
+            return None
+        for host in cls.delta_hosts():
+            if host["name"] == canonical:
+                return dict(host)
+        return None
+
+    @classmethod
+    def is_delta_broker(cls, broker_code: Optional[str]) -> bool:
+        """True when ``broker_code`` resolves to one of the Delta families."""
+        text = str(broker_code or "").strip()
+        return (text in cls.DELTA_FAMILIES
+                or (text.lower() in ("delta", "delta exchange", "deltaglobal",
+                                     "delta global")))
+
     # Binance order types the terminal can send.
     BINANCE_ORDER_TYPES = {
         "market": "MARKET", "limit": "LIMIT",

@@ -28,6 +28,7 @@ from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
 from .services.live_trader import LiveTradeService, COORDINATOR
 from .services.data_sync import DataSyncService
+from .services.broker_client import BrokerClient
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
     MarketTick, MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
@@ -1149,6 +1150,120 @@ async def test_broker_connection(connection_id: int, request: Request,
                              'base_url': detected.get('base_url', '')}
         result['live_instances'] = await _adopt_saved_credentials(row, user.id)
     return result
+
+
+class DeltaEnvironmentAlignPayload(BaseModel):
+    environment: str
+
+
+def _resolve_delta_environment(environment: str) -> Dict[str, Any]:
+    """Canonical Delta environment dict for an align request, or a 400.
+
+    The names are the ones the connection battery prints (INDIA-PRODUCTION,
+    INDIA-TESTNET, GLOBAL-PRODUCTION, GLOBAL-TESTNET), with the same spelling
+    tolerance as :meth:`BrokerClient.delta_environment`.
+    """
+    env = BrokerClient.delta_environment(environment)
+    if env is None:
+        known = ", ".join(h["name"] for h in BrokerClient.delta_hosts())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown Delta environment {environment!r}. Use one of: {known}")
+    return env
+
+
+def _align_connection_to_environment(db, row: BrokerConnection,
+                                     environment: str) -> Dict[str, Any]:
+    """Point one saved Delta connection at a named environment (no key needed).
+
+    The detection flow (``/test?apply=true``) needs the venue to accept the
+    stored key before it can name the environment; when the operator already
+    knows where the key belongs (e.g. it was just created on India
+    production), this applies that decision directly — broker code + testnet
+    flag — and lets the next signed call prove it. Returns the applied block.
+    """
+    env = _resolve_delta_environment(environment)
+    code = _canonical_broker_code(db, row.broker_code)
+    if not BrokerClient.is_delta_broker(code):
+        raise HTTPException(status_code=400,
+                            detail=f"Connection '{row.label or code}' is a {code} "
+                                   "connection — only Delta (India) and DeltaGlobal "
+                                   "connections have named environments to align.")
+    row.broker_code = env["broker_code"]
+    row.is_testnet = int(bool(env["testnet"]))
+    db.commit()
+    db.refresh(row)
+    return {"applied": True, "environment": env["name"],
+            "broker_code": row.broker_code, "is_testnet": bool(row.is_testnet),
+            "label": row.label or row.broker_code, "base_url": env["url"]}
+
+
+@app.post('/broker-connections/align-delta')
+async def align_all_delta_connections(payload: DeltaEnvironmentAlignPayload,
+                                      user=Depends(get_current_user),
+                                      db=Depends(get_db)):
+    """Point EVERY saved Delta-family connection of this login at one environment.
+
+    The one-shot alignment for a deployment decision like "we trade Delta
+    India production": every Delta / DeltaGlobal connection row is repointed
+    (broker code + testnet flag) without needing the stored key to be accepted
+    first — a key that was created on the target environment proves itself on
+    the next signed call. Non-Delta connections are left alone. Running live
+    instances on the repointed rows are handed the change immediately.
+    """
+    target = _resolve_delta_environment(payload.environment)
+    rows = db.query(BrokerConnection).filter(
+        BrokerConnection.user_id == user.id).all()
+    delta_rows = [r for r in rows if BrokerClient.is_delta_broker(
+        _canonical_broker_code(db, r.broker_code))]
+    changed = []
+    unchanged = []
+    for row in delta_rows:
+        before = (_canonical_broker_code(db, row.broker_code), bool(row.is_testnet))
+        entry = {"connection_id": row.id, "label": row.label or row.broker_code,
+                 "before": {"broker_code": before[0], "is_testnet": before[1]}}
+        if before == (target["broker_code"], bool(target["testnet"])):
+            unchanged.append(entry)
+            continue
+        row.broker_code = target["broker_code"]
+        row.is_testnet = int(bool(target["testnet"]))
+        db.commit()
+        db.refresh(row)
+        await asyncio.to_thread(_fetch_connection_settings, db, row)
+        live = await _adopt_saved_credentials(row, user.id)
+        entry.update({"broker_code": row.broker_code, "is_testnet": bool(row.is_testnet),
+                      "account_settings": _connection_dict(row).get("account_settings"),
+                      "live_instances": live})
+        changed.append(entry)
+    return {"environment": target["name"], "base_url": target["url"],
+            "delta_connections": len(delta_rows), "changed": changed,
+            "unchanged": unchanged}
+
+
+@app.post('/broker-connections/{connection_id}/align')
+async def align_broker_connection(connection_id: int,
+                                  payload: DeltaEnvironmentAlignPayload,
+                                  user=Depends(get_current_user),
+                                  db=Depends(get_db)):
+    """Point ONE saved connection at a named Delta environment, no key needed.
+
+    The counterpart of ``?apply=true`` on the connection test for when the
+    answer is already known: e.g. the key was just created on **Delta India
+    production**, so align this connection to INDIA-PRODUCTION (REST
+    ``https://api.india.delta.exchange``) and let the next signed call prove
+    the key. Re-reads account details and hands the change to running
+    instances, same as saving the connection would.
+    """
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id,
+                                            BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    applied = _align_connection_to_environment(db, row, payload.environment)
+    await asyncio.to_thread(_fetch_connection_settings, db, row)
+    db.refresh(row)
+    out = {"connection_id": row.id, **applied,
+           "account_settings": _connection_dict(row).get("account_settings")}
+    out["live_instances"] = await _adopt_saved_credentials(row, user.id)
+    return out
 
 
 @app.post('/broker-connections/{connection_id}/refresh')

@@ -492,11 +492,14 @@ def _auth_error_verdict(source: str, errors: Dict[str, str],
         "incompletely, it is a production key on a testnet connection "
         "(or the reverse), or it belongs to the other Delta market (India "
         "vs Global keep separate key stores). Replace the key in Broker "
-        "Settings, or run 'Test connection' on the connection there — it "
-        "says which environment accepts the key and offers 'Use this "
-        "environment' — and running live instances re-read the saved "
-        "credentials by themselves (or use 'Reload keys' on the instance), "
-        "so a key fix no longer needs a restart."
+        "Settings, or run 'Check key' (quick) / 'Test connection' (full "
+        "battery) on the connection there — they say which environment "
+        "accepts the key and offer 'Use this environment'; if you already "
+        "know the environment (e.g. the key was just created on Delta "
+        "India production), use 'Align to India production' — and running "
+        "live instances re-read the saved credentials by themselves (or "
+        "use 'Reload keys' on the instance), so a key fix no longer needs "
+        "a restart."
     )
 
 

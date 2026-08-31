@@ -54,9 +54,24 @@ the first minute instead of the first trade.
    trimmed of whitespace as saved; a newline from a terminal paste is invisible in the UI and is
    a different key to the venue. Running instances are handed the new key by that same save, and
    the response says how many took it.
-3. **Live Trade → Reload keys** on the instance, if you would rather not wait for the next retry
+3. **If you already know the environment — align without a key check.** Detection needs the venue
+   to accept the stored key; a key you *just created* proves itself on the next signed call.
+   This deployment trades **Delta India production**, so:
+   * UI: Broker Settings → **Align to India production** on the connection (or **Align all to
+     India production** on the Saved connections header) — sets broker `Delta`, testnet OFF,
+     REST `https://api.india.delta.exchange`, private WS `wss://socket.india.delta.exchange`,
+     public WS `wss://public-socket.india.delta.exchange`, and hands it to running instances.
+   * API: `POST /broker-connections/{id}/align {"environment":"INDIA_PRODUCTION"}` (one row) or
+     `POST /broker-connections/align-delta` (every Delta-family row of the login).
+   * CLI, on the trading server (a whitelisted key only validates from its egress IP):
+     ```bash
+     cd backend && ../.venv/bin/python tools/align_delta_env.py --all-delta --apply --verify
+     # dry run first:  --all-delta           (prints what would change)
+     # one row only:   --label "NishKudos global"
+     ```
+4. **Live Trade → Reload keys** on the instance, if you would rather not wait for the next retry
    window. It re-reads and probes immediately; a still-bad key just goes back to holding entries.
-4. Verify: the connection card shows the margin mode read back from the venue (not an error), and
+5. Verify: the connection card shows the margin mode read back from the venue (not an error), and
    `GET /live-account/snapshot` returns a non-empty `balance` with `auth_error: null`.
 
 From the command line, the same battery as step 1 (run it **on the trading server** — a key with an
@@ -97,9 +112,12 @@ Fixing the key is usually routine, but do it with the position **flat** when you
 
 ## Which environment is which
 
+**This deployment trades Delta India production** — the first row is where every Delta connection
+must point:
+
 | | REST host | Keys work on | App broker code |
 | :--- | :--- | :--- | :--- |
-| Delta India **production** | `https://api.india.delta.exchange` | real-money keys from the live panel | `Delta` |
+| Delta India **production** ✅ target | `https://api.india.delta.exchange` | real-money keys from the live panel | `Delta` |
 | Delta India **testnet / demo** | `https://cdn-ind.testnet.deltaex.org` | keys from `demo.delta.exchange` only | `Delta` (testnet ON) |
 | Delta **Global** production | `https://api.delta.exchange` | keys from `global.delta.exchange` / `www.delta.exchange` | `DeltaGlobal` |
 | Delta **Global** testnet / demo | `https://testnet-api.delta.exchange` | keys from `demo-global.delta.exchange` | `DeltaGlobal` (testnet ON) |

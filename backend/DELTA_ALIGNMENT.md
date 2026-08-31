@@ -2,6 +2,33 @@
 
 This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-cases** (mcp.delta.exchange/docs/use-cases) to *our software's actual flows*, not generic parity.
 
+## Deployment Target (this system): DELTA INDIA PRODUCTION
+
+The deployment decision for this system — every Delta connection, key and live
+instance belongs on **Delta India production** (`INDIA-PRODUCTION`):
+
+| | Endpoint |
+| :--- | :--- |
+| REST | `https://api.india.delta.exchange` |
+| Private WebSocket | `wss://socket.india.delta.exchange` |
+| Public WebSocket | `wss://public-socket.india.delta.exchange` |
+| App broker code | `Delta` · testnet **OFF** |
+
+`INDIA_PRODUCTION` (also `INDIA-PRODUCTION`) is a first-class environment name
+in the app: `BrokerClient.delta_environment()` resolves it, and the one-shot
+align actions below repoint saved connections at it **without needing the
+stored key to pass a probe first** (the probe-detection flow needs the venue to
+accept the key; a freshly created key proves itself on the next signed call).
+
+* UI: Broker Settings → the connection → **Align to India production** (or
+  **Align all to India production** on the Saved connections header).
+* API: `POST /broker-connections/{id}/align {"environment":"INDIA_PRODUCTION"}`
+  (one row) / `POST /broker-connections/align-delta` (every Delta-family row of
+  the login). Both re-read account details and hand the change to running live
+  instances — no restart.
+* CLI (on the trading server, because a whitelisted key only validates from its
+  egress IP): `backend/tools/align_delta_env.py --all-delta --apply --verify`.
+
 ## Software Need (live_trader.py + broker_account.py + tick_feed + data_sync + main.py)
 
 - **Instrument warmup**: `get_instrument` → tick_size, contract_value, product_id. REST: GET /v2/products/{symbol}. Used once at startup + daily refresh.
@@ -97,3 +124,11 @@ This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-
   it (no restart), and **DeltaGlobal** is a built-in broker with its own hosts so a Global key has a
   first-class adapter. Run the check **on the trading server** (a whitelisted key 401s from any
   other egress IP), then apply the verdict there.
+- **Deterministic alignment (2026-08-31).** Detection needs a working key; alignment does not.
+  `BrokerClient.delta_environment()` resolves the four canonical environment names,
+  `POST /broker-connections/{id}/align` + `/align-delta` apply a named environment (broker code +
+  testnet flag) with no probe, `tools/align_delta_env.py` does the same from the shell with
+  `--apply --verify`, and Broker Settings exposes **Align to India production** on every Delta-family
+  connection that is not there yet. Tests: `test_delta_env_align.py` (29 checks, offline) +
+  `broker_keys_ui` align checks; the auth verdict in `broker_account.account_snapshot` now names
+  Check key / Test connection / Align as the three fix paths.

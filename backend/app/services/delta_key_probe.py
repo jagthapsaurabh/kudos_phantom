@@ -187,7 +187,11 @@ def verdict(rows: List[Dict[str, Any]], flagged_testnet: Optional[bool] = None,
                       "the last characters). Create a fresh key in the panel of the "
                       "environment you want to trade, paste key AND secret, and save. "
                       "If the key is IP-whitelisted, run the probe on the trading server "
-                      "— a different egress IP 401s the same way a bad key does.")
+                      "— a different egress IP 401s the same way a bad key does. If you "
+                      "already know where the key belongs (e.g. it was just created on "
+                      "Delta India production), use 'Align to India production' on the "
+                      "connection — it repoints broker + environment without the key "
+                      "having to pass first.")
         return out
     out["summary"] = ("No Delta host answered from this machine, so this says "
                       "nothing about the key.")
