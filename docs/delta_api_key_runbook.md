@@ -110,6 +110,31 @@ Fixing the key is usually routine, but do it with the position **flat** when you
   (`state`, `error`, `retry_in_seconds`, `held_calls`), and the instance's `credentials` block in
   `GET /live-trade/status` shows `entries_held`, `reloads` and `last_reload`.
 
+## Delta's error table, mapped to what this app does
+
+The same five rejections Delta's support guidance lists are all recognised as **key problems**
+(they latch the credential guard, hold entries, and surface the red banner instead of burning
+quota); the connection battery (Test connection) separates the causes:
+
+| Delta error | What it means | What the app does |
+| :--- | :--- | :--- |
+| `ip_not_whitelisted_for_api_key` | Request from a non-whitelisted IP | Recognised as an auth rejection; the banner says to run the check on the trading server — a whitelisted key 401s from any other egress IP exactly like a dead key |
+| `invalid_signature` / `signature mismatch` | Wrong secret, or method/path/query/payload changed between signing and sending | Recognised; **Test connection** re-signs the documented `METHOD+timestamp+path+?query+body` string on all four hosts and reports where the key works |
+| `request_expired` | Timestamp older than the 5-second window | Recognised; the connection battery compares the server clock to the exchange and tells you to NTP-sync if the skew exceeds 5 s |
+| `api_key_not_found` / `invalid_api_key` | Incorrect or deleted key | Recognised; runbook steps 1–3 (re-paste, re-create, or Align to India production) |
+| `incomplete_payload` | Missing api-key/timestamp/signature header | Recognised — this one is a client bug, not an operator fix; report it with the full error text |
+
+Signing (implemented in `BrokerClient._delta_request`, verified against the official client):
+
+* `signature_data = METHOD + timestamp + path + query_string + payload`, `timestamp` in Unix
+  **seconds** generated right before sending (inside the 5-second window);
+* `query_string` is `''` or `?k=v&…` with keys sorted and values `quote_plus`-encoded;
+* `payload` is compact JSON (`{"k":"v"}` separators) or `''`;
+* `signature = HMAC_SHA256(api_secret, signature_data)` hex;
+* headers `api-key`, `timestamp`, `signature`, `Content-Type: application/json` (+ the
+  `User-Agent` Delta requires). Secrets live server-side in the database and are never returned
+  by the API or shipped to the browser; each bot can use its own connection/key.
+
 ## Which environment is which
 
 The official rule, enforced by the app on this box (`DELTA_DEPLOYMENT_FAMILY=india`, the default):

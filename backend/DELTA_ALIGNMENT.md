@@ -132,7 +132,11 @@ accept the key; a freshly created key proves itself on the next signed call).
 
 ## Key Provided
 
-- `axvjY1xAZy9ToImAbySqLoRswwTLKo` — sandbox egress blocks live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and signing matches official client.
+- The original report's API key is deliberately **not** stored in this repo — per Delta's own
+  security guidance (never hardcode API secrets in shared code, keep them out of chat/repos). The
+  sandbox egress blocks the live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and
+  signing matches the official client; a key that appeared in git history should be treated as
+  exposed and **rotated** in API Management.
 - **Delta runs four separate key stores** (India production/testnet, Global production/testnet); the
   live report showed the connection on India testnet with `invalid_api_key`, which is the *same*
   answer for: an India production key on testnet, a Global key on India, a half-pasted key, or a

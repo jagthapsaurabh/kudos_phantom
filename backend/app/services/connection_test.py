@@ -101,7 +101,8 @@ def _signed(client: BrokerClient, method: str, path: str, weight: float = 1.0) -
             return {"ok": False, "state": "permission", "detail": detail}
         if any(marker in lowered for marker in ("http 401", "invalid_api_key",
                                                 "invalidapikey", "api key not found",
-                                                "invalid_api_key")):
+                                                "invalid_signature", "request_expired",
+                                                "incomplete_payload", "signature mismatch")):
             return {"ok": False, "state": "auth", "detail": detail}
         return {"ok": False, "state": "error", "detail": detail}
     if isinstance(payload, dict) and payload.get("success") is False:

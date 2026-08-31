@@ -65,13 +65,17 @@ from app.core.rate_limit import (
 # outside this list is an endpoint problem, not a key problem, and must NOT
 # silence the whole signed surface. Includes Delta India taxonomy:
 # SignatureExpired, InvalidApiKey, UnauthorizedApiAccess, ip_not_whitelisted,
-# Signature Mismatch, plus Binance -2015.
+# Signature Mismatch, plus the error table from Delta's own support guidance
+# (invalid_signature / request_expired / api_key_not_found /
+# incomplete_payload / ip_not_whitelisted_for_api_key) and Binance -2015.
 AUTH_REJECTION_MARKERS = (
     "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
     "api-key format", "-2015", "unauthorized",
-    "signatureexpired", "signature expired",
+    "signatureexpired", "signature expired", "request_expired",
+    "invalid_signature", "incomplete_payload", "api_key_not_found",
     "unauthorizedapiaccess", "unauthorized_api_access",
-    "ip_not_whitelisted", "ip not whitelisted",
+    "ip_not_whitelisted", "ip_not_whitelisted_for_api_key",
+    "ip not whitelisted",
     "signature mismatch", "signature_mismatch",
 )
 
@@ -477,24 +481,35 @@ class BrokerClient:
     # Low-level transport (rate limited + 429 aware)
     # ==================================================================
     def _throttled_request(self, method, url, params=None, data=None, headers=None,
-                           weight: float = 1.0, is_order: bool = False):
-        """One HTTP call inside the rate-limit budget, retrying 429/5xx."""
+                           weight: float = 1.0, is_order: bool = False,
+                           refresh_headers=None):
+        """One HTTP call inside the rate-limit budget, retrying 429/5xx.
+
+        ``refresh_headers`` is an optional ``() -> dict`` that rebuilds the
+        request headers for each attempt. Signed Delta requests pass it so a
+        retry sends a **fresh timestamp + signature** — Delta rejects
+        timestamps more than 5 s old, so a 429 retry reusing the first
+        attempt's headers would always answer ``request_expired``.
+        """
         cfg = self.rate_limit_config
         last_error = None
         # Delta requires a User-Agent on every request (public and signed);
         # missing it can 4XX. Harmless on Binance, so always set it.
-        headers = dict(headers or {})
-        headers.setdefault("User-Agent", self.USER_AGENT)
-        headers.setdefault("Accept", "application/json")
+        base_headers = dict(headers or {})
+        base_headers.setdefault("User-Agent", self.USER_AGENT)
+        base_headers.setdefault("Accept", "application/json")
         for attempt in range(1, int(max(1, cfg.max_retries)) + 1):
             try:
                 self.limiter.acquire(weight=weight, is_order=is_order)
             except RateLimitExceeded as exc:
                 self.limiter.note_rejected(str(exc))
                 return None, {"error": str(exc)}
+            attempt_headers = dict(refresh_headers() if refresh_headers else base_headers)
+            attempt_headers.setdefault("User-Agent", self.USER_AGENT)
+            attempt_headers.setdefault("Accept", "application/json")
             try:
                 response = requests.request(method, url, params=params, data=data,
-                                            headers=headers, timeout=20)
+                                            headers=attempt_headers, timeout=20)
             except requests.RequestException as exc:
                 last_error = f"{self.broker_name} request failed: {exc.__class__.__name__}: {exc}"
                 self.limiter.note_rejected(last_error)
@@ -604,6 +619,21 @@ class BrokerClient:
     # ------------------------------------------------------------------
     # Delta signing
     # ------------------------------------------------------------------
+    def _delta_headers(self, method: str, path: str, query_text: str,
+                       body_text: str) -> Dict[str, str]:
+        """Fresh signed headers for one Delta attempt.
+
+        Delta rejects a request whose timestamp is more than 5 s old
+        (``request_expired``), so every (re)send signs a new timestamp — a
+        retry after a 429/5xx must never reuse the first attempt's signature.
+        """
+        timestamp = str(int(time.time()))
+        signature_data = method.upper() + timestamp + path + query_text + body_text
+        signature = hmac.new(self.api_secret.encode(),
+                             signature_data.encode(), hashlib.sha256).hexdigest()
+        return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature,
+                "Content-Type": "application/json", "User-Agent": self.USER_AGENT}
+
     def _delta_request(self, method, path, body=None, query=None, weight: float = 1.0,
                        is_order: bool = False):
         # Changelog 19.08.26 (docs.delta.exchange): GET /v2/profile is rejected
@@ -643,15 +673,16 @@ class BrokerClient:
 
         body_text = _body_string(body)
         query_text = _query_string(query)
-        timestamp = str(int(time.time()))
-        signature_data = method.upper() + timestamp + path + query_text + body_text
-        signature = hmac.new(self.api_secret.encode(), signature_data.encode(), hashlib.sha256).hexdigest()
-        headers = {"api-key": self.api_key, "timestamp": timestamp, "signature": signature,
-                   "Content-Type": "application/json", "User-Agent": "PHANTOM-Trading-Tool/1.0"}
         url = f"{self.trading_url}{path}"
+
+        def _signed_headers():
+            return self._delta_headers(method, path, query_text, body_text)
+
         response, error = self._throttled_request(method, url, params=query or None,
-                                                  data=body_text or None, headers=headers,
-                                                  weight=weight, is_order=is_order)
+                                                  data=body_text or None,
+                                                  headers=_signed_headers(),
+                                                  weight=weight, is_order=is_order,
+                                                  refresh_headers=_signed_headers)
         return self._mark_signed(response, error)
 
     def _delta_result(self, payload):
