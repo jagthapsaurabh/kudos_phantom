@@ -37,22 +37,22 @@ class BacktestEngine:
 
         # Fallback: when DB is empty (e.g. sandbox or recent date not seeded yet),
         # fetch from the venue's public API so chart signals and backtest use the
-        # same candles. This fixes \"chart shows 5 signals for 28 Aug 2026 but
-        # backtest shows 0 trades\" when the DB has no 2026 data but /klines does.
+        # same candles. This fixes "chart shows 5 signals for 28 Aug 2026 but
+        # backtest shows 0 trades" when the DB has no 2026 data but /klines does.
         try:
             from ..services.data_sync import DataSyncService
             from datetime import datetime as _dt
-            # Parse start/end which may be strings like \"2026-08-28\"
+            # Parse start/end which may be strings like "2026-08-28"
             s_dt = None
             e_dt = None
             if start_date:
                 try:
-                    s_dt = _dt.strptime(str(start_date)[:10], \"%Y-%m-%d\")
+                    s_dt = _dt.strptime(str(start_date)[:10], "%Y-%m-%d")
                 except Exception:
                     s_dt = None
             if end_date:
                 try:
-                    e_dt = _dt.strptime(str(end_date)[:10], \"%Y-%m-%d\") + pd.Timedelta(days=1)
+                    e_dt = _dt.strptime(str(end_date)[:10], "%Y-%m-%d") + pd.Timedelta(days=1)
                 except Exception:
                     e_dt = None
             # Fetch enough candles to cover the range; for a single-day window
