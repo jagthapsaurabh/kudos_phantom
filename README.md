@@ -211,8 +211,12 @@ now a state, not a wall of identical errors:
   Global production/testnet — India and Global keep separate key stores) and says which one accepts
   the key, so "production key on a testnet connection" or "India connection, Global key" is answered
   with a repoint instead of a new key. `POST /broker-connections/{id}/test` (**Test connection**)
-  runs the full read-only battery — market data, clock skew, environment, signed calls, rate quota —
-  and offers **Use this environment** to apply the fix with no restart. Same code as
+  runs the full read-only battery — market data, clock skew, environment, signed calls
+  (balance, positions, open orders, order history, trading preferences, and the sub-account
+  listing margin mode is read from), rate quota — and offers **Use this environment** to apply
+  the fix with no restart. A signed step that gets no HTTP answer is reported as `unreachable`
+  with the endpoint it tried, never as a passing check: a URL built out of `"GET /v2/x"` reads
+  as a DNS failure and used to say "ready" anyway. Same code as
   `tools/test_connection.py` (with `--apply`) and `tools/check_delta_key.py`, run from the server
   when the key is IP-whitelisted. **Delta Exchange Global** is a built-in broker (`DeltaGlobal`)
   with its own hosts, so a Global key is a first-class adapter, not a URL override of `Delta`.

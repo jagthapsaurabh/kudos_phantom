@@ -91,6 +91,8 @@ def print_human(result: dict) -> None:
                 "error": "  FAIL", "skipped": "  SKIP", "unreachable": "  NET "}.get(
             step.get("state"), f"  {str(step.get('state'))[:8].upper():8s}")
         print(f"{mark} {step.get('title', step.get('name', ''))}")
+        if step.get("state") not in (None, "ok", "skipped") and step.get("endpoint"):
+            print(f"       tried: {step.get('endpoint')}")
         if step.get("detail"):
             print(f"       {step.get('detail')}")
         for row in step.get("rows") or []:

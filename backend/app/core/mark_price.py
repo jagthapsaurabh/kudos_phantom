@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
+from app.core.urls import normalize_base_url
+
 # ---------------------------------------------------------------------------
 # Perpetual contracts
 # ---------------------------------------------------------------------------
@@ -197,7 +199,7 @@ class MarkPriceService:
         kind = None
         if definition is not None:
             kind = str(getattr(definition, "kind", "") or "").lower()
-            base = (getattr(definition, "market_data_url", None) or "").rstrip("/") or None
+            base = normalize_base_url(getattr(definition, "market_data_url", None)) or None
         if not base:
             base = "https://fapi.binance.com" if venue == "Binance" else "https://api.india.delta.exchange"
             kind = "binance" if venue == "Binance" else "delta"

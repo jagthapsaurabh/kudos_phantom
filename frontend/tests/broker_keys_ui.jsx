@@ -119,11 +119,21 @@ const tested = render(React.createElement(ConnectionCard, {
       { name: 'environment', title: 'Which Delta environment accepts this key?', state: 'ok', detail: 'accepted by GLOBAL-PRODUCTION',
         rows: [{ name: 'GLOBAL-PRODUCTION', base_url: 'https://api.delta.exchange', state: 'ok', detail: 'wallet balances OK' },
                { name: 'INDIA-TESTNET', base_url: 'https://cdn-ind.testnet.deltaex.org', state: 'auth', detail: 'invalid_api_key' }] },
-      { name: 'balance', title: 'Account balance', state: 'ok', detail: 'signed call accepted' },
+      { name: 'balance', title: 'Account balance', state: 'ok', detail: 'signed call accepted',
+        endpoint: 'GET /v2/wallet/balances' },
+      // A step that never got an answer has to show which endpoint was asked
+      // for: a host built out of "GET " + path reads as DNS trouble otherwise.
+      { name: 'positions', title: 'Open positions', state: 'unreachable',
+        detail: "Delta request failed: ConnectionError: Failed to resolve",
+        endpoint: 'GET /v2/positions/margined?product_symbol=BTCUSD' },
     ],
   },
 }));
 const testedText = tested.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ');
+check('a failing step names the exact endpoint that was tried',
+  testedText.includes('tried GET /v2/positions/margined?product_symbol=BTCUSD'), testedText.slice(0, 400));
+check('a step that passed does not clutter the report with its endpoint',
+  !testedText.includes('tried GET /v2/wallet/balances'));
 check('the card offers a full connection test next to Check key', tested.includes('Test connection'));
 check('the report explains a key that is live but on the wrong Delta family',
   testedText.includes('GLOBAL-PRODUCTION') && testedText.includes('separate key stores'));

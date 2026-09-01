@@ -18,9 +18,13 @@ a key with only *Read Data* permission can even fail the balance check.
    as ``SignatureExpired``/``request_expired``, which looks like a bad key.
 3. **environment**  — signs ``wallet/balances`` against ALL Delta hosts and
    reports the one that accepts the key.
-4. **signed calls** — balance, positions, order history, trading preferences
-   on the accepted host. Each is categorized as ``ok`` / ``permission``
-   (key is fine, endpoint permission is missing) / ``auth`` / ``unreachable``.
+4. **signed calls** — balance, positions, open orders, order history, trading
+   preferences on the accepted host, plus the sub-account listing the margin-mode
+   panel reads (reported, never decisive). Each is categorized as ``ok`` /
+   ``permission`` (key is fine, endpoint permission is missing) / ``auth`` /
+   ``unreachable`` (no HTTP answer came back — this machine, not the key) /
+   ``error``. Any of the last three on a decisive call means the connection is
+   NOT ready, even when the host accepted the key one step earlier.
 5. **quota**        — the venue's remaining 5-minute weight budget.
 
 Nothing here places, edits or cancels an order: the check is read-only.
@@ -31,11 +35,14 @@ The CLI wrapper is ``tools/test_connection.py``; the API wrapper is
 from __future__ import annotations
 
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
+from app.core.urls import normalize_base_url
 from app.services.broker_client import BrokerClient
+from app.services.delta_key_probe import never_reached_the_venue
 
 
 def _delta_environments() -> List[Dict[str, Any]]:
@@ -57,7 +64,7 @@ def _public_ticker(base_url: str, symbol: str = "BTCUSD") -> Dict[str, Any]:
     import requests
     started = time.time()
     try:
-        response = requests.get(f"{base_url.rstrip('/')}/v2/tickers/{symbol}",
+        response = requests.get(f"{normalize_base_url(base_url)}/v2/tickers/{symbol}",
                                 headers={"User-Agent": BrokerClient.USER_AGENT},
                                 timeout=15)
         latency_ms = int((time.time() - started) * 1000)
@@ -85,29 +92,84 @@ def _public_ticker(base_url: str, symbol: str = "BTCUSD") -> Dict[str, Any]:
             "latency_ms": latency_ms, "clock_skew_s": clock_skew_s}
 
 
-def _signed(client: BrokerClient, method: str, path: str, weight: float = 1.0) -> Dict[str, Any]:
-    """One signed call categorized: ok / permission / auth / unreachable."""
-    try:
-        response, error = client._delta_request(method, path, weight=weight)
-        payload = client._json_body(response, error)
-    except Exception as exc:  # pragma: no cover - defensive
-        return {"ok": False, "state": "unreachable",
-                "detail": f"{exc.__class__.__name__}: {exc}"}
+def _endpoint_label(method: str, path: str, query: Optional[Dict[str, Any]] = None) -> str:
+    """``"GET /v2/orders?product_symbol=BTCUSD"`` — for *humans* only.
+
+    This string is what the report and the terminal display. It must never be
+    fed back into a request builder: that is exactly how "check the balance"
+    turned into a DNS lookup for ``api.india.delta.exchangeget%20`` (see
+    :func:`_signed`).
+    """
+    text = f"{str(method).upper()} {path}"
+    params = {k: v for k, v in dict(query or {}).items() if v is not None}
+    if params:
+        text += "?" + urllib.parse.urlencode(sorted(params.items()))
+    return text
+
+
+def _classify(payload: Any, label: str) -> Dict[str, Any]:
+    """One venue answer → a step state, in the report's vocabulary.
+
+    Order matters and is shared with the environment probe
+    (:func:`app.services.delta_key_probe.never_reached_the_venue`): "no HTTP answer
+    came back" is checked first, because that is a statement about this
+    machine — DNS, TLS, egress, or a URL we built wrong — and it must never be
+    filed as an opinion about the key.
+    """
     if isinstance(payload, dict) and payload.get("error"):
         detail = str(payload["error"])
+        if never_reached_the_venue(detail):
+            return {"ok": False, "state": "unreachable", "endpoint": label, "detail": detail}
         lowered = detail.lower()
         if any(marker in lowered for marker in ("unauthorized", "not authorised",
                                                 "not authorized", "forbidden")):
-            return {"ok": False, "state": "permission", "detail": detail}
+            return {"ok": False, "state": "permission", "endpoint": label, "detail": detail}
         if any(marker in lowered for marker in ("http 401", "invalid_api_key",
                                                 "invalidapikey", "api key not found",
                                                 "invalid_signature", "request_expired",
                                                 "incomplete_payload", "signature mismatch")):
-            return {"ok": False, "state": "auth", "detail": detail}
-        return {"ok": False, "state": "error", "detail": detail}
+            return {"ok": False, "state": "auth", "endpoint": label, "detail": detail}
+        return {"ok": False, "state": "error", "endpoint": label, "detail": detail}
     if isinstance(payload, dict) and payload.get("success") is False:
-        return {"ok": False, "state": "auth", "detail": str(payload)[:300]}
-    return {"ok": True, "state": "ok", "detail": "signed call accepted"}
+        return {"ok": False, "state": "auth", "endpoint": label, "detail": str(payload)[:300]}
+    return {"ok": True, "state": "ok", "endpoint": label, "detail": "signed call accepted"}
+
+
+def _signed(client: BrokerClient, method: str, path: str,
+            query: Optional[Dict[str, Any]] = None, weight: float = 1.0) -> Dict[str, Any]:
+    """One signed call categorized: ok / permission / auth / unreachable / error.
+
+    ``path`` is the **bare** endpoint and ``query`` its params. Passing the
+    display label instead (``"GET /v2/wallet/balances"``, or a path with its
+    query glued on) used to make every account panel of this report fail with
+    ``Failed to resolve 'api.india.delta.exchangeget '``, because the label was
+    concatenated onto the host and the space ended the authority. The transport
+    now refuses such a path outright (:meth:`BrokerClient._path_error`) and the
+    label is built here, separately, for display.
+    """
+    label = _endpoint_label(method, path, query)
+    try:
+        response, error = client._delta_request(method, path, query=query, weight=weight)
+        payload = client._json_body(response, error)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "state": "unreachable", "endpoint": label,
+                "detail": f"{exc.__class__.__name__}: {exc}"}
+    return _classify(payload, label)
+
+
+def _call(client: BrokerClient, call, label: str) -> Dict[str, Any]:
+    """One read-only high-level client call, categorized like :func:`_signed`.
+
+    Used where the venue's own adapter has to build the request (a non-Delta
+    key has a different signing scheme, so hand-picking a ``/v2/...`` path
+    would sign a Binance call the Delta way).
+    """
+    try:
+        payload = call()
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "state": "unreachable", "endpoint": label,
+                "detail": f"{exc.__class__.__name__}: {exc}"}
+    return _classify(payload, label)
 
 
 def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta",
@@ -175,7 +237,8 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
         steps.append(env_step)
     else:
         probe_client = BrokerClient(api_key, api_secret, code, testnet=testnet)
-        single = _signed(probe_client, "GET", "/v2/wallet/balances", weight=5)
+        single = _call(probe_client, probe_client.get_account_balance,
+                       f"{code} signed account call")
         single.update({"name": "environment",
                        "title": f"Signed call on {code} ({'testnet' if testnet else 'production'})",
                        "base_url": probe_client.trading_url,
@@ -188,27 +251,105 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
                         "permission_gap": False, "family": None}
 
     # 4. Signed calls on the environment that accepted the key.
+    #
+    # Every row carries its own bare endpoint and its own display label is
+    # derived from that — never the other way round. See the comment on the
+    # Delta table below for what happens when a label is used as a path.
     signed_ok = detected is not None
+    unreachable_steps: List[str] = []
     if detected:
         client = BrokerClient(api_key, api_secret, detected["broker_code"],
                               testnet=detected["testnet"])
-        client.trading_url = client.market_url = detected["base_url"].rstrip("/")
-        battery = [
-            ("balance", "GET /v2/wallet/balances", 5, "Account balance"),
-            ("positions", "GET /v2/positions?product_symbol=BTCUSD", 5, "Open positions"),
-            ("orders", "GET /v2/orders?product_symbol=BTCUSD&page_size=1", 5, "Open orders"),
-            ("history", "GET /v2/orders/history?product_symbol=BTCUSD&page_size=1", 5, "Order history"),
-            ("preferences", "GET /v2/users/trading_preferences", 5, "Trading preferences"),
-        ]
-        for key, path, weight, title in battery:
-            result = _signed(client, "GET", path, weight=weight)
+        client.trading_url = client.market_url = normalize_base_url(detected["base_url"])
+        if client.kind == "delta":
+            # Rows are (name, title, method, path, query) — the *bare* endpoint
+            # and its params, which is what gets signed and sent. The
+            # human-readable version is derived from them in :func:`_signed`,
+            # never supplied alongside: this battery used to carry
+            # ``("balance", "GET /v2/wallet/balances", …)`` and pass that label
+            # as the path, so every step looked up
+            # ``api.india.delta.exchangeget%20`` and the report blamed the
+            # exchange for a string built three lines away.
+            rows = [
+                ("balance", "Account balance", "GET", "/v2/wallet/balances", None),
+                # /v2/positions/margined, not /v2/positions: the margined
+                # endpoint is what get_positions() trades against, and the
+                # singular /v2/positions needs a product_id this battery does
+                # not resolve.
+                ("positions", "Open positions", "GET", "/v2/positions/margined",
+                 {"product_symbol": "BTCUSD"}),
+                ("orders", "Open orders", "GET", "/v2/orders",
+                 {"product_symbol": "BTCUSD", "page_size": 1}),
+                ("history", "Order history", "GET", "/v2/orders/history",
+                 {"product_symbol": "BTCUSD", "page_size": 1}),
+                ("preferences", "Trading preferences", "GET",
+                 "/v2/users/trading_preferences", None),
+                # Read-only, and reported but never decisive: the terminal's
+                # "margin mode" comes from this endpoint (Delta keeps margin
+                # mode on the (sub)account, not in trading_preferences), and a
+                # key that belongs to a sub-account is *not allowed* to list
+                # the parent's accounts. Both facts have to be visible without
+                # letting either one call the key dead.
+                ("accounts", "Margin mode source (sub-accounts)", "GET",
+                 "/v2/sub_accounts", None),
+            ]
+            battery = [(name, title,
+                        (lambda m=method, p=path, q=query:
+                         _signed(client, m, p, query=q, weight=5)))
+                       for (name, title, method, path, query) in rows]
+        else:
+            # Another venue signs differently, so nothing here may be spelled
+            # ``/v2/…``: the account adapters already know their own endpoints,
+            # and calling them is the more honest check anyway — it is the code
+            # the trader will actually run. Endpoints a venue does not have are
+            # reported as skipped, never as failures.
+            rows = [
+                ("balance", "Account balance", client.get_account_balance,
+                 "signed wallet balance"),
+                ("positions", "Open positions",
+                 lambda: client.get_positions("BTCUSDT"), "signed open positions"),
+                ("orders", "Open orders",
+                 lambda: client.get_open_orders("BTCUSDT"), "signed open orders"),
+                ("history", "Order history",
+                 lambda: client.get_order_history("BTCUSDT", limit=1),
+                 "signed order history"),
+                ("preferences", "Trading preferences", None, None),
+                ("accounts", "Margin mode source (sub-accounts)", None, None),
+            ]
+            battery = []
+            for (name, title, fn, label) in rows:
+                if fn is None:
+                    battery.append((name, title, lambda: {
+                        "ok": True, "state": "skipped",
+                        "endpoint": f"{detected['broker_code']} has no such endpoint",
+                        "detail": "Delta-only account setting — not checked"}))
+                else:
+                    battery.append((name, title,
+                                    (lambda f=fn, l=label: _call(client, f, l))))
+        for key, title, run in battery:
+            result = run()
             result.update({"name": key, "title": title,
                            "base_url": detected["base_url"],
                            "broker_code": detected["broker_code"],
                            "testnet": bool(detected["testnet"])})
+            if key == "accounts":
+                result["decisive"] = False
+                if result.get("state") == "auth":
+                    result["detail"] = (
+                        f"{result['detail']} — this key may be a sub-account key, "
+                        f"which cannot list its parent's accounts; the margin-mode "
+                        f"panel falls back to the open position's margin type")
             steps.append(result)
-            if result.get("state") in ("auth", "unreachable"):
+            # Anything but "the venue answered and accepted the key" (or
+            # accepted it but the endpoint needs a permission the key lacks —
+            # still proof the credential works) means the account side does not
+            # work, *including* a call that never got a reply at all.
+            if result.get("state") not in ("ok", "permission", "skipped"):
+                if key == "accounts":
+                    continue
                 signed_ok = False
+                if result.get("state") == "unreachable":
+                    unreachable_steps.append(str(result.get("endpoint") or title))
     else:
         steps.append({"name": "signed", "title": "Signed account calls",
                       "ok": False, "state": "skipped",
@@ -220,7 +361,7 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
         try:
             client = BrokerClient(api_key, api_secret, detected["broker_code"],
                                   testnet=detected["testnet"])
-            client.trading_url = client.market_url = detected["base_url"].rstrip("/")
+            client.trading_url = client.market_url = normalize_base_url(detected["base_url"])
             payload = client.fetch_rate_limit_quota()
             if isinstance(payload, dict) and not payload.get("error"):
                 quota = payload
@@ -273,8 +414,31 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
                             "(Delta answers UnauthorizedApiAccess).")
             fixes.append("Open API Management for this key and enable Read Data + Trading, "
                          "then Test connection again.")
-        if not signed_ok:
-            problems.append("Some signed calls failed on the accepted host (see rows above).")
+        if unreachable_steps:
+            # A signed call that never got an HTTP answer while the same host
+            # accepted the key two steps earlier cannot be about the key, and
+            # must not be allowed to end this report with "ready".
+            problems.append(
+                "Some signed calls never reached "
+                f"{detected['name']} ({', '.join(unreachable_steps)}) — that is a "
+                "network or URL-construction problem on this server, NOT a key "
+                "problem: the same host accepted the key in the step above.")
+            fixes.append(
+                f"Read the host named in the error against the one under test "
+                f"({detected['base_url']}). If they differ, a value was appended to "
+                "the base URL by the caller — the transport refuses such a request "
+                "before opening a socket now, and the step detail says so. If the "
+                "hosts match, this is DNS/TLS/egress on the trading server.")
+        elif not signed_ok:
+            failed = [str(s.get("endpoint") or s.get("title")) for s in steps
+                      if s.get("name") in ("balance", "positions", "orders",
+                                          "history", "preferences")
+                      and s.get("state") not in ("ok", "permission", "skipped")]
+            problems.append("Some signed calls failed on the accepted host "
+                            f"({', '.join(failed) or 'see steps above'}).")
+            fixes.append("Check the state of each step: 'rejected' is the key or the "
+                         "environment, 'failed' is the endpoint itself (a Delta error "
+                         "code follows it), 'unreachable' never reached the venue.")
 
     ok = bool(tick.get("ok")) and detected is not None and signed_ok and not problems
     verdict = {

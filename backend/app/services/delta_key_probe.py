@@ -31,13 +31,24 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+# The marker the transport guards use for "this client refused to build the
+# request" (see app.core.urls.refusal). Importing the constant instead of
+# repeating the phrase is the point: if the wording changes in one place, the
+# probe does not quietly start reporting a code bug as "the key was rejected".
+from app.core.urls import REFUSAL_PREFIX, normalize_base_url
 from app.services.broker_client import BrokerClient
 
 # All four Delta REST environments, in the order they are probed.
 HOSTS: List[Dict[str, Any]] = BrokerClient.delta_hosts()
 
 # Transport-level failures say nothing about the key — they say the machine
-# could not reach the host, which is its own bug (DNS, SSL, egress IP, proxy).
+# could not reach the host, which is its own bug (DNS, SSL, egress IP, proxy)
+# and, since 01.09.26, the shape a malformed request URL reports itself as:
+# "Failed to resolve 'api.india.delta.exchangeget '" was a label glued onto
+# the base URL, and nothing else. A battery that files that under "error, key
+# probably fine" instead of "this call never left the box" sends the operator
+# to the exchange panel when the bug is in this repo — hence
+# :func:`is_transport_failure` being shared with ``connection_test``.
 _TRANSPORT_TOKENS = ("SSLError", "ConnectionError", "Timeout", "Max retries",
                      "Failed to resolve", "request failed", "non-JSON body")
 
@@ -49,9 +60,45 @@ _PERMISSION_TOKENS = ("unauthorizedapiaccess", "unauthorized_api_access",
                       "permission", "api key not authorised")
 
 
+def is_transport_failure(detail: Any) -> bool:
+    """True when ``detail`` means "we never got an HTTP answer", not "we were refused".
+
+    Shared with the connection battery, because the two need to agree: a
+    DNS/SSL/timeout answer says nothing about a key, and reading one as an auth
+    failure sends the operator hunting for a key that was fine. The reverse
+    reading is what used to hide a malformed URL — ``Failed to resolve
+    'api.india.delta.exchangeget '`` is this function's problem, not the
+    venue's.
+    """
+    text = str(detail or "")
+    return any(token in text for token in _TRANSPORT_TOKENS)
+
+
+def is_local_refusal(detail: Any) -> bool:
+    """True when *this process* refused to send the request at all.
+
+    The transport guards in :class:`BrokerClient` (see
+    :meth:`BrokerClient._path_error`) answer ``"<venue> request not sent: ..."``
+    for a URL they can not stand behind. That is neither "the key is dead" nor
+    "the network is down": no packet left, no weight was spent, and the venue
+    never had a chance to disagree with anything.
+    """
+    return REFUSAL_PREFIX in str(detail or "")
+
+
+def never_reached_the_venue(detail: Any) -> bool:
+    """True when the venue cannot have formed an opinion about this request.
+
+    Covers both ways a call fails without an answer — the network dropped it,
+    or the client refused to build it — so no report can read either one as a
+    verdict on the API key.
+    """
+    return is_transport_failure(detail) or is_local_refusal(detail)
+
+
 def _state_for(detail: str) -> str:
     """``"unreachable"`` / ``"auth"`` / ``"permission"`` for one host's answer."""
-    if any(token in detail for token in _TRANSPORT_TOKENS):
+    if never_reached_the_venue(detail):
         return "unreachable"
     if any(token in detail for token in _PERMISSION_TOKENS):
         return "permission"
@@ -82,7 +129,7 @@ def probe_host(api_key: str, api_secret: str, base_url: str,
         client = BrokerClient(api_key, api_secret, broker_code, testnet=testnet)
         # Belt and braces: probe exactly the host we were asked about, whatever
         # the broker definition's URLs say.
-        client.trading_url = client.market_url = base_url.rstrip("/")
+        client.trading_url = client.market_url = normalize_base_url(base_url)
         payload = client.get_account_balance()
     except Exception as exc:  # pragma: no cover - defensive
         return {"state": "unreachable", "detail": f"{exc.__class__.__name__}: {exc}",
@@ -196,7 +243,11 @@ def verdict(rows: List[Dict[str, Any]], flagged_testnet: Optional[bool] = None,
     out["summary"] = ("No Delta host answered from this machine, so this says "
                       "nothing about the key.")
     out["fix"] = ("Fix connectivity/DNS/SSL on the trading server first "
-                  "(the probe runs from the box, not the browser).")
+                  "(the probe runs from the box, not the browser). If the host in "
+                  "the error is not exactly one of the four URLs above — a name "
+                  "with a path, a method or a %20 in it — no request was ever "
+                  "aimed at the exchange: that is the base URL being built wrong in "
+                  "this codebase, not the network.")
     return out
 
 

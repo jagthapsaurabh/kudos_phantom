@@ -49,6 +49,7 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -58,6 +59,9 @@ import requests
 from app.core.mark_price import MarkPriceQuote, perpetual_symbol
 from app.core.rate_limit import (
     RateLimitConfig, RateLimitExceeded, default_config_for, get_limiter,
+)
+from app.core.urls import (
+    normalize_base_url, path_problem, refusal, url_problem,
 )
 
 
@@ -286,8 +290,13 @@ class BrokerClient:
         self.definition = definition
         defaults = self.DEFAULTS.get(self.broker_name, self.DEFAULTS["Binance"])
         self.kind = getattr(definition, "kind", None) or defaults["kind"]
-        self.market_url = (getattr(definition, "market_data_url", None) or defaults["market"]).rstrip("/")
-        self.trading_url = (getattr(definition, "trading_api_url", None) or defaults["trading"]).rstrip("/")
+        # Normalized, not trusted: a broker definition is an admin-typed DB
+        # row, and one pasted trailing space is enough to turn every signed
+        # call into a DNS lookup for a host that does not exist.
+        self.market_url = normalize_base_url(
+            getattr(definition, "market_data_url", None), defaults["market"])
+        self.trading_url = normalize_base_url(
+            getattr(definition, "trading_api_url", None), defaults["trading"])
         if self.testnet and self.kind == "binance":
             self.market_url = "https://testnet.binancefuture.com"
             self.trading_url = "https://testnet.binancefuture.com"
@@ -480,6 +489,13 @@ class BrokerClient:
     # ==================================================================
     # Low-level transport (rate limited + 429 aware)
     # ==================================================================
+    # The URL rules live in app.core.urls so the diagnostics, the market-data
+    # fallback and this transport all refuse the same shapes. These two are the
+    # client's own view of them, kept as methods because the guards read as part
+    # of the request path they protect.
+    _path_error = staticmethod(path_problem)
+    _url_error = staticmethod(url_problem)
+
     def _throttled_request(self, method, url, params=None, data=None, headers=None,
                            weight: float = 1.0, is_order: bool = False,
                            refresh_headers=None):
@@ -490,7 +506,13 @@ class BrokerClient:
         retry sends a **fresh timestamp + signature** — Delta rejects
         timestamps more than 5 s old, so a 429 retry reusing the first
         attempt's headers would always answer ``request_expired``.
+
+        A malformed URL is refused here, before the limiter and before DNS:
+        see :meth:`_url_error`.
         """
+        bad_url = self._url_error(url)
+        if bad_url:
+            return None, refusal(self.broker_name, bad_url, {"url": str(url)})
         cfg = self.rate_limit_config
         last_error = None
         # Delta requires a User-Agent on every request (public and signed);
@@ -586,6 +608,10 @@ class BrokerClient:
     # ------------------------------------------------------------------
     def _binance_request(self, method, endpoint, params, weight: float = 1.0,
                          is_order: bool = False):
+        bad_path = self._path_error(endpoint)
+        if bad_path:
+            return None, refusal(self.broker_name, bad_path,
+                                 {"method": str(method), "path": str(endpoint)})
         params = {k: v for k, v in dict(params or {}).items() if v is not None}
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = int(params.get("recvWindow", 5000))
@@ -639,6 +665,13 @@ class BrokerClient:
         # Changelog 19.08.26 (docs.delta.exchange): GET /v2/profile is rejected
         # when signed with API keys from 19 Aug 2026. Account identity / a key
         # ping must use GET /v2/wallet/balances (or GET /v2/users/trading_preferences).
+        bad_path = self._path_error(path)
+        if bad_path:
+            # Never signed, never sent: the mistake is in this process, the
+            # venue's weight budget is not spent discovering it, and the caller
+            # gets back the endpoint it asked for so a report can show both.
+            return None, refusal(self.broker_name, bad_path,
+                                 {"method": str(method), "path": str(path)})
         if str(path).rstrip("/").endswith("/v2/profile") or str(path).rstrip("/") == "/profile":
             return None, {"error": "GET /v2/profile is no longer accessible with API keys "
                                    "(Delta changelog 19.08.26). Use GET /v2/wallet/balances."}
@@ -648,8 +681,6 @@ class BrokerClient:
         # and body_string is '' when body is None else compact JSON. The exact
         # ordered and encoded query string below is also passed to requests;
         # signing a separately serialized query is a common source of 401s.
-        import urllib.parse
-
         def _query_params(q):
             # Build one deterministic mapping for both signing and requests.
             # ``requests`` preserves dict insertion order when it serializes
