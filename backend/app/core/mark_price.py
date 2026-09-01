@@ -50,7 +50,7 @@ DELTA_MARK_PREFIX = "MARK:"
 
 
 def normalize_source_name(source: Optional[str]) -> str:
-    text = str(source or "Binance").strip()
+    text = str(source or "Delta").strip()
     return {"binance": "Binance", "delta": "Delta",
             "delta exchange": "Delta"}.get(text.lower(), text)
 
@@ -183,7 +183,7 @@ class MarkPriceService:
         return quote if quote.mark_price or quote.last_price else None
 
     @classmethod
-    def current(cls, source: str = "Binance", symbol: str = "BTCUSDT",
+    def current(cls, source: str = "Delta", symbol: str = "BTCUSD",
                 definition=None, client=None) -> Optional[MarkPriceQuote]:
         """Current mark + last price. Returns ``None`` when the venue is unreachable."""
         venue = normalize_source_name(source)
@@ -213,7 +213,7 @@ class MarkPriceService:
         return None
 
     @classmethod
-    def mark_klines(cls, source: str = "Binance", symbol: str = "BTCUSDT",
+    def mark_klines(cls, source: str = "Delta", symbol: str = "BTCUSD",
                     interval: str = "1h", start_time=None, end_time=None,
                     limit: int = 1000) -> List[Dict[str, Any]]:
         """Historical mark-price candles, normalized like regular OHLC rows."""

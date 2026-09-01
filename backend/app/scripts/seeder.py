@@ -1,6 +1,6 @@
 """Market-data seeder CLI.
 
-Default behaviour (no arguments) is exactly what a corrupted Binance seed
+Default behaviour (no arguments) is exactly what a corrupted Delta seed
 needs: fetch clean candles straight from the exchange — 1 Jan 2020 → today
 for 15m, 1h, 4h and 1d (daily candles included) — after removing the
 duplicate and off-grid candles the legacy CSV path left behind, then refresh
@@ -12,7 +12,7 @@ mark pricing all saw corrupted data. CSVs are now a validated opt-in via
 --csv and are rejected when their timestamps are not aligned to the interval.
 
 Examples:
-  python -m app.scripts.seeder                        # Binance 2020 → today (15m,1h,4h,1d)
+  python -m app.scripts.seeder                        # Delta 2020 → today (15m,1h,4h,1d)
   python -m app.scripts.seeder --source Delta         # Delta 2020 → today (15m,1h,4h,1d)
   python -m app.scripts.seeder --intervals 1d         # daily candles only
   python -m app.scripts.seeder --start 2022-01-01     # custom range
@@ -30,7 +30,7 @@ DEFAULT_INTERVALS = "15m,1h,4h,1d"  # 1d = daily candles; matches the Delta pres
 DEFAULT_START = "2020-01-01"
 
 
-def seed_full_history(source="Binance", symbol="BTCUSDT", intervals=None,
+def seed_full_history(source="Delta", symbol="BTCUSD", intervals=None,
                       start=DEFAULT_START, end=None, limit=1500,
                       repair=True, mark_price=True, daily_refresh=True):
     """Repair + fetch + upsert one source's full history (default 2020 → today)."""
@@ -67,7 +67,7 @@ def seed_full_history(source="Binance", symbol="BTCUSDT", intervals=None,
     return summary
 
 
-def seed_from_csv(csv_path, interval, symbol="BTCUSDT", source="Binance", clear_existing=False):
+def seed_from_csv(csv_path, interval, symbol="BTCUSD", source="Delta", clear_existing=False):
     """Validated CSV import. Returns True on success; False with a message.
 
     Timestamps must already sit on the interval grid — the historical CSVs
@@ -90,7 +90,7 @@ def update_daily_data(symbol="BTCUSDT", intervals=None):
     return DataSyncService.sync_all_configured_sources_daily(symbol, intervals)
 
 
-def seed_to_db(symbol="BTCUSDT", interval="1h", years=6, source="Binance"):
+def seed_to_db(symbol="BTCUSD", interval="1h", years=6, source="Delta"):
     """Back-compat helper: full-history fetch for one interval."""
     start = (datetime.utcnow() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
     return seed_full_history(source, symbol, [interval], start=start,
@@ -99,10 +99,10 @@ def seed_to_db(symbol="BTCUSDT", interval="1h", years=6, source="Binance"):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Seed market data from a live exchange API (Binance by default) or a validated CSV.",
+        description="Seed market data from a live exchange API (Delta by default) or a validated CSV.",
         epilog="Full-history requests are split into exchange-safe windows, resume from a durable "
                "cursor after an interruption, and upsert every candle (no duplicates).")
-    parser.add_argument('--source', default='Binance', help='Binance (default) or Delta')
+    parser.add_argument('--source', default='Delta', help='Delta (default) or Binance')
     parser.add_argument('--symbol', default='BTCUSDT')
     parser.add_argument('--intervals', default=DEFAULT_INTERVALS,
                         help=f"comma-separated intervals (default {DEFAULT_INTERVALS}; 1d = daily candles)")

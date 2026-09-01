@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse, LayoutDashboard, FileText } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import LiveTerminal from '../components/LiveTerminal';
 import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
@@ -116,6 +117,147 @@ export const CredentialsBadge = ({ credentials, onReload, busy }) => {
   );
 };
 
+// ---------- Broker balance panel ----------
+// This panel used to render the literal string "Connecting..." forever: no
+// code ever fetched a balance, so there was nothing to connect. It now reads
+// GET /live-account/balance, which always answers with a state — so the user
+// sees either real equity or the actual reason it cannot be read.
+export const BalancePanel = ({ balance, marginUsed, broker, onRefresh }) => {
+  const b = balance || {};
+  const money = (v, cur) => (v === null || v === undefined || Number.isNaN(Number(v)))
+    ? '—'
+    : `${cur || ''}${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  if (b.state === 'loading' || !balance) {
+    return (
+      <div className="space-y-3">
+        <div className="h-4 w-2/3 animate-pulse rounded bg-gray-700/60" />
+        <div className="h-4 w-1/2 animate-pulse rounded bg-gray-700/40" />
+        <p className="text-[10px] text-gray-500">Reading your {broker} account…</p>
+      </div>
+    );
+  }
+
+  if (b.state === 'no_credentials' || b.state === 'error') {
+    const missing = b.state === 'no_credentials';
+    return (
+      <div className="space-y-3">
+        <div className={`rounded-lg border p-2.5 text-[11px] leading-snug ${
+          missing ? 'border-amber-800/60 bg-amber-900/20 text-amber-200'
+                  : 'border-red-800/60 bg-red-900/20 text-red-200'}`}>
+          <div className="mb-1 font-bold">
+            {missing ? 'No usable API key' : `${broker} rejected the balance call`}
+          </div>
+          <div className="opacity-90">{b.error || 'Unknown error'}</div>
+          {missing && (
+            <a href="/broker" className="mt-1 inline-block underline">Add keys in Broker Settings →</a>
+          )}
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-gray-500">Used Margin (local)</span>
+          <span className="font-mono text-sm font-bold text-green-400">
+            ₹{Number(marginUsed || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+          </span>
+        </div>
+        {onRefresh && (
+          <button onClick={onRefresh}
+                  className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-1.5 text-[11px] font-semibold text-gray-300 transition hover:border-blue-500 hover:text-white">
+            Retry
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const cur = b.asset === 'USD' || b.asset === 'USDT' ? '$' : '';
+  const rows = [
+    ['Wallet balance', money(b.wallet_balance, cur)],
+    ['Available', money(b.available_balance, cur)],
+    ['Used margin', money(b.used_margin, cur)],
+    ['Unrealised PnL', money(b.unrealized_pnl, cur)],
+  ];
+  return (
+    <div className="space-y-2.5">
+      {b.testnet && (
+        <div className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[9px] font-bold text-amber-300">
+          TESTNET ACCOUNT
+        </div>
+      )}
+      {rows.map(([label, value]) => (
+        <div key={label} className="flex items-center justify-between">
+          <span className="text-xs text-gray-500">{label}</span>
+          <span className="font-mono text-sm font-bold text-white">{value}</span>
+        </div>
+      ))}
+      <div className="flex items-center justify-between border-t border-gray-700 pt-2">
+        <span className="text-xs text-gray-500">Margin in Kudos trades</span>
+        <span className="font-mono text-sm font-bold text-green-400">
+          ₹{Number(marginUsed || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+        </span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-gray-600">{b.asset} · {b.broker}</span>
+        {onRefresh && (
+          <button onClick={onRefresh} className="text-[10px] text-gray-500 underline hover:text-gray-300">
+            Refresh
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ---------- Pre-flight modal ----------
+// Answers "can this strategy start?" BEFORE the user commits. The blocking
+// case is a duplicate: the same strategy already running on the same broker
+// account, which cannot work because the account nets one position.
+export const PreflightModal = ({ check, onCancel, onConfirm, busy }) => {
+  if (!check) return null;
+  const blocked = check.blocking;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onCancel}>
+      <div className="mx-4 w-full max-w-lg rounded-2xl border border-gray-700 bg-gray-800 p-6 shadow-2xl"
+           onClick={e => e.stopPropagation()}>
+        <h3 className={`mb-2 flex items-center gap-2 text-lg font-bold ${blocked ? 'text-red-400' : 'text-white'}`}>
+          {blocked ? <AlertCircle size={20} /> : <ShieldCheck size={20} className="text-green-400" />}
+          {blocked ? 'This strategy cannot start' : 'Confirm start'}
+        </h3>
+        <div className={`mb-4 rounded-lg border p-3 text-sm leading-relaxed ${
+          blocked ? 'border-red-900/50 bg-red-900/20 text-red-200'
+                  : check.kind === 'shared'
+                    ? 'border-amber-900/50 bg-amber-900/20 text-amber-200'
+                    : 'border-gray-700 bg-gray-900 text-gray-300'}`}>
+          {check.reason || 'Ready to start on ' + (check.account_label || 'the primary account') + '.'}
+        </div>
+        {!blocked && (
+          <dl className="mb-5 grid grid-cols-2 gap-2 text-xs">
+            {[['Broker', check.broker], ['Account', check.account_label],
+              ['Mode', String(check.mode || '').toUpperCase()],
+              ['Environment', check.testnet ? 'Testnet' : 'Production']].map(([k, v]) => (
+              <div key={k} className="rounded border border-gray-700 bg-gray-900 p-2">
+                <dt className="text-[9px] font-bold uppercase text-gray-500">{k}</dt>
+                <dd className="truncate font-mono text-gray-200">{v || '—'}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel}
+                  className="rounded-lg bg-gray-700 px-4 py-2 text-sm font-semibold text-gray-300 transition hover:bg-gray-600 hover:text-white">
+            {blocked ? 'Close' : 'Cancel'}
+          </button>
+          {!blocked && (
+            <button onClick={onConfirm} disabled={busy}
+                    className="rounded-lg bg-green-600 px-4 py-2 text-sm font-bold text-white transition hover:bg-green-500 disabled:opacity-50">
+              {busy ? 'Starting…' : 'Start instance'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ---------- Confirmation modal ----------
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
   if (!open) return null;
@@ -162,8 +304,9 @@ const LiveTrade = () => {
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
   const [strategies, setStrategies] = useState([]);
-  const [dataSource, setDataSource] = useState('Binance');
-  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  // Delta Exchange is the house broker and the default for every new instance.
+  const [dataSource, setDataSource] = useState('Delta');
+  const [sources, setSources] = useState([{ code: 'Delta', name: 'Delta Exchange' }, { code: 'Binance', name: 'Binance Futures' }]);
   const [connections, setConnections] = useState([]);
   const [connectionId, setConnectionId] = useState('');
   const [capital, setCapital] = useState(20000);
@@ -180,7 +323,22 @@ const LiveTrade = () => {
   const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
   const [showWindows, setShowWindows] = useState(false);
   // Deadman switch: ON by default for Delta (must-have), OFF for others.
-  const [heartbeat, setHeartbeat] = useState(false);
+  const [heartbeat, setHeartbeat] = useState(true);
+  // Risk controls pushed to the venue at start (see POST /live-trade/start).
+  const [leverage, setLeverage] = useState(7);
+  const [marginMode, setMarginMode] = useState('');
+  // Live broker equity (replaces the hardcoded "Connecting...").
+  const [balance, setBalance] = useState(null);
+  // Pre-flight result shown before a start is actually sent.
+  const [preflight, setPreflight] = useState(null);
+  const [starting, setStarting] = useState(false);
+  // Per-strategy live results (GET /live-trade/results).
+  const [results, setResults] = useState([]);
+  // The broker terminal is no longer a separate page — it is the second view
+  // of live trading, on the same broker/connection already selected above.
+  const [view, setView] = useState('automation');
+  const [reloading, setReloading] = useState(null);
+  const [reloadNote, setReloadNote] = useState(null);
 
   useEffect(() => {
     fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(list => {
@@ -189,7 +347,7 @@ const LiveTrade = () => {
     fetch(`${API_URL}/broker-connections`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : []).then(setConnections).catch(() => {});
     fetch(`${API_URL}/broker-settings`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } }).then(r => r.ok ? r.json() : null).then(data => {
       if (data) {
-        const broker = data.broker_name || 'Binance';
+        const broker = data.broker_name || 'Delta';
         setDataSource(broker);
         setHeartbeat(String(broker).toLowerCase() === 'delta');
         setCapital(data.initial_capital || 20000);
@@ -212,21 +370,105 @@ const LiveTrade = () => {
       .then(data => setStrategies(data));
   }, []);
 
-  const startTrade = async () => {
+  // Broker equity for the balance panel. Always resolves to a state the panel
+  // can render, so the card never sits on "Connecting..." again.
+  const fetchBalance = useCallback(async () => {
+    setBalance({ state: 'loading' });
+    try {
+      const qs = new URLSearchParams({ broker: dataSource });
+      if (connectionId) qs.set('connection_id', String(connectionId));
+      const res = await fetch(`${API_URL}/live-account/balance?${qs}`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      const data = await res.json();
+      setBalance(res.ok ? data : { state: 'error', error: data.detail || 'Request failed' });
+    } catch (e) {
+      setBalance({ state: 'error', error: e.message });
+    }
+  }, [dataSource, connectionId]);
+
+  useEffect(() => {
+    fetchBalance();
+    const id = setInterval(fetchBalance, 30000);
+    return () => clearInterval(id);
+  }, [fetchBalance]);
+
+  // Per-strategy live results, so a client can judge ONE strategy on ONE
+  // account rather than reading a merged blob of every instance.
+  const fetchResults = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/live-trade/results`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+      });
+      if (res.ok) setResults(await res.json());
+    } catch (e) { /* results are an extra; never block the live view */ }
+  }, []);
+
+  useEffect(() => {
+    fetchResults();
+    const id = setInterval(fetchResults, 10000);
+    return () => clearInterval(id);
+  }, [fetchResults]);
+
+  const startPayload = () => ({
+    strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
+    connection_id: connectionId ? Number(connectionId) : null,
+    initial_capital: Number(capital), margin_pct: Number(marginPct),
+    use_mark_price: useMarkPrice, trading_windows: tradingWindows,
+    price_feed: priceFeed, tick_interval: Number(tickInterval),
+    leverage: Number(leverage) || null,
+    margin_mode: marginMode || null,
+    heartbeat,
+  });
+
+  // Two-step start: ask the backend whether this strategy MAY start on this
+  // account, show the answer, and only then send it. The blocking case (the
+  // same strategy already live on the same account) is now impossible to
+  // trigger by accident.
+  const requestStart = async () => {
     setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/trade/preflight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+        body: JSON.stringify({ mode: 'live', strategy_id: selectedStrategy, broker_name: dataSource,
+                               data_source: dataSource, connection_id: connectionId ? Number(connectionId) : null }),
+      });
+      const data = await res.json();
+      setPreflight(res.ok ? data : { blocking: true, reason: data.detail || 'Pre-flight check failed' });
+    } catch (e) {
+      setPreflight({ blocking: true, reason: e.message });
+    }
+    setLoading(false);
+  };
+
+  const startTrade = async () => {
+    setStarting(true);
     try {
       const res = await fetch(`${API_URL}/live-trade/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
-          connection_id: connectionId ? Number(connectionId) : null, initial_capital: Number(capital), margin_pct: Number(marginPct),
-          use_mark_price: useMarkPrice, trading_windows: tradingWindows,
-          price_feed: priceFeed, tick_interval: Number(tickInterval),
-          heartbeat })
+        body: JSON.stringify(startPayload()),
       });
-      if (!res.ok) { const err = await res.json().catch(() => ({})); alert(err.detail || 'Could not start live trade'); }
-    } catch (e) { console.error(e); alert(e.message); }
-    setLoading(false);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPreflight({ blocking: true, reason: data.detail || 'Could not start live trade' });
+      } else {
+        setPreflight(null);
+        // Surface what the exchange said about leverage / margin mode.
+        const rs = data.risk_setup || {};
+        const problems = ['leverage', 'margin_mode']
+          .filter(k => rs[k] && rs[k].status === 'rejected')
+          .map(k => `${k.replace('_', ' ')}: ${rs[k].error}`);
+        if (problems.length) {
+          setReloadNote({ ok: false, text: `Started, but the venue refused — ${problems.join(' · ')}` });
+        }
+        fetchStatus(); fetchBalance(); fetchResults();
+      }
+    } catch (e) {
+      setPreflight({ blocking: true, reason: e.message });
+    }
+    setStarting(false);
   };
 
   const requestStop = (instanceKey) => setConfirm({ instanceKey });
@@ -234,8 +476,6 @@ const LiveTrade = () => {
   // Reload one instance's saved broker credentials without restarting it. The
   // worker re-reads its connection row, swaps the client, and resumes on the
   // next tick; this just skips the backoff wait after a key is fixed.
-  const [reloading, setReloading] = useState(null);
-  const [reloadNote, setReloadNote] = useState(null);
   const reloadKeys = async (instanceKey) => {
     setReloading(instanceKey); setReloadNote(null);
     try {
@@ -290,6 +530,9 @@ const LiveTrade = () => {
 
   return (
     <div className="page-shell">
+      <PreflightModal check={preflight} busy={starting}
+                      onCancel={() => setPreflight(null)}
+                      onConfirm={startTrade} />
       <ConfirmModal
         open={!!confirm}
         title="Stop Live Trade Instance?"
@@ -305,6 +548,21 @@ const LiveTrade = () => {
             <ShieldCheck size={28} /> Live Trading
           </h1>
           <p className="text-gray-400 text-sm mt-1">Executing real trades on your broker account</p>
+          {/* The broker terminal used to be its own page, which split live
+              trading in two: the strategy ran here, the actual account lived
+              somewhere else. It is now the second view of this page, on the
+              same broker and connection selected below. */}
+          <div className="mt-4 inline-flex rounded-xl border border-gray-700 bg-gray-800 p-1">
+            {[['automation', 'Strategy automation', LayoutDashboard],
+              ['terminal', 'Broker terminal', TerminalSquare]].map(([key, label, Icon]) => (
+              <button key={key} onClick={() => setView(key)}
+                      className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                        view === key ? 'bg-green-600 text-white shadow'
+                                     : 'text-gray-400 hover:text-white'}`}>
+                <Icon size={15} /> {label}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="flex gap-3 items-end flex-wrap">
           <div className="flex flex-col">
@@ -325,6 +583,7 @@ const LiveTrade = () => {
               {connections.filter(c => c.broker_code === dataSource).map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
             </select>
           </div>
+          {view === 'automation' && (<>
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
             <input type="number" value={capital} onChange={e => setCapital(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-28" />
@@ -332,6 +591,24 @@ const LiveTrade = () => {
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Margin %</label>
             <input type="number" value={marginPct} onChange={e => setMarginPct(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-20" />
+          </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Leverage</label>
+            <input type="number" min="1" max="125" value={leverage}
+                   onChange={e => setLeverage(e.target.value)}
+                   title="Sizing leverage. It is also pushed to the exchange before the first order so the venue and the local sizing agree."
+                   className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-20" />
+          </div>
+          <div className="flex flex-col">
+            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Margin mode</label>
+            <select value={marginMode} onChange={e => setMarginMode(e.target.value)}
+                    title="Applied to the broker account at start. Leave on 'Keep current' to use whatever the account is already set to."
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+              <option value="">Keep current</option>
+              <option value="isolated">Isolated</option>
+              <option value="cross">Cross</option>
+              <option value="portfolio">Portfolio</option>
+            </select>
           </div>
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Active Strategy</label>
@@ -400,17 +677,29 @@ const LiveTrade = () => {
             title="Download live fills as a Kudos/backtest-style CSV">
             <Download size={16} /> Export fills
           </button>
-          <a href="/terminal"
-             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
-            <TerminalSquare size={16} /> Terminal
+          <a href="/sessions"
+             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-purple-500 hover:text-white flex items-center gap-2 text-sm"
+             title="Every past run, kept after it stops — trades, equity curve and logs">
+            <FileText size={16} /> Results
           </a>
-          <button onClick={startTrade} disabled={loading}
-                  className="px-6 py-2 rounded-lg font-bold transition bg-green-600 hover:bg-green-500 flex items-center gap-2">
-            <Play size={18} /> Start Instance
+          <button onClick={requestStart} disabled={loading || starting}
+                  className="px-6 py-2 rounded-lg font-bold transition bg-green-600 hover:bg-green-500 disabled:opacity-50 flex items-center gap-2">
+            <Play size={18} /> {loading ? 'Checking…' : 'Start Instance'}
           </button>
+          </>)}
         </div>
       </div>
 
+      {view === 'terminal' && (
+        <LiveTerminal
+          key={`${dataSource}:${connectionId}`}
+          broker={dataSource}
+          connectionId={connectionId ? Number(connectionId) : null}
+          refreshMs={10000}
+        />
+      )}
+
+      {view === 'automation' && (<>
       {/* Pricing basis + "skip new trades" schedule for new instances */}
       {showWindows && (
         <div className="mb-8 grid grid-cols-1 gap-4 xl:grid-cols-3">
@@ -463,16 +752,8 @@ const LiveTrade = () => {
             <h3 className="text-sm font-bold text-gray-400 uppercase mb-4 flex items-center gap-2">
               <Wallet size={16} /> Broker Balance
             </h3>
-            <div className="space-y-4">
-              <div className="flex justify-between items-center">
-                <span className="text-gray-500 text-xs">Total Equity</span>
-                <span className="font-mono font-bold">Connecting...</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-gray-500 text-xs">Used Margin</span>
-                <span className="font-mono font-bold text-green-400">₹{marginUsed.toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
-              </div>
-            </div>
+            <BalancePanel balance={balance} marginUsed={marginUsed}
+                          broker={dataSource} onRefresh={fetchBalance} />
           </div>
           <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
             <h3 className="text-sm font-bold text-gray-400 uppercase mb-4 flex items-center gap-2">
@@ -558,14 +839,72 @@ const LiveTrade = () => {
                 {activeTrades.map((t, i) => <TradeCard key={i} trade={t} />)}
               </div>
             ) : (
-              <div className="flex flex-col items-center justify-center h-[400px] text-gray-600">
+              <div className="flex flex-col items-center justify-center h-[300px] text-gray-600">
                 <TrendingUp size={48} className="mb-4 opacity-20" />
                 <p>No live positions open. Scanning {dataSource} for institutional entries...</p>
               </div>
             )}
+
+            {/* Per-strategy live results: how each strategy is actually doing
+                on each account, which the running-instance list cannot say. */}
+            <div className="mt-8 border-t border-gray-700 pt-6">
+              <h3 className="mb-4 flex items-center gap-2 text-lg font-bold">
+                <Activity size={20} className="text-blue-400" /> Strategy results (live)
+              </h3>
+              {results.length === 0 ? (
+                <p className="text-xs text-gray-500">
+                  No live strategy results yet. Results appear here per strategy and per broker
+                  account as soon as an instance is running.
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  {results.map(r => (
+                    <div key={`${r.strategy_id}-${r.connection_id}`}
+                         className="rounded-xl border border-gray-700 bg-gray-900 p-4">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="truncate font-bold text-white">{r.strategy_name}</div>
+                          <div className="text-[10px] text-gray-500">
+                            {r.broker_name} · {r.account_label} ·
+                            {' '}{r.instances.length} instance{r.instances.length === 1 ? '' : 's'} ·
+                            {' '}{r.leverage ?? '—'}× · {r.margin_pct ?? '—'}% margin
+                          </div>
+                        </div>
+                        <div className={`font-mono text-lg font-bold ${
+                          (r.net_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {(r.net_pnl || 0) >= 0 ? '+' : ''}₹{Number(r.net_pnl || 0).toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 text-center text-[10px] uppercase text-gray-400 sm:grid-cols-4 xl:grid-cols-7">
+                        {[
+                          ['Closed', r.closed_trade_count ?? 0],
+                          ['Win rate', r.win_rate != null ? `${Number(r.win_rate).toFixed(1)}%` : '—'],
+                          ['Profit factor', r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : '—'],
+                          ['ROI', r.roi != null ? `${Number(r.roi).toFixed(2)}%` : '—'],
+                          ['Max DD', r.max_drawdown_pct != null ? `${Number(r.max_drawdown_pct).toFixed(2)}%` : '—'],
+                          ['Open', r.open_position_count ?? 0],
+                          ['Unrealised', `₹${Number(r.unrealised_pnl || 0).toFixed(2)}`],
+                        ].map(([label, value]) => (
+                          <div key={label} className="rounded bg-gray-800/60 p-2">
+                            {label}<br />
+                            <span className="font-mono text-xs text-white">{value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {r.last_order_error && (
+                        <div className="mt-2 rounded border border-red-900/50 bg-red-900/20 p-2 text-[10px] text-red-300">
+                          Last order error: {r.last_order_error}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
+      </>)}
     </div>
   );
 };

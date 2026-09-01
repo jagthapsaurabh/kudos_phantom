@@ -358,7 +358,7 @@ const OrderTicket = ({ broker, symbol, contract, markPrice, disabled, onSubmit, 
 // ---------------------------------------------------------------------------
 // Terminal
 // ---------------------------------------------------------------------------
-const LiveTerminal = ({ broker = 'Binance', connectionId = null, snapshot: initialSnapshot = null,
+const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initialSnapshot = null,
                         autoRefresh = true, refreshMs = 10000, initialTab = 'positions' }) => {
   const [snapshot, setSnapshot] = useState(initialSnapshot || EMPTY);
   const [tab, setTab] = useState(initialTab);

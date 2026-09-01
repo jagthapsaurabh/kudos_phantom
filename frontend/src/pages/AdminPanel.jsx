@@ -555,7 +555,7 @@ export const SeedDataTab = () => {
   // Seed the mark-price series of the BTC perpetual alongside the traded
   // OHLCV — risk (stops/targets/PnL) is priced on the mark price.
   const [includeMarkPrice, setIncludeMarkPrice] = useState(true);
-  const [source, setSource] = useState('Binance');
+  const [source, setSource] = useState('Delta');
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [intervals, setIntervals] = useState(ALL_INTERVALS);
   const [start, setStart] = useState('');

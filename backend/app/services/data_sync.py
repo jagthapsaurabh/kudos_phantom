@@ -11,6 +11,8 @@ import requests
 from sqlalchemy import func
 
 from app.core.urls import normalize_base_url
+from sqlalchemy.exc import IntegrityError
+from app.core.mark_price import perpetual_symbol, _PERPETUAL_ALIASES
 from app.database.models import (
     BrokerDefinition, MarketDataSeedProgress, SessionLocal, Klines, init_db,
 )
@@ -74,8 +76,27 @@ class DataSyncService:
 
     @classmethod
     def normalize_source(cls, source: str | None) -> str:
-        value = (source or "Binance").strip()
+        value = (source or "Delta").strip()
         return cls.SOURCE_ALIASES.get(value.lower(), value)
+
+    @classmethod
+    def venue_symbol(cls, source, symbol="BTCUSDT"):
+        """The symbol this venue actually stores its BTC perpetual under.
+
+        Delta lists BTCUSD, Binance BTCUSDT. Callers pass whichever they have;
+        storing and reading through this resolver keeps one venue's candles
+        from being written under the other's ticker, which previously left the
+        live fallback querying a symbol that had no rows.
+
+        Only the known BTC-perpetual aliases are translated. Any other symbol
+        is stored exactly as given — `perpetual_symbol` would substitute the
+        venue's default contract, which for arbitrary tickers would file
+        candles under the wrong instrument entirely.
+        """
+        raw = str(symbol or "BTCUSDT").replace("/", "").replace("-", "").upper()
+        if raw not in _PERPETUAL_ALIASES:
+            return symbol
+        return perpetual_symbol(cls.normalize_source(source), raw)
 
     @staticmethod
     def _as_datetime(value):
@@ -323,7 +344,7 @@ class DataSyncService:
         raise MarketDataError(detail)
 
     @classmethod
-    def fetch_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+    def fetch_klines(cls, source="Delta", symbol="BTCUSD", interval="1h",
                      start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,
                      limit: int = 1000, definition=None):
         source = cls.normalize_source(source)
@@ -375,7 +396,7 @@ class DataSyncService:
     # The rows are stored on the matching klines row (mark_open/high/low/close)
     # so a backtest always has the traded price and the mark price aligned.
     @classmethod
-    def fetch_mark_klines(cls, source="Binance", symbol="BTCUSDT", interval="1h",
+    def fetch_mark_klines(cls, source="Delta", symbol="BTCUSD", interval="1h",
                           start_time=None, end_time=None, limit=1000, definition=None):
         from app.core.mark_price import mark_symbol, perpetual_symbol
 
@@ -409,7 +430,7 @@ class DataSyncService:
         )
 
     @classmethod
-    def sync_mark_prices(cls, source="Binance", symbol="BTCUSDT", intervals=None,
+    def sync_mark_prices(cls, source="Delta", symbol="BTCUSD", intervals=None,
                          start_time=None, end_time=None, limit=1000, definition=None):
         """Fetch mark-price candles and write them onto the seeded klines.
 
@@ -492,7 +513,7 @@ class DataSyncService:
         return summary
 
     @classmethod
-    def test_source(cls, source="Binance", symbol="BTCUSDT", interval="1h", limit=3, definition=None):
+    def test_source(cls, source="Delta", symbol="BTCUSD", interval="1h", limit=3, definition=None):
         """Small round-trip used by the admin UI's 'Test connection' button.
 
         Returns a diagnostic dict describing exactly what the exchange
@@ -538,6 +559,7 @@ class DataSyncService:
                 ).all()
             }
         inserted = updated = 0
+        pending = []
         for event_time, values in prepared.items():
             item = existing.get(event_time)
             if item:
@@ -545,14 +567,36 @@ class DataSyncService:
                     setattr(item, key, value)
                 updated += 1
             else:
-                db.add(Klines(source=source, symbol=symbol, interval=interval,
-                               event_time=event_time, **values))
+                pending.append((event_time, values))
+
+        # Inserts go through a SAVEPOINT each. The read above cannot see rows a
+        # concurrent seed has inserted but not yet committed, so an "absent"
+        # candle can exist by the time we flush. The unique constraint catches
+        # that; we then update the row that won the race instead of duplicating
+        # the candle. Without this, overlapping seed windows silently doubled
+        # the series and every chart and backtest read it twice.
+        for event_time, values in pending:
+            try:
+                with db.begin_nested():
+                    db.add(Klines(source=source, symbol=symbol, interval=interval,
+                                  event_time=event_time, **values))
+                    db.flush()
                 inserted += 1
+            except IntegrityError:
+                row = db.query(Klines).filter(
+                    Klines.source == source, Klines.symbol == symbol,
+                    Klines.interval == interval, Klines.event_time == event_time,
+                ).first()
+                if row is not None:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                    updated += 1
         return {"inserted": inserted, "updated": updated, "total": inserted + updated}
 
     @classmethod
-    def upsert_rows(cls, rows: Iterable[dict], source="Binance", symbol="BTCUSDT", interval="1h", clear_existing=False):
+    def upsert_rows(cls, rows: Iterable[dict], source="Delta", symbol="BTCUSDT", interval="1h", clear_existing=False):
         source = cls.normalize_source(source)
+        symbol = cls.venue_symbol(source, symbol)
         init_db()
         db = SessionLocal()
         try:
@@ -593,7 +637,7 @@ class DataSyncService:
             seconds=epoch - (epoch % interval_seconds) + interval_seconds)
 
     @classmethod
-    def repair_klines(cls, source="Binance", symbol="BTCUSDT", intervals=None, definition=None):
+    def repair_klines(cls, source="Delta", symbol="BTCUSD", intervals=None, definition=None):
         """Remove corrupted candles from a stored series.
 
         Two defects have shipped from historical seeding paths and both corrupt
@@ -682,7 +726,7 @@ class DataSyncService:
                 Klines.source, Klines.symbol, Klines.interval,
                 func.count(Klines.id), func.count(func.distinct(Klines.event_time)),
             ).group_by(Klines.source, Klines.symbol, Klines.interval).all():
-                key = (source or "Binance", symbol, interval)
+                key = (source or "Delta", symbol, interval)
                 report[key] = {
                     "source": key[0], "symbol": symbol, "interval": interval,
                     "count": int(total),
@@ -857,7 +901,7 @@ class DataSyncService:
             db.close()
 
     @classmethod
-    def seed_market_data(cls, source="Binance", symbol="BTCUSDT", intervals=None,
+    def seed_market_data(cls, source="Delta", symbol="BTCUSD", intervals=None,
                          start_date=None, end_date=None, limit=1000, fetch_all=False,
                          definition=None):
         """Fetch and upsert a date range, splitting it into API-sized windows.
@@ -1110,7 +1154,7 @@ class DataSyncService:
         return summary
 
     @classmethod
-    def sync_market_data(cls, source="Binance", symbol=None, intervals=None,
+    def sync_market_data(cls, source="Delta", symbol=None, intervals=None,
                           definition=None, limit=1000):
         """Incrementally refresh one configured source for the daily job."""
         source = cls.normalize_source(source)
@@ -1215,7 +1259,7 @@ class DataSyncService:
         return summary
 
     @classmethod
-    def seed_from_csv(cls, csv_path, interval, symbol="BTCUSDT", source="Binance", clear_existing=False):
+    def seed_from_csv(cls, csv_path, interval, symbol="BTCUSD", source="Delta", clear_existing=False):
         if not os.path.exists(csv_path):
             raise FileNotFoundError(os.path.abspath(csv_path))
         df = pd.read_csv(csv_path)
@@ -1252,7 +1296,7 @@ class DataSyncService:
                 "fetched": len(rows), **result}
 
     @classmethod
-    def update_daily_data(cls, symbol="BTCUSDT", intervals=None, source="Binance"):
+    def update_daily_data(cls, symbol="BTCUSD", intervals=None, source="Delta"):
         """Backward-compatible daily entry point for one source."""
         return cls.sync_market_data(source, symbol, intervals, limit=1000)
 
@@ -1263,7 +1307,7 @@ def fetch_binance_klines(symbol, interval, start_time, end_time=None):
     return [[int(pd.Timestamp(r["event_time"]).timestamp() * 1000), str(r["open"]), str(r["high"]), str(r["low"]), str(r["close"]), str(r["volume"])] for r in rows]
 
 
-def seed_to_db(symbol="BTCUSDT", interval="1h", years=6, source="Binance"):
+def seed_to_db(symbol="BTCUSD", interval="1h", years=6, source="Delta"):
     """Back-compat full-history seed (the old helper fetched a single page and
     inserted it without an upsert, leaving partial data and duplicates)."""
     end = datetime.utcnow()
@@ -1274,9 +1318,9 @@ def seed_to_db(symbol="BTCUSDT", interval="1h", years=6, source="Binance"):
     )
 
 
-def seed_from_csv(csv_path, interval, symbol="BTCUSDT", source="Binance"):
+def seed_from_csv(csv_path, interval, symbol="BTCUSD", source="Delta"):
     return DataSyncService.seed_from_csv(csv_path, interval, symbol, source)
 
 
-def update_daily_data(symbol="BTCUSDT", intervals=None, source="Binance"):
+def update_daily_data(symbol="BTCUSD", intervals=None, source="Delta"):
     return DataSyncService.update_daily_data(symbol, intervals, source)

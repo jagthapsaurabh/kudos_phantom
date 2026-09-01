@@ -7,7 +7,7 @@ from ..database.models import SessionLocal, Klines
 from datetime import datetime
 
 class BacktestEngine:
-    def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Binance"):
+    def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Delta"):
         self.config = config
         self.fee_schedule = fee_schedule
         self.data_source = data_source

@@ -233,17 +233,22 @@ def extract_fill_price(response):
 
 
 class LiveTradeService:
+    MAX_LOG_LINES = 300      # log tail kept in memory / saved per session
+    MAX_EQUITY_POINTS = 5000
+    MAX_CLOSED_TRADES = 100  # keep the last N in memory; totals stay exact
+    PERSIST_EVERY_TICKS = 5  # quiet ticks between database snapshots
+
     def __init__(self, strategy_id: str, config_or_rules, api_key: str, api_secret: str,
                  initial_capital=20000.0, margin_pct=25.0, is_custom=False,
-                 broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
+                 broker_name="Delta", passphrase="", testnet=False, fee_schedule=None,
                  definition=None, trading_windows=None, use_mark_price=None,
                  user_id=None, instance_key=None, bracket_orders=True,
                  price_feed="off", tick_interval=5.0, account_label=None,
                  heartbeat=None, connection_id=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
-        self.market_source = broker_name or "Binance"
-        self.broker_name = broker_name or "Binance"
+        self.market_source = broker_name or "Delta"
+        self.broker_name = broker_name or "Delta"
         self.broker = BrokerClient(api_key, api_secret, self.broker_name, passphrase, testnet, definition)
         self.definition = definition
         self.fee_schedule = fee_schedule
@@ -330,6 +335,30 @@ class LiveTradeService:
         # PaperTradeService._record_closed, so the market-chart execution
         # overlay renders paper and live trades through one builder.
         self.closed_trades: list = []
+        # ---- Session recording ----------------------------------------
+        # A stopped live instance used to vanish with its whole history. It is
+        # now mirrored into the sessions table exactly like a paper run, so the
+        # client can review the trades, equity curve and log of a finished live
+        # session in the same depth.
+        self.session_mode = "live"
+        self.session_id = None
+        self.history_status = "running"
+        self.account_label_for_history = account_label or "Primary"
+        self.logs: list = []
+        self.equity_inr = float(initial_capital)
+        # Whole-session counters, independent of the in-memory trade window.
+        self.total_closed_count = 0
+        self.total_realised_pnl = 0.0
+        self.dropped_trade_count = 0
+        self.dropped_trade_pnl = 0.0
+        self.equity_history: list = [
+            {"ts": datetime.utcnow().isoformat(timespec="seconds"),
+             "equity": float(initial_capital)}]
+        self.stop_reason = None
+        self.last_error = None
+        self.restarts = 0
+        self.auto_resume = False   # live is never silently re-armed
+        self._tick_count = 0
         # Entries go out as bracket orders (entry + stop-loss + take-profit) so
         # risk is protected exchange-side even if this worker dies mid-trade.
         self.bracket_orders = bool(bracket_orders)
@@ -581,8 +610,15 @@ class LiveTradeService:
 
     async def start(self):
         self.is_running = True
+        self.stop_reason = None
         COORDINATOR.register(self)
         print(f"🚀 LIVE Trading Started for {self.broker_name}/{self.strategy_id}")
+        self._log("info", f"🟢 Live trading started — strategy={self.strategy_id} on "
+                          f"{self.broker_name} / {self.account_label_for_history}")
+        self._log("info", f"Contract: {self.contract_symbol} perpetual · pricing basis "
+                          f"{'MARK price' if self.use_mark_price else 'traded price'} · "
+                          f"{getattr(self.config, 'leverage', '?')}x leverage · "
+                          f"{self.margin_pct}% margin")
         others = len(COORDINATOR.siblings(self))
         if others:
             print(f"   Shared account: {others} other live strateg{'y' if others == 1 else 'ies'} "
@@ -640,6 +676,8 @@ class LiveTradeService:
                     try:
                         await self.tick()
                     except Exception as e:
+                        self.last_error = f"{e.__class__.__name__}: {e}"
+                        self._log("error", f"Tick error: {e}")
                         print(f"Live Trade Error [{self.strategy_id}]: {e}")
                     await asyncio.sleep(60)
                 return
@@ -676,6 +714,8 @@ class LiveTradeService:
                     try:
                         await self.tick()
                     except Exception as e:
+                        self.last_error = f"{e.__class__.__name__}: {e}"
+                        self._log("error", f"Tick error: {e}")
                         print(f"Live Trade Error [{self.strategy_id}]: {e}")
                 else:
                     try:
@@ -716,8 +756,9 @@ class LiveTradeService:
         self._manage_open_positions(float(price), self._last_atr, self._last_bar_time,
                                     quote.last_price or price, quote.mark_price, False)
 
-    async def stop(self):
+    async def stop(self, reason="stopped by user"):
         self.is_running = False
+        self.stop_reason = reason
         COORDINATOR.unregister(self)
         if self.heartbeat is not None:
             try:
@@ -728,6 +769,11 @@ class LiveTradeService:
         # operator can close it from the broker; this worker stops opening new
         # positions and the next status call remains visible until then.
         print(f"🔴 LIVE Trading Stopped for {self.broker_name}/{self.strategy_id}")
+        self._log("info", f"🔴 Live trading stopped ({reason}) — full session saved to History")
+        # Final snapshot: closing equity, every closed trade, the positions
+        # still open, and the log. This is what makes a stopped live instance
+        # reviewable in depth instead of disappearing.
+        self._persist_history(force=True)
 
     def _is_delta(self):
         return (str(getattr(self.broker, "kind", "") or "").lower() == "delta"
@@ -779,9 +825,14 @@ class LiveTradeService:
         return float(dist) * float(atr)
 
     async def tick(self):
+        self._tick_count += 1
+        # Periodic snapshot so a session killed by a crash/restart still has a
+        # recent state saved, not just whatever the last fill left behind.
+        self._persist_history()
         df_1h = self._fetch_candles("1h", 100)
         df_4h = self._fetch_candles("4h", 100)
         if df_1h is None or df_4h is None or df_1h.empty or df_4h.empty:
+            self._log("warn", "Candle data fetch failed — retrying next tick")
             return
         ind_1h = compute_indicators(df_1h)
         df_1h_with_ind = df_1h.copy()
@@ -928,12 +979,54 @@ class LiveTradeService:
                 protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}"
                               f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
             print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
+            self._log("trade", f"OPENED {side} {lots} BTC at {entry_note}{protection}")
+            self._persist_history(force=True)
         else:
             # No order left the building: roll the OMS trade back so the
             # local book does not drift away from the exchange.
             self.oms.active_trades.pop("BTCUSDT", None)
             self.last_order_error = res.get("error")
+            self.last_error = res.get("error")
             print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
+            self._log("error", f"Entry order REJECTED by {self.broker_name}: {res['error']}")
+            self._persist_history(force=True)
+
+    # ------------------------------------------------------------------
+    # Session recording (mirrors PaperTradeService so History is identical)
+    # ------------------------------------------------------------------
+    def _log(self, level: str, msg: str):
+        """Append one line to this instance's live log buffer.
+
+        Live runs previously logged only to stdout, so a client reviewing a
+        finished session had no record of what the worker actually did.
+        """
+        try:
+            self.logs.append({"ts": _to_ist(datetime.utcnow()), "level": level, "msg": str(msg)})
+            if len(self.logs) > self.MAX_LOG_LINES:
+                self.logs = self.logs[-self.MAX_LOG_LINES:]
+        except Exception:
+            pass
+
+    def _record_equity_point(self):
+        try:
+            self.equity_history.append({"ts": _to_ist(datetime.utcnow()),
+                                        "equity": float(self.equity_inr)})
+            if len(self.equity_history) > self.MAX_EQUITY_POINTS:
+                self.equity_history = self.equity_history[-self.MAX_EQUITY_POINTS:]
+        except Exception:
+            pass
+
+    def _persist_history(self, force=False):
+        """Mirror this live session into the sessions table (best effort)."""
+        if not getattr(self, "session_id", None):
+            return
+        if not (force or self._tick_count % self.PERSIST_EVERY_TICKS == 0):
+            return
+        try:
+            from app.services.paper_history import persist_snapshot
+            persist_snapshot(self.instance_key, self)
+        except Exception as exc:
+            print(f"[{self.strategy_id}] live history snapshot failed: {exc}")
 
     # ------------------------------------------------------------------
     # Entry gating
@@ -983,8 +1076,27 @@ class LiveTradeService:
                 "exit_time": _to_ist(trade.exit_time),
                 "bars_held": int(trade.bars_held or 0),
             })
-            if len(self.closed_trades) > 100:
-                self.closed_trades = self.closed_trades[-100:]
+            # Trades are capped in memory, but the counters are not: dropping
+            # old trades used to drop their PnL from net_pnl too, so after 100
+            # trades the reported net_pnl no longer matched the equity/ROI that
+            # kept accumulating. Track the discarded totals so the summary
+            # stays truthful about the whole session, not just its tail.
+            self.total_closed_count += 1
+            self.total_realised_pnl += float(pnl)
+            if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
+                dropped = self.closed_trades[:-self.MAX_CLOSED_TRADES]
+                self.dropped_trade_count += len(dropped)
+                self.dropped_trade_pnl += sum(float(t.get("pnl") or 0.0) for t in dropped)
+                self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
+            # Roll the session equity forward and bank a snapshot: this is what
+            # makes a finished live session reviewable (curve + trades + log).
+            self.equity_inr = float(self.equity_inr) + float(pnl)
+            self._record_equity_point()
+            self._log("trade",
+                      f"CLOSED {'LONG' if int(trade.direction) == 1 else 'SHORT'} "
+                      f"{trade.symbol} @ {exit_price:,.2f} ({trade.exit_reason}) "
+                      f"— PnL ₹{pnl:,.2f}, held {int(trade.bars_held or 0)} bars")
+            self._persist_history(force=True)
         except Exception as exc:
             print(f"[{self.strategy_id}] closed-trade record failed: {exc}")
 
@@ -1051,6 +1163,7 @@ class LiveTradeService:
             else:
                 self.last_order_error = response.get("error")
                 print(f"❌ [{self.strategy_id}] LIVE close failed: {response['error']}")
+                self._log("error", f"Close order REJECTED: {response['error']}")
 
     def _entry_hold_reason(self, signal, current_time):
         """Why no new order may go out this tick; ``None`` means go ahead.
@@ -1150,6 +1263,7 @@ class LiveTradeService:
             # The old position is still on: never open the other side on top.
             self.last_order_error = response.get("error")
             print(f"❌ [{self.strategy_id}] LIVE close-&-reverse failed: {response['error']} — entry not sent")
+            self._log("error", f"Close-&-reverse REJECTED: {response['error']} — entry not sent")
             return False
         self.oms.close_trade("BTCUSDT", float(price), current_time, "REV",
                              "Close & reverse — opposite signal",
@@ -1250,7 +1364,7 @@ class LiveTradeService:
         # Live mode prefers the selected broker's current feed. Seeded data is
         # an offline fallback, useful for tests and when a public endpoint is down.
         try:
-            rows = self.broker.fetch_klines("BTCUSDT", interval, limit)
+            rows = self.broker.fetch_klines(self.contract_symbol, interval, limit)
             df = pd.DataFrame(rows)
             if not df.empty:
                 df.set_index('event_time', inplace=True)
@@ -1259,7 +1373,13 @@ class LiveTradeService:
             pass
         try:
             db = SessionLocal()
-            rows = db.query(Klines).filter(Klines.symbol == "BTCUSDT", Klines.interval == interval,
+            # Query the symbol this venue actually stores. Delta candles are
+            # seeded as BTCUSD, so the old hardcoded "BTCUSDT" filter matched
+            # nothing on Delta: the offline fallback silently returned an empty
+            # frame and a Delta session sat at "Connecting..." whenever the
+            # public endpoint hiccuped, instead of falling back to seeded data.
+            rows = db.query(Klines).filter(Klines.symbol == self.contract_symbol,
+                                           Klines.interval == interval,
                                            Klines.source == self.market_source).order_by(Klines.event_time.desc()).limit(limit).all()
             db.close()
             df = pd.DataFrame([{'event_time': k.event_time, 'open': k.open, 'high': k.high,

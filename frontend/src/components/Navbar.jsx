@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, Users, LineChart, Radio, Menu, X, ChevronLeft, ChevronRight, BookOpen, TerminalSquare } from 'lucide-react';
+import { LayoutDashboard, PlayCircle, Activity, Settings, LogOut, TrendingUp, Users, LineChart, Radio, Menu, X, ChevronLeft, ChevronRight, BookOpen, TerminalSquare, FileText } from 'lucide-react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 
 const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCancel, onConfirm }) => {
@@ -62,8 +62,8 @@ const Navbar = () => {
     { name: 'Market Chart', path: '/chart', icon: LineChart },
     { name: 'Backtest', path: '/backtest', icon: TrendingUp },
     { name: 'Paper Trade', path: '/paper', icon: Activity },
-    ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: Radio },
-                   { name: 'Terminal', path: '/terminal', icon: TerminalSquare }] : []),
+    ...(canLive ? [{ name: 'Live Trade', path: '/live', icon: Radio }] : []),
+    { name: 'Results', path: '/sessions', icon: FileText },
     { name: 'Strategies', path: '/strategies', icon: PlayCircle },
     { name: 'Kudos Strategy', path: '/strategy', icon: BookOpen },
     { name: 'Broker', path: '/broker', icon: Settings },
