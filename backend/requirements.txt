@@ -17,3 +17,4 @@ bcrypt
 # (e.g. postgresql://user:pass@host:5432/dbname). Use psycopg2-binary for a
 # precompiled wheel; psycopg2 for a source build.
 psycopg2-binary
+cryptography

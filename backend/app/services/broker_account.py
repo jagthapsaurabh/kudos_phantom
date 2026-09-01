@@ -492,11 +492,14 @@ def _auth_error_verdict(source: str, errors: Dict[str, str],
         "incompletely, it is a production key on a testnet connection "
         "(or the reverse), or it belongs to the other Delta market (India "
         "vs Global keep separate key stores). Replace the key in Broker "
-        "Settings, or run 'Test connection' on the connection there — it "
-        "says which environment accepts the key and offers 'Use this "
-        "environment' — and running live instances re-read the saved "
-        "credentials by themselves (or use 'Reload keys' on the instance), "
-        "so a key fix no longer needs a restart."
+        "Settings, or run 'Check key' (quick) / 'Test connection' (full "
+        "battery) on the connection there — they say which environment "
+        "accepts the key and offer 'Use this environment'; if you already "
+        "know the environment (e.g. the key was just created on Delta "
+        "India production), use 'Align to India production' — and running "
+        "live instances re-read the saved credentials by themselves (or "
+        "use 'Reload keys' on the instance), so a key fix no longer needs "
+        "a restart."
     )
 
 
@@ -700,8 +703,16 @@ def saved_credentials(user_id: Optional[int], broker_code: str,
                                     "switched off — nothing to reload")
                     return out
             if row is not None:
+                from app.core.secrets import decrypt_secret, SecretDecryptionError
+                try:
+                    secret = decrypt_secret(row.api_secret)
+                except SecretDecryptionError as exc:
+                    # Fail secure: keep trading on the credentials the instance
+                    # started with instead of adopting an undecryptable secret.
+                    out["error"] = str(exc)
+                    return out
                 return {
-                    "api_key": row.api_key, "api_secret": row.api_secret,
+                    "api_key": row.api_key, "api_secret": secret,
                     "passphrase": getattr(row, "passphrase", None) or None,
                     "is_testnet": bool(getattr(row, "is_testnet", 0)),
                     "connection_id": row.id,
@@ -712,8 +723,14 @@ def saved_credentials(user_id: Optional[int], broker_code: str,
                 user = db.query(User).filter(User.id == int(user_id)).first()
                 if user is not None and (user.broker_name or "Binance") == broker_code \
                         and user.api_key and user.api_secret:
+                    from app.core.secrets import decrypt_secret, SecretDecryptionError
+                    try:
+                        secret = decrypt_secret(user.api_secret)
+                    except SecretDecryptionError as exc:
+                        out["error"] = str(exc)
+                        return out
                     return {
-                        "api_key": user.api_key, "api_secret": user.api_secret,
+                        "api_key": user.api_key, "api_secret": secret,
                         "passphrase": None,
                         "is_testnet": None,   # legacy keys carry no environment flag
                         "connection_id": None,

@@ -26,6 +26,16 @@ const field = 'w-full bg-gray-900 p-3 rounded-lg border border-gray-700 text-whi
 const lbl = 'block text-xs text-gray-400 mb-1';
 const card = 'bg-gray-800 p-6 rounded-2xl border border-gray-700';
 
+/* Deployment decision: this system trades Delta **India production**
+   (REST https://api.india.delta.exchange, private WS
+   wss://socket.india.delta.exchange, public WS
+   wss://public-socket.india.delta.exchange). Every Delta-family connection
+   should end up there; the align action applies that without needing the
+   stored key to pass a probe first. */
+const INDIA_PRODUCTION = 'INDIA_PRODUCTION';
+const isDeltaFamily = (c) => ['Delta', 'DeltaGlobal', 'Delta Exchange', 'Delta Exchange Global'].includes(c?.broker_code);
+const isIndiaProduction = (c) => (c?.broker_code === 'Delta' || c?.broker_code === 'Delta Exchange') && !c?.is_testnet;
+
 /* ----------------------------------------------------- Exchange registry -- */
 /* Admin-only: the named-source registry (formerly the Admin > Broker        */
 /* Integrations tab). Merged here so all broker configuration lives in one   */
@@ -203,7 +213,7 @@ const ExchangeRegistry = () => {
    directly rather than through the whole page. */
 export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggleKeys,
                    onSaveKeys, onProbe, probing, probeResult, onRefresh,
-                   onRemove, onTest, testing, testResult, onApplyEnv }) => (
+                   onRemove, onTest, testing, testResult, onApplyEnv, onAlign }) => (
   <div className="p-3 bg-gray-900 rounded-lg border border-gray-700">
   <div className="flex justify-between items-center gap-2">
     <div className="min-w-0">
@@ -256,6 +266,18 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
     </div>
   )}
 
+  {isDeltaFamily(c) && !isIndiaProduction(c) && (
+    <div className="mt-1.5 rounded-lg border border-amber-800/60 bg-amber-900/10 p-2 text-[10px] leading-relaxed text-amber-300">
+      {c?.broker_code === 'DeltaGlobal'
+        ? <><b>This connection points at Delta Global</b> (<span className="font-mono">api.delta.exchange</span>) —
+           that host is not used by this deployment: India keys are rejected there and Global keys are
+           rejected by India. Use <b>Align to India production</b> below, then paste the India key.</>
+        : <>This connection is flagged <b>testnet/demo</b>. India production keys work only on{' '}
+           <span className="font-mono">api.india.delta.exchange</span> — use <b>Align to India production</b> below
+           (demo keys stay on testnet).</>}
+    </div>
+  )}
+
   <div className="mt-2 flex flex-wrap gap-1.5">
     <button onClick={onProbe} disabled={probing}
             className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40 disabled:opacity-40">
@@ -266,6 +288,13 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
               className="flex items-center gap-1 rounded border border-blue-800/60 bg-blue-900/20 px-2 py-1 text-[10px] font-bold text-blue-300 transition hover:bg-blue-900/40 disabled:opacity-40">
         <Activity size={11} />
         {testing ? 'Testing…' : 'Test connection'}
+      </button>
+    )}
+    {onAlign && isDeltaFamily(c) && !isIndiaProduction(c) && (
+      <button onClick={onAlign} disabled={busy}
+              className="rounded border border-green-800/60 bg-green-900/20 px-2 py-1 text-[10px] font-bold text-green-300 transition hover:bg-green-900/40 disabled:opacity-40"
+              title="This deployment trades Delta India production (https://api.india.delta.exchange). Repoints the connection at Delta · production and hands it to running instances — no restart.">
+        Align to India production
       </button>
     )}
   </div>
@@ -514,6 +543,57 @@ const BrokerSettings = () => {
     setBusy(false);
   };
 
+  /* ---- Align to a named Delta environment (no key check needed) ---------- */
+  /* The detection flow ("Use this environment") only fires when the venue
+     accepts the stored key. When the operator already knows where the key
+     belongs — e.g. it was just created on Delta India production — these
+     calls apply that decision directly: broker code + testnet flag, then
+     the next signed call proves the key. */
+  const alignToEnvironment = async (c, environment = INDIA_PRODUCTION) => {
+    setBusy(true); setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/${c.id}/align`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ environment }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not align the connection');
+      const s = data.account_settings || {};
+      const live = data.live_instances || {};
+      const picked = live.verified
+        ? ` ${live.verified} running instance${live.verified === 1 ? '' : 's'} picked it up and resumed.`
+        : (live.notified ? ` ${live.notified} running instance${live.notified === 1 ? '' : 's'} re-read it${s.error ? ' and is still rejected' : ''}.` : '');
+      setMessage({
+        ok: !s.error,
+        text: s.error
+          ? `${data.label}: aligned to ${data.environment} (${data.broker_code}${data.is_testnet ? ' testnet/demo' : ' production'}), but the exchange still rejects the stored key: ${String(s.error).slice(0, 140)}. Paste the fresh key under "Replace keys".`
+          : `${data.label}: aligned to ${data.environment} — broker ${data.broker_code}${data.is_testnet ? ' testnet/demo' : ' production'} (${data.base_url}).${picked}`,
+      });
+      load();
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    setBusy(false);
+  };
+
+  const alignAllDelta = async () => {
+    setBusy(true); setMessage(null);
+    try {
+      const res = await fetch(`${API_URL}/broker-connections/align-delta`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ environment: INDIA_PRODUCTION }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not align the connections');
+      const changed = data.changed || [];
+      const reloaded = changed.reduce((n, ch) => n + (ch.live_instances?.reloaded || 0), 0);
+      setMessage({
+        ok: true,
+        text: changed.length
+          ? `Aligned ${changed.length} Delta connection(s) to ${data.environment} (${data.base_url}).${reloaded ? ` ${reloaded} running instance(s) reloaded.` : ''}`
+          : `Every Delta connection (${data.delta_connections}) already points at ${data.environment} (${data.base_url}).`,
+      });
+      load();
+    } catch (e) { setMessage({ ok: false, text: e.message }); }
+    setBusy(false);
+  };
+
   const refreshConnection = async (id) => {
     setBusy(true); setMessage(null);
     try {
@@ -547,6 +627,7 @@ const BrokerSettings = () => {
   };
 
   const activeConnections = connections.filter(c => !c.legacy);
+  const misalignedDelta = activeConnections.filter(c => isDeltaFamily(c) && !isIndiaProduction(c));
 
   return (
     <div className="page-shell">
@@ -584,7 +665,15 @@ const BrokerSettings = () => {
         </div>
 
         <div className={card}>
-          <h2 className="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2"><Plug size={18} className="text-blue-400" /> Saved connections</h2>
+          <h2 className="text-lg font-bold text-gray-200 mb-4 flex items-center gap-2 flex-wrap"><Plug size={18} className="text-blue-400" /> Saved connections
+            {misalignedDelta.length > 0 && (
+              <button onClick={alignAllDelta} disabled={busy}
+                      className="ml-auto rounded border border-green-800/60 bg-green-900/20 px-2 py-1 text-[10px] font-bold text-green-300 transition hover:bg-green-900/40 disabled:opacity-40"
+                      title="Point every Delta / DeltaGlobal connection of this login at Delta India production (https://api.india.delta.exchange) — no restart.">
+                Align all to India production
+              </button>
+            )}
+          </h2>
           <div className="space-y-3">
             {activeConnections.map(c => (
               <ConnectionCard key={c.id} c={c} busy={busy}
@@ -595,6 +684,7 @@ const BrokerSettings = () => {
                               onTest={() => testConnection(c.id)} testing={testing === c.id}
                               testResult={testResults[c.id]}
                               onApplyEnv={(detected) => applyTestedEnvironment(c, detected)}
+                              onAlign={() => alignToEnvironment(c)}
                               onRefresh={() => refreshConnection(c.id)} onRemove={() => removeConnection(c.id)}
               />
             ))}
@@ -619,8 +709,19 @@ const BrokerSettings = () => {
             <div>
               <label className={lbl}>Exchange / broker</label>
               <select className={field} value={form.broker_code} onChange={e => setForm({ ...form, broker_code: e.target.value })}>
-                {definitions.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}
+                {definitions.map(d => <option key={d.code} value={d.code}>{d.name}{d.code === 'DeltaGlobal' ? ' (Global · api.delta.exchange — not for India keys)' : ''}</option>)}
               </select>
+              {form.broker_code === 'DeltaGlobal' && (
+                <p className="mt-2 rounded-lg border border-amber-800/60 bg-amber-900/10 p-2 text-[11px] leading-relaxed text-amber-300">
+                  <b>Delta Global is not used by this deployment.</b> API keys created on the
+                  Delta India account (www.delta.exchange) work <b>only</b> with the production API{' '}
+                  <span className="font-mono">https://api.india.delta.exchange</span>; keys from the Demo
+                  account work only with the testnet API{' '}
+                  <span className="font-mono">https://cdn-ind.testnet.deltaex.org</span>. Choose{' '}
+                  <b>Delta Exchange</b> (India) for those keys — <b>Align to India production</b> repoints
+                  an existing Global connection.
+                </p>
+              )}
             </div>
             <div><label className={lbl}>Connection label</label><input className={field} placeholder="Primary, Delta live…" value={form.label} onChange={e => setForm({ ...form, label: e.target.value })} /></div>
             <div><label className={lbl}>API key *</label><input required className={field} type="password" value={form.api_key} onChange={e => setForm({ ...form, api_key: e.target.value })} /></div>

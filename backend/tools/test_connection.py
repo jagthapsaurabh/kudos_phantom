@@ -133,8 +133,12 @@ def main() -> int:
 
     if args.label:
         row = creds_from_db(args.label)
+        from app.core.secrets import decrypt_secret, SecretDecryptionError
         api_key = row.api_key or ""
-        api_secret = row.api_secret or ""
+        try:
+            api_secret = decrypt_secret(row.api_secret) or ""
+        except SecretDecryptionError as exc:
+            raise SystemExit(str(exc))
         broker_code = str(row.broker_code or args.broker)
         testnet = bool(row.is_testnet)
         label = row.label or broker_code

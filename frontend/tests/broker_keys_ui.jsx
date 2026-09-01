@@ -130,6 +130,46 @@ check('the report explains a key that is live but on the wrong Delta family',
 check('and offers the one-click repoint for running instances', testedText.includes('Use this environment'));
 check('the check key button remains for quick probes', tested.includes('Check key'));
 
+// ---- Align to a named environment (deployment decision, no key check) -----
+// When the operator already knows where the key belongs (Delta India
+// production), the card offers to repoint broker + environment directly —
+// the detection flow needs the venue to accept the key first.
+const misalignedCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+  c: { ...CONNECTIONS[0], broker_code: 'DeltaGlobal' },
+}));
+check('a DeltaGlobal connection offers the India-production align',
+  misalignedCard.includes('Align to India production'), misalignedCard.slice(0, 300));
+const testnetCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+}));
+check('a Delta testnet connection offers the India-production align',
+  testnetCard.includes('Align to India production'));
+const alignedCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+  c: { ...CONNECTIONS[0], is_testnet: false },
+}));
+check('a Delta production connection hides the align action (already there)',
+  !alignedCard.includes('Align to India production'));
+const noAlignProp = render(React.createElement(ConnectionCard, { ...cardProps, keysOpen: false }));
+check('without a handler the align action is not offered (older surfaces)',
+  !noAlignProp.includes('Align to India production</button>'));
+
+// ---- The official key/API rule is shown on misaligned Delta rows ---------
+const globalCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+  c: { ...CONNECTIONS[0], broker_code: 'DeltaGlobal', is_testnet: false },
+}));
+check('a Global connection names api.delta.exchange and says it is not used here',
+  globalCard.includes('api.delta.exchange') && globalCard.includes('not used by this deployment'),
+  globalCard.slice(0, 400));
+const demoCard = render(React.createElement(ConnectionCard, {
+  ...cardProps, keysOpen: false, onAlign: () => {},
+}));
+check('a testnet connection states the production-only rule for India keys',
+  demoCard.includes('api.india.delta.exchange') && demoCard.includes('production keys work only'),
+  demoCard.slice(0, 400));
+
 // ------------------------------------------------------- Instance badges ----
 console.log('\n== live instance: credential state + parked deadman switch ==');
 const rejected = {

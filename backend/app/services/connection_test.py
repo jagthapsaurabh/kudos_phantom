@@ -101,7 +101,8 @@ def _signed(client: BrokerClient, method: str, path: str, weight: float = 1.0) -
             return {"ok": False, "state": "permission", "detail": detail}
         if any(marker in lowered for marker in ("http 401", "invalid_api_key",
                                                 "invalidapikey", "api key not found",
-                                                "invalid_api_key")):
+                                                "invalid_signature", "request_expired",
+                                                "incomplete_payload", "signature mismatch")):
             return {"ok": False, "state": "auth", "detail": detail}
         return {"ok": False, "state": "error", "detail": detail}
     if isinstance(payload, dict) and payload.get("success") is False:
@@ -247,7 +248,11 @@ def run_connection_test(api_key: str, api_secret: str, broker_code: str = "Delta
     if detected is None:
         problems.append("No Delta environment accepted the key.")
         fixes.append("Re-create the key in the panel of the environment you want to trade, "
-                     "or paste it again in full (key AND secret, no stray characters).")
+                     "or paste it again in full (key AND secret, no stray characters). "
+                     "If you already know where the key belongs (e.g. it was just created "
+                     "on Delta India production), use 'Align to India production' on the "
+                     "connection — it repoints broker + environment without the key having "
+                     "to pass first.")
     else:
         family_mismatch = str(code).lower() != str(detected["broker_code"]).lower()
         env_mismatch = bool(testnet) != bool(detected["testnet"])

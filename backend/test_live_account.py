@@ -673,6 +673,35 @@ check("rate-limit snapshot exposes config + usage",
       {"limits", "requests_last_second", "broker"} <= set(delta.rate_limit_usage()),
       str(list(delta.rate_limit_usage())))
 
+# Signed Delta retries must re-sign with a fresh timestamp: the venue rejects
+# any signature older than 5 seconds (request_expired), so a 429 retry that
+# reused the first attempt's headers would always fail the retry.
+import app.services.broker_client as broker_client_mod  # noqa: E402
+_orders_before = [r["headers"].get("timestamp") for r in STATE["requests"]
+                  if r["path"] == "/v2/orders" and r["method"] == "POST"]
+_real_time = broker_client_mod.time.time
+_clock = {"t": int(_real_time()) + 100}
+try:
+    # Every clock read advances one second, whatever consumes it, so the two
+    # signed attempts are guaranteed distinct timestamps.
+    def _fake_time():
+        _clock["t"] += 1
+        return float(_clock["t"])
+    broker_client_mod.time.time = _fake_time
+    STATE["fail_next_order"] = 1
+    res = delta.place_order("BTCUSDT", "buy", "market", 0.03, size_in_btc=True)
+finally:
+    broker_client_mod.time.time = _real_time
+    STATE["fail_next_order"] = 0
+_orders_after = [r["headers"].get("timestamp") for r in STATE["requests"]
+                 if r["path"] == "/v2/orders" and r["method"] == "POST"]
+_fresh = _orders_after[len(_orders_before):]
+check("Delta 429 retry succeeds after re-signing",
+      isinstance(res, dict) and "error" not in res, str(res)[:200])
+check("each Delta attempt carried a fresh timestamp (5-second window)",
+      len(_fresh) == 2 and _fresh[0] != _fresh[1] and _fresh[1] > _fresh[0],
+      str(_fresh))
+
 # ===========================================================================
 section("7. normalized terminal schema")
 # ===========================================================================
@@ -1077,6 +1106,49 @@ check("POST /live-account/leverage", r.status_code == 200 and r.json()["response
 
 r = api.post("/live-account/margin-mode", headers=H, json={"broker": "Delta", "mode": "isolated"})
 check("POST /live-account/margin-mode", r.status_code == 200 and r.json()["status"] == "ok", r.text[:200])
+
+# ---- Margin-mode sync across (sub)accounts (Delta's guidance flow) -------
+# GET /v2/sub_accounts with the main key → read reference margin_mode →
+# PUT /v2/users/margin_mode {margin_mode, subaccount_user_id: target}.
+STATE["requests"].clear()
+sync_res = delta.sync_margin_mode("5112346", "5112347")
+check("sync_margin_mode mirrors the reference account's mode",
+      sync_res.get("status") == "ok" and sync_res.get("margin_mode") == "cross",
+      str(sync_res)[:250])
+put_body = next((r["body"] for r in STATE["requests"]
+                 if r["path"] == "/v2/users/margin_mode" and r["method"] == "PUT"), None)
+check("the sync applied the mode to the TARGET sub-account",
+      put_body == {"margin_mode": "cross", "subaccount_user_id": "5112347"},
+      str(put_body))
+check("dry_run performs no network call",
+      delta.sync_margin_mode("5112346", "5112347", dry_run=True).get("dry_run") is True)
+bad_sync = delta.sync_margin_mode("9999999", "5112347")
+check("an unknown reference says so and names the main-key requirement",
+      bad_sync.get("error") and "main/parent" in str(bad_sync.get("error")),
+      str(bad_sync)[:250])
+
+STATE["requests"].clear()
+r = api.post("/live-account/margin-mode", headers=H,
+             json={"broker": "Delta", "mode": "portfolio", "subaccount_user_id": "5112347"})
+check("POST /live-account/margin-mode can target a sub-account",
+      r.status_code == 200 and r.json()["status"] == "ok", r.text[:200])
+put_body2 = next((r_["body"] for r_ in STATE["requests"]
+                  if r_["path"] == "/v2/users/margin_mode" and r_["method"] == "PUT"), None)
+check("the targeted call carries the sub-account user id",
+      put_body2 == {"margin_mode": "portfolio", "subaccount_user_id": "5112347"},
+      str(put_body2))
+
+r = api.post("/live-account/margin-mode-sync", headers=H,
+             json={"broker": "Delta", "reference_user_id": "5112346",
+                   "target_user_id": "5112347"})
+check("POST /live-account/margin-mode-sync mirrors reference to target",
+      r.status_code == 200 and r.json()["status"] == "ok"
+      and r.json()["response"]["margin_mode"] == "cross", r.text[:300])
+r = api.post("/live-account/margin-mode-sync", headers=H,
+             json={"broker": "Delta", "reference_user_id": "5112346",
+                   "target_user_id": "5112347", "dry_run": True})
+check("the sync endpoint honours dry_run",
+      r.status_code == 200 and r.json()["response"].get("dry_run") is True, r.text[:300])
 
 r = api.post("/live-account/position-margin", headers=H,
              json={"broker": "Delta", "amount": 5.0})

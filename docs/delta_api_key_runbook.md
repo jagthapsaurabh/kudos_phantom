@@ -54,9 +54,24 @@ the first minute instead of the first trade.
    trimmed of whitespace as saved; a newline from a terminal paste is invisible in the UI and is
    a different key to the venue. Running instances are handed the new key by that same save, and
    the response says how many took it.
-3. **Live Trade → Reload keys** on the instance, if you would rather not wait for the next retry
+3. **If you already know the environment — align without a key check.** Detection needs the venue
+   to accept the stored key; a key you *just created* proves itself on the next signed call.
+   This deployment trades **Delta India production**, so:
+   * UI: Broker Settings → **Align to India production** on the connection (or **Align all to
+     India production** on the Saved connections header) — sets broker `Delta`, testnet OFF,
+     REST `https://api.india.delta.exchange`, private WS `wss://socket.india.delta.exchange`,
+     public WS `wss://public-socket.india.delta.exchange`, and hands it to running instances.
+   * API: `POST /broker-connections/{id}/align {"environment":"INDIA_PRODUCTION"}` (one row) or
+     `POST /broker-connections/align-delta` (every Delta-family row of the login).
+   * CLI, on the trading server (a whitelisted key only validates from its egress IP):
+     ```bash
+     cd backend && ../.venv/bin/python tools/align_delta_env.py --all-delta --apply --verify
+     # dry run first:  --all-delta           (prints what would change)
+     # one row only:   --label "NishKudos global"
+     ```
+4. **Live Trade → Reload keys** on the instance, if you would rather not wait for the next retry
    window. It re-reads and probes immediately; a still-bad key just goes back to holding entries.
-4. Verify: the connection card shows the margin mode read back from the venue (not an error), and
+5. Verify: the connection card shows the margin mode read back from the venue (not an error), and
    `GET /live-account/snapshot` returns a non-empty `balance` with `auth_error: null`.
 
 From the command line, the same battery as step 1 (run it **on the trading server** — a key with an
@@ -95,11 +110,50 @@ Fixing the key is usually routine, but do it with the position **flat** when you
   (`state`, `error`, `retry_in_seconds`, `held_calls`), and the instance's `credentials` block in
   `GET /live-trade/status` shows `entries_held`, `reloads` and `last_reload`.
 
+## Delta's error table, mapped to what this app does
+
+The same five rejections Delta's support guidance lists are all recognised as **key problems**
+(they latch the credential guard, hold entries, and surface the red banner instead of burning
+quota); the connection battery (Test connection) separates the causes:
+
+| Delta error | What it means | What the app does |
+| :--- | :--- | :--- |
+| `ip_not_whitelisted_for_api_key` | Request from a non-whitelisted IP | Recognised as an auth rejection; the banner says to run the check on the trading server — a whitelisted key 401s from any other egress IP exactly like a dead key |
+| `invalid_signature` / `signature mismatch` | Wrong secret, or method/path/query/payload changed between signing and sending | Recognised; **Test connection** re-signs the documented `METHOD+timestamp+path+?query+body` string on all four hosts and reports where the key works |
+| `request_expired` | Timestamp older than the 5-second window | Recognised; the connection battery compares the server clock to the exchange and tells you to NTP-sync if the skew exceeds 5 s |
+| `api_key_not_found` / `invalid_api_key` | Incorrect or deleted key | Recognised; runbook steps 1–3 (re-paste, re-create, or Align to India production) |
+| `incomplete_payload` | Missing api-key/timestamp/signature header | Recognised — this one is a client bug, not an operator fix; report it with the full error text |
+
+Signing (implemented in `BrokerClient._delta_request`, verified against the official client):
+
+* `signature_data = METHOD + timestamp + path + query_string + payload`, `timestamp` in Unix
+  **seconds** generated right before sending (inside the 5-second window);
+* `query_string` is `''` or `?k=v&…` with keys sorted and values `quote_plus`-encoded;
+* `payload` is compact JSON (`{"k":"v"}` separators) or `''`;
+* `signature = HMAC_SHA256(api_secret, signature_data)` hex;
+* headers `api-key`, `timestamp`, `signature`, `Content-Type: application/json` (+ the
+  `User-Agent` Delta requires). Secrets live server-side in the database and are never returned
+  by the API or shipped to the browser; each bot can use its own connection/key.
+
 ## Which environment is which
+
+The official rule, enforced by the app on this box (`DELTA_DEPLOYMENT_FAMILY=india`, the default):
+
+* **Delta India account keys** (www.delta.exchange) → used **only** with the production API
+  `https://api.india.delta.exchange`.
+* **Demo account keys** (demo.delta.exchange) → used **only** with the testnet API
+  `https://cdn-ind.testnet.deltaex.org`.
+* **`https://api.delta.exchange` belongs to Delta Global and is not used here.** On an India box
+  the app refuses to create/switch/align a connection onto DeltaGlobal with a 400 carrying this
+  rule; the read-only key check still signs one call per environment so it can *report* a Global
+  key (re-create such a key on India instead).
+
+**This deployment trades Delta India production** — the first row is where every Delta connection
+must point:
 
 | | REST host | Keys work on | App broker code |
 | :--- | :--- | :--- | :--- |
-| Delta India **production** | `https://api.india.delta.exchange` | real-money keys from the live panel | `Delta` |
+| Delta India **production** ✅ target | `https://api.india.delta.exchange` | real-money keys from the live panel | `Delta` |
 | Delta India **testnet / demo** | `https://cdn-ind.testnet.deltaex.org` | keys from `demo.delta.exchange` only | `Delta` (testnet ON) |
 | Delta **Global** production | `https://api.delta.exchange` | keys from `global.delta.exchange` / `www.delta.exchange` | `DeltaGlobal` |
 | Delta **Global** testnet / demo | `https://testnet-api.delta.exchange` | keys from `demo-global.delta.exchange` | `DeltaGlobal` (testnet ON) |
@@ -108,3 +162,21 @@ The four key stores are separate: a production key on a testnet host, a demo key
 an India key on Global (and the reverse) all answer `invalid_api_key`, and no amount of re-pasting
 fixes it — only pointing the connection at the right environment does. That is why the check
 signs all four hosts before it is allowed to call a key dead.
+
+## Credentials & IP whitelisting (per Delta's integration guidance)
+
+* **Signing happens only on the backend.** The React app talks to this server's own endpoints with
+  its own login token; the API secret is decrypted in memory at signing time and is never returned
+  by the API (responses carry `has_secret` and a masked key), never logged, and never shipped to
+  the browser. Secrets are encrypted at rest with AES-256-GCM
+  (`SECRETS_ENCRYPTION_KEY` in the server environment — generate with
+  `python -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"` and keep the
+  same key across restarts/rotations).
+* **IP whitelisting is per API key.** The trading server's outbound IP must be on the whitelist of
+  *every* key in use — the main-account key and any sub-account key separately; a sub-account key
+  whose own whitelist is empty still answers `ip_not_whitelisted_for_api_key` from a server that
+  works fine for the main key. Use a static IP on the VPS: Delta does not support ranges, and a
+  dynamic IP breaks order management when it changes. That is also why the key check must run on
+  the trading server itself.
+* **Separate keys per purpose.** Use different keys for testnet vs production and for each bot;
+  the app supports one key/secret per saved connection, so create a connection per key.

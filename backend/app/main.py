@@ -24,10 +24,12 @@ from .core.error_handling import (
     validate_broker_code, validate_margin_mode, validate_order_type, validate_side,
     register_exception_handlers, logger as phantom_logger,
 )
+from .core.secrets import encrypt_secret, decrypt_secret, SecretDecryptionError
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
 from .services.live_trader import LiveTradeService, COORDINATOR
 from .services.data_sync import DataSyncService
+from .services.broker_client import BrokerClient
 from .database.models import (
     init_db, SessionLocal, User, CustomStrategy, BacktestRun, Trade, Klines,
     MarketTick, MarketDataSeedProgress, BrokerDefinition, BrokerConnection, FeeSetting,
@@ -823,6 +825,18 @@ def _mask(value):
     return value[:4] + ('•' * max(0, len(value) - 8)) + value[-4:] if len(value) > 8 else '••••••••'
 
 
+def _decrypt_secret(value):
+    """Decrypt a stored API secret, or fail loud with a fixable message.
+
+    API secrets are encrypted at rest (``app.core.secrets``); every read point
+    goes through here so the plaintext exists only in memory while signing.
+    """
+    try:
+        return decrypt_secret(value)
+    except SecretDecryptionError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def _connection_dict(row):
     # Account details as last read from the venue (margin mode / leverage /
     # sub-accounts). Parsed JSON so the UI never has to guess what mode a
@@ -854,7 +868,7 @@ def _fetch_connection_settings(db, connection):
     try:
         definition = db.query(BrokerDefinition).filter(
             BrokerDefinition.code == _canonical_broker_code(db, connection.broker_code)).first()
-        client = BrokerClient(connection.api_key, connection.api_secret,
+        client = BrokerClient(connection.api_key, _decrypt_secret(connection.api_secret),
                               connection.broker_code, connection.passphrase or '',
                               bool(connection.is_testnet), definition)
         settings = client.get_account_settings('BTCUSDT')
@@ -1017,6 +1031,11 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
     # display name) and store the canonical registry code, so a saved row always
     # matches what the live call looks up.
     code = _canonical_broker_code(db, broker_code)
+    # Deployment rail: this box trades Delta India, so the Global adapter
+    # (https://api.delta.exchange) is refused at the door with the official
+    # key/API rule — an India key would be rejected there anyway.
+    if not BrokerClient.delta_family_allowed(code):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
     if not db.query(BrokerDefinition).filter_by(code=code, enabled=1).first():
         raise HTTPException(status_code=400, detail='Unknown or disabled broker integration')
     if not payload.api_key or not payload.api_secret:
@@ -1028,7 +1047,8 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
     # key as far as the venue is concerned.
     try:
         row = BrokerConnection(user_id=user.id, broker_code=code, label=payload.label,
-                               api_key=payload.api_key.strip(), api_secret=payload.api_secret.strip(),
+                               api_key=payload.api_key.strip(),
+                               api_secret=encrypt_secret(payload.api_secret.strip()),
                                passphrase=(payload.passphrase or '').strip() or None,
                                is_testnet=int(payload.is_testnet), is_active=int(payload.is_active))
         db.add(row); db.commit(); db.refresh(row)
@@ -1057,11 +1077,18 @@ async def create_broker_connection(payload: BrokerConnectionPayload, user=Depend
 async def update_broker_connection(connection_id: int, payload: BrokerConnectionPayload, user=Depends(get_current_user), db=Depends(get_db)):
     row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id, BrokerConnection.user_id == user.id).first()
     if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
-    row.broker_code = _canonical_broker_code(db, payload.broker_code); row.label = payload.label
+    code = _canonical_broker_code(db, payload.broker_code)
+    # Deployment rail: a row may stay on DeltaGlobal (the operator can still
+    # align or delete it), but it may not be *switched onto* the Global
+    # adapter on an India-only box.
+    if code == "DeltaGlobal" and BrokerClient.delta_deployment_family() == "india" \
+            and str(row.broker_code or "").lower() not in ("deltaglobal",):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
+    row.broker_code = code; row.label = payload.label
     # Empty secrets mean "keep the existing secret" in the edit form — the API
     # never returns one, so an edit form cannot round-trip it.
     if payload.api_key: row.api_key = payload.api_key.strip()
-    if payload.api_secret: row.api_secret = payload.api_secret.strip()
+    if payload.api_secret: row.api_secret = encrypt_secret(payload.api_secret.strip())
     if payload.passphrase is not None: row.passphrase = (payload.passphrase or '').strip() or None
     row.is_testnet = int(payload.is_testnet); row.is_active = int(payload.is_active)
     db.commit(); db.refresh(row)
@@ -1098,7 +1125,7 @@ async def probe_broker_connection(connection_id: int, user=Depends(get_current_u
     definition = db.query(BrokerDefinition).filter(BrokerDefinition.code == code).first()
     from .services.delta_key_probe import probe_connection
     result = await asyncio.to_thread(
-        probe_connection, row.api_key, row.api_secret, bool(row.is_testnet),
+        probe_connection, row.api_key, _decrypt_secret(row.api_secret), bool(row.is_testnet),
         row.label or code, (definition.kind if definition else 'generic'), code)
     out = {'connection_id': row.id, 'label': row.label or code, 'broker': code,
            'is_testnet': bool(row.is_testnet), **result}
@@ -1134,7 +1161,7 @@ async def test_broker_connection(connection_id: int, request: Request,
         raise HTTPException(status_code=400, detail='This connection has no key/secret pair to test')
     code = _canonical_broker_code(db, row.broker_code)
     result = await asyncio.to_thread(
-        run_connection_test, row.api_key, row.api_secret, code,
+        run_connection_test, row.api_key, _decrypt_secret(row.api_secret), code,
         bool(row.is_testnet), row.id, row.label or code)
     detected = result.get('detected')
     if detected and request.query_params.get('apply') == 'true':
@@ -1149,6 +1176,128 @@ async def test_broker_connection(connection_id: int, request: Request,
                              'base_url': detected.get('base_url', '')}
         result['live_instances'] = await _adopt_saved_credentials(row, user.id)
     return result
+
+
+class DeltaEnvironmentAlignPayload(BaseModel):
+    environment: str
+
+
+def _resolve_delta_environment(environment: str) -> Dict[str, Any]:
+    """Canonical Delta environment dict for an align request, or a 400.
+
+    The names are the ones the connection battery prints (INDIA-PRODUCTION,
+    INDIA-TESTNET, GLOBAL-PRODUCTION, GLOBAL-TESTNET), with the same spelling
+    tolerance as :meth:`BrokerClient.delta_environment`.
+    """
+    env = BrokerClient.delta_environment(environment)
+    if env is None:
+        known = ", ".join(h["name"] for h in BrokerClient.delta_hosts())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown Delta environment {environment!r}. Use one of: {known}")
+    return env
+
+
+def _align_connection_to_environment(db, row: BrokerConnection,
+                                     environment: str) -> Dict[str, Any]:
+    """Point one saved Delta connection at a named environment (no key needed).
+
+    The detection flow (``/test?apply=true``) needs the venue to accept the
+    stored key before it can name the environment; when the operator already
+    knows where the key belongs (e.g. it was just created on India
+    production), this applies that decision directly — broker code + testnet
+    flag — and lets the next signed call prove it. Returns the applied block.
+    """
+    env = _resolve_delta_environment(environment)
+    code = _canonical_broker_code(db, row.broker_code)
+    if not BrokerClient.is_delta_broker(code):
+        raise HTTPException(status_code=400,
+                            detail=f"Connection '{row.label or code}' is a {code} "
+                                   "connection — only Delta (India) and DeltaGlobal "
+                                   "connections have named environments to align.")
+    # Deployment rail: aligning *onto* the Global family is refused on an
+    # India-only box; aligning off it (the fix) stays allowed.
+    if env["broker_code"] == "DeltaGlobal" \
+            and not BrokerClient.delta_family_allowed("DeltaGlobal"):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
+    row.broker_code = env["broker_code"]
+    row.is_testnet = int(bool(env["testnet"]))
+    db.commit()
+    db.refresh(row)
+    return {"applied": True, "environment": env["name"],
+            "broker_code": row.broker_code, "is_testnet": bool(row.is_testnet),
+            "label": row.label or row.broker_code, "base_url": env["url"]}
+
+
+@app.post('/broker-connections/align-delta')
+async def align_all_delta_connections(payload: DeltaEnvironmentAlignPayload,
+                                      user=Depends(get_current_user),
+                                      db=Depends(get_db)):
+    """Point EVERY saved Delta-family connection of this login at one environment.
+
+    The one-shot alignment for a deployment decision like "we trade Delta
+    India production": every Delta / DeltaGlobal connection row is repointed
+    (broker code + testnet flag) without needing the stored key to be accepted
+    first — a key that was created on the target environment proves itself on
+    the next signed call. Non-Delta connections are left alone. Running live
+    instances on the repointed rows are handed the change immediately.
+    """
+    target = _resolve_delta_environment(payload.environment)
+    if target["broker_code"] == "DeltaGlobal" \
+            and not BrokerClient.delta_family_allowed("DeltaGlobal"):
+        raise HTTPException(status_code=400, detail=BrokerClient.DELTA_FAMILY_RULE)
+    rows = db.query(BrokerConnection).filter(
+        BrokerConnection.user_id == user.id).all()
+    delta_rows = [r for r in rows if BrokerClient.is_delta_broker(
+        _canonical_broker_code(db, r.broker_code))]
+    changed = []
+    unchanged = []
+    for row in delta_rows:
+        before = (_canonical_broker_code(db, row.broker_code), bool(row.is_testnet))
+        entry = {"connection_id": row.id, "label": row.label or row.broker_code,
+                 "before": {"broker_code": before[0], "is_testnet": before[1]}}
+        if before == (target["broker_code"], bool(target["testnet"])):
+            unchanged.append(entry)
+            continue
+        row.broker_code = target["broker_code"]
+        row.is_testnet = int(bool(target["testnet"]))
+        db.commit()
+        db.refresh(row)
+        await asyncio.to_thread(_fetch_connection_settings, db, row)
+        live = await _adopt_saved_credentials(row, user.id)
+        entry.update({"broker_code": row.broker_code, "is_testnet": bool(row.is_testnet),
+                      "account_settings": _connection_dict(row).get("account_settings"),
+                      "live_instances": live})
+        changed.append(entry)
+    return {"environment": target["name"], "base_url": target["url"],
+            "delta_connections": len(delta_rows), "changed": changed,
+            "unchanged": unchanged}
+
+
+@app.post('/broker-connections/{connection_id}/align')
+async def align_broker_connection(connection_id: int,
+                                  payload: DeltaEnvironmentAlignPayload,
+                                  user=Depends(get_current_user),
+                                  db=Depends(get_db)):
+    """Point ONE saved connection at a named Delta environment, no key needed.
+
+    The counterpart of ``?apply=true`` on the connection test for when the
+    answer is already known: e.g. the key was just created on **Delta India
+    production**, so align this connection to INDIA-PRODUCTION (REST
+    ``https://api.india.delta.exchange``) and let the next signed call prove
+    the key. Re-reads account details and hands the change to running
+    instances, same as saving the connection would.
+    """
+    row = db.query(BrokerConnection).filter(BrokerConnection.id == connection_id,
+                                            BrokerConnection.user_id == user.id).first()
+    if not row: raise HTTPException(status_code=404, detail='Broker connection not found')
+    applied = _align_connection_to_environment(db, row, payload.environment)
+    await asyncio.to_thread(_fetch_connection_settings, db, row)
+    db.refresh(row)
+    out = {"connection_id": row.id, **applied,
+           "account_settings": _connection_dict(row).get("account_settings")}
+    out["live_instances"] = await _adopt_saved_credentials(row, user.id)
+    return out
 
 
 @app.post('/broker-connections/{connection_id}/refresh')
@@ -2191,7 +2340,8 @@ def resolve_broker_context(payload, user, db, require_credentials=False):
     else:
         connection, _ = _pick_connection(db, user, code)
     api_key = connection.api_key if connection else (user.api_key if (user.broker_name or 'Binance') == code else '')
-    api_secret = connection.api_secret if connection else (user.api_secret if (user.broker_name or 'Binance') == code else '')
+    api_secret = (_decrypt_secret(connection.api_secret) if connection
+                  else (_decrypt_secret(user.api_secret) if (user.broker_name or 'Binance') == code else ''))
     passphrase = connection.passphrase if connection else ''
     testnet = bool(connection.is_testnet) if connection else bool(payload.testnet)
     if require_credentials and (not api_key or not api_secret):
@@ -3041,20 +3191,20 @@ def update_broker_settings(settings: BrokerSettingsUpdate, user=Depends(get_curr
                                                 BrokerConnection.user_id == user.id).first()
         if not row: raise HTTPException(status_code=404, detail="Broker connection not found")
         if settings.api_key: row.api_key = settings.api_key
-        if settings.api_secret: row.api_secret = settings.api_secret
+        if settings.api_secret: row.api_secret = encrypt_secret(settings.api_secret)
         row.broker_code = code; row.passphrase = settings.passphrase; row.is_testnet = int(settings.is_testnet)
     elif settings.api_key and settings.api_secret:
         row = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id,
                                                 BrokerConnection.broker_code == code).first()
         if row:
-            row.api_key = settings.api_key; row.api_secret = settings.api_secret
+            row.api_key = settings.api_key; row.api_secret = encrypt_secret(settings.api_secret)
             row.is_testnet = int(settings.is_testnet)
         else:
             db.add(BrokerConnection(user_id=user.id, broker_code=code, label='Primary',
-                                    api_key=settings.api_key, api_secret=settings.api_secret,
+                                    api_key=settings.api_key, api_secret=encrypt_secret(settings.api_secret),
                                     passphrase=settings.passphrase, is_testnet=int(settings.is_testnet), is_active=1))
         # Keep legacy columns synchronized for old workers and clients.
-        user.api_key = settings.api_key; user.api_secret = settings.api_secret; user.broker_name = code
+        user.api_key = settings.api_key; user.api_secret = encrypt_secret(settings.api_secret); user.broker_name = code
     user.initial_capital = settings.initial_capital
     user.margin_deployment_pct = settings.margin_pct
     user.broker_name = code
@@ -3070,7 +3220,10 @@ def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
     rows = db.query(BrokerConnection).filter(BrokerConnection.user_id == user.id).all()
     return {
         "api_key": _mask(user.api_key),
-        "api_secret": _mask(user.api_secret),
+        # The secret is never returned, not even masked: anything that reaches
+        # the browser is reachable in dev tools, and Delta's guidance is that
+        # the React side must never see the secret in any form.
+        "has_secret": bool(user.api_secret),
         "broker_name": user.broker_name or 'Binance',
         "initial_capital": user.initial_capital,
         "margin_deployment_pct": user.margin_deployment_pct,
@@ -3229,7 +3382,8 @@ def _live_client(db, user, broker_code: str, connection_id: Optional[int] = None
         raise HTTPException(status_code=400, detail=f"Broker '{code}' is not configured or enabled")
     connection, problem = _pick_connection(db, user, code, connection_id)
     api_key = (connection.api_key if connection else None) or (user.api_key or '')
-    api_secret = (connection.api_secret if connection else None) or (user.api_secret or '')
+    api_secret = (_decrypt_secret(connection.api_secret) if connection
+                  else _decrypt_secret(user.api_secret))
     passphrase = (connection.passphrase if connection else None) or ''
     testnet = bool(connection.is_testnet) if connection else False
     if require_credentials and (not api_key or not api_secret):
@@ -3293,6 +3447,19 @@ class LiveMarginModeRequest(BaseModel):
     connection_id: Optional[int] = None
     symbol: str = 'BTCUSDT'
     mode: str = 'isolated'
+    # Delta India keeps margin mode per (sub)account: pass the target
+    # account's user id to set it there (default: this key's own account).
+    subaccount_user_id: Optional[str] = None
+
+
+class LiveMarginModeSyncRequest(BaseModel):
+    """Mirror a reference account's margin mode onto a target (sub)account."""
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    reference_user_id: str
+    target_user_id: str
+    dry_run: bool = False
 
 
 class LivePositionMarginRequest(BaseModel):
@@ -3494,12 +3661,38 @@ def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_curren
     except PhantomValidationError as ve:
         raise HTTPException(status_code=ve.status_code, detail=ve.message)
     client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
-    response = client.set_margin_mode(symbol, mode)
+    response = client.set_margin_mode(symbol, mode,
+                                      subaccount_user_id=payload.subaccount_user_id)
     if isinstance(response, dict) and response.get('error'):
         cls = classify_broker_error(response.get('error'), broker=definition.code)
         phantom_logger.warning(f"set_margin_mode failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.post('/live-account/margin-mode-sync')
+def live_sync_margin_mode(payload: LiveMarginModeSyncRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Mirror one (sub)account's margin mode onto another (Delta India).
+
+    The flow Delta's integration guidance spells out: list the accounts under
+    the main key, read the reference account's ``margin_mode``, apply it to
+    the target via ``PUT /v2/users/margin_mode``. Read-only with
+    ``dry_run`` — and the listing must come from the main/parent key, which
+    the error reports when it cannot.
+    """
+    try:
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    result = client.sync_margin_mode(payload.reference_user_id, payload.target_user_id,
+                                     symbol, payload.dry_run)
+    if isinstance(result, dict) and result.get('error'):
+        cls = classify_broker_error(result.get('error'), broker=definition.code)
+        phantom_logger.warning(f"margin-mode sync failed [{cls['category']}]: {result.get('error')}")
+    return {"status": result.get("status", "rejected"),
+            "response": result, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/position-margin')

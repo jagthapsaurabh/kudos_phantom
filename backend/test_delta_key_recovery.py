@@ -238,6 +238,10 @@ check("Delta's invalid_api_key and Binance's -2015 are key failures",
       is_auth_rejection('Delta HTTP 401: {"code": "invalid_api_key"}')
       and is_auth_rejection("Binance HTTP 401: Invalid API-key, IP, or permissions for this endpoint")
       and is_auth_rejection("Delta HTTP 401: invalid api-key"), "markers")
+check("the whole error table from Delta's support guidance is key failures",
+      all(is_auth_rejection(f"Delta HTTP 401: {{'code': '{code}'}}") for code in (
+          "invalid_signature", "request_expired", "api_key_not_found",
+          "incomplete_payload", "ip_not_whitelisted_for_api_key")), "markers")
 check("a throttled or 5xx endpoint is NOT reported as a key problem",
       not is_auth_rejection("Delta rate limited (HTTP 429)")
       and not is_auth_rejection("Delta server error (HTTP 502)")

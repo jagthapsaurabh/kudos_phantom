@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -64,13 +65,17 @@ from app.core.rate_limit import (
 # outside this list is an endpoint problem, not a key problem, and must NOT
 # silence the whole signed surface. Includes Delta India taxonomy:
 # SignatureExpired, InvalidApiKey, UnauthorizedApiAccess, ip_not_whitelisted,
-# Signature Mismatch, plus Binance -2015.
+# Signature Mismatch, plus the error table from Delta's own support guidance
+# (invalid_signature / request_expired / api_key_not_found /
+# incomplete_payload / ip_not_whitelisted_for_api_key) and Binance -2015.
 AUTH_REJECTION_MARKERS = (
     "http 401", "invalid_api_key", "invalidapikey", "invalid api-key",
     "api-key format", "-2015", "unauthorized",
-    "signatureexpired", "signature expired",
+    "signatureexpired", "signature expired", "request_expired",
+    "invalid_signature", "incomplete_payload", "api_key_not_found",
     "unauthorizedapiaccess", "unauthorized_api_access",
-    "ip_not_whitelisted", "ip not whitelisted",
+    "ip_not_whitelisted", "ip_not_whitelisted_for_api_key",
+    "ip not whitelisted",
     "signature mismatch", "signature_mismatch",
 )
 
@@ -173,6 +178,94 @@ class BrokerClient:
         text = str(broker_code or "Delta")
         family = cls.DELTA_FAMILIES.get(text, cls.DELTA_FAMILIES["Delta"])
         return family[2] if testnet else family[1]
+
+    # The four Delta environments under their canonical names, as used by the
+    # connection battery and the one-shot "align this connection" action. The
+    # deployment target for this system is INDIA-PRODUCTION (see
+    # backend/DELTA_ALIGNMENT.md), so that is the name operators will type.
+    DELTA_ENVIRONMENT_ALIASES = {
+        "INDIA-PRODUCTION": "INDIA-PRODUCTION",
+        "INDIA_PRODUCTION": "INDIA-PRODUCTION",
+        "INDIA PRODUCTION": "INDIA-PRODUCTION",
+        "INDIAPRODUCTION": "INDIA-PRODUCTION",
+        "INDIA": "INDIA-PRODUCTION",
+        "INDIA-TESTNET": "INDIA-TESTNET",
+        "INDIA_TESTNET": "INDIA-TESTNET",
+        "INDIA-DEMO": "INDIA-TESTNET",
+        "GLOBAL-PRODUCTION": "GLOBAL-PRODUCTION",
+        "GLOBAL_PRODUCTION": "GLOBAL-PRODUCTION",
+        "GLOBAL": "GLOBAL-PRODUCTION",
+        "GLOBAL-TESTNET": "GLOBAL-TESTNET",
+        "GLOBAL_TESTNET": "GLOBAL-TESTNET",
+        "GLOBAL-DEMO": "GLOBAL-TESTNET",
+    }
+
+    @classmethod
+    def delta_environment(cls, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Look a Delta environment up by its canonical name (case/_-tolerant).
+
+        Returns the same dict shape as :meth:`delta_hosts` — ``name``, ``url``,
+        ``testnet``, ``broker_code``, ``site`` — or ``None`` for an unknown
+        name, so callers get one obvious 400 instead of silently guessing.
+        """
+        if not name:
+            return None
+        canonical = cls.DELTA_ENVIRONMENT_ALIASES.get(str(name).strip().upper())
+        if canonical is None:
+            return None
+        for host in cls.delta_hosts():
+            if host["name"] == canonical:
+                return dict(host)
+        return None
+
+    @classmethod
+    def is_delta_broker(cls, broker_code: Optional[str]) -> bool:
+        """True when ``broker_code`` resolves to one of the Delta families."""
+        text = str(broker_code or "").strip()
+        return (text in cls.DELTA_FAMILIES
+                or (text.lower() in ("delta", "delta exchange", "deltaglobal",
+                                     "delta global")))
+
+    # This deployment trades Delta **India** (www.delta.exchange account).
+    # Official rule, as quoted by the operator:
+    #   * keys created on the Delta India account → production API only
+    #     (https://api.india.delta.exchange);
+    #   * keys created on the Demo account (demo.delta.exchange) → testnet API
+    #     only (https://cdn-ind.testnet.deltaex.org);
+    #   * https://api.delta.exchange belongs to Delta GLOBAL and is not used
+    #     here — India keys are rejected there and Global keys are rejected
+    #     here.
+    # ``DELTA_DEPLOYMENT_FAMILY=global`` opts a box back into the Global
+    # market; the default (and this system's choice) is ``india``.
+    DELTA_DEPLOYMENT_FAMILY_DEFAULT = "india"
+    DELTA_FAMILY_RULE = (
+        "https://api.delta.exchange belongs to Delta Global and is not used by "
+        "this deployment. API keys created on the Delta India account "
+        "(www.delta.exchange) work only with the production API "
+        "https://api.india.delta.exchange; keys created on the Demo account "
+        "(demo.delta.exchange) work only with the testnet API "
+        "https://cdn-ind.testnet.deltaex.org. Use the 'Delta' (India) "
+        "integration and 'Align to India production' for this connection.")
+
+    @classmethod
+    def delta_deployment_family(cls) -> str:
+        """``india`` (default) or ``global`` — which Delta market this box trades."""
+        value = str(os.getenv("DELTA_DEPLOYMENT_FAMILY",
+                              cls.DELTA_DEPLOYMENT_FAMILY_DEFAULT)).strip().lower()
+        return value if value in ("india", "global") else cls.DELTA_DEPLOYMENT_FAMILY_DEFAULT
+
+    @classmethod
+    def delta_family_allowed(cls, broker_code: Optional[str]) -> bool:
+        """True when the deployment family permits this Delta broker code.
+
+        India-only boxes refuse DeltaGlobal (the Global adapter), which is the
+        rail that makes ``api.delta.exchange`` unreachable through the app:
+        a Global connection cannot even be created here.
+        """
+        code = str(broker_code or "")
+        if "global" in code.lower():
+            return cls.delta_deployment_family() == "global"
+        return True
 
     # Binance order types the terminal can send.
     BINANCE_ORDER_TYPES = {
@@ -388,24 +481,35 @@ class BrokerClient:
     # Low-level transport (rate limited + 429 aware)
     # ==================================================================
     def _throttled_request(self, method, url, params=None, data=None, headers=None,
-                           weight: float = 1.0, is_order: bool = False):
-        """One HTTP call inside the rate-limit budget, retrying 429/5xx."""
+                           weight: float = 1.0, is_order: bool = False,
+                           refresh_headers=None):
+        """One HTTP call inside the rate-limit budget, retrying 429/5xx.
+
+        ``refresh_headers`` is an optional ``() -> dict`` that rebuilds the
+        request headers for each attempt. Signed Delta requests pass it so a
+        retry sends a **fresh timestamp + signature** — Delta rejects
+        timestamps more than 5 s old, so a 429 retry reusing the first
+        attempt's headers would always answer ``request_expired``.
+        """
         cfg = self.rate_limit_config
         last_error = None
         # Delta requires a User-Agent on every request (public and signed);
         # missing it can 4XX. Harmless on Binance, so always set it.
-        headers = dict(headers or {})
-        headers.setdefault("User-Agent", self.USER_AGENT)
-        headers.setdefault("Accept", "application/json")
+        base_headers = dict(headers or {})
+        base_headers.setdefault("User-Agent", self.USER_AGENT)
+        base_headers.setdefault("Accept", "application/json")
         for attempt in range(1, int(max(1, cfg.max_retries)) + 1):
             try:
                 self.limiter.acquire(weight=weight, is_order=is_order)
             except RateLimitExceeded as exc:
                 self.limiter.note_rejected(str(exc))
                 return None, {"error": str(exc)}
+            attempt_headers = dict(refresh_headers() if refresh_headers else base_headers)
+            attempt_headers.setdefault("User-Agent", self.USER_AGENT)
+            attempt_headers.setdefault("Accept", "application/json")
             try:
                 response = requests.request(method, url, params=params, data=data,
-                                            headers=headers, timeout=20)
+                                            headers=attempt_headers, timeout=20)
             except requests.RequestException as exc:
                 last_error = f"{self.broker_name} request failed: {exc.__class__.__name__}: {exc}"
                 self.limiter.note_rejected(last_error)
@@ -515,6 +619,21 @@ class BrokerClient:
     # ------------------------------------------------------------------
     # Delta signing
     # ------------------------------------------------------------------
+    def _delta_headers(self, method: str, path: str, query_text: str,
+                       body_text: str) -> Dict[str, str]:
+        """Fresh signed headers for one Delta attempt.
+
+        Delta rejects a request whose timestamp is more than 5 s old
+        (``request_expired``), so every (re)send signs a new timestamp — a
+        retry after a 429/5xx must never reuse the first attempt's signature.
+        """
+        timestamp = str(int(time.time()))
+        signature_data = method.upper() + timestamp + path + query_text + body_text
+        signature = hmac.new(self.api_secret.encode(),
+                             signature_data.encode(), hashlib.sha256).hexdigest()
+        return {"api-key": self.api_key, "timestamp": timestamp, "signature": signature,
+                "Content-Type": "application/json", "User-Agent": self.USER_AGENT}
+
     def _delta_request(self, method, path, body=None, query=None, weight: float = 1.0,
                        is_order: bool = False):
         # Changelog 19.08.26 (docs.delta.exchange): GET /v2/profile is rejected
@@ -554,15 +673,16 @@ class BrokerClient:
 
         body_text = _body_string(body)
         query_text = _query_string(query)
-        timestamp = str(int(time.time()))
-        signature_data = method.upper() + timestamp + path + query_text + body_text
-        signature = hmac.new(self.api_secret.encode(), signature_data.encode(), hashlib.sha256).hexdigest()
-        headers = {"api-key": self.api_key, "timestamp": timestamp, "signature": signature,
-                   "Content-Type": "application/json", "User-Agent": "PHANTOM-Trading-Tool/1.0"}
         url = f"{self.trading_url}{path}"
+
+        def _signed_headers():
+            return self._delta_headers(method, path, query_text, body_text)
+
         response, error = self._throttled_request(method, url, params=query or None,
-                                                  data=body_text or None, headers=headers,
-                                                  weight=weight, is_order=is_order)
+                                                  data=body_text or None,
+                                                  headers=_signed_headers(),
+                                                  weight=weight, is_order=is_order,
+                                                  refresh_headers=_signed_headers)
         return self._mark_signed(response, error)
 
     def _delta_result(self, payload):
@@ -2157,6 +2277,50 @@ class BrokerClient:
                 return result2 if isinstance(result2, dict) and result2 else {"ok": True}
             return result if isinstance(result, dict) else {"error": str(result)}
         return {"error": f"No margin-mode adapter installed for '{self.broker_name}'"}
+
+    def sync_margin_mode(self, reference_user_id, target_user_id,
+                         symbol: str = "BTCUSDT", dry_run: bool = False):
+        """Mirror one (sub)account's margin mode onto another (Delta India).
+
+        The flow Delta's own integration guidance spells out: list the
+        accounts under the main key (``GET /v2/sub_accounts``), read the
+        reference account's ``margin_mode``, then apply it to the target with
+        ``PUT /v2/users/margin_mode`` (``subaccount_user_id`` = target). The
+        listing must come from the **main/parent** key — a sub-account key
+        cannot list its parent's accounts, and the error says so instead of
+        guessing. Returns a structured result (never raises) so the terminal
+        can show exactly which step disagreed.
+        """
+        if self.kind != "delta":
+            return {"error": f"margin-mode sync is a Delta feature; "
+                             f"'{self.broker_name}' is a {self.kind} adapter"}
+        if dry_run:
+            return {"dry_run": True, "reference_user_id": str(reference_user_id),
+                    "target_user_id": str(target_user_id), "symbol": symbol}
+        settings = self.get_account_settings(symbol)
+        if isinstance(settings, dict) and settings.get("error"):
+            return {"error": settings["error"]}
+        accounts = (settings or {}).get("accounts") or []
+        reference = next((a for a in accounts
+                          if str(a.get("id")) == str(reference_user_id)), None)
+        if reference is None:
+            return {"error": f"reference account {reference_user_id} not found in "
+                             f"the sub-accounts list (this key lists "
+                             f"{[a.get('id') for a in accounts] or 'no accounts'}) — "
+                             f"the listing must be made with the main/parent API key",
+                    "accounts": accounts}
+        mode = reference.get("margin_mode")
+        if not mode:
+            return {"error": f"reference account {reference_user_id} reports no "
+                             f"margin_mode to mirror", "accounts": accounts}
+        result = self.set_margin_mode(symbol, mode,
+                                      subaccount_user_id=str(target_user_id))
+        rejected = isinstance(result, dict) and result.get("error")
+        return {"status": "rejected" if rejected else "ok",
+                "reference_user_id": str(reference_user_id),
+                "target_user_id": str(target_user_id),
+                "reference_account_name": reference.get("account_name"),
+                "margin_mode": mode, "result": result}
 
     # ---- Additional authenticated endpoints (wallet, subaccounts, prefs, margin) ----
     def get_wallet_transactions(self, asset_id: Optional[int] = None, limit: int = 100):

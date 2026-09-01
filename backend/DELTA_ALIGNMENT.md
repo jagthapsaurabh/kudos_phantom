@@ -2,6 +2,67 @@
 
 This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-cases** (mcp.delta.exchange/docs/use-cases) to *our software's actual flows*, not generic parity.
 
+## Deployment Target (this system): DELTA INDIA PRODUCTION
+
+The deployment decision for this system — every Delta connection, key and live
+instance belongs on **Delta India production** (`INDIA-PRODUCTION`):
+
+| | Endpoint |
+| :--- | :--- |
+| REST | `https://api.india.delta.exchange` |
+| Private WebSocket | `wss://socket.india.delta.exchange` |
+| Public WebSocket | `wss://public-socket.india.delta.exchange` |
+| App broker code | `Delta` · testnet **OFF** |
+
+The official key/API rule (as quoted by the operator) is enforced by the app:
+
+* API keys created on the **Delta India** account (www.delta.exchange) → used
+  **only** with the production API `https://api.india.delta.exchange`.
+* API keys created on the **Demo** account (demo.delta.exchange) → used
+  **only** with the testnet API `https://cdn-ind.testnet.deltaex.org`.
+* `https://api.delta.exchange` belongs to **Delta Global** and is **not used
+  here**.
+
+Enforcement: `DELTA_DEPLOYMENT_FAMILY` defaults to `india` (set it to `global`
+only on a box that trades the Global market). On an India box the app refuses
+to *create* a DeltaGlobal connection, refuses to *switch* a connection onto
+DeltaGlobal, and refuses to *align* onto the Global family — each 400 carries
+the rule text (`BrokerClient.DELTA_FAMILY_RULE`). The read-only four-host key
+probe still signs one call per environment, so it can *tell you* a key is a
+Global key (and then you re-create it on India); it never places orders.
+
+`INDIA_PRODUCTION` (also `INDIA-PRODUCTION`) is a first-class environment name
+in the app: `BrokerClient.delta_environment()` resolves it, and the one-shot
+align actions below repoint saved connections at it **without needing the
+stored key to pass a probe first** (the probe-detection flow needs the venue to
+accept the key; a freshly created key proves itself on the next signed call).
+
+### Secrets at rest (per Delta's architecture guidance)
+
+* Signing happens **only** in the Python backend; the React frontend never sees
+  the API secret in any form — it talks to `/broker-connections`, `/live-*` and
+  the terminal endpoints with its own JWT, and every secret-holding response
+  returns `has_secret` / a masked key instead of secret material.
+* `app/core/secrets.py` encrypts the `api_secret` at rest with **AES-256-GCM**
+  (`enc:v1:` envelope) using `SECRETS_ENCRYPTION_KEY` from the environment
+  (32-byte base64). Rows written before encryption pass through and are
+  re-encrypted on the next save; decryption happens only in memory at signing
+  time (`_live_client`, connection probe/test, `saved_credentials`, the CLI
+  tools). A missing/rotated key fails loud (`SecretDecryptionError`) and live
+  instances fail secure — they keep the credentials they started with.
+* IP whitelisting is **per API key** (main and sub-account keys separately);
+  the server's static egress IP must be on every key in use, and the probe
+  runs from the trading box for exactly that reason.
+
+* UI: Broker Settings → the connection → **Align to India production** (or
+  **Align all to India production** on the Saved connections header).
+* API: `POST /broker-connections/{id}/align {"environment":"INDIA_PRODUCTION"}`
+  (one row) / `POST /broker-connections/align-delta` (every Delta-family row of
+  the login). Both re-read account details and hand the change to running live
+  instances — no restart.
+* CLI (on the trading server, because a whitelisted key only validates from its
+  egress IP): `backend/tools/align_delta_env.py --all-delta --apply --verify`.
+
 ## Software Need (live_trader.py + broker_account.py + tick_feed + data_sync + main.py)
 
 - **Instrument warmup**: `get_instrument` → tick_size, contract_value, product_id. REST: GET /v2/products/{symbol}. Used once at startup + daily refresh.
@@ -88,7 +149,11 @@ This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-
 
 ## Key Provided
 
-- `axvjY1xAZy9ToImAbySqLoRswwTLKo` — sandbox egress blocks live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and signing matches official client.
+- The original report's API key is deliberately **not** stored in this repo — per Delta's own
+  security guidance (never hardcode API secrets in shared code, keep them out of chat/repos). The
+  sandbox egress blocks the live probe (SSL_ERROR_SYSCALL/EOF), but local mock tests pass and
+  signing matches the official client; a key that appeared in git history should be treated as
+  exposed and **rotated** in API Management.
 - **Delta runs four separate key stores** (India production/testnet, Global production/testnet); the
   live report showed the connection on India testnet with `invalid_api_key`, which is the *same*
   answer for: an India production key on testnet, a Global key on India, a half-pasted key, or a
@@ -97,3 +162,33 @@ This doc maps **official REST** (docs.delta.exchange/#ApiSection) and **MCP use-
   it (no restart), and **DeltaGlobal** is a built-in broker with its own hosts so a Global key has a
   first-class adapter. Run the check **on the trading server** (a whitelisted key 401s from any
   other egress IP), then apply the verdict there.
+- **Deterministic alignment (2026-08-31).** Detection needs a working key; alignment does not.
+  `BrokerClient.delta_environment()` resolves the four canonical environment names,
+  `POST /broker-connections/{id}/align` + `/align-delta` apply a named environment (broker code +
+  testnet flag) with no probe, `tools/align_delta_env.py` does the same from the shell with
+  `--apply --verify`, and Broker Settings exposes **Align to India production** on every Delta-family
+  connection that is not there yet.
+- **Delta integration scripts conformance (2026-08-31).** Audited against Delta's four reference
+  scripts + endpoint/WS tables. Already conforming: order strings `market_order`/`limit_order`,
+  `DELETE /v2/orders` `{id, product_id}`, `DELETE /v2/orders/all` with product filter, public
+  candles chunked at 2000, public WS on `wss://public-socket.india.delta.exchange` with new channel
+  names, private-WS key-auth `HMAC("GET"+ts+"/live")`. Closed gaps: `BrokerClient.sync_margin_mode`
+  (reference→target mirror via `GET /v2/sub_accounts` + `PUT /v2/users/margin_mode`),
+  `POST /live-account/margin-mode-sync` + `subaccount_user_id` on `POST /live-account/margin-mode`,
+  and `delta_private_subscribe` now covers orders/positions/margins (fills stay on REST
+  `GET /v2/fills`, deliberately not duplicated).
+- **Deployment rail (2026-08-31).** `DELTA_DEPLOYMENT_FAMILY` (default `india`) enforces the
+  official rule — India keys → `api.india.delta.exchange` only, Demo keys →
+  `cdn-ind.testnet.deltaex.org` only, `api.delta.exchange` = Global, not used here. On an India box:
+  creating/switch-aligning onto DeltaGlobal is a 400 carrying the rule
+  (`BrokerClient.DELTA_FAMILY_RULE`), the CLI refuses Global targets, and Broker Settings shows the
+  rule on Global/testnet rows + the Add-connection form. The read-only four-host probe still
+  *reports* Global keys (so the operator re-creates the key on India) without ever trading there.
+- **Secrets encrypted at rest (2026-08-31).** AES-256-GCM via `app/core/secrets.py` +
+  `SECRETS_ENCRYPTION_KEY`; `GET /broker-settings` no longer returns even the masked secret
+  (`has_secret` instead); decrypt-only-at-signing across `_live_client`, probe/test endpoints,
+  `saved_credentials` and the CLI tools; `cryptography` added to requirements. Tests:
+  `test_secret_encryption.py` (22 checks, offline) + full backend/frontend sweep green.
+  Tests: `test_delta_env_align.py` (41 checks, offline) + `broker_keys_ui` align/rule checks; the
+  auth verdict in `broker_account.account_snapshot` names Check key / Test connection / Align as
+  the three fix paths.
