@@ -155,6 +155,7 @@ class PaperTradeService:
         # fills both in when the instance is registered.
         self.instance_key = None
         self.session_id = None
+        self.session_mode = "paper"
         self.history_status = "running"
         self._tick_count = 0
         # Why a session is no longer running, and the last error the loop saw.

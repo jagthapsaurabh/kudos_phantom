@@ -343,28 +343,35 @@ class Trade(Base):
 
 
 class PaperSession(Base):
-    """Persistent record of one paper-trading instance.
+    """Persistent record of one trading session — paper OR live.
 
-    The live worker (``PaperTradeService``) exists only in process memory, so
-    stopping an instance — or restarting the server — used to throw its result
-    away. Every instance now writes a row here while it runs: the parameters it
-    started with, its equity curve, closed trades and log buffer. Stopping a
-    session keeps the row so the client can review the outcome afterwards;
-    only an explicit delete from the History list removes it.
+    Workers (``PaperTradeService`` / ``LiveTradeService``) exist only in
+    process memory, so stopping an instance — or restarting the server — used
+    to throw its result away. Every instance now writes a row here while it
+    runs: the parameters it started with, its equity curve, closed trades and
+    log buffer. Stopping a session keeps the row so the client can review the
+    outcome in depth afterwards; only an explicit delete removes it.
+
+    The table keeps its original name for backwards compatibility, but
+    ``mode`` now separates the two kinds of session.
 
     ``status`` is one of:
       * ``running``     — worker is live in this process
       * ``stopped``     — the user stopped or deleted the live session
       * ``interrupted`` — the server restarted while it was running
+      * ``failed``      — the worker crashed repeatedly and gave up
     """
     __tablename__ = 'paper_sessions'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     instance_key = Column(String, unique=True, nullable=False, index=True)
+    # 'paper' | 'live' — a live session is recorded exactly like a paper one
+    # so stopping a live instance no longer discards its trades and logs.
+    mode = Column(String, default='paper', index=True)
     strategy_id = Column(String, nullable=True)
     strategy_name = Column(String, nullable=True)
     symbol = Column(String, default='BTCUSDT')
-    data_source = Column(String, default='Binance')
+    data_source = Column(String, default='Delta')
     broker_name = Column(String, nullable=True)
     status = Column(String, default='running', index=True)
     # Run parameters, snapshotted at start so the result can be reproduced.
@@ -542,6 +549,13 @@ def migrate_db():
                     index.create(bind=conn, checkfirst=True)
                 except Exception:
                     pass
+        # Sessions predate the paper/live split: everything already stored was
+        # a paper run, so stamp it rather than leaving the discriminator NULL.
+        if inspector.has_table('paper_sessions'):
+            session_cols = {col['name'] for col in inspect(engine).get_columns('paper_sessions')}
+            if 'mode' in session_cols:
+                conn.execute(text("UPDATE paper_sessions SET mode='paper' WHERE mode IS NULL"))
+
         if inspector.has_table('users'):
             user_cols = {col['name'] for col in inspect(engine).get_columns('users')}
             if 'role' in user_cols:

@@ -2729,6 +2729,82 @@ def delete_paper_history(session_id: int, user=Depends(get_current_user), db=Dep
     return {"status": "Paper session deleted", "id": session_id}
 
 
+# --- UNIFIED SESSION HISTORY (paper AND live) ----------------------------
+# One store, one shape, one reviewer. A stopped live instance is now just as
+# reviewable as a paper one: same trades, equity curve, logs and parameters.
+
+@app.get("/sessions")
+def list_all_sessions(mode: Optional[str] = None, strategy_id: Optional[str] = None,
+                      user=Depends(get_current_user), db=Depends(get_db)):
+    """Every paper AND live session this user has run, newest first.
+
+    ``mode`` filters to 'paper' or 'live'; ``strategy_id`` narrows to one
+    strategy so a client can look at a single strategy's whole track record.
+    """
+    try:
+        rows = paper_history.list_sessions(user.id, db, mode=mode)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load sessions: {exc}")
+    if strategy_id is not None:
+        rows = [r for r in rows if str(r.get('strategy_id')) == str(strategy_id)]
+    # Mark which sessions still have a worker alive in this process, so the UI
+    # can offer Stop on those and review-only on the rest.
+    live_keys = set(live_trade_instances) | set(paper_trade_instances)
+    for row in rows:
+        row['is_running'] = row.get('instance_key') in live_keys
+    return rows
+
+
+@app.get("/sessions/{session_id}")
+def session_detail(session_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Full saved detail for ONE session: trades, curve, logs, parameters.
+
+    When the worker is still alive its in-memory state is layered on top, so a
+    running session shows live numbers and a stopped one shows exactly what it
+    finished with.
+    """
+    detail = paper_history.get_session(session_id, user.id, db)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Session not found")
+    key = detail.get('instance_key')
+    service = live_trade_instances.get(key) or paper_trade_instances.get(key)
+    detail['is_running'] = service is not None
+    if service is not None:
+        detail['closed_trades'] = list(getattr(service, 'closed_trades', []) or [])
+        detail['equity_curve'] = list(getattr(service, 'equity_history', []) or [])
+        detail['logs'] = list(getattr(service, 'logs', []) or [])
+        detail['last_price'] = getattr(service, 'last_price', detail.get('last_price'))
+        detail['open_positions'] = [
+            {
+                'symbol': sym, 'direction': int(t.direction),
+                'entry': float(t.entry_price),
+                'current': float(getattr(service, 'last_price', None) or t.entry_price),
+                'lots': float(getattr(t, 'lots', 0) or 0),
+                'margin_inr': float(getattr(t, 'margin_inr', 0) or 0),
+                'sl': (float(t.sl) if getattr(t, 'sl', None) else None),
+                'tp': (float(t.tp) if getattr(t, 'tp', None) else None),
+                'trail_stop': (float(t.trail_stop) if getattr(t, 'trail_stop', None) else None),
+                'bars_held': int(getattr(t, 'bars_held', 0) or 0),
+                'entry_time': _to_ist(t.entry_time),
+                'unrealised': True,
+            }
+            for sym, t in (getattr(service, 'oms', None).active_trades.items()
+                           if getattr(service, 'oms', None) else [])
+        ]
+    return detail
+
+
+@app.delete("/sessions/{session_id}")
+def delete_any_session(session_id: int, user=Depends(get_current_user), db=Depends(get_db)):
+    """Delete one saved session (paper or live) from History."""
+    found, instance_key = paper_history.delete_session(session_id, user.id, db)
+    if not found:
+        raise HTTPException(status_code=404, detail="Session not found")
+    paper_trade_instances.pop(instance_key, None)
+    live_trade_instances.pop(instance_key, None)
+    return {"status": "Session deleted", "id": session_id}
+
+
 @app.get("/paper-trade/status")
 def get_paper_status(user=Depends(get_current_user)):
     status_list = []
@@ -2957,9 +3033,14 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
+    # Mirror the live session into the sessions table from the start, exactly
+    # like a paper run, so stopping it later leaves a full reviewable record.
+    service.user_id = user.id
+    service.account_label_for_history = account_label
+    session_id = paper_history.start_session(user.id, instance_key, service)
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
-    return {"status": "Live trade started", "instance_key": instance_key, "broker_name": source,
+    return {"status": "Live trade started", "session_id": session_id, "instance_key": instance_key, "broker_name": source,
             "contract": contract_label(source, "BTCUSDT"),
             "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
             # Which saved connection the instance will sign with, so a key
@@ -2979,12 +3060,21 @@ def start_live_trade(
 
 @app.post("/live-trade/stop")
 async def stop_live_trade(instance_key: str, user=Depends(get_current_user)):
+    """Stop a live instance and keep its complete result in History.
+
+    Stopping used to drop the worker and everything it knew. The session is now
+    finalised first, so the client can open the stopped run and review every
+    trade, the equity curve, the log and the positions that were still open.
+    """
     if f"_{user.username}_" not in instance_key:
         raise HTTPException(status_code=403, detail="Not your instance")
     if instance_key in live_trade_instances:
-        await live_trade_instances[instance_key].stop()
+        service = live_trade_instances[instance_key]
+        await service.stop()
+        session_id = paper_history.finalize_session(instance_key, service)
         del live_trade_instances[instance_key]
-        return {"status": "Live trade stopped"}
+        return {"status": "Live trade stopped", "saved_to_history": session_id is not None,
+                "session_id": session_id}
     raise HTTPException(status_code=404, detail="Instance not found")
 
 def _shared_account_status(service):

@@ -157,17 +157,34 @@ def _payload(service, status=None):
     """Build the column values for one session snapshot."""
     closed = list(getattr(service, 'closed_trades', []) or [])
     curve = list(getattr(service, 'equity_history', []) or [])
+    # The paper worker calls these *_inr; the live worker uses the plain
+    # names. Accept either so one persister serves both.
     initial = _f(getattr(service, 'initial_capital_inr', None))
+    if initial is None:
+        initial = _f(getattr(service, 'initial_capital', None))
     equity = _f(getattr(service, 'equity_inr', None))
     stats = summarize(closed, initial, equity, curve)
+    # Prefer the pydantic request model; fall back to a plain params dict so a
+    # worker that only keeps params still saves what it was configured with.
     config = getattr(service, 'config', None)
+    if config is None:
+        config = getattr(service, 'params', None)
     try:
-        config_json = config.model_dump_json() if hasattr(config, 'model_dump_json') \
-            else (config.json() if hasattr(config, 'json') else None)
+        if hasattr(config, 'model_dump_json'):
+            config_json = config.model_dump_json()
+        elif hasattr(config, 'json'):
+            config_json = config.json()
+        elif isinstance(config, dict):
+            config_json = json.dumps(config, default=str)
+        else:
+            config_json = None
     except Exception:
         config_json = None
     values = {
         'status': status or getattr(service, 'history_status', STATUS_RUNNING),
+        # 'paper' or 'live'. Live workers record the same shape so a stopped
+        # live instance is reviewable in exactly the same depth.
+        'mode': getattr(service, 'session_mode', 'paper'),
         'symbol': getattr(service, 'symbol', None) or 'BTCUSDT',
         'strategy_id': str(getattr(service, 'strategy_id', '') or ''),
         'strategy_name': getattr(service, 'strategy_name', None) or str(getattr(service, 'strategy_id', '')),
@@ -298,7 +315,11 @@ def mark_interrupted_sessions():
             row.status = STATUS_INTERRUPTED
             row.stopped_at = row.stopped_at or _utc_now()
             row.stop_reason = row.stop_reason or 'the server restarted while this session was running'
-            out.append(_resume_spec(row))
+            spec = _resume_spec(row)
+            # Live sessions are recorded and reviewable, but never auto-restarted.
+            if spec['mode'] == 'live':
+                spec['auto_resume'] = False
+            out.append(spec)
         db.commit()
         return out
     except Exception as exc:
@@ -314,6 +335,7 @@ def _resume_spec(row):
     return {
         'id': row.id,
         'user_id': row.user_id,
+        'mode': getattr(row, 'mode', 'paper') or 'paper',
         'instance_key': row.instance_key,
         'strategy_id': row.strategy_id,
         'strategy_name': row.strategy_name,
@@ -337,11 +359,18 @@ def _resume_spec(row):
 
 
 def resumable_sessions():
-    """Interrupted sessions the user asked to keep alive across restarts."""
+    """Interrupted PAPER sessions the user asked to keep alive.
+
+    Live sessions are deliberately never auto-resumed: silently re-arming a
+    worker that sends real orders after a restart is not a decision software
+    should make on the operator's behalf. A stopped/interrupted live session
+    stays fully reviewable, and restarting it is an explicit action.
+    """
     db = SessionLocal()
     try:
         rows = db.query(PaperSession).filter(
-            PaperSession.status == STATUS_INTERRUPTED).all()
+            PaperSession.status == STATUS_INTERRUPTED,
+            PaperSession.mode != 'live').all()
         return [_resume_spec(r) for r in rows
                 if (r.auto_resume if r.auto_resume is not None else 1)]
     except Exception as exc:
@@ -356,6 +385,7 @@ def _summary_dict(row):
         'id': row.id,
         'instance_key': row.instance_key,
         'strategy_id': row.strategy_id,
+        'mode': getattr(row, 'mode', 'paper') or 'paper',
         'strategy_name': row.strategy_name or row.strategy_id,
         'symbol': row.symbol,
         'data_source': row.data_source,
@@ -396,13 +426,15 @@ def _summary_dict(row):
     }
 
 
-def list_sessions(user_id, db=None):
-    """History list (newest first) for one user."""
+def list_sessions(user_id, db=None, mode=None):
+    """History list (newest first) for one user, optionally one mode only."""
     own_db = db is None
     session = db or SessionLocal()
     try:
-        rows = session.query(PaperSession).filter(PaperSession.user_id == user_id) \
-            .order_by(PaperSession.created_at.desc()).all()
+        query = session.query(PaperSession).filter(PaperSession.user_id == user_id)
+        if mode:
+            query = query.filter(PaperSession.mode == mode)
+        rows = query.order_by(PaperSession.created_at.desc()).all()
         return [_summary_dict(r) for r in rows]
     finally:
         if own_db:

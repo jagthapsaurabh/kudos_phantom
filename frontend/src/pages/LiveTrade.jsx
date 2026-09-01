@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse } from 'lucide-react';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse, LayoutDashboard, FileText } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
+import LiveTerminal from '../components/LiveTerminal';
 import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
@@ -333,6 +334,9 @@ const LiveTrade = () => {
   const [starting, setStarting] = useState(false);
   // Per-strategy live results (GET /live-trade/results).
   const [results, setResults] = useState([]);
+  // The broker terminal is no longer a separate page — it is the second view
+  // of live trading, on the same broker/connection already selected above.
+  const [view, setView] = useState('automation');
   const [reloading, setReloading] = useState(null);
   const [reloadNote, setReloadNote] = useState(null);
 
@@ -544,6 +548,21 @@ const LiveTrade = () => {
             <ShieldCheck size={28} /> Live Trading
           </h1>
           <p className="text-gray-400 text-sm mt-1">Executing real trades on your broker account</p>
+          {/* The broker terminal used to be its own page, which split live
+              trading in two: the strategy ran here, the actual account lived
+              somewhere else. It is now the second view of this page, on the
+              same broker and connection selected below. */}
+          <div className="mt-4 inline-flex rounded-xl border border-gray-700 bg-gray-800 p-1">
+            {[['automation', 'Strategy automation', LayoutDashboard],
+              ['terminal', 'Broker terminal', TerminalSquare]].map(([key, label, Icon]) => (
+              <button key={key} onClick={() => setView(key)}
+                      className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                        view === key ? 'bg-green-600 text-white shadow'
+                                     : 'text-gray-400 hover:text-white'}`}>
+                <Icon size={15} /> {label}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="flex gap-3 items-end flex-wrap">
           <div className="flex flex-col">
@@ -564,6 +583,7 @@ const LiveTrade = () => {
               {connections.filter(c => c.broker_code === dataSource).map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
             </select>
           </div>
+          {view === 'automation' && (<>
           <div className="flex flex-col">
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Capital (₹)</label>
             <input type="number" value={capital} onChange={e => setCapital(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-28" />
@@ -657,17 +677,29 @@ const LiveTrade = () => {
             title="Download live fills as a Kudos/backtest-style CSV">
             <Download size={16} /> Export fills
           </button>
-          <a href="/terminal"
-             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-blue-500 hover:text-white flex items-center gap-2 text-sm">
-            <TerminalSquare size={16} /> Terminal
+          <a href="/sessions"
+             className="px-4 py-2 rounded-lg font-bold transition border border-gray-700 bg-gray-800 text-gray-300 hover:border-purple-500 hover:text-white flex items-center gap-2 text-sm"
+             title="Every past run, kept after it stops — trades, equity curve and logs">
+            <FileText size={16} /> Results
           </a>
           <button onClick={requestStart} disabled={loading || starting}
                   className="px-6 py-2 rounded-lg font-bold transition bg-green-600 hover:bg-green-500 disabled:opacity-50 flex items-center gap-2">
             <Play size={18} /> {loading ? 'Checking…' : 'Start Instance'}
           </button>
+          </>)}
         </div>
       </div>
 
+      {view === 'terminal' && (
+        <LiveTerminal
+          key={`${dataSource}:${connectionId}`}
+          broker={dataSource}
+          connectionId={connectionId ? Number(connectionId) : null}
+          refreshMs={10000}
+        />
+      )}
+
+      {view === 'automation' && (<>
       {/* Pricing basis + "skip new trades" schedule for new instances */}
       {showWindows && (
         <div className="mb-8 grid grid-cols-1 gap-4 xl:grid-cols-3">
@@ -872,6 +904,7 @@ const LiveTrade = () => {
           </div>
         </div>
       </div>
+      </>)}
     </div>
   );
 };

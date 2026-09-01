@@ -7,7 +7,7 @@ import Dashboard from './pages/Dashboard';
 import Backtest from './pages/Backtest';
 import PaperTrade from './pages/PaperTrade';
 import LiveTrade from './pages/LiveTrade';
-import Terminal from './pages/Terminal';
+import Sessions from './pages/Sessions';
 import Strategies from './pages/Strategies';
 import PhantomStrategy from './pages/PhantomStrategy';
 import BrokerSettings from './pages/BrokerSettings';
@@ -66,7 +66,10 @@ root.render(
         <Route path="/backtest" element={<ProtectedRoute><Navbar /><Backtest /></ProtectedRoute>} />
         <Route path="/paper" element={<ProtectedRoute><Navbar /><PaperTrade /></ProtectedRoute>} />
         <Route path="/live" element={<ProtectedRoute><Navbar /><LiveTrade /></ProtectedRoute>} />
-        <Route path="/terminal" element={<ProtectedRoute><Navbar /><Terminal /></ProtectedRoute>} />
+        {/* The terminal is now a tab inside Live Trading; keep the old URL
+            working so existing bookmarks land in the right place. */}
+        <Route path="/terminal" element={<Navigate to="/live" replace />} />
+        <Route path="/sessions" element={<ProtectedRoute><Navbar /><Sessions /></ProtectedRoute>} />
         <Route path="/chart" element={<ProtectedRoute><Navbar /><ChartPage /></ProtectedRoute>} />
         <Route path="/strategies" element={<ProtectedRoute><Navbar /><Strategies /></ProtectedRoute>} />
         <Route path="/strategy" element={<ProtectedRoute><Navbar /><PhantomStrategy /></ProtectedRoute>} />
