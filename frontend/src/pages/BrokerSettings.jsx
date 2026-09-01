@@ -329,6 +329,9 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
             <span className="min-w-0">
               <span className="text-gray-300">{s.title || s.name}</span>
               {s.detail && <span className="text-gray-500"> — {s.detail}</span>}
+              {s.endpoint && s.state !== 'ok' && (
+                <span className="block truncate text-gray-600" title={s.endpoint}>tried {s.endpoint}</span>
+              )}
               {(s.rows || []).map(r => (
                 <span key={r.name} className="block truncate text-gray-600" title={r.detail}>
                   · {r.name} {r.base_url} → {r.state === 'ok' ? 'accepts' : r.state === 'permission' ? 'missing permission' : r.state === 'unreachable' ? 'unreachable' : 'rejects'}

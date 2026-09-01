@@ -35,7 +35,9 @@ the first minute instead of the first trade.
 ## What you have to do
 
 1. **Broker Settings → the connection → Check key** (quick) or **Test connection** (full
-   read-only battery: market data, clock, all four Delta environments, signed calls, rate quota).
+   read-only battery: market data, clock, all four Delta environments, signed calls —
+   balance, positions, open orders, order history, trading preferences and the sub-account
+   listing the margin-mode panel reads — and rate quota).
    The key is signed against **all four** Delta environments, and a verdict:
    * *“accepted by INDIA-PRODUCTION”* + *“the connection is flagged testnet”* → flip the toggle.
      That mismatch is the whole bug; the key is fine.
@@ -123,6 +125,7 @@ quota); the connection battery (Test connection) separates the causes:
 | `request_expired` | Timestamp older than the 5-second window | Recognised; the connection battery compares the server clock to the exchange and tells you to NTP-sync if the skew exceeds 5 s |
 | `api_key_not_found` / `invalid_api_key` | Incorrect or deleted key | Recognised; runbook steps 1–3 (re-paste, re-create, or Align to India production) |
 | `incomplete_payload` | Missing api-key/timestamp/signature header | Recognised — this one is a client bug, not an operator fix; report it with the full error text |
+| *no Delta error at all* — `ConnectionError: Failed to resolve 'api.india.delta.exchangeget '` (or any host that is not one of the four above) on signed calls, while **Check key** and market data pass | The request never reached the exchange: something that is not an endpoint path was concatenated onto the base URL — classically a display label (`"GET /v2/wallet/balances"`) passed where the path belongs, or a value appended to the configured host. The signature is built from the same string, so the call could not have worked either way | **Not a key problem**, and the battery no longer reports it as one: such a step is filed `unreachable` ("never reached INDIA-PRODUCTION"), the verdict refuses to say *ready*, and the step prints the exact endpoint it tried (`tried GET /v2/orders?product_symbol=BTCUSD`). The transport refuses to sign or send a malformed path/URL at all (`… request not sent: …`), so no quota is spent and the message names the mistake. Fix the caller — see `app/core/urls.py` |
 
 Signing (implemented in `BrokerClient._delta_request`, verified against the official client):
 

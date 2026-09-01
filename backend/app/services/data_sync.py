@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 from sqlalchemy import func
 
+from app.core.urls import normalize_base_url
 from app.database.models import (
     BrokerDefinition, MarketDataSeedProgress, SessionLocal, Klines, init_db,
 )
@@ -126,7 +127,10 @@ class DataSyncService:
     @staticmethod
     def _base_url(definition, fallback):
         value = getattr(definition, "market_data_url", None) if definition is not None else None
-        return (value or fallback).rstrip("/")
+        # Same normalization the broker client uses: a stored URL and a literal
+        # fallback must not differ by a trailing space, because that difference
+        # is a seed that "cannot resolve the host".
+        return normalize_base_url(value, fallback)
 
     @staticmethod
     def _delta_hosts_for(definition):
@@ -142,12 +146,11 @@ class DataSyncService:
             return None
         code = str(getattr(definition, "code", "") or "").lower()
         if code == "deltaglobal":
-            url = getattr(definition, "market_data_url", None) or \
-                "https://api.delta.exchange"
-            return [str(url).rstrip("/")]
+            return [normalize_base_url(getattr(definition, "market_data_url", None),
+                                       "https://api.delta.exchange")]
         if not getattr(definition, "is_builtin", False):
-            url = getattr(definition, "market_data_url", None)
-            return [str(url).rstrip("/")] if url else None
+            url = normalize_base_url(getattr(definition, "market_data_url", None))
+            return [url] if url else None
         return None
 
     @classmethod
