@@ -3,9 +3,11 @@ from sqlalchemy import (
     Index, JSON, Boolean, UniqueConstraint, inspect, text, Text,
 )
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, relationship
 import datetime
 import os
+import time
 from dotenv import load_dotenv
 
 # Load .env BEFORE reading DATABASE_URL so the engine is built against the
@@ -22,10 +24,47 @@ Base = declarative_base()
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DEFAULT_DB_PATH = os.path.join(_BACKEND_DIR, 'trading_system.db')
 DATABASE_URL = os.getenv('DATABASE_URL', f'sqlite:///{_DEFAULT_DB_PATH}')
+
+# How long a SQLite connection waits for a competing writer before giving up
+# with "database is locked". The API server, the paper/live traders and the
+# seeder all write to the same file, and a pm2 restart briefly runs two
+# processes at once, so the driver must wait rather than fail instantly.
+SQLITE_BUSY_TIMEOUT_S = float(os.getenv('SQLITE_BUSY_TIMEOUT', '30'))
+
+_IS_SQLITE = DATABASE_URL.startswith('sqlite')
 _engine_kwargs = {}
-if DATABASE_URL.startswith('sqlite'):
-    _engine_kwargs['connect_args'] = {'check_same_thread': False}
+if _IS_SQLITE:
+    _engine_kwargs['connect_args'] = {
+        'check_same_thread': False,
+        # sqlite3's own busy handler; without it the default is 5s.
+        'timeout': SQLITE_BUSY_TIMEOUT_S,
+    }
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+if _IS_SQLITE:
+    from sqlalchemy import event as _sa_event
+
+    @_sa_event.listens_for(engine, 'connect')
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):  # pragma: no cover - driver hook
+        """Make concurrent access survivable on SQLite.
+
+        WAL lets readers run while a writer holds the lock (the rollback
+        journal blocks them, which is what turned a slow migration into
+        "database is locked" at startup), and busy_timeout makes any
+        remaining contention wait instead of raising immediately.
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute('PRAGMA journal_mode=WAL')
+            cursor.execute(f'PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_S * 1000)}')
+            cursor.execute('PRAGMA synchronous=NORMAL')
+        except Exception:
+            # A read-only or exotic filesystem may refuse WAL; the connection
+            # is still usable, so never fail startup on a pragma.
+            pass
+        finally:
+            cursor.close()
+
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -546,12 +585,26 @@ def _seed_reference_data():
 
 def migrate_db():
     """Lightweight additive migration for SQLite and compatible databases."""
+    # Everything below runs on ONE connection. Reflecting through
+    # ``inspect(engine)`` while this transaction holds a write lock opens a
+    # second connection that then waits on the first one — a self-deadlock
+    # that surfaced as "database is locked: PRAGMA main.table_info(...)" and
+    # killed startup.
     with engine.begin() as conn:
-        inspector = inspect(engine)
+        inspector = inspect(conn)
+
+        def _columns(table_name):
+            inspector.clear_cache()
+            return {col['name'] for col in inspector.get_columns(table_name)}
+
+        def _has_table(table_name):
+            inspector.clear_cache()
+            return inspector.has_table(table_name)
+
         for table in Base.metadata.sorted_tables:
-            if not inspector.has_table(table.name):
+            if not _has_table(table.name):
                 continue
-            existing = {col['name'] for col in inspect(engine).get_columns(table.name)}
+            existing = _columns(table.name)
             for col in table.columns:
                 if col.name not in existing and col.name != 'id':
                     coltype = col.type.compile(engine.dialect)
@@ -566,7 +619,7 @@ def migrate_db():
         # index can be built, or index creation fails and the app won't
         # start. Keep the highest id per (source, symbol, interval, time) —
         # the most recently written copy.
-        if inspector.has_table('klines'):
+        if _has_table('klines'):
             try:
                 removed = conn.execute(text(
                     'DELETE FROM klines WHERE id NOT IN ('
@@ -588,13 +641,13 @@ def migrate_db():
 
         # Sessions predate the paper/live split: everything already stored was
         # a paper run, so stamp it rather than leaving the discriminator NULL.
-        if inspector.has_table('paper_sessions'):
-            session_cols = {col['name'] for col in inspect(engine).get_columns('paper_sessions')}
+        if _has_table('paper_sessions'):
+            session_cols = _columns('paper_sessions')
             if 'mode' in session_cols:
                 conn.execute(text("UPDATE paper_sessions SET mode='paper' WHERE mode IS NULL"))
 
-        if inspector.has_table('users'):
-            user_cols = {col['name'] for col in inspect(engine).get_columns('users')}
+        if _has_table('users'):
+            user_cols = _columns('users')
             if 'role' in user_cols:
                 conn.execute(text("UPDATE users SET role='client' WHERE role IS NULL"))
                 conn.execute(text("UPDATE users SET role='admin' WHERE username='admin'"))
@@ -604,12 +657,12 @@ def migrate_db():
                 conn.execute(text('UPDATE users SET can_paper=1 WHERE can_paper IS NULL'))
             if 'can_live' in user_cols:
                 conn.execute(text('UPDATE users SET can_live=0 WHERE can_live IS NULL'))
-        if inspector.has_table('backtest_runs'):
-            run_cols = {col['name'] for col in inspect(engine).get_columns('backtest_runs')}
+        if _has_table('backtest_runs'):
+            run_cols = _columns('backtest_runs')
             if 'strategy_id' in run_cols:
                 conn.execute(text("UPDATE backtest_runs SET strategy_id='PhantomV2' WHERE strategy_id IS NULL OR strategy_id=''"))
-        if inspector.has_table('klines'):
-            kcols = {col['name'] for col in inspect(engine).get_columns('klines')}
+        if _has_table('klines'):
+            kcols = _columns('klines')
             if 'source' in kcols:
                 # Legacy unlabelled candles predate multi-venue support and
                 # came from Binance. They are stamped Binance for accuracy —
@@ -618,7 +671,27 @@ def migrate_db():
                 conn.execute(text("UPDATE klines SET source='Binance' WHERE source IS NULL OR source=''"))
 
 
-def init_db():
-    Base.metadata.create_all(engine)
-    migrate_db()
-    _seed_reference_data()
+def init_db(max_attempts: int = 5, retry_delay_s: float = 2.0):
+    """Create/upgrade the schema, retrying while another process holds the DB.
+
+    On a pm2 restart the outgoing worker can still be flushing writes when the
+    new one boots. Failing startup there put the process into a restart loop;
+    waiting a couple of seconds and trying again clears it.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            Base.metadata.create_all(engine)
+            migrate_db()
+            _seed_reference_data()
+            return
+        except OperationalError as exc:
+            if 'database is locked' not in str(exc).lower():
+                raise
+            last_exc = exc
+            engine.dispose()
+            if attempt < max_attempts:
+                print(f'[init_db] database is locked (attempt {attempt}/{max_attempts}); '
+                      f'retrying in {retry_delay_s}s')
+                time.sleep(retry_delay_s)
+    raise last_exc
