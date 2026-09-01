@@ -1,5 +1,7 @@
 fastapi
 uvicorn[standard]
+# FastAPI's TestClient dependency for the current Starlette release.
+httpx2
 pandas
 numpy
 requests

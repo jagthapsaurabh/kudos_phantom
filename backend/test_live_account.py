@@ -250,6 +250,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._delta(_delta_order(id=body.get("id"), state="open")))
         if path == "/v2/orders/all" and method == "DELETE":
             return self._send(self._delta({"cancelled": 2}))
+        # Keep the client-order-id fallback ahead of the numeric order-id
+        # route; otherwise the mock tries to parse "client" as an integer and
+        # drops the connection while the real client is handling a valid 404.
+        if path == "/v2/orders/client" and method == "DELETE":
+            return self._send(self._delta(_delta_order(state="cancelled")))
         if path.startswith("/v2/orders/") and method == "DELETE":
             return self._send(self._delta(_delta_order(id=int(path.rsplit("/", 1)[-1]),
                                                        state="cancelled")))
