@@ -249,10 +249,22 @@ call = CAPTURE2["calls"][-1]
 sl = (call["body"] or {}).get("stop_loss_order") or {}
 check("bracket posts to /v2/orders/bracket",
       call["method"] == "POST" and call["path"] == "/v2/orders/bracket", call)
-check("SL stop_price is a string (decimal gotcha)",
-      sl.get("stop_price") == "59000", sl)
+# Delta rejects a bracket SL leg carrying BOTH stop_price and trail_amount
+# ("Only stop_price or trail_amount should be specified for bracket stop loss
+# order"), which failed every entry on a trailing strategy. The trail wins.
 check("trail_amount is a string on the SL leg",
       sl.get("trail_amount") == "250.5", sl)
+check("a trailing SL leg omits stop_price (Delta bad_schema)",
+      "stop_price" not in sl, sl)
+
+# Without a trail distance the fixed stop is still sent, as a string.
+rec.place_bracket_order("BTCUSDT", "buy", 0.01, price=None,
+                        stop_loss_price=59000, take_profit_price=62000,
+                        size_in_btc=True)
+sl_fixed = (CAPTURE2["calls"][-1]["body"] or {}).get("stop_loss_order") or {}
+check("SL stop_price is a string (decimal gotcha)",
+      sl_fixed.get("stop_price") == "59000", sl_fixed)
+check("a fixed SL leg carries no trail_amount", "trail_amount" not in sl_fixed, sl_fixed)
 check("TP stop_price is a string",
       (call["body"] or {}).get("take_profit_order", {}).get("stop_price") == "62000",
       call["body"])

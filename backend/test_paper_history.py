@@ -258,11 +258,20 @@ db.add(PaperSession(user_id=1, instance_key="paper_admin_Delta_PhantomV2_deadbee
                     status="running", initial_capital=20000.0, final_equity=20000.0,
                     created_at=datetime.utcnow(), started_at=datetime.utcnow()))
 db.commit(); db.close()
-count = paper_history.mark_interrupted_sessions()
-check("one row flagged", count == 1, str(count))
+# Now returns the resume specs of the rows it flagged (so the startup pass
+# can stand them back up) instead of a bare count.
+flagged = paper_history.mark_interrupted_sessions()
+check("one row flagged", len(flagged) == 1, str(flagged))
+check("flagged row carries a resume spec",
+      flagged[0].get("instance_key") == "paper_admin_Delta_PhantomV2_deadbeef", str(flagged)[:200])
+check("resume spec defaults to auto_resume", flagged[0].get("auto_resume") is True, str(flagged)[:200])
 row = client.get("/paper-trade/history", headers=H).json()[0]
 check("status == interrupted", row.get("status") == "interrupted", str(row)[:200])
 check("interrupted row still reviewable", row.get("id") is not None)
+check("interrupted row explains itself", bool(row.get("stop_reason")), str(row)[:300])
+# The row is now listed as resumable so the next startup can continue it.
+check("row is resumable", any(r["instance_key"] == "paper_admin_Delta_PhantomV2_deadbeef"
+                              for r in paper_history.resumable_sessions()))
 
 print("\n== summarize() roll-up maths ==", flush=True)
 closed = [{"pnl": 100.0, "fees": 5.0}, {"pnl": -40.0, "fees": 5.0}, {"pnl": 20.0, "fees": 5.0}]

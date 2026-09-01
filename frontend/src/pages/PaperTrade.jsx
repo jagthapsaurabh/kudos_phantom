@@ -4,7 +4,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import EntryGuardBadges from '../components/EntryGuardBadges';
-import { FeedBadge } from './LiveTrade';
+import { FeedBadge, PreflightModal } from './LiveTrade';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -40,6 +40,7 @@ const SESSION_STATUS = {
   running: { label: 'Running', cls: 'text-green-400 border-green-800 bg-green-900/20' },
   stopped: { label: 'Stopped', cls: 'text-gray-300 border-gray-700 bg-gray-900' },
   interrupted: { label: 'Interrupted', cls: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
+  failed: { label: 'Failed', cls: 'text-red-400 border-red-800 bg-red-900/20' },
 };
 const statusMeta = (s) => SESSION_STATUS[s] || { label: s || '—', cls: 'text-gray-400 border-gray-700 bg-gray-900' };
 
@@ -380,6 +381,11 @@ const HistoryRowDetail = ({ session }) => {
           ['Started', fmtUTC(session.started_at)],
           ['Stopped', fmtUTC(session.stopped_at)],
           ['Last tick', fmtUTC(session.last_checked)],
+          ['Account', session.account_label || '—'],
+          ['Price feed', session.price_feed || 'off'],
+          ['Worker restarts', session.restarts ?? 0],
+          ['Ended because', session.stop_reason || '—'],
+          ['Last error', session.last_error || '—'],
         ].map(([label, value], i) => (
           <div key={i} className="rounded-lg border border-gray-800 bg-gray-800/60 p-2">
             <div className="text-[9px] font-bold uppercase text-gray-500">{label}</div>
@@ -550,7 +556,19 @@ const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {
                       </td>
                       <td className="p-2 text-gray-400">{row.data_source || '—'}</td>
                       <td className="p-2">
-                        <span className={`rounded border px-2 py-0.5 text-[10px] font-bold ${st.cls}`}>{st.label}</span>
+                        <span className={`rounded border px-2 py-0.5 text-[10px] font-bold ${st.cls}`}
+                              title={row.stop_reason || row.last_error || ''}>{st.label}</span>
+                        {/* An ended session must always say WHY. "Interrupted"
+                            on its own was the single most confusing thing on
+                            this page. */}
+                        {(row.stop_reason || row.last_error) && row.status !== 'running' && row.status !== 'stopped' && (
+                          <div className="mt-1 max-w-[200px] text-[9px] leading-snug text-gray-400">
+                            {row.stop_reason || row.last_error}
+                            {row.auto_resume && row.status === 'interrupted' && (
+                              <span className="text-emerald-400"> · will auto-resume on next restart</span>
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td className="p-2 font-mono text-[10px] text-gray-400">{fmtUTC(row.started_at)}</td>
                       <td className="p-2 font-mono text-[10px] text-gray-400">{fmtUTC(row.stopped_at)}</td>
@@ -628,8 +646,19 @@ const PaperTrade = () => {
   // wait for a closed 1h candle either way.
   const [priceFeed, setPriceFeed] = useState('off');
   const [tickInterval, setTickInterval] = useState(5);
-  const [dataSource, setDataSource] = useState('Binance');
-  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  // Sizing leverage for new paper sessions (mirrors the live form so a paper
+  // result is comparable with the live run of the same strategy).
+  const [leverage, setLeverage] = useState(7);
+  // Which broker connection this paper run is modelled on. Paper places no
+  // orders, but pinning it to an account is what makes the result comparable
+  // AND lets the one-strategy-per-account rule apply in both modes.
+  const [connectionId, setConnectionId] = useState('');
+  const [connections, setConnections] = useState([]);
+  const [preflight, setPreflight] = useState(null);
+  const [starting, setStarting] = useState(false);
+  // Delta Exchange is the house broker and the default for every new session.
+  const [dataSource, setDataSource] = useState('Delta');
+  const [sources, setSources] = useState([{ code: 'Delta', name: 'Delta Exchange' }, { code: 'Binance', name: 'Binance Futures' }]);
   // Saved sessions (survive stop / server restart) shown in Paper Trade History.
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -657,6 +686,8 @@ const PaperTrade = () => {
       .then(r => r.ok ? r.json() : []).then(list => {
         if (Array.isArray(list) && list.length) setSources(list.map(x => ({ code: x.code, name: x.name })));
       }).catch(() => {});
+    fetch(`${API_URL}/broker-connections`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => (r.ok ? r.json() : [])).then(setConnections).catch(() => {});
     fetch(`${API_URL}/strategies`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
       .then(res => res.json())
       .then(data => setStrategies(data));
@@ -701,8 +732,28 @@ const PaperTrade = () => {
     return () => clearInterval(interval);
   }, [fetchStatus]);
 
-  const startTrade = async () => {
+  // Ask the backend whether this strategy may start on this account before
+  // sending anything, so a duplicate is explained up front instead of being
+  // rejected after the click.
+  const requestStart = async () => {
     setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/trade/preflight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+        body: JSON.stringify({ mode: 'paper', strategy_id: selectedStrategy, broker_name: dataSource,
+                               data_source: dataSource, connection_id: connectionId ? Number(connectionId) : null }),
+      });
+      const data = await res.json();
+      setPreflight(res.ok ? data : { blocking: true, reason: data.detail || 'Pre-flight check failed' });
+    } catch (e) {
+      setPreflight({ blocking: true, reason: e.message });
+    }
+    setLoading(false);
+  };
+
+  const startTrade = async () => {
+    setStarting(true);
     try {
       const res = await fetch(`${API_URL}/paper-trade/start`, {
         method: 'POST',
@@ -713,12 +764,15 @@ const PaperTrade = () => {
           margin_pct: parseFloat(marginPct),
           broker_name: dataSource,
           data_source: dataSource,
+          connection_id: connectionId ? Number(connectionId) : null,
+          leverage: Number(leverage) || null,
           use_mark_price: useMarkPrice,
           trading_windows: tradingWindows,
           price_feed: priceFeed, tick_interval: Number(tickInterval),
         })
       });
       if (res.ok) {
+        setPreflight(null);
         const data = await res.json();
         // Auto-select the new instance after a short delay
         setTimeout(() => {
@@ -729,10 +783,10 @@ const PaperTrade = () => {
         fetchHistory();
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(err.detail || 'Could not start paper trade');
+        setPreflight({ blocking: true, reason: err.detail || 'Could not start paper trade' });
       }
-    } catch (e) { console.error(e); alert(e.message); }
-    setLoading(false);
+    } catch (e) { setPreflight({ blocking: true, reason: e.message }); }
+    setStarting(false);
   };
 
   const requestStop = (instanceKey, name) => {
@@ -783,6 +837,9 @@ const PaperTrade = () => {
 
   return (
     <div className="page-shell">
+      <PreflightModal check={preflight} busy={starting}
+                      onCancel={() => setPreflight(null)}
+                      onConfirm={startTrade} />
       <ConfirmModal
         open={!!confirm}
         title={confirm?.type === 'delete'
@@ -863,9 +920,26 @@ const PaperTrade = () => {
               <input type="number" min="1" max="100" step="1" value={marginPct} onChange={e => setMarginPct(e.target.value)}
                 className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-20 outline-none focus:ring-2 focus:ring-blue-500" />
             </div>
-            <button onClick={startTrade} disabled={loading}
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Leverage</label>
+              <input type="number" min="1" max="125" step="1" value={leverage} onChange={e => setLeverage(e.target.value)}
+                title="Sizing leverage for this paper session. Match it to your live setting so the two results are comparable."
+                className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-20 outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div className="flex flex-col">
+              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Account</label>
+              <select value={connectionId} onChange={e => setConnectionId(e.target.value)}
+                      title="Which broker account this paper run is modelled on. Paper places no orders, but pinning it to an account keeps the result comparable with the live run."
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white outline-none">
+                <option value="">Primary / legacy</option>
+                {connections.filter(c => c.broker_code === dataSource).map(c => (
+                  <option key={c.id} value={c.id}>{c.label}</option>
+                ))}
+              </select>
+            </div>
+            <button onClick={requestStart} disabled={loading || starting}
                     className="self-end px-6 py-2 rounded-lg font-bold transition bg-blue-600 hover:bg-blue-500 disabled:opacity-50 flex items-center gap-2">
-              <Play size={18} /> {loading ? 'Starting…' : 'Start Instance'}
+              <Play size={18} /> {loading ? 'Checking…' : 'Start Instance'}
             </button>
           </div>
         </div>

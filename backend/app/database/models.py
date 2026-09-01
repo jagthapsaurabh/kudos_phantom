@@ -37,7 +37,9 @@ class User(Base):
     # Legacy single-broker fields are retained for existing installations.
     api_key = Column(String, nullable=True)
     api_secret = Column(String, nullable=True)
-    broker_name = Column(String, default='Binance')
+    # Delta Exchange (India) is the house broker: the BTCUSD perpetual, the
+    # deadman switch and the bracket orders are all built around it.
+    broker_name = Column(String, default='Delta')
     initial_capital = Column(Float, default=20000.0)
     margin_deployment_pct = Column(Float, default=25.0)
     virtual_balance = Column(Float, default=20000.0)
@@ -401,6 +403,20 @@ class PaperSession(Base):
     closed_trades = Column(JSON, nullable=True)
     open_positions = Column(JSON, nullable=True)
     logs = Column(JSON, nullable=True)
+    # Why the session is no longer running, plus the last error the loop saw.
+    # Without these an ended session could only say "interrupted", which tells
+    # the user nothing actionable.
+    stop_reason = Column(String, nullable=True)
+    last_error = Column(String, nullable=True)
+    restarts = Column(Integer, default=0)
+    # Enough of the run context to rebuild the worker after a server restart.
+    price_feed = Column(String, nullable=True)
+    tick_interval = Column(Float, nullable=True)
+    testnet = Column(Integer, default=0)
+    connection_id = Column(Integer, nullable=True)
+    account_label = Column(String, nullable=True)
+    # 1 = the user asked for this session to keep running across restarts.
+    auto_resume = Column(Integer, default=1)
 
 
 class BrokerOrder(Base):

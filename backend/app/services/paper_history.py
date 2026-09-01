@@ -21,6 +21,9 @@ from app.database.models import SessionLocal, PaperSession
 STATUS_RUNNING = 'running'
 STATUS_STOPPED = 'stopped'
 STATUS_INTERRUPTED = 'interrupted'
+# The worker crashed repeatedly and gave up. Distinct from `interrupted`
+# (server restart) so the UI can show the actual error instead of a shrug.
+STATUS_FAILED = 'failed'
 
 # Only the tail of the log buffer is worth keeping per session.
 MAX_SAVED_LOG_LINES = 500
@@ -181,6 +184,16 @@ def _payload(service, status=None):
         'trading_windows_json': _windows_json(service, config),
         'blocked_entries': int(getattr(service, 'blocked_entries', 0) or 0),
         'config_json': config_json,
+        # Why it is not running any more, and the last error the loop saw.
+        'stop_reason': getattr(service, 'stop_reason', None),
+        'last_error': getattr(service, 'last_error', None),
+        'restarts': int(getattr(service, 'restarts', 0) or 0),
+        'price_feed': getattr(service, 'price_feed_mode', None),
+        'tick_interval': _f(getattr(service, 'tick_interval', None)),
+        'testnet': int(bool(getattr(service, 'testnet', False))),
+        'connection_id': getattr(service, 'connection_id', None),
+        'account_label': getattr(service, 'account_label', None),
+        'auto_resume': int(bool(getattr(service, 'auto_resume', True))),
         'last_price': _f(getattr(service, 'last_price', None)),
         'last_checked': _parse_ist(getattr(service, 'last_checked', None)),
         'equity_curve': curve[-5000:],
@@ -271,19 +284,69 @@ def delete_records_for_user(user_id):
 
 
 def mark_interrupted_sessions():
-    """Flag rows still marked running — the process that owned them is gone."""
+    """Flag rows still marked running — the process that owned them is gone.
+
+    Returns the list of interrupted rows (as plain dicts) so the caller can
+    offer to resume them; the rows themselves are flagged ``interrupted`` and
+    stamped with a reason first, so nothing is left claiming to be alive.
+    """
     db = SessionLocal()
     try:
         rows = db.query(PaperSession).filter(PaperSession.status == STATUS_RUNNING).all()
+        out = []
         for row in rows:
             row.status = STATUS_INTERRUPTED
             row.stopped_at = row.stopped_at or _utc_now()
+            row.stop_reason = row.stop_reason or 'the server restarted while this session was running'
+            out.append(_resume_spec(row))
         db.commit()
-        return len(rows)
+        return out
     except Exception as exc:
         db.rollback()
         print(f"[paper-history] failed to mark interrupted sessions: {exc}")
-        return 0
+        return []
+    finally:
+        db.close()
+
+
+def _resume_spec(row):
+    """Everything needed to rebuild a worker for one saved session."""
+    return {
+        'id': row.id,
+        'user_id': row.user_id,
+        'instance_key': row.instance_key,
+        'strategy_id': row.strategy_id,
+        'strategy_name': row.strategy_name,
+        'data_source': row.data_source or row.broker_name or 'Delta',
+        'broker_name': row.broker_name or row.data_source or 'Delta',
+        'initial_capital': row.initial_capital,
+        'final_equity': row.final_equity,
+        'margin_pct': row.margin_pct,
+        'use_mark_price': row.use_mark_price,
+        'trading_windows': _parse_config(row.trading_windows_json) or None,
+        'price_feed': row.price_feed or 'off',
+        'tick_interval': row.tick_interval or 5.0,
+        'testnet': bool(row.testnet),
+        'connection_id': row.connection_id,
+        'account_label': row.account_label,
+        'auto_resume': bool(row.auto_resume if row.auto_resume is not None else 1),
+        'closed_trades': row.closed_trades or [],
+        'equity_curve': row.equity_curve or [],
+        'logs': row.logs or [],
+    }
+
+
+def resumable_sessions():
+    """Interrupted sessions the user asked to keep alive across restarts."""
+    db = SessionLocal()
+    try:
+        rows = db.query(PaperSession).filter(
+            PaperSession.status == STATUS_INTERRUPTED).all()
+        return [_resume_spec(r) for r in rows
+                if (r.auto_resume if r.auto_resume is not None else 1)]
+    except Exception as exc:
+        print(f"[paper-history] failed to list resumable sessions: {exc}")
+        return []
     finally:
         db.close()
 
@@ -316,6 +379,15 @@ def _summary_dict(row):
         'trading_windows': _parse_config(row.trading_windows_json) or None,
         'blocked_entries': row.blocked_entries or 0,
         'last_price': row.last_price,
+        # Why it ended and what went wrong, so "Interrupted"/"Failed" is
+        # always accompanied by something the user can act on.
+        'stop_reason': getattr(row, 'stop_reason', None),
+        'last_error': getattr(row, 'last_error', None),
+        'restarts': getattr(row, 'restarts', 0) or 0,
+        'price_feed': getattr(row, 'price_feed', None),
+        'account_label': getattr(row, 'account_label', None),
+        'connection_id': getattr(row, 'connection_id', None),
+        'auto_resume': bool(getattr(row, 'auto_resume', 1)),
         'created_at': row.created_at,
         'started_at': row.started_at,
         'stopped_at': row.stopped_at,

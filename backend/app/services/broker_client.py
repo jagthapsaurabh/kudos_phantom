@@ -1297,10 +1297,19 @@ class BrokerClient:
                                      "(Delta changelog 15.04.26)"}
                 body["limit_price"] = limit
             if stop_loss_price is not None:
-                sl_leg: Dict[str, Any] = {"order_type": "market_order",
-                                          "stop_price": str(stop_loss_price)}
+                # Delta rejects a bracket stop-loss leg that carries BOTH a
+                # stop_price and a trail_amount:
+                #   "Only stop_price or trail_amount should be specified for
+                #    bracket stop loss order"
+                # …which silently killed every entry on a strategy with an ATR
+                # trail configured. A trailing stop is the strictly better
+                # protection of the two, so when a trail distance is supplied
+                # it wins and the fixed stop is dropped from the leg.
+                sl_leg: Dict[str, Any] = {"order_type": "market_order"}
                 if trail_amount is not None:
                     sl_leg["trail_amount"] = str(trail_amount)
+                else:
+                    sl_leg["stop_price"] = str(stop_loss_price)
                 body["stop_loss_order"] = sl_leg
             if take_profit_price is not None:
                 body["take_profit_order"] = {"order_type": "market_order",

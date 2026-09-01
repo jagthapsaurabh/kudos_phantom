@@ -141,8 +141,14 @@ def require_admin(user=Depends(get_current_user)):
     return user
 
 
+#: The house broker. Delta Exchange India is the venue this tool is built
+#: around (BTCUSD perpetual, deadman switch, bracket orders), so it is what
+#: every "no broker specified" path resolves to.
+DEFAULT_BROKER = 'Delta'
+
+
 def normalize_source(source: Optional[str]) -> str:
-    value = (source or 'Binance').strip()
+    value = (source or DEFAULT_BROKER).strip()
     return {'binance': 'Binance', 'delta': 'Delta', 'delta exchange': 'Delta'}.get(value.lower(), value)
 
 
@@ -332,14 +338,102 @@ async def daily_sync_task():
         # Sleep for 24 hours (86400 seconds).
         await asyncio.sleep(86400)
 
+def _resume_paper_session(spec):
+    """Rebuild and restart one interrupted paper worker from its saved row.
+
+    A paper session used to die permanently on every deploy/restart, which is
+    what the user saw as "Interrupted". The saved row carries everything needed
+    to stand the worker back up — strategy, broker, capital, margin, schedule,
+    feed — so the session continues instead of ending. The closed trades and
+    equity curve already banked are carried over, so History stays continuous.
+    """
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == spec["user_id"]).first()
+        if not user:
+            return None
+        source = normalize_source(spec.get("data_source"))
+        fees = resolve_fees(db, source, 'paper')
+        definition = db.query(BrokerDefinition).filter(
+            BrokerDefinition.code == source, BrokerDefinition.enabled == 1).first()
+        if not definition:
+            return None
+        strategy_id = str(spec.get("strategy_id") or "")
+        capital = float(spec.get("initial_capital") or user.initial_capital or 20000.0)
+        margin_pct = float(spec.get("margin_pct") or user.margin_deployment_pct or 25.0)
+        common = dict(initial_capital=capital, margin_pct=margin_pct, market_source=source,
+                      broker_name=source, fee_schedule=fees, broker_definition=definition,
+                      strategy_name=spec.get("strategy_name"),
+                      trading_windows=spec.get("trading_windows"),
+                      use_mark_price=(None if spec.get("use_mark_price") is None
+                                      else bool(spec["use_mark_price"])),
+                      price_feed=spec.get("price_feed") or 'off',
+                      tick_interval=float(spec.get("tick_interval") or 5.0),
+                      testnet=bool(spec.get("testnet")),
+                      connection_id=spec.get("connection_id"),
+                      account_label=spec.get("account_label"))
+        if strategy_id == "FastTest":
+            from .core.strategy import FastTestStrategyService
+            config = _fee_config(PhantomV2Config(), fees)
+            service = PaperTradeService(strategy_id, config, **common)
+            service.strategy = FastTestStrategyService(service.config)
+        elif strategy_id == "PhantomV2":
+            service = PaperTradeService(strategy_id, _fee_config(_load_champion_config(), fees), **common)
+        else:
+            resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
+            if not resolved:
+                return None
+            kind, strategy_payload, strat = resolved
+            common["strategy_name"] = strat.name
+            service = PaperTradeService(strategy_id, strategy_payload,
+                                        is_custom=(kind != 'phantom'), **common)
+        # Carry the banked result forward so the resumed session is continuous.
+        service.instance_key = spec["instance_key"]
+        service.user_id = spec["user_id"]
+        service.session_id = spec["id"]
+        service.resumed_from_session = spec["id"]
+        service.closed_trades = list(spec.get("closed_trades") or [])
+        curve = list(spec.get("equity_curve") or [])
+        if curve:
+            service.equity_history = curve
+            try:
+                service.equity_inr = float(curve[-1].get("equity", capital))
+            except (TypeError, ValueError, AttributeError):
+                pass
+        service.logs = list(spec.get("logs") or [])[-service.MAX_LOG_LINES:]
+        service._log("info", "♻️ Session resumed automatically after a server restart — "
+                             "trades, equity curve and logs carried over.")
+        paper_history.persist_snapshot(spec["instance_key"], service)
+        return service
+    except Exception as exc:
+        print(f"[paper-history] resume failed for {spec.get('instance_key')}: {exc}")
+        return None
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def startup():
     init_db()
     # Sessions saved as 'running' belong to a process that no longer exists
-    # (the server restarted). Flag them so History shows why they stopped.
+    # (the server restarted). Flag them, then stand the resumable ones back up
+    # so a deploy no longer silently ends every client's paper run.
     interrupted = paper_history.mark_interrupted_sessions()
     if interrupted:
-        print(f"[paper-history] marked {interrupted} paper session(s) as interrupted")
+        print(f"[paper-history] marked {len(interrupted)} paper session(s) as interrupted")
+    resumed = 0
+    for spec in interrupted:
+        if not spec.get("auto_resume"):
+            continue
+        service = _resume_paper_session(spec)
+        if service is None:
+            continue
+        service.history_status = paper_history.STATUS_RUNNING
+        paper_trade_instances[spec["instance_key"]] = service
+        asyncio.create_task(service.start())
+        resumed += 1
+    if resumed:
+        print(f"[paper-history] auto-resumed {resumed} paper session(s)")
     # Start the background sync task
     asyncio.create_task(daily_sync_task())
     # Persist every live tick (Binance + Delta BTC perpetual) so the series
@@ -955,7 +1049,7 @@ def list_broker_connections(user=Depends(get_current_user), db=Depends(get_db)):
     # A legacy account still gets a selectable connection without a migration step.
     result = [_connection_dict(r) for r in rows]
     if not result and user.api_key:
-        result.append({'id': None, 'broker_code': user.broker_name or 'Binance', 'label': 'Legacy account',
+        result.append({'id': None, 'broker_code': user.broker_name or DEFAULT_BROKER, 'label': 'Legacy account',
                        'api_key': _mask(user.api_key), 'has_secret': bool(user.api_secret), 'is_testnet': False,
                        'is_active': True, 'legacy': True})
     return result
@@ -2303,7 +2397,7 @@ class TradeStartRequest(BaseModel):
     # initial capital is used.
     initial_capital: Optional[float] = None
     margin_pct: Optional[float] = None
-    broker_name: str = 'Binance'
+    broker_name: str = 'Delta'
     data_source: Optional[str] = None
     connection_id: Optional[int] = None
     testnet: bool = False
@@ -2321,6 +2415,16 @@ class TradeStartRequest(BaseModel):
     tick_interval: float = 5.0
     # Deadman switch (Delta Exchange India). None = ON for Delta, OFF otherwise.
     heartbeat: Optional[bool] = None
+    # ---- Risk controls -------------------------------------------------
+    # Leverage the instance sizes with. Omitted -> the strategy config default
+    # (7x). On live, it is also pushed to the venue before the first order so
+    # the exchange and the local sizing agree.
+    leverage: Optional[int] = None
+    # isolated | cross | portfolio. Omitted -> whatever the account already is.
+    # Applied to the venue on live starts only; paper has no margin engine.
+    margin_mode: Optional[str] = None
+    # Keep a paper session alive across a server restart (auto-resume).
+    auto_resume: Optional[bool] = True
 
 def resolve_broker_context(payload, user, db, require_credentials=False):
     code = normalize_source(payload.data_source or payload.broker_name)
@@ -2339,15 +2443,127 @@ def resolve_broker_context(payload, user, db, require_credentials=False):
                                        f"is switched off. Enable it in Broker Settings.")
     else:
         connection, _ = _pick_connection(db, user, code)
-    api_key = connection.api_key if connection else (user.api_key if (user.broker_name or 'Binance') == code else '')
+    api_key = connection.api_key if connection else (user.api_key if (user.broker_name or DEFAULT_BROKER) == code else '')
     api_secret = (_decrypt_secret(connection.api_secret) if connection
-                  else (_decrypt_secret(user.api_secret) if (user.broker_name or 'Binance') == code else ''))
+                  else (_decrypt_secret(user.api_secret) if (user.broker_name or DEFAULT_BROKER) == code else ''))
     passphrase = connection.passphrase if connection else ''
     testnet = bool(connection.is_testnet) if connection else bool(payload.testnet)
     if require_credentials and (not api_key or not api_secret):
         raise HTTPException(status_code=400,
                             detail=_credentials_problem(db, user, code, payload.connection_id))
     return code, definition, api_key or '', api_secret or '', passphrase or '', testnet, connection
+
+
+# ---------------------------------------------------------------------------
+# One strategy per (strategy + broker account) at a time
+# ---------------------------------------------------------------------------
+# A futures account holds ONE netted position per contract. Two runs of the
+# same strategy on the same API key therefore cannot both carry their own
+# trade: they stack, hedge to flat, or fight over the same stop legs. This is
+# the guard that stops it happening, and the pre-flight endpoint below lets the
+# UI tell the user *before* they press Start rather than after.
+
+def _account_identity(source, connection, user):
+    """Stable identity of the venue account an instance would trade on."""
+    if connection is not None:
+        return f"{source}:conn:{connection.id}"
+    return f"{source}:legacy:{user.id}"
+
+
+def _instance_account_identity(service, fallback_user_id=None):
+    conn_id = getattr(service, "connection_id", None)
+    source = normalize_source(getattr(service, "broker_name", None)
+                              or getattr(service, "market_source", None))
+    if conn_id is not None:
+        return f"{source}:conn:{conn_id}"
+    return f"{source}:legacy:{getattr(service, 'user_id', fallback_user_id)}"
+
+
+def running_conflict(mode, user, strategy_id, source, connection):
+    """The already-running instance that blocks this start, or ``None``.
+
+    Matching is on (strategy, venue account) — the same strategy on a *different*
+    connection is fine, and a different strategy on the same connection is
+    allowed but queues (reported separately by ``_shared_account_status``).
+    """
+    pool = live_trade_instances if mode == 'live' else paper_trade_instances
+    wanted = _account_identity(source, connection, user)
+    for key, service in pool.items():
+        if f"_{user.username}_" not in key:
+            continue
+        if str(getattr(service, "strategy_id", "")) != str(strategy_id):
+            continue
+        if _instance_account_identity(service, user.id) != wanted:
+            continue
+        if not getattr(service, "is_running", False):
+            continue
+        return key, service
+    return None
+
+
+def _conflict_detail(mode, key, service, connection):
+    account = (getattr(connection, "label", None) or "the primary account")
+    return (
+        f"'{getattr(service, 'strategy_name', None) or service.strategy_id}' is already "
+        f"running in {mode} on {account}. A futures account holds one netted position "
+        f"per contract, so the same strategy cannot run twice on the same account — "
+        f"stop the existing instance ({key.split('_')[-1]}) first, or pick a different "
+        f"broker connection."
+    )
+
+
+class PreflightRequest(BaseModel):
+    mode: str = 'paper'              # paper | live
+    strategy_id: str
+    broker_name: str = DEFAULT_BROKER
+    data_source: Optional[str] = None
+    connection_id: Optional[int] = None
+    # resolve_broker_context() reads this off the payload when no saved
+    # connection is selected; it must exist here too.
+    testnet: bool = False
+
+
+@app.post("/trade/preflight")
+def trade_preflight(payload: PreflightRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Can this strategy start right now — and what will it share?
+
+    Called by the Start button before it posts, so the user is told about a
+    duplicate (blocking) or a shared account (queueing) up front instead of
+    getting a 409 after the fact.
+    """
+    mode = 'live' if str(payload.mode).lower() == 'live' else 'paper'
+    try:
+        source, definition, api_key, api_secret, _p, testnet, connection = \
+            resolve_broker_context(payload, user, db, require_credentials=(mode == 'live'))
+    except HTTPException as exc:
+        return {"can_start": False, "blocking": True, "reason": exc.detail,
+                "kind": "broker", "mode": mode}
+
+    conflict = running_conflict(mode, user, payload.strategy_id, source, connection)
+    if conflict:
+        key, service = conflict
+        return {"can_start": False, "blocking": True, "kind": "duplicate", "mode": mode,
+                "instance_key": key, "reason": _conflict_detail(mode, key, service, connection)}
+
+    # Not blocking, but worth saying: another strategy already holds this
+    # account, so this one will start and then wait its turn.
+    pool = live_trade_instances if mode == 'live' else paper_trade_instances
+    wanted = _account_identity(source, connection, user)
+    sharing = [str(getattr(s, "strategy_name", None) or s.strategy_id)
+               for k, s in pool.items()
+               if f"_{user.username}_" in k and getattr(s, "is_running", False)
+               and _instance_account_identity(s, user.id) == wanted]
+    return {
+        "can_start": True, "blocking": False, "mode": mode,
+        "kind": "shared" if sharing else "ok",
+        "account_label": (getattr(connection, "label", None) or "Primary"),
+        "connection_id": (connection.id if connection else None),
+        "broker": source, "testnet": bool(testnet),
+        "sharing_with": sharing,
+        "reason": (f"{len(sharing)} other strategy/strategies already run on this account "
+                   f"({', '.join(sharing)}). Only one of them can hold a position at a "
+                   f"time — the rest wait their turn.") if sharing else None,
+    }
 
 
 @app.post("/paper-trade/start")
@@ -2360,6 +2576,12 @@ def start_paper_trade(
     if not (user.can_paper if user.can_paper is not None else 1):
         raise HTTPException(status_code=403, detail="Paper trading is disabled for this account. Contact admin.")
     source, definition, api_key, api_secret, passphrase, testnet, connection = resolve_broker_context(payload, user, db)
+    # One strategy per venue account: refuse a duplicate up front rather than
+    # letting two workers fight over the same netted position.
+    conflict = running_conflict('paper', user, payload.strategy_id, source, connection)
+    if conflict:
+        raise HTTPException(status_code=409,
+                            detail=_conflict_detail('paper', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'paper')
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
@@ -2370,6 +2592,10 @@ def start_paper_trade(
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
     feed_mode, feed_interval = _resolve_price_feed(payload)
+    # Which sub-account this paper run is modelled on, so its card matches the
+    # live card for the same strategy/account pair.
+    account_label = (getattr(connection, "label", None) or
+                     getattr(connection, "broker_code", None) or "Primary") if connection else "Primary"
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -2379,7 +2605,9 @@ def start_paper_trade(
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
                                     trading_windows=window_config, use_mark_price=use_mark,
-                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
         service.strategy = FastTestStrategyService(service.config)
     elif strategy_id != "PhantomV2":
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
@@ -2392,29 +2620,40 @@ def start_paper_trade(
                                         market_source=source, broker_name=source, fee_schedule=fees,
                                         is_custom=False, broker_definition=definition, strategy_name=strategy_name,
                                         trading_windows=window_config, use_mark_price=use_mark,
-                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
         else:
             service = PaperTradeService(strategy_id, strategy_payload, initial_capital=capital, margin_pct=margin_pct,
                                         market_source=source, broker_name=source, fee_schedule=fees,
                                         is_custom=True, broker_definition=definition, strategy_name=strategy_name,
                                        trading_windows=window_config, use_mark_price=use_mark,
-                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
     else:
         service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
                                     trading_windows=window_config, use_mark_price=use_mark,
-                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet)
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
     service.user_id = user.id
+    service.auto_resume = bool(payload.auto_resume if payload.auto_resume is not None else True)
     session_id = paper_history.start_session(user.id, instance_key, service)
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
             "strategy_name": service.strategy_name, "data_source": source,
             "session_id": session_id,
+            "account_label": account_label,
+            "connection_id": (connection.id if connection else None),
+            "leverage": getattr(service.config, 'leverage', None),
+            "margin_pct": margin_pct,
             "contract": contract_label(source, "BTCUSDT"),
             "perpetual_symbol": perpetual_symbol(source, "BTCUSDT"),
             "use_mark_price": bool(getattr(service, 'use_mark_price', True)),
@@ -2551,6 +2790,17 @@ def get_paper_status(user=Depends(get_current_user)):
                 "margin_pct": getattr(service, 'margin_pct', 0),
                 "conversion_rate": service.conversion_rate,
                 "is_running": service.is_running, "active_trades": active_trades,
+                # Which venue account this run is modelled on, plus why it is
+                # not running if it stopped and what the last error was. These
+                # are what turn a bare "Interrupted" into something actionable.
+                "account_label": getattr(service, 'account_label', 'Primary'),
+                "connection_id": getattr(service, 'connection_id', None),
+                "stop_reason": getattr(service, 'stop_reason', None),
+                "last_error": getattr(service, 'last_error', None),
+                "restarts": int(getattr(service, 'restarts', 0) or 0),
+                "resumed": getattr(service, 'resumed_from_session', None) is not None,
+                "auto_resume": bool(getattr(service, 'auto_resume', True)),
+                "testnet": bool(getattr(service, 'testnet', False)),
                 "open_trade_count": len(service.oms.active_trades),
                 "closed_trades": service.closed_trades[-50:],
                 "last_price": service.last_price, "last_checked": service.last_checked,
@@ -2603,6 +2853,10 @@ def start_live_trade(
     if not (user.can_live if user.can_live is not None else 0):
         raise HTTPException(status_code=403, detail="Live trading is not enabled for this account. Contact admin.")
     source, definition, api_key, api_secret, passphrase, testnet, connection = resolve_broker_context(payload, user, db, True)
+    conflict = running_conflict('live', user, payload.strategy_id, source, connection)
+    if conflict:
+        raise HTTPException(status_code=409,
+                            detail=_conflict_detail('live', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'live')
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     strategy_id = payload.strategy_id
@@ -2622,6 +2876,41 @@ def start_live_trade(
     # instance is which; without it every card just says "Binance".
     account_label = (getattr(connection, "label", None) or
                      getattr(connection, "broker_code", None) or "Primary") if connection else "Primary"
+    # ---- Risk controls, applied to the VENUE before the first order -----
+    # Sizing uses config.leverage locally; if the exchange still holds a
+    # different leverage (or a different margin mode) the position that comes
+    # back is not the one the strategy sized. Push both first and report what
+    # the venue said, so a rejection is visible at start rather than at the
+    # first fill.
+    risk_setup = {"leverage": None, "margin_mode": None}
+    if payload.leverage is not None:
+        try:
+            config.leverage = int(validate_leverage(payload.leverage))
+        except PhantomValidationError as ve:
+            raise HTTPException(status_code=ve.status_code, detail=ve.message)
+    if payload.leverage is not None or payload.margin_mode is not None:
+        try:
+            client, _def, _cid = _live_client(db, user, source, payload.connection_id)
+            if payload.leverage is not None:
+                res = client.set_leverage("BTCUSDT", int(config.leverage))
+                risk_setup["leverage"] = {
+                    "requested": int(config.leverage),
+                    "status": "rejected" if (isinstance(res, dict) and res.get("error")) else "ok",
+                    "error": (res or {}).get("error") if isinstance(res, dict) else None}
+            if payload.margin_mode is not None:
+                mode = validate_margin_mode(payload.margin_mode)
+                res = client.set_margin_mode("BTCUSDT", mode)
+                risk_setup["margin_mode"] = {
+                    "requested": mode,
+                    "status": "rejected" if (isinstance(res, dict) and res.get("error")) else "ok",
+                    "error": (res or {}).get("error") if isinstance(res, dict) else None}
+        except HTTPException:
+            raise
+        except PhantomValidationError as ve:
+            raise HTTPException(status_code=ve.status_code, detail=ve.message)
+        except Exception as exc:
+            risk_setup["error"] = f"{exc.__class__.__name__}: {exc}"
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -2682,6 +2971,10 @@ def start_live_trade(
             "trading_windows": service.window_guard.summary(),
             "heartbeat": bool(getattr(service, "heartbeat_enabled", False)),
             "testnet": bool(testnet),
+            "leverage": getattr(service.config, 'leverage', None),
+            "margin_pct": margin_pct,
+            # What the exchange said when leverage / margin mode were pushed.
+            "risk_setup": risk_setup,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
@@ -3175,7 +3468,7 @@ class BrokerSettingsUpdate(BaseModel):
     api_secret: Optional[str] = ''
     initial_capital: float = 20000.0
     margin_pct: float = 25.0
-    broker_name: str = "Binance"
+    broker_name: str = DEFAULT_BROKER
     connection_id: Optional[int] = None
     passphrase: Optional[str] = None
     is_testnet: bool = False
@@ -3224,7 +3517,7 @@ def get_broker_settings(user=Depends(get_current_user), db=Depends(get_db)):
         # the browser is reachable in dev tools, and Delta's guidance is that
         # the React side must never see the secret in any form.
         "has_secret": bool(user.api_secret),
-        "broker_name": user.broker_name or 'Binance',
+        "broker_name": user.broker_name or DEFAULT_BROKER,
         "initial_capital": user.initial_capital,
         "margin_deployment_pct": user.margin_deployment_pct,
         # BTC perpetual pricing + the account's default "skip new trades"
@@ -3668,6 +3961,108 @@ def live_set_margin_mode(payload: LiveMarginModeRequest, user=Depends(get_curren
         phantom_logger.warning(f"set_margin_mode failed [{cls['category']}]: {response.get('error')}")
     return {"status": "rejected" if (isinstance(response, dict) and response.get('error')) else "ok",
             "response": response, "rate_limits": client.rate_limit_usage()}
+
+
+@app.get('/live-account/balance')
+def live_account_balance(broker: Optional[str] = None, connection_id: Optional[int] = None,
+                         user=Depends(get_current_user), db=Depends(get_db)):
+    """Wallet equity / used margin for one broker account.
+
+    The Live Trading page used to hardcode "Connecting..." because nothing ever
+    fetched the balance. This is that call: it always answers 200 with a
+    `state` the UI can render — `ok`, `no_credentials`, or `error` with the
+    venue's own message — so the panel shows a number or a reason, never an
+    eternal spinner.
+    """
+    from .services.broker_account import normalize_balance
+    code = normalize_source(broker)
+    try:
+        client, definition, cid = _live_client(db, user, code, connection_id,
+                                               require_credentials=True)
+    except HTTPException as exc:
+        return {"state": "no_credentials", "broker": code, "error": exc.detail,
+                "wallet_balance": None, "available_balance": None}
+    try:
+        payload = client.get_account_balance()
+    except Exception as exc:
+        return {"state": "error", "broker": code, "connection_id": cid,
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "wallet_balance": None, "available_balance": None}
+    balance = normalize_balance(payload, code)
+    if isinstance(balance, dict) and balance.get("error"):
+        return {"state": "error", "broker": code, "connection_id": cid,
+                "error": balance["error"], "wallet_balance": None,
+                "available_balance": None}
+    return {"state": "ok", "broker": code, "connection_id": cid,
+            "testnet": bool(getattr(client, "testnet", False)), **balance}
+
+
+@app.get('/live-trade/results')
+def live_trade_results(strategy_id: Optional[str] = None, connection_id: Optional[int] = None,
+                       user=Depends(get_current_user), db=Depends(get_db)):
+    """Per-strategy live performance, so a client can judge ONE strategy.
+
+    The live status feed answers "what is running right now"; this answers "how
+    has this strategy actually done on this account". Results are grouped by
+    (strategy, account) because the same strategy on two sub-accounts is two
+    different results — which is exactly the comparison the multi-account setup
+    exists to make. Open positions are reported separately and never folded
+    into the realised stats.
+    """
+    from .services.paper_history import summarize
+    groups = {}
+    for key, service in live_trade_instances.items():
+        if f"_{user.username}_" not in key:
+            continue
+        sid = str(getattr(service, "strategy_id", ""))
+        if strategy_id is not None and sid != str(strategy_id):
+            continue
+        cid = getattr(service, "connection_id", None)
+        if connection_id is not None and cid != connection_id:
+            continue
+        gkey = (sid, cid)
+        group = groups.setdefault(gkey, {
+            "strategy_id": sid,
+            "strategy_name": getattr(service, "strategy_name", None) or sid,
+            "connection_id": cid,
+            "account_label": getattr(service, "account_label", "Primary"),
+            "broker_name": getattr(service, "broker_name", None),
+            "instances": [], "closed_trades": [], "open_positions": [],
+            "initial_capital": 0.0, "leverage": getattr(service.config, "leverage", None),
+            "margin_pct": getattr(service, "margin_pct", None),
+            "last_order_error": None,
+        })
+        group["instances"].append(key)
+        group["initial_capital"] += float(getattr(service, "initial_capital", 0.0) or 0.0)
+        group["closed_trades"].extend(list(getattr(service, "closed_trades", []) or []))
+        if getattr(service, "last_order_error", None):
+            group["last_order_error"] = service.last_order_error
+        rate = float(getattr(service, "conversion_rate", 85.0) or 85.0)
+        price = getattr(service, "last_price", None)
+        for symbol, trade in (getattr(service, "oms", None).active_trades.items()
+                              if getattr(service, "oms", None) else []):
+            current = price or trade.entry_price
+            group["open_positions"].append({
+                "instance_key": key, "symbol": symbol,
+                "direction": int(trade.direction), "entry": float(trade.entry_price),
+                "current": float(current), "lots": float(getattr(trade, "lots", 0) or 0),
+                "unrealised_pnl": (float(current) - float(trade.entry_price))
+                                  * int(trade.direction) * float(getattr(trade, "lots", 0) or 0) * rate,
+                "entry_time": _to_ist(trade.entry_time),
+            })
+
+    out = []
+    for group in groups.values():
+        closed = group.pop("closed_trades")
+        initial = group["initial_capital"] or None
+        net = sum(float(t.get("pnl") or 0.0) for t in closed)
+        stats = summarize(closed, initial, (initial + net) if initial else None)
+        out.append({**group, "closed_trade_count": len(closed),
+                    "recent_trades": closed[-50:], **stats,
+                    "unrealised_pnl": sum(p["unrealised_pnl"] for p in group["open_positions"]),
+                    "open_position_count": len(group["open_positions"])})
+    out.sort(key=lambda g: (g["strategy_name"], g["account_label"] or ""))
+    return out
 
 
 @app.post('/live-account/margin-mode-sync')

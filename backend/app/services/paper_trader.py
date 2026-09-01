@@ -1,4 +1,6 @@
 import asyncio
+import time
+import traceback
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from app.core.strategy import StrategyService, PhantomV2Config, ValidatorService
@@ -34,12 +36,14 @@ class PaperTradeService:
     MAX_CLOSED_TRADES = 100  # keep last N closed trades per instance
     MAX_EQUITY_POINTS = 5000  # equity-curve resolution kept in memory/DB
     PERSIST_EVERY_TICKS = 5  # quiet ticks between database snapshots (minutes)
+    MAX_RESTARTS = 5  # consecutive crashes before the session is marked failed
 
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
                  is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
                  broker_definition=None, strategy_name=None, user_id=None,
                  trading_windows=None, use_mark_price=None,
-                 price_feed="off", tick_interval=5.0, testnet=False):
+                 price_feed="off", tick_interval=5.0, testnet=False,
+                 connection_id=None, account_label=None, leverage=None):
         self.strategy_id = str(strategy_id)
         # Custom strategies are identified by a numeric id internally. Keep a
         # human-readable name on the worker so every status/list view can show
@@ -54,6 +58,13 @@ class PaperTradeService:
         self.broker_definition = broker_definition
         self.fee_schedule = fee_schedule
         self.initial_capital_inr = initial_capital
+        # Which saved broker connection (sub-account) this paper run mirrors.
+        # Paper trading places no orders, but it must be sized and reported
+        # against a *specific* account so its result is comparable with the
+        # live run on the same account — and so the one-strategy-per-account
+        # rule can be applied identically in both modes.
+        self.connection_id = connection_id
+        self.account_label = account_label or "Primary"
 
         if is_custom:
             # config_or_rules is a list of rules
@@ -66,6 +77,12 @@ class PaperTradeService:
             self.config = config_or_rules
             self.strategy = StrategyService(self.config)
 
+        # Per-instance leverage override (the client sets it on the start form).
+        if leverage is not None:
+            try:
+                self.config.leverage = int(leverage)
+            except (TypeError, ValueError):
+                pass
         self.validator = ValidatorService()
         self.oms = OrderManager(self.config)
         self.is_running = False
@@ -140,6 +157,17 @@ class PaperTradeService:
         self.session_id = None
         self.history_status = "running"
         self._tick_count = 0
+        # Why a session is no longer running, and the last error the loop saw.
+        # Surfaced in the status API and History so "Interrupted" is never the
+        # only thing the user is told.
+        self.stop_reason = None
+        self.last_error = None
+        self.restarts = 0
+        # Set when a session is rebuilt from a saved row after a restart.
+        self.resumed_from_session = None
+        # Keep this session alive across a server restart (see the startup
+        # resume pass in app.main). Set by the API from the start payload.
+        self.auto_resume = True
         self._log("info", f"Instance initialised — strategy={self.strategy_name}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
         # The BTC perpetual is the only contract this tool trades; say which
         # one the venue uses and which price the maths runs on.
@@ -149,6 +177,19 @@ class PaperTradeService:
             self._log("info", "Skip-new-trade windows ON — " + "; ".join(self.window_guard.describe()))
         else:
             self._log("info", "Skip-new-trade windows OFF — new entries allowed at any time")
+
+    async def _sleep_responsive(self, seconds: float, step: float = 1.0):
+        """Sleep, but wake up as soon as the session is stopped.
+
+        A flat ``asyncio.sleep(60)`` meant a Stop could sit unacknowledged for
+        up to a minute (and a shutdown could be cut off mid-sleep, which is one
+        of the ways a session ended up flagged interrupted). Polling the flag
+        in short steps makes stopping immediate.
+        """
+        waited = 0.0
+        while waited < seconds and self.is_running:
+            await asyncio.sleep(min(step, seconds - waited))
+            waited += step
 
     def _log(self, level: str, msg: str):
         entry = {"ts": _ist_now(), "level": level, "msg": msg}
@@ -225,9 +266,55 @@ class PaperTradeService:
             print(f"[{self.strategy_id}] History snapshot failed: {exc}")
 
     async def start(self):
+        """Supervised entry point for the worker.
+
+        Everything below this method used to be able to kill a session for
+        good: one unhandled exception outside the per-tick ``try`` (a bad
+        import, a dead websocket, a NameError) ended the background task while
+        ``is_running`` stayed True and the saved row stayed ``running`` — which
+        is exactly what surfaced later as "Interrupted". The loop body is now
+        supervised: it is restarted with a backoff, the reason is logged and
+        persisted, and only a genuine stop (or too many failures in a row)
+        ends the session.
+        """
         self.is_running = True
+        self.stop_reason = None
         self._log("info", f"🟢 Paper trading started — strategy={self.strategy_id}")
         print(f"🟢 Paper Trading Started for Strategy: {self.strategy_id}")
+        failures = 0
+        while self.is_running:
+            try:
+                await self._run_loop()
+                # A clean return means the user stopped it.
+                return
+            except asyncio.CancelledError:
+                self.stop_reason = "cancelled"
+                raise
+            except Exception as exc:
+                failures += 1
+                self.restarts += 1
+                detail = f"{exc.__class__.__name__}: {exc}"
+                self.last_error = detail
+                self._log("error", f"Worker crashed ({detail}) — restart {failures}/{self.MAX_RESTARTS}")
+                print(f"[{self.strategy_id}] paper worker crashed: {detail}\n"
+                      f"{traceback.format_exc()}")
+                self._persist_history(force=True)
+                if failures >= self.MAX_RESTARTS:
+                    self.is_running = False
+                    self.stop_reason = f"stopped after {failures} consecutive failures: {detail}"
+                    self._log("error", f"🔴 Giving up — {self.stop_reason}")
+                    try:
+                        from app.services.paper_history import finalize_session, STATUS_FAILED
+                        finalize_session(self.instance_key, self, STATUS_FAILED)
+                    except Exception:
+                        pass
+                    return
+                await asyncio.sleep(min(60.0, 5.0 * failures))
+                # A restart that survives one full tick resets the counter.
+                self._log("info", "Restarting the worker loop…")
+
+    async def _run_loop(self):
+        """The actual trading loop (candle cadence, or candle + live ticks)."""
         if self.price_feed_mode != "off":
             self._log("info", f"Live ticks ON ({self.price_feed_mode}) — exits every "
                               f"{self.tick_interval:g}s; entries still wait for a closed 1h candle")
@@ -236,23 +323,45 @@ class PaperTradeService:
         while self.is_running:
             try:
                 await self.tick()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
+                self.last_error = f"{e.__class__.__name__}: {e}"
                 self._log("error", f"Tick error: {e}")
                 print(f"Paper Trade Error [{self.strategy_id}]: {e}")
-            await asyncio.sleep(60)  # Check every minute
+            await self._sleep_responsive(60)  # Check every minute
 
     async def _run_with_feed(self):
         """Candle tick every 60s, plus an exit check on every live price."""
         from app.services.tick_feed import build_tick_feed
-        feed_client = BrokerClient(broker_name=self.market_source,
-                                   definition=self.broker_definition,
-                                   testnet=self.testnet)
-        self.tick_feed = build_tick_feed(
-            self.price_feed_mode, self.market_source, self.symbol,
-            definition=self.broker_definition,
-            perpetual=perpetual_symbol(self.market_source, self.symbol),
-            client=feed_client, interval=self.tick_interval)
-        await self.tick_feed.start()
+        try:
+            feed_client = BrokerClient(broker_name=self.market_source,
+                                       definition=self.broker_definition,
+                                       testnet=self.testnet)
+            self.tick_feed = build_tick_feed(
+                self.price_feed_mode, self.market_source, self.symbol,
+                definition=self.broker_definition,
+                perpetual=perpetual_symbol(self.market_source, self.symbol),
+                client=feed_client, interval=self.tick_interval)
+            await self.tick_feed.start()
+        except Exception as exc:
+            # A feed that will not start must degrade to the 60-second cadence,
+            # not end the session. The badge in the UI shows the mode is off.
+            self.tick_feed = None
+            self.price_feed_mode = "off"
+            self.last_error = f"price feed unavailable: {exc}"
+            self._log("warn", f"Live tick feed could not start ({exc}) — "
+                              "falling back to the 60-second candle cadence")
+            while self.is_running:
+                try:
+                    await self.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.last_error = f"{e.__class__.__name__}: {e}"
+                    self._log("error", f"Tick error: {e}")
+                await self._sleep_responsive(60)
+            return
         last_candle_tick = 0.0
         try:
             while self.is_running:
@@ -270,7 +379,7 @@ class PaperTradeService:
                     except Exception as e:
                         self._log("error", f"Fast-tick error: {e}")
                         print(f"Paper fast-tick error [{self.strategy_id}]: {e}")
-                await asyncio.sleep(self.tick_interval)
+                await self._sleep_responsive(self.tick_interval, step=min(1.0, self.tick_interval))
         finally:
             if self.tick_feed is not None:
                 await self.tick_feed.stop()
@@ -315,8 +424,9 @@ class PaperTradeService:
             self._record_equity_point()
             self._persist_history(force=True)
 
-    async def stop(self):
+    async def stop(self, reason="stopped by user"):
         self.is_running = False
+        self.stop_reason = reason
         if self.tick_feed is not None:
             try:
                 await self.tick_feed.stop()
