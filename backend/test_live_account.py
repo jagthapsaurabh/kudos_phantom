@@ -250,6 +250,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._delta(_delta_order(id=body.get("id"), state="open")))
         if path == "/v2/orders/all" and method == "DELETE":
             return self._send(self._delta({"cancelled": 2}))
+        # Keep the client-order-id fallback ahead of the numeric order-id
+        # route; otherwise the mock tries to parse "client" as an integer and
+        # drops the connection while the real client is handling a valid 404.
+        if path == "/v2/orders/client" and method == "DELETE":
+            return self._send(self._delta(_delta_order(state="cancelled")))
         if path.startswith("/v2/orders/") and method == "DELETE":
             return self._send(self._delta(_delta_order(id=int(path.rsplit("/", 1)[-1]),
                                                        state="cancelled")))
@@ -512,6 +517,35 @@ check("Delta instrument: whole contracts",
       str(delta_inst))
 check("Delta contract value comes from the product (0.001 BTC)",
       abs(delta_inst["contract_value"] - 0.001) < 1e-9, str(delta_inst["contract_value"]))
+
+# Regression coverage for Delta's signed account filters. These four endpoints
+# accept product_ids (plural); product_id is reserved for GET /v2/positions.
+# Sending both was also able to make the signed query order differ from the
+# query that requests put on the wire.
+STATE["requests"].clear()
+delta.get_positions("BTCUSDT")
+delta.get_open_orders("BTCUSDT")
+delta.get_fills("BTCUSDT", limit=10)
+delta.get_order_history("BTCUSDT", limit=10)
+_account_queries = {
+    request["path"]: request["query"]
+    for request in STATE["requests"]
+    if request["path"] in ("/v2/positions/margined", "/v2/orders",
+                            "/v2/fills", "/v2/orders/history")
+}
+check("Delta account endpoints send product_ids only",
+      len(_account_queries) == 4
+      and all("product_ids" in query and "product_id" not in query
+              for query in _account_queries.values()),
+      str(_account_queries))
+check("Delta positions filter is product_ids=139",
+      _account_queries.get("/v2/positions/margined", {}).get("product_ids") == "139",
+      str(_account_queries.get("/v2/positions/margined")))
+check("Delta orders, fills and history filters are product_ids=139",
+      all(query.get("product_ids") == "139"
+          for path, query in _account_queries.items()
+          if path != "/v2/positions/margined"),
+      str(_account_queries))
 
 check("0.03 BTC -> 30 Delta contracts", abs(delta.base_to_venue_size(0.03) - 30.0) < 1e-9,
       str(delta.base_to_venue_size(0.03)))

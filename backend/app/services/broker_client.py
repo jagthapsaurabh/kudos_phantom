@@ -645,26 +645,27 @@ class BrokerClient:
         # Official reference (delta-rest-client PyPI 1.0.14):
         #   signature_data = METHOD + timestamp + path + query_string + body_string
         # where query_string is '' or '?k=v&...' URL-encoded with quote_plus,
-        # and body_string is '' when body is None else compact JSON.
-        # The previous implementation missed the leading '?' which broke every
-        # signed call that carries a query (open orders, positions, fills…).
-        # Those calls then answered 'Signature Mismatch' instead of the real
-        # data, while /v2/wallet/balances (no query) kept working — exactly the
-        # pattern that looks like a dead key.
+        # and body_string is '' when body is None else compact JSON. The exact
+        # ordered and encoded query string below is also passed to requests;
+        # signing a separately serialized query is a common source of 401s.
         import urllib.parse
 
+        def _query_params(q):
+            # Build one deterministic mapping for both signing and requests.
+            # ``requests`` preserves dict insertion order when it serializes
+            # params, so sorting here prevents the signature order from
+            # diverging from the query string on the wire.
+            return {k: v for k, v in sorted((q or {}).items()) if v is not None}
+
         def _query_string(q):
-            if not q:
+            params = _query_params(q)
+            if not params:
                 return ""
-            # Sorted for determinism, values quote_plus-encoded like the
-            # official client so 'BTCUSD' stays 'BTCUSD' but special chars
-            # are encoded identically to what requests will send.
-            parts = []
-            for k, v in sorted((q or {}).items()):
-                if v is None:
-                    continue
-                parts.append(f"{k}={urllib.parse.quote_plus(str(v))}")
-            return ("?" + "&".join(parts)) if parts else ""
+            # Use the same application/x-www-form-urlencoded encoding that
+            # requests uses for ``params=`` (including quote_plus semantics).
+            # This matters for commas, spaces, and any future filter values.
+            encoded = urllib.parse.urlencode(list(params.items()), doseq=True)
+            return "?" + encoded
 
         def _body_string(b):
             if b is None:
@@ -672,13 +673,14 @@ class BrokerClient:
             return json.dumps(b, separators=(",", ":"))
 
         body_text = _body_string(body)
-        query_text = _query_string(query)
+        query_params = _query_params(query)
+        query_text = _query_string(query_params)
         url = f"{self.trading_url}{path}"
 
         def _signed_headers():
             return self._delta_headers(method, path, query_text, body_text)
 
-        response, error = self._throttled_request(method, url, params=query or None,
+        response, error = self._throttled_request(method, url, params=query_params or None,
                                                   data=body_text or None,
                                                   headers=_signed_headers(),
                                                   weight=weight, is_order=is_order,
@@ -1642,9 +1644,9 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else ([payload] if payload.get("error") is None else payload)
         if self.kind == "delta":
-            # Docs & official test.py use product_ids (plural) for active orders.
-            # Send both product_ids and product_id for backward compat with
-            # older deployments/mocks that still filter on singular.
+            # Delta's active-orders endpoint accepts the plural product_ids
+            # filter. Do not add product_id here: the singular filter belongs
+            # to GET /v2/positions only, and sending both breaks signed calls.
             query: Dict[str, Any] = {}
             if symbol:
                 try:
@@ -1652,7 +1654,6 @@ class BrokerClient:
                     pid = instrument.get("product_id")
                     if pid:
                         query["product_ids"] = int(pid)
-                        query["product_id"] = int(pid)
                 except Exception:
                     pass
             if not query and perp:
@@ -1678,8 +1679,9 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else payload
         if self.kind == "delta":
-            # Official test.py uses product_ids for history & fills; send both
-            # singular/plural for backward compat with older mocks.
+            # Delta order history accepts product_ids (plural). Keep the
+            # singular product_id off this query; it is only valid on
+            # GET /v2/positions.
             query: Dict[str, Any] = {"page_size": min(max(1, int(limit)), 100)}
             if symbol:
                 try:
@@ -1687,7 +1689,6 @@ class BrokerClient:
                     pid = inst.get("product_id")
                     if pid:
                         query["product_ids"] = int(pid)
-                        query["product_id"] = int(pid)
                 except Exception:
                     pass
             if "product_ids" not in query and perp:
@@ -1749,7 +1750,7 @@ class BrokerClient:
             payload = self._json_body(response, error)
             return payload if isinstance(payload, list) else payload
         if self.kind == "delta":
-            # Official test.py uses product_ids for fills; send both for compat.
+            # Delta fills accepts product_ids (plural), not product_id.
             query: Dict[str, Any] = {"page_size": min(max(1, int(limit)), 100)}
             if symbol:
                 try:
@@ -1757,7 +1758,6 @@ class BrokerClient:
                     pid = inst.get("product_id")
                     if pid:
                         query["product_ids"] = int(pid)
-                        query["product_id"] = int(pid)
                 except Exception:
                     pass
             if "product_ids" not in query and perp:
@@ -1944,10 +1944,9 @@ class BrokerClient:
             return payload
         if self.kind == "delta":
             # Official: GET /v2/positions/margined?product_ids=84 or
-            # GET /v2/positions?product_id=84. Use margined endpoint with
-            # product_ids when we can resolve product_id, else fall back to
-            # product_symbol for backward compat with older mocks. Send both
-            # plural and singular for compatibility.
+            # GET /v2/positions?product_id=84. Use the margined endpoint with
+            # only product_ids when we can resolve product_id; fall back to
+            # product_symbol for older mocks when the instrument is unknown.
             query: Dict[str, Any] = {}
             if symbol:
                 try:
@@ -1955,7 +1954,6 @@ class BrokerClient:
                     pid = instrument.get("product_id")
                     if pid:
                         query["product_ids"] = int(pid)
-                        query["product_id"] = int(pid)
                 except Exception:
                     pass
             if not query and perp:
