@@ -721,7 +721,7 @@ def saved_credentials(user_id: Optional[int], broker_code: str,
                 }
             if user_id is not None:
                 user = db.query(User).filter(User.id == int(user_id)).first()
-                if user is not None and (user.broker_name or "Binance") == broker_code \
+                if user is not None and (user.broker_name or "Delta") == broker_code \
                         and user.api_key and user.api_secret:
                     from app.core.secrets import decrypt_secret, SecretDecryptionError
                     try:

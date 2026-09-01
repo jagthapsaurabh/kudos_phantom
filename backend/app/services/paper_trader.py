@@ -39,7 +39,7 @@ class PaperTradeService:
     MAX_RESTARTS = 5  # consecutive crashes before the session is marked failed
 
     def __init__(self, strategy_id: str, config_or_rules, initial_capital=20000.0, margin_pct=25.0,
-                 is_custom=False, market_source="Binance", broker_name=None, fee_schedule=None,
+                 is_custom=False, market_source="Delta", broker_name=None, fee_schedule=None,
                  broker_definition=None, strategy_name=None, user_id=None,
                  trading_windows=None, use_mark_price=None,
                  price_feed="off", tick_interval=5.0, testnet=False,
@@ -53,7 +53,7 @@ class PaperTradeService:
         self.created_at = _ist_now()
         self.symbol = "BTCUSDT"
         self.user_id = user_id
-        self.market_source = market_source or "Binance"
+        self.market_source = market_source or "Delta"
         self.broker_name = broker_name or self.market_source
         self.broker_definition = broker_definition
         self.fee_schedule = fee_schedule
@@ -156,6 +156,8 @@ class PaperTradeService:
         self.instance_key = None
         self.session_id = None
         self.session_mode = "paper"
+        self.dropped_trade_count = 0
+        self.dropped_trade_pnl = 0.0
         self.history_status = "running"
         self._tick_count = 0
         # Why a session is no longer running, and the last error the loop saw.
@@ -240,7 +242,12 @@ class PaperTradeService:
             "exit_time": _to_ist(trade.exit_time),
             "bars_held": int(trade.bars_held),
         })
+        # Same accounting rule as the live worker: trades age out of memory,
+        # but their PnL must not vanish from the session totals.
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
+            dropped = self.closed_trades[:-self.MAX_CLOSED_TRADES]
+            self.dropped_trade_count += len(dropped)
+            self.dropped_trade_pnl += sum(float(t.get("pnl") or 0.0) for t in dropped)
             self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
 
     def _record_equity_point(self):

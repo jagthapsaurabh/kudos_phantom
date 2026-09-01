@@ -111,7 +111,7 @@ def bid_ask_of(quote: MarkPriceQuote) -> Tuple[Optional[float], Optional[float]]
 def quote_to_row(quote: MarkPriceQuote, feed_kind: str = "websocket") -> Optional[Dict[str, Any]]:
     if quote is None or getattr(quote, "basis_price", None) is None:
         return None
-    source = normalize_source_name(getattr(quote, "source", None) or "Binance")
+    source = normalize_source_name(getattr(quote, "source", None) or "Delta")
     symbol = str(getattr(quote, "symbol", None) or perpetual_symbol(source, "BTCUSDT"))
     event_time = event_time_of(quote)
     received = getattr(quote, "fetched_at", None)
@@ -231,7 +231,7 @@ def flush_ticks() -> int:
         return 0
 
 
-def query_ticks(source: str = "Binance", symbol: str = "BTCUSDT",
+def query_ticks(source: str = "Delta", symbol: str = "BTCUSD",
                 start: Optional[datetime] = None, end: Optional[datetime] = None,
                 limit: int = 5000, db=None) -> List[MarketTick]:
     own = db is None
@@ -258,7 +258,7 @@ def query_ticks(source: str = "Binance", symbol: str = "BTCUSDT",
             db.close()
 
 
-def latest_tick(source: str = "Binance", symbol: str = "BTCUSDT", db=None) -> Optional[MarketTick]:
+def latest_tick(source: str = "Delta", symbol: str = "BTCUSD", db=None) -> Optional[MarketTick]:
     own = db is None
     if own:
         db = SessionLocal()

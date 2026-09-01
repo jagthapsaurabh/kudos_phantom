@@ -69,8 +69,8 @@ const ChartPage = () => {
   const [interval, setInterval] = useState('1h');
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [symbols, setSymbols] = useState(['BTCUSDT']);
-  const [dataSource, setDataSource] = useState('Binance');
-  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  const [dataSource, setDataSource] = useState('Delta');
+  const [sources, setSources] = useState([{ code: 'Delta', name: 'Delta Exchange' }, { code: 'Binance', name: 'Binance Futures' }]);
   const [showSignals, setShowSignals] = useState(true);
   const [signalRange, setSignalRange] = useState(() => defaultSignalRange());
   const [signalCount, setSignalCount] = useState(0);

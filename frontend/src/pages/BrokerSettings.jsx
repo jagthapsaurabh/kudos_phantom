@@ -389,8 +389,8 @@ const BrokerSettings = () => {
   const [connections, setConnections] = useState([]);
   const [capital, setCapital] = useState(20000);
   const [margin, setMargin] = useState(25);
-  const [defaultBroker, setDefaultBroker] = useState('Binance');
-  const [form, setForm] = useState({ broker_code: 'Binance', label: '', api_key: '', api_secret: '', passphrase: '', is_testnet: false });
+  const [defaultBroker, setDefaultBroker] = useState('Delta');
+  const [form, setForm] = useState({ broker_code: 'Delta', label: '', api_key: '', api_secret: '', passphrase: '', is_testnet: false });
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
   // `GET /broker-connections/diagnose` — what the server sees for this login,

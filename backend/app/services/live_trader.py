@@ -235,19 +235,20 @@ def extract_fill_price(response):
 class LiveTradeService:
     MAX_LOG_LINES = 300      # log tail kept in memory / saved per session
     MAX_EQUITY_POINTS = 5000
+    MAX_CLOSED_TRADES = 100  # keep the last N in memory; totals stay exact
     PERSIST_EVERY_TICKS = 5  # quiet ticks between database snapshots
 
     def __init__(self, strategy_id: str, config_or_rules, api_key: str, api_secret: str,
                  initial_capital=20000.0, margin_pct=25.0, is_custom=False,
-                 broker_name="Binance", passphrase="", testnet=False, fee_schedule=None,
+                 broker_name="Delta", passphrase="", testnet=False, fee_schedule=None,
                  definition=None, trading_windows=None, use_mark_price=None,
                  user_id=None, instance_key=None, bracket_orders=True,
                  price_feed="off", tick_interval=5.0, account_label=None,
                  heartbeat=None, connection_id=None):
         self.strategy_id = strategy_id
         self.is_custom = is_custom
-        self.market_source = broker_name or "Binance"
-        self.broker_name = broker_name or "Binance"
+        self.market_source = broker_name or "Delta"
+        self.broker_name = broker_name or "Delta"
         self.broker = BrokerClient(api_key, api_secret, self.broker_name, passphrase, testnet, definition)
         self.definition = definition
         self.fee_schedule = fee_schedule
@@ -345,6 +346,11 @@ class LiveTradeService:
         self.account_label_for_history = account_label or "Primary"
         self.logs: list = []
         self.equity_inr = float(initial_capital)
+        # Whole-session counters, independent of the in-memory trade window.
+        self.total_closed_count = 0
+        self.total_realised_pnl = 0.0
+        self.dropped_trade_count = 0
+        self.dropped_trade_pnl = 0.0
         self.equity_history: list = [
             {"ts": datetime.utcnow().isoformat(timespec="seconds"),
              "equity": float(initial_capital)}]
@@ -1070,8 +1076,18 @@ class LiveTradeService:
                 "exit_time": _to_ist(trade.exit_time),
                 "bars_held": int(trade.bars_held or 0),
             })
-            if len(self.closed_trades) > 100:
-                self.closed_trades = self.closed_trades[-100:]
+            # Trades are capped in memory, but the counters are not: dropping
+            # old trades used to drop their PnL from net_pnl too, so after 100
+            # trades the reported net_pnl no longer matched the equity/ROI that
+            # kept accumulating. Track the discarded totals so the summary
+            # stays truthful about the whole session, not just its tail.
+            self.total_closed_count += 1
+            self.total_realised_pnl += float(pnl)
+            if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
+                dropped = self.closed_trades[:-self.MAX_CLOSED_TRADES]
+                self.dropped_trade_count += len(dropped)
+                self.dropped_trade_pnl += sum(float(t.get("pnl") or 0.0) for t in dropped)
+                self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
             # Roll the session equity forward and bank a snapshot: this is what
             # makes a finished live session reviewable (curve + trades + log).
             self.equity_inr = float(self.equity_inr) + float(pnl)
@@ -1348,7 +1364,7 @@ class LiveTradeService:
         # Live mode prefers the selected broker's current feed. Seeded data is
         # an offline fallback, useful for tests and when a public endpoint is down.
         try:
-            rows = self.broker.fetch_klines("BTCUSDT", interval, limit)
+            rows = self.broker.fetch_klines(self.contract_symbol, interval, limit)
             df = pd.DataFrame(rows)
             if not df.empty:
                 df.set_index('event_time', inplace=True)
@@ -1357,7 +1373,13 @@ class LiveTradeService:
             pass
         try:
             db = SessionLocal()
-            rows = db.query(Klines).filter(Klines.symbol == "BTCUSDT", Klines.interval == interval,
+            # Query the symbol this venue actually stores. Delta candles are
+            # seeded as BTCUSD, so the old hardcoded "BTCUSDT" filter matched
+            # nothing on Delta: the offline fallback silently returned an empty
+            # frame and a Delta session sat at "Connecting..." whenever the
+            # public endpoint hiccuped, instead of falling back to seeded data.
+            rows = db.query(Klines).filter(Klines.symbol == self.contract_symbol,
+                                           Klines.interval == interval,
                                            Klines.source == self.market_source).order_by(Klines.event_time.desc()).limit(limit).all()
             db.close()
             df = pd.DataFrame([{'event_time': k.event_time, 'open': k.open, 'high': k.high,

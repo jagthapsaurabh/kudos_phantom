@@ -23,6 +23,7 @@ if os.path.exists(TESTDB):
 os.environ["DATABASE_URL"] = f"sqlite:///{TESTDB}"
 
 from app.database.models import init_db, SessionLocal, Klines
+from sqlalchemy.exc import IntegrityError
 from app.services.data_sync import DataSyncService, MarketDataError
 
 PASS, FAIL = [], []
@@ -73,16 +74,30 @@ print("\n== repair_klines ==")
 db = SessionLocal()
 add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 0, 0))        # good
 add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 4, 0))        # good
-add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 4, 0))        # duplicate timestamp
 add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 5, 41, 59, 523330))  # off-grid
 add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 8, 0))        # good
 db.commit()
 db.close()
 
+# Duplicate candles can no longer be created: (source, symbol, interval,
+# event_time) is UNIQUE, which is what stops concurrent seeds from doubling a
+# series. repair_klines keeps its duplicate branch for databases seeded before
+# the constraint existed, but new writes are rejected outright.
+db = SessionLocal()
+try:
+    add_kline(db, "Binance", "BTCUSDT", "4h", datetime(2020, 1, 1, 4, 0))
+    db.commit()
+    check("duplicate candle rejected by the database", False, "insert was accepted")
+except IntegrityError:
+    db.rollback()
+    check("duplicate candle rejected by the database", True)
+finally:
+    db.close()
+
 summary = DataSyncService.repair_klines("Binance", "BTCUSDT", ["4h"])
 item = summary[0]
-check("repair reports totals", item["total"] == 5 and item["removed"] == 2)
-check("repair splits defect kinds", item["duplicates_removed"] == 1 and item["misaligned_removed"] == 1)
+check("repair reports totals", item["total"] == 4 and item["removed"] == 1, str(item))
+check("repair splits defect kinds", item["duplicates_removed"] == 0 and item["misaligned_removed"] == 1, str(item))
 db = SessionLocal()
 remaining = [row.event_time for row in db.query(Klines).filter_by(
     source="Binance", symbol="BTCUSDT", interval="4h").order_by(Klines.event_time).all()]
@@ -109,13 +124,14 @@ check("health counts corrupt series before repair was possible",
       h4h and h4h["count"] == 3 and h4h["duplicate_rows"] == 0 and h4h["misaligned_rows"] == 0)
 db = SessionLocal()
 add_kline(db, "Binance", "BTCUSDT", "5m", datetime(2020, 1, 1))
-add_kline(db, "Binance", "BTCUSDT", "5m", datetime(2020, 1, 1))              # duplicate
 add_kline(db, "Binance", "BTCUSDT", "5m", datetime(2020, 1, 2, 11, 41, 59))  # off-grid
 db.commit(); db.close()
 health = {(row["source"], row["symbol"], row["interval"]): row for row in DataSyncService.data_health()}
 h5m = health[("Binance", "BTCUSDT", "5m")]
-check("health exposes duplicates", h5m["duplicate_rows"] == 1)
-check("health exposes off-grid candles", h5m["misaligned_rows"] == 1 and h5m["scanned"] == 3)
+# The unique constraint keeps duplicate_rows at zero for anything written
+# through the app; the field still reports pre-constraint data.
+check("health exposes duplicates", h5m["duplicate_rows"] == 0, str(h5m))
+check("health exposes off-grid candles", h5m["misaligned_rows"] == 1 and h5m["scanned"] == 2, str(h5m))
 
 
 # ---------------------------------------------------------------------------

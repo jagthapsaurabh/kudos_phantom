@@ -116,7 +116,7 @@ class BacktestRequest(BaseModel):
     # Capital to run the backtest with. If omitted, the user's (admin-set)
     # initial_capital is used.
     initial_capital: Optional[float] = None
-    data_source: str = 'Binance'
+    data_source: str = 'Delta'
     fee_mode: str = 'backtest'
     # Optional top-level overrides. The UI sends both inside `params` (so they
     # are saved with the run and restored later); these exist so a scripted run
@@ -570,7 +570,7 @@ class ScanRequest(BaseModel):
     rules: Union[List[Dict], Dict]
     symbol: str = "BTCUSDT"
     interval: str = "1h"
-    source: str = "Binance"
+    source: str = "Delta"
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     limit: int = 25
@@ -816,14 +816,25 @@ def _apply_broker_payload(row, payload):
     row.tick_size = payload.tick_size
 
 
+# Delta is the default venue, so it leads every broker dropdown. Ordering by
+# name alone would put "Binance Futures" first purely alphabetically.
+DEFAULT_BROKER_CODE = 'Delta'
+
+
+def _broker_sort_key(row):
+    return (0 if (row.code or '') == DEFAULT_BROKER_CODE else 1, row.name or '')
+
+
 @app.get('/broker-definitions')
 def broker_definitions(user=Depends(get_current_user), db=Depends(get_db)):
-    return [_broker_dict(b) for b in db.query(BrokerDefinition).filter(BrokerDefinition.enabled == 1).order_by(BrokerDefinition.name).all()]
+    rows = db.query(BrokerDefinition).filter(BrokerDefinition.enabled == 1).all()
+    return [_broker_dict(b) for b in sorted(rows, key=_broker_sort_key)]
 
 
 @app.get('/admin/brokers')
 def admin_brokers(admin=Depends(require_admin), db=Depends(get_db)):
-    return [_broker_dict(b) for b in db.query(BrokerDefinition).order_by(BrokerDefinition.name).all()]
+    rows = db.query(BrokerDefinition).all()
+    return [_broker_dict(b) for b in sorted(rows, key=_broker_sort_key)]
 
 
 @app.post('/admin/brokers')
@@ -871,7 +882,7 @@ def admin_fee_settings(admin=Depends(require_admin), db=Depends(get_db)):
 
 
 @app.get('/fee-settings')
-def fee_settings(broker_code: str = 'Binance', mode: str = 'backtest', user=Depends(get_current_user), db=Depends(get_db)):
+def fee_settings(broker_code: str = 'Delta', mode: str = 'backtest', user=Depends(get_current_user), db=Depends(get_db)):
     return _fee_dict(resolve_fees(db, broker_code, mode), normalize_source(broker_code), mode)
 
 
@@ -1056,7 +1067,7 @@ def list_broker_connections(user=Depends(get_current_user), db=Depends(get_db)):
 
 
 @app.get('/broker-connections/diagnose')
-def diagnose_broker_connection(broker: str = 'Binance', connection_id: Optional[int] = None,
+def diagnose_broker_connection(broker: str = 'Delta', connection_id: Optional[int] = None,
                                user=Depends(get_current_user), db=Depends(get_db)):
     """Explain, for THIS login, whether a broker is ready to trade.
 
@@ -1421,7 +1432,7 @@ def delete_broker_connection(connection_id: int, user=Depends(get_current_user),
 
 
 class MarketSeedPayload(BaseModel):
-    source: str = 'Binance'
+    source: str = 'Delta'
     symbol: str = 'BTCUSDT'
     # None lets the adapter choose its safe default. Delta defaults to the
     # full-history-compatible 15m/1h/4h/1d set; Binance keeps all app candles.
@@ -1584,7 +1595,7 @@ def market_data_status(health: bool = False, admin=Depends(require_admin), db=De
             health_by_key[(item['source'], item['symbol'], item['interval'])] = item
     result = []
     for source, symbol, interval, count, volume_rows, distinct_times, first, last in rows:
-        source = source or 'Binance'
+        source = source or 'Delta'
         entry = {'source': source, 'symbol': symbol, 'interval': interval,
                  'count': int(count), 'volume_rows': int(volume_rows),
                  'duplicate_rows': int(count) - int(distinct_times),
@@ -1648,7 +1659,7 @@ def market_data_seed_job(admin=Depends(require_admin)):
 
 
 @app.post('/admin/market-data/repair')
-def repair_market_data(source: str = 'Binance', symbol: str = 'BTCUSDT', intervals: Optional[str] = None,
+def repair_market_data(source: str = 'Delta', symbol: str = 'BTCUSD', intervals: Optional[str] = None,
                        admin=Depends(require_admin), db=Depends(get_db)):
     """Remove corrupted candles without fetching: duplicate timestamps (legacy
     batch inserts stored each candle again) and off-grid timestamps (legacy
@@ -1686,7 +1697,7 @@ def market_data_seed_progress(admin=Depends(require_admin), db=Depends(get_db)):
 
 
 @app.get('/admin/market-data/test')
-def test_market_data_source(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
+def test_market_data_source(source: str = 'Delta', symbol: str = 'BTCUSD', interval: str = '1h',
                             admin=Depends(require_admin), db=Depends(get_db)):
     """Round-trip probe: shows exactly what the exchange answers for a tiny
     request, so an empty seed (0 candles) can be diagnosed from the UI."""
@@ -1712,7 +1723,7 @@ def sync_market_data_now(admin=Depends(require_admin)):
 
 
 @app.post('/admin/market-data/seed-csv')
-async def seed_market_data_csv(source: str = 'Binance', symbol: str = 'BTCUSDT', interval: str = '1h',
+async def seed_market_data_csv(source: str = 'Delta', symbol: str = 'BTCUSD', interval: str = '1h',
                          clear_existing: bool = False, file: UploadFile = File(...), admin=Depends(require_admin)):
     try:
         import tempfile
@@ -1731,7 +1742,7 @@ async def seed_market_data_csv(source: str = 'Binance', symbol: str = 'BTCUSDT',
 
 # --- BTC PERPETUAL: contract, mark price and "skip new trades" schedule ---
 @app.get("/market/contract")
-def market_contract(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
+def market_contract(source: str = "Delta", user=Depends(get_current_user), db=Depends(get_db)):
     """Which contract the tool trades on a venue.
 
     Both venues are wired to the BTC **perpetual** (BTCUSDT on Binance, BTCUSD
@@ -1750,7 +1761,7 @@ def market_contract(source: str = "Binance", user=Depends(get_current_user), db=
 
 
 @app.get("/market/mark-price")
-def market_mark_price(source: str = "Binance", symbol: str = "BTCUSDT",
+def market_mark_price(source: str = "Delta", symbol: str = "BTCUSD",
                       user=Depends(get_current_user), db=Depends(get_db)):
     """Live mark price (and traded price) of the BTC perpetual.
 
@@ -1867,7 +1878,7 @@ def phantom_config(user=Depends(get_current_user)):
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
                     symbol: str = "BTCUSDT", strategy_id: Optional[str] = "PhantomV2",
-                    source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
+                    source: str = "Delta", user=Depends(get_current_user), db=Depends(get_db)):
     """Signal candles for the chart overlay.
 
     By default it overlays the tuned Phantom champion config. Pass
@@ -2112,7 +2123,7 @@ def get_backtest_history(user=Depends(get_current_user), db=Depends(get_db)):
     return [{"id": r.id, "name": r.name, "strategy_id": r.strategy_id or 'PhantomV2',
              "start_date": r.start_date, "end_date": r.end_date,
              "roi": r.roi, "initial_capital": r.initial_capital or 20000,
-             "data_source": r.data_source or 'Binance', "taker_fee_bps": r.taker_fee_bps,
+             "data_source": r.data_source or 'Delta', "taker_fee_bps": r.taker_fee_bps,
              "maker_fee_bps": r.maker_fee_bps, "timestamp": r.timestamp,
              "use_mark_price": int(r.use_mark_price) if r.use_mark_price is not None else 1,
              "blocked_entries": int(r.blocked_entries or 0)} for r in runs]
@@ -2177,7 +2188,7 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
             "max_drawdown": run.max_drawdown,
             "roi": run.roi,
             "equity_curve": run.equity_curve,
-            "data_source": run.data_source or 'Binance',
+            "data_source": run.data_source or 'Delta',
             "fee_mode": run.fee_mode or 'backtest',
             "taker_fee_bps": run.taker_fee_bps,
             "maker_fee_bps": run.maker_fee_bps,
@@ -2187,7 +2198,7 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
             "use_mark_price": int(run.use_mark_price) if run.use_mark_price is not None else 1,
             "trading_windows_enabled": int(run.trading_windows_enabled or 0),
             "blocked_entries": int(run.blocked_entries or 0),
-            "contract": contract_label(run.data_source or 'Binance', "BTCUSDT"),
+            "contract": contract_label(run.data_source or 'Delta', "BTCUSDT"),
         },
         "trades": trade_list
     }
@@ -2231,8 +2242,8 @@ class FilterPreviewRequest(BaseModel):
     params: StrategyParams
     start_date: Optional[str] = None
     end_date: Optional[str] = None
-    symbol: str = "BTCUSDT"
-    data_source: str = 'Binance'
+    symbol: str = "BTCUSD"
+    data_source: str = 'Delta'
     fee_mode: str = 'backtest'
     use_mark_price: Optional[bool] = None
     trading_windows: Optional[TradingWindowConfig] = None
@@ -3399,7 +3410,7 @@ async def reload_live_credentials(payload: LiveReloadCredentialsRequest,
 # --- DATA ENDPOINTS ---
 @app.get("/klines")
 def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
-               source: str = "Binance", start_date: Optional[str] = None,
+               source: str = "Delta", start_date: Optional[str] = None,
                end_date: Optional[str] = None, db=Depends(get_db)):
     try:
         # A date window is required for strategy/backtest overlays: the last-N
@@ -3453,7 +3464,7 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
         return []
 
 @app.get("/ticks")
-def get_ticks(symbol: str = "BTCUSDT", source: str = "Binance",
+def get_ticks(symbol: str = "BTCUSD", source: str = "Delta",
               start_date: Optional[str] = None, end_date: Optional[str] = None,
               limit: int = 5000, user=Depends(get_current_user), db=Depends(get_db)):
     """Raw live ticks stored from the venue stream / REST poll.
@@ -3491,7 +3502,7 @@ def get_ticks(symbol: str = "BTCUSDT", source: str = "Binance",
 
 
 @app.get("/ticks/latest")
-def get_latest_tick(symbol: str = "BTCUSDT", source: str = "Binance",
+def get_latest_tick(symbol: str = "BTCUSD", source: str = "Delta",
                     user=Depends(get_current_user), db=Depends(get_db)):
     from .services.tick_store import flush_ticks, latest_tick
     flush_ticks()
@@ -3508,7 +3519,7 @@ def get_latest_tick(symbol: str = "BTCUSDT", source: str = "Binance",
 
 
 @app.get("/ticks/ohlc")
-def get_tick_ohlc(symbol: str = "BTCUSDT", source: str = "Binance",
+def get_tick_ohlc(symbol: str = "BTCUSD", source: str = "Delta",
                   interval: str = "1m", start_date: Optional[str] = None,
                   end_date: Optional[str] = None, limit: int = 20000,
                   user=Depends(get_current_user), db=Depends(get_db)):
@@ -3544,7 +3555,7 @@ def get_tick_stats(user=Depends(get_current_user), db=Depends(get_db)):
 
 
 @app.get("/symbols")
-def list_symbols(source: str = "Binance", user=Depends(get_current_user), db=Depends(get_db)):
+def list_symbols(source: str = "Delta", user=Depends(get_current_user), db=Depends(get_db)):
     """Distinct symbols available in the selected source's local store."""
     try:
         rows = db.query(Klines.symbol).filter(Klines.source == normalize_source(source)).distinct().all()
@@ -4215,7 +4226,7 @@ def live_reset_mmp(payload: LiveMMPResetRequest, user=Depends(get_current_user),
 
 
 @app.get('/live-account/rate-limits')
-def live_rate_limits(broker: str = 'Binance', connection_id: Optional[int] = None,
+def live_rate_limits(broker: str = 'Delta', connection_id: Optional[int] = None,
                      user=Depends(get_current_user), db=Depends(get_db)):
     """Local throttling state, plus the exchange's own quota (Delta)."""
     from .core.rate_limit import all_snapshots

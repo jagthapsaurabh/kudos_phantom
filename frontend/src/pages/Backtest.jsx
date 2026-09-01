@@ -429,8 +429,8 @@ const Backtest = () => {
   const [overlayCandles, setOverlayCandles] = useState([]);
   const [overlaySignals, setOverlaySignals] = useState([]);
   const [overlayLoading, setOverlayLoading] = useState(false);
-  const [dataSource, setDataSource] = useState('Binance');
-  const [sources, setSources] = useState([{ code: 'Binance', name: 'Binance Futures' }, { code: 'Delta', name: 'Delta Exchange' }]);
+  const [dataSource, setDataSource] = useState('Delta');
+  const [sources, setSources] = useState([{ code: 'Delta', name: 'Delta Exchange' }, { code: 'Binance', name: 'Binance Futures' }]);
   const [fees, setFees] = useState({ taker_fee_bps: 5.9, maker_fee_bps: 2.36 });
   const defaultSectionVisibility = {
     history: true,
@@ -1059,7 +1059,7 @@ const Backtest = () => {
               <div key={run.id} onClick={() => loadRun(run.id)} className="group relative cursor-pointer rounded-xl border border-gray-700 bg-gray-900 p-4 transition hover:border-blue-500">
                 <div>
                   <div className="font-bold text-gray-200 transition group-hover:text-blue-400">{run.name || 'Unnamed Run'}</div>
-                  <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Binance'}</div>
+                  <div className="text-xs text-gray-500">{run.start_date?.split('T')[0]} → {run.end_date?.split('T')[0]} · {run.data_source || 'Delta'}</div>
                   <div className={`mt-2 text-sm font-mono ${(run.roi || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>ROI: {(run.roi || 0).toFixed(2)}%</div>
                   <a href={`/chart?run=${run.id}`} onClick={(e) => e.stopPropagation()}
                      className="mt-2 inline-flex items-center gap-1 text-[11px] font-semibold text-sky-400 hover:text-sky-300">

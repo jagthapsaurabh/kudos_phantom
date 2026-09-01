@@ -59,10 +59,19 @@ def _f(value):
         return None
 
 
-def summarize(closed_trades, initial_capital=None, final_equity=None, equity_curve=None):
-    """Roll up a session's closed trades into headline numbers."""
+def summarize(closed_trades, initial_capital=None, final_equity=None, equity_curve=None,
+              dropped_count=0, dropped_pnl=0.0):
+    """Roll up a session's closed trades into headline numbers.
+
+    Workers keep only the last N trades in memory. ``dropped_count`` and
+    ``dropped_pnl`` carry the trades that aged out, so a long session's
+    net PnL and trade count describe the whole run rather than just the
+    tail that happens to still be retained.
+    """
     closed = [t for t in (closed_trades or []) if isinstance(t, dict)]
-    count = len(closed)
+    dropped_count = int(dropped_count or 0)
+    dropped_pnl = float(dropped_pnl or 0.0)
+    count = len(closed) + dropped_count
     pnls = [_f(t.get('pnl')) or 0.0 for t in closed]
     wins = [p for p in pnls if p > 0]
     losses = [abs(p) for p in pnls if p < 0]
@@ -72,7 +81,7 @@ def summarize(closed_trades, initial_capital=None, final_equity=None, equity_cur
         profit_factor = gross_win / gross_loss
     else:
         profit_factor = 99.0 if gross_win > 0 else 0.0
-    net_pnl = sum(pnls)
+    net_pnl = sum(pnls) + dropped_pnl
     fees = sum([_f(t.get('fees')) or 0.0 for t in closed])
     initial = _f(initial_capital)
     final = _f(final_equity)
@@ -95,7 +104,9 @@ def summarize(closed_trades, initial_capital=None, final_equity=None, equity_cur
                 max_dd = max(max_dd, (running_peak - value) / running_peak * 100.0)
     return {
         'closed_trade_count': count,
-        'win_rate': round(len(wins) / count * 100.0, 2) if count else 0.0,
+        # Rates are measured over the retained trades (the only ones whose
+        # win/loss detail survives); the counts and PnL above cover the run.
+        'win_rate': round(len(wins) / len(closed) * 100.0, 2) if closed else 0.0,
         'profit_factor': round(profit_factor, 2),
         'net_pnl': round(net_pnl, 2),
         'total_fees': round(fees, 2),
@@ -163,7 +174,9 @@ def _payload(service, status=None):
     if initial is None:
         initial = _f(getattr(service, 'initial_capital', None))
     equity = _f(getattr(service, 'equity_inr', None))
-    stats = summarize(closed, initial, equity, curve)
+    stats = summarize(closed, initial, equity, curve,
+                      dropped_count=getattr(service, 'dropped_trade_count', 0),
+                      dropped_pnl=getattr(service, 'dropped_trade_pnl', 0.0))
     # Prefer the pydantic request model; fall back to a plain params dict so a
     # worker that only keeps params still saves what it was configured with.
     config = getattr(service, 'config', None)
@@ -188,7 +201,7 @@ def _payload(service, status=None):
         'symbol': getattr(service, 'symbol', None) or 'BTCUSDT',
         'strategy_id': str(getattr(service, 'strategy_id', '') or ''),
         'strategy_name': getattr(service, 'strategy_name', None) or str(getattr(service, 'strategy_id', '')),
-        'data_source': getattr(service, 'market_source', None) or 'Binance',
+        'data_source': getattr(service, 'market_source', None) or 'Delta',
         'broker_name': getattr(service, 'broker_name', None),
         'initial_capital': initial,
         'final_equity': equity,

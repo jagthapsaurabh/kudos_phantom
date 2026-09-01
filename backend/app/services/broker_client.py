@@ -279,13 +279,13 @@ class BrokerClient:
         "trailing_stop": "TRAILING_STOP_MARKET",
     }
 
-    def __init__(self, api_key: str = "", api_secret: str = "", broker_name: str = "Binance",
+    def __init__(self, api_key: str = "", api_secret: str = "", broker_name: str = "Delta",
                  passphrase: str = "", testnet: bool = False, definition=None,
                  rate_limit: Optional[RateLimitConfig] = None, limiter_key: str = ""):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.passphrase = passphrase or ""
-        self.broker_name = broker_name or "Binance"
+        self.broker_name = broker_name or "Delta"
         self.testnet = testnet
         self.definition = definition
         defaults = self.DEFAULTS.get(self.broker_name, self.DEFAULTS["Binance"])

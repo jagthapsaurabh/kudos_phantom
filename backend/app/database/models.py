@@ -144,7 +144,7 @@ class Klines(Base):
     id = Column(Integer, primary_key=True)
     symbol = Column(String, index=True)
     interval = Column(String, index=True)
-    source = Column(String, index=True, default='Binance')
+    source = Column(String, index=True, default='Delta')
     event_time = Column(DateTime, index=True)
     open = Column(Float)
     high = Column(Float)
@@ -158,7 +158,17 @@ class Klines(Base):
     mark_high = Column(Float, nullable=True)
     mark_low = Column(Float, nullable=True)
     mark_close = Column(Float, nullable=True)
-    __table_args__ = (Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),)
+    # UNIQUE, not merely indexed. upsert_rows reads-then-writes, so two
+    # concurrent seeds (the daily auto-sync racing a manual admin seed) each
+    # saw "no existing row" and both inserted the same candle. The database
+    # is the only place that race can be settled; the constraint turns a
+    # silent duplicate into an error the upsert can catch and retry as an
+    # update.
+    __table_args__ = (
+        Index('ix_source_symbol_interval_time', 'source', 'symbol', 'interval', 'event_time'),
+        UniqueConstraint('source', 'symbol', 'interval', 'event_time',
+                         name='uq_klines_series_time'),
+    )
 
 
 class MarketTick(Base):
@@ -250,7 +260,7 @@ class BacktestRun(Base):
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
     config_json = Column(String)
     initial_capital = Column(Float, nullable=True)
-    data_source = Column(String, default='Binance')
+    data_source = Column(String, default='Delta')
     fee_mode = Column(String, default='backtest')
     taker_fee_bps = Column(Float, nullable=True)
     maker_fee_bps = Column(Float, nullable=True)
@@ -506,9 +516,11 @@ def _seed_reference_data():
     """Create built-in providers and .env-compatible initial fee rows once."""
     db = SessionLocal()
     try:
+        # Delta first: it is the default venue, and this order drives the
+        # broker dropdowns the user sees.
         builtins = [
-            ('Binance', 'Binance Futures', 'binance', 'https://fapi.binance.com', 'https://fapi.binance.com', 'Built-in Binance Futures adapter'),
             ('Delta', 'Delta Exchange', 'delta', 'https://api.india.delta.exchange', 'https://api.india.delta.exchange', 'Built-in Delta Exchange (India) adapter'),
+            ('Binance', 'Binance Futures', 'binance', 'https://fapi.binance.com', 'https://fapi.binance.com', 'Built-in Binance Futures adapter'),
             # Delta Exchange Global (www/global.delta.exchange) keeps a SEPARATE
             # key store from India (docs-global.delta.exchange). A key created on
             # the Global site is InvalidApiKey on the India host and vice versa,
@@ -522,7 +534,7 @@ def _seed_reference_data():
                                         trading_api_url=trading, enabled=1, is_builtin=1, notes=notes))
         taker = float(os.getenv('TAKER_FEE_BPS', '5.9'))
         maker = float(os.getenv('MAKER_FEE_BPS', '2.36'))
-        for code in ('Binance', 'Delta', 'DeltaGlobal'):
+        for code in ('Delta', 'Binance', 'DeltaGlobal'):
             for mode in ('backtest', 'paper', 'live'):
                 if not db.query(FeeSetting).filter_by(broker_code=code, mode=mode).first():
                     db.add(FeeSetting(broker_code=code, mode=mode, taker_fee_bps=taker,
@@ -549,6 +561,31 @@ def migrate_db():
                     index.create(bind=conn, checkfirst=True)
                 except Exception:
                     pass
+        # The klines uniqueness constraint is new. Any duplicate candles an
+        # earlier concurrent seed already wrote must go before the unique
+        # index can be built, or index creation fails and the app won't
+        # start. Keep the highest id per (source, symbol, interval, time) —
+        # the most recently written copy.
+        if inspector.has_table('klines'):
+            try:
+                removed = conn.execute(text(
+                    'DELETE FROM klines WHERE id NOT IN ('
+                    '  SELECT MAX(id) FROM klines'
+                    '  GROUP BY source, symbol, interval, event_time)'
+                )).rowcount
+                if removed:
+                    print(f'[migrate] removed {removed} duplicate kline rows')
+                # A table-level UniqueConstraint only exists on tables created
+                # from the model. SQLite cannot add one with ALTER TABLE, so an
+                # upgraded install needs the equivalent UNIQUE INDEX or the
+                # duplicate-candle race stays open there.
+                conn.execute(text(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS uq_klines_series_time '
+                    'ON klines (source, symbol, interval, event_time)'
+                ))
+            except Exception as exc:
+                print(f'[migrate] kline dedupe skipped: {exc}')
+
         # Sessions predate the paper/live split: everything already stored was
         # a paper run, so stamp it rather than leaving the discriminator NULL.
         if inspector.has_table('paper_sessions'):
@@ -574,6 +611,10 @@ def migrate_db():
         if inspector.has_table('klines'):
             kcols = {col['name'] for col in inspect(engine).get_columns('klines')}
             if 'source' in kcols:
+                # Legacy unlabelled candles predate multi-venue support and
+                # came from Binance. They are stamped Binance for accuracy —
+                # Delta is the default for NEW data, but relabelling existing
+                # rows would attribute one venue's prices to another.
                 conn.execute(text("UPDATE klines SET source='Binance' WHERE source IS NULL OR source=''"))
 
 
