@@ -338,9 +338,24 @@ class BacktestEngine:
                      if "mark_close" in df_1h.columns else None)
         raw_open = (pd.to_numeric(df_1h["mark_open"], errors="coerce")
                     if "mark_open" in df_1h.columns else None)
+        # Candle extremes on the decision basis, for intra-candle stop/target
+        # checks: on mark basis use the mark high/low when the history carries
+        # them; the traded high/low is the honest fallback (still far better
+        # than pretending the candle only ever traded at its close).
+        def _extreme(column, mark_column):
+            if basis == "mark" and mark_column in df_1h.columns:
+                series = pd.to_numeric(df_1h[mark_column], errors="coerce")
+                if series.notna().all():
+                    return series.astype(float).values
+            if column in df_1h.columns:
+                return pd.to_numeric(df_1h[column], errors="coerce").astype(float).values
+            return None
+
         return {
             "decision_close": dec_close.astype(float).values,
             "decision_open": dec_open.astype(float).values,
+            "decision_high": _extreme("high", "mark_high"),
+            "decision_low": _extreme("low", "mark_low"),
             "mark_close": raw_close.astype(float).values if raw_close is not None else None,
             "mark_open": raw_open.astype(float).values if raw_open is not None else None,
             "basis": basis,
@@ -402,6 +417,8 @@ class BacktestEngine:
         price_frame = self._resolve_price_frame(df_1h)
         dec_closes = price_frame["decision_close"]
         dec_opens = price_frame["decision_open"]
+        dec_highs = price_frame["decision_high"]
+        dec_lows = price_frame["decision_low"]
         mark_closes = price_frame["mark_close"]
         mark_opens = price_frame["mark_open"]
         self.mark_price_basis = price_frame["basis"] == "mark"
@@ -444,9 +461,16 @@ class BacktestEngine:
 
             # ---- Manage open positions ----------------------------------
             for sym in list(self.oms.active_trades.keys()):
+                # The candle's high/low go along so a stop pierced INSIDE the
+                # bar triggers even when the close recovered — on the venue
+                # the resting stop would have filled. A backtest that quietly
+                # survives those candles reports profits live trading cannot
+                # reproduce.
                 result = self.oms.update_trade(sym, current_price_usd, current_atr_usd, current_time,
                                                trade_price_usd=trade_price_usd,
-                                               mark_price_usd=current_mark_usd)
+                                               mark_price_usd=current_mark_usd,
+                                               bar_high_usd=(float(dec_highs[i]) if dec_highs is not None else None),
+                                               bar_low_usd=(float(dec_lows[i]) if dec_lows is not None else None))
                 if result:
                     net, equity_box[0], td = self._book_closed_trade(result, equity_box[0], conversion_rate)
                     td.update(open_ctx_box.pop(sym, {}))

@@ -117,7 +117,8 @@ class OrderManager:
         return trade
 
     def update_trade(self, symbol, current_price_usd, current_atr_usd, timestamp,
-                     trade_price_usd=None, mark_price_usd=None, advance_bar=True):
+                     trade_price_usd=None, mark_price_usd=None, advance_bar=True,
+                     bar_high_usd=None, bar_low_usd=None):
         """Mark-to-market an open position and apply its stop/target rules.
 
         ``advance_bar`` controls the holding-time clock only. The backtest
@@ -126,12 +127,27 @@ class OrderManager:
         1h candle — so they pass ``advance_bar=False`` until the candle actually
         rolls over, otherwise ``timeout_bars`` (72 candles = 3 days) would
         force-close a position after 72 *minutes*.
+
+        ``bar_high_usd`` / ``bar_low_usd`` are the candle's extremes on the same
+        pricing basis as ``current_price_usd``. The backtest engine passes them
+        so a stop pierced INSIDE the candle triggers even when the close
+        recovered — on the venue the resting stop order would have filled, and
+        a backtest that quietly survives those candles reports profits live
+        trading can never see. When both the stop and the target sit inside one
+        candle the STOP fills (the sequence inside the bar is unknowable, so
+        the worst case is booked, never the best). Live and paper tick with
+        real-time prices and omit them; behaviour there is unchanged.
         """
         if symbol not in self.active_trades: return None
         trade = self.active_trades[symbol]
         if advance_bar:
             trade.bars_held += 1
         trade.current_price = current_price_usd
+        # The candle's reach on the pricing basis: how high and how low the
+        # price actually went while this bar formed. Without candle extremes
+        # they collapse to the tick price and nothing changes.
+        seen_high = max(current_price_usd, bar_high_usd) if bar_high_usd is not None else current_price_usd
+        seen_low = min(current_price_usd, bar_low_usd) if bar_low_usd is not None else current_price_usd
         # Keep both prices current: `current_price` is the pricing basis (mark),
         # `exit_trade_price` records what the market was trading at when the
         # stop/target level was reached.
@@ -142,9 +158,29 @@ class OrderManager:
         elif trade.mark_price_basis:
             trade.current_mark_price = float(current_price_usd)
             trade.exit_mark_price = float(current_price_usd)
+        # With candle extremes the price path INSIDE the bar is unknowable, so
+        # every ambiguity is booked against the trade, never for it.
+        intra_bar = bar_high_usd is not None or bar_low_usd is not None
         if trade.direction == 1:
+            # 0. Worst case first (intra-candle only): did the low pierce the
+            #    stop as it stood when the bar OPENED? The resting stop fills
+            #    before any trail advance this bar's high might have earned —
+            #    assuming the high came before the low is exactly the optimism
+            #    this exists to kill.
+            if intra_bar:
+                pre_trail = trade.peak_price >= trade.trail_activation
+                pre_stop = trade.trail_stop if pre_trail else trade.sl
+                if seen_low <= pre_stop:
+                    if pre_trail:
+                        detail = (f"Trailing stop hit — price fell to {seen_low:,.2f} \u2264 trail {pre_stop:,.2f} "
+                                  f"(peak {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
+                    else:
+                        be_note = " (at breakeven)" if trade.sl >= trade.entry_price else ""
+                        detail = f"Stop loss hit — price fell to {seen_low:,.2f} \u2264 SL {pre_stop:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                    return self.close_trade(symbol, pre_stop, timestamp, "TSL" if pre_trail else "SL", detail)
+
             # 1. Update peak and activate trail
-            trade.peak_price = max(trade.peak_price, current_price_usd)
+            trade.peak_price = max(trade.peak_price, seen_high)
             if trade.peak_price >= trade.trail_activation:
                 # Trail advances based on peak
                 new_tsl = trade.peak_price - (self.config.trail_distance_atr * current_atr_usd)
@@ -158,25 +194,45 @@ class OrderManager:
                 if trade.peak_price >= trade.trail_activation:
                     trade.trail_stop = max(trade.trail_stop, trade.entry_price)
             
-            # 2. Check TSL / SL FIRST
+            # 2. Check TSL / SL against the freshly-updated levels. Without
+            #    extremes this is the tick price (legacy behaviour). With
+            #    extremes only the CLOSE may be compared to the new trail: the
+            #    close is the one price known to come after the high that
+            #    advanced it. The bar's low was already handled in step 0.
+            stop_ref = current_price_usd if intra_bar else seen_low
             trail_hit = trade.peak_price >= trade.trail_activation
             stop_level = trade.trail_stop if trail_hit else trade.sl
-            if current_price_usd <= stop_level:
+            if stop_ref <= stop_level:
                 if trail_hit:
-                    detail = (f"Trailing stop hit — price fell to {current_price_usd:,.2f} ≤ trail {stop_level:,.2f} "
+                    detail = (f"Trailing stop hit — price fell to {stop_ref:,.2f} ≤ trail {stop_level:,.2f} "
                               f"(peak {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
                 else:
                     be_note = " (at breakeven)" if trade.sl >= trade.entry_price else ""
-                    detail = f"Stop loss hit — price fell to {current_price_usd:,.2f} ≤ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                    detail = f"Stop loss hit — price fell to {stop_ref:,.2f} ≤ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
                 return self.close_trade(symbol, stop_level, timestamp, "TSL" if trail_hit else "SL", detail)
 
-            # 3. Check TP SECOND
-            if current_price_usd >= trade.tp:
-                detail = f"Take profit hit — price rose to {current_price_usd:,.2f} ≥ TP {trade.tp:,.2f}"
+            # 3. Check TP — on the candle's HIGH: a resting venue TP order at
+            #    that level would have filled the moment the bar touched it.
+            if seen_high >= trade.tp:
+                detail = f"Take profit hit — price rose to {seen_high:,.2f} ≥ TP {trade.tp:,.2f}"
                 return self.close_trade(symbol, trade.tp, timestamp, "TP", detail)
                 
         else: # SHORT
-            trade.peak_price = min(trade.peak_price, current_price_usd)
+            # 0. Worst case first (intra-candle only): the bar's HIGH against
+            #    the stop as it stood at the open.
+            if intra_bar:
+                pre_trail = trade.peak_price <= trade.trail_activation
+                pre_stop = trade.trail_stop if pre_trail else trade.sl
+                if seen_high >= pre_stop:
+                    if pre_trail:
+                        detail = (f"Trailing stop hit — price rose to {seen_high:,.2f} ≥ trail {pre_stop:,.2f} "
+                                  f"(low {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
+                    else:
+                        be_note = " (at breakeven)" if trade.sl <= trade.entry_price else ""
+                        detail = f"Stop loss hit — price rose to {seen_high:,.2f} ≥ SL {pre_stop:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                    return self.close_trade(symbol, pre_stop, timestamp, "TSL" if pre_trail else "SL", detail)
+
+            trade.peak_price = min(trade.peak_price, seen_low)
             if trade.peak_price <= trade.trail_activation:
                 new_tsl = trade.peak_price + (self.config.trail_distance_atr * current_atr_usd)
                 trade.trail_stop = min(trade.trail_stop, new_tsl)
@@ -188,19 +244,20 @@ class OrderManager:
                 if trade.peak_price <= trade.trail_activation:
                     trade.trail_stop = min(trade.trail_stop, trade.entry_price)
                 
+            stop_ref = current_price_usd if intra_bar else seen_high
             trail_hit = trade.peak_price <= trade.trail_activation
             stop_level = trade.trail_stop if trail_hit else trade.sl
-            if current_price_usd >= stop_level:
+            if stop_ref >= stop_level:
                 if trail_hit:
-                    detail = (f"Trailing stop hit — price rose to {current_price_usd:,.2f} ≥ trail {stop_level:,.2f} "
+                    detail = (f"Trailing stop hit — price rose to {stop_ref:,.2f} ≥ trail {stop_level:,.2f} "
                               f"(low {trade.peak_price:,.2f}, trail activated at {trade.trail_activation:,.2f})")
                 else:
                     be_note = " (at breakeven)" if trade.sl <= trade.entry_price else ""
-                    detail = f"Stop loss hit — price rose to {current_price_usd:,.2f} ≥ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
+                    detail = f"Stop loss hit — price rose to {stop_ref:,.2f} ≥ SL {stop_level:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
                 return self.close_trade(symbol, stop_level, timestamp, "TSL" if trail_hit else "SL", detail)
 
-            if current_price_usd <= trade.tp:
-                detail = f"Take profit hit — price fell to {current_price_usd:,.2f} ≤ TP {trade.tp:,.2f}"
+            if seen_low <= trade.tp:
+                detail = f"Take profit hit — price fell to {seen_low:,.2f} ≤ TP {trade.tp:,.2f}"
                 return self.close_trade(symbol, trade.tp, timestamp, "TP", detail)
 
         if trade.bars_held >= self.config.timeout_bars:

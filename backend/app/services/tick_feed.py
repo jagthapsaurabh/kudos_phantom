@@ -466,6 +466,114 @@ class RestTickFeed(TickFeed):
                 break
 
 
+class FailoverTickFeed(TickFeed):
+    """Automatic transport: WebSocket first, REST polling when it goes quiet.
+
+    Choosing between "websocket" and "polling" is a transport detail, not a
+    trading decision — operators should never have to make it. This feed
+    subscribes to the venue's socket and watches its freshness: when no usable
+    price has arrived for ``grace`` seconds the REST poller is started, and
+    the moment the socket delivers again the poller is stopped so it does not
+    burn the shared rate-limit budget. The worker only ever calls ``quote()``
+    and cannot tell the difference; ``kind`` always names the transport that
+    is ACTUALLY delivering prices right now, so status badges tell the truth.
+    """
+
+    def __init__(self, primary: TickFeed, backup: TickFeed, source: str,
+                 symbol: str, max_age: float = DEFAULT_MAX_AGE,
+                 grace: float = 15.0, check_interval: float = 1.0):
+        super().__init__(source, symbol, max_age)
+        self.primary = primary
+        self.backup = backup
+        self.grace = float(grace)
+        self.check_interval = float(check_interval)
+        self.failovers = 0
+        self._on_backup = False
+        self._started_at: Optional[float] = None
+
+    @property
+    def kind(self) -> str:
+        # The transport currently delivering prices, not the wrapper itself.
+        return self.backup.kind if self._on_backup else self.primary.kind
+
+    @property
+    def mode(self) -> str:
+        return "auto"
+
+    @property
+    def connected(self) -> bool:
+        return self.backup.connected if self._on_backup else self.primary.connected
+
+    def quote(self) -> Optional[MarkPriceQuote]:
+        # The socket always wins while it is fresh; the poller only speaks
+        # when the socket has gone quiet.
+        quote = self.primary.quote()
+        if quote is not None:
+            return quote
+        return self.backup.quote() if self._on_backup else None
+
+    def age(self) -> Optional[float]:
+        ages = [a for a in (self.primary.age(),
+                            self.backup.age() if self._on_backup else None)
+                if a is not None]
+        return min(ages) if ages else None
+
+    async def start(self):
+        await self.primary.start()
+        await super().start()
+
+    async def stop(self):
+        await self.primary.stop()
+        await self.backup.stop()
+        await super().stop()
+
+    async def _run(self):
+        self._started_at = time.monotonic()
+        while not self._stopping:
+            try:
+                await asyncio.sleep(self.check_interval)
+            except asyncio.CancelledError:
+                break
+            # Candles only arrive on the socket (Delta candlesticks channel);
+            # mirror them so the worker's fast candle wake-up keeps working.
+            self.last_candle = self.primary.last_candle
+            self.closed_candles = self.primary.closed_candles
+            if self.primary.quote() is not None:
+                if self._on_backup:
+                    # The socket recovered: hand back and stop paying the
+                    # poller's rate-limit cost.
+                    self._on_backup = False
+                    await self.backup.stop()
+                continue
+            quiet_for = self.primary.age()
+            if quiet_for is None:
+                quiet_for = time.monotonic() - self._started_at
+            if not self._on_backup and quiet_for >= self.grace:
+                self._on_backup = True
+                self.failovers += 1
+                await self.backup.start()
+
+    def stats(self) -> Dict[str, Any]:
+        active = self.backup if self._on_backup else self.primary
+        age = self.age()
+        return {
+            "kind": self.kind,
+            "mode": "auto",
+            "connected": self.connected,
+            "messages": self.primary.messages + self.backup.messages,
+            "reconnects": self.primary.reconnects,
+            "failovers": int(self.failovers),
+            "age_seconds": round(age, 2) if age is not None else None,
+            "stale": self.quote() is None,
+            "last_error": active.last_error or self.primary.last_error,
+            "closed_candles": int(self.primary.closed_candles),
+            "last_candle_time": (
+                self.primary.last_candle["event_time"].isoformat(timespec="seconds")
+                if self.primary.last_candle and self.primary.last_candle.get("event_time") else None
+            ),
+        }
+
+
 def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
                     perpetual: Optional[str] = None,
                     client=None, interval: float = 5.0,
@@ -473,9 +581,12 @@ def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
                     connect_fn: Optional[Callable] = None) -> TickFeed:
     """Build the requested feed, degrading to REST and then to nothing.
 
-    ``kind`` is ``websocket``, ``rest`` or ``none``. An unsupported venue never
-    raises: the caller still gets a working feed object, it simply has no live
-    price and the worker behaves as it did before.
+    ``kind`` is ``auto``, ``websocket``, ``rest`` or ``none``. ``auto`` is
+    what non-technical operators get by default: the websocket when the venue
+    has one, with an automatic REST failover the moment it goes quiet — no
+    transport decision to make. An unsupported venue never raises: the caller
+    still gets a working feed object, it simply has no live price and the
+    worker behaves as it did before.
     """
     venue_kind = str(getattr(definition, "kind", "") or "").lower()
     if not venue_kind:
@@ -490,19 +601,41 @@ def build_tick_feed(kind: str, source: str, symbol: str, definition=None,
     contract = perpetual or symbol
     parser = PARSERS.get(venue_kind)
 
-    if kind == "websocket" and parser is not None:
+    def _websocket() -> Optional[WebSocketTickFeed]:
+        if parser is None:
+            return None
         testnet = bool(getattr(client, "testnet", False))
         urls = STREAM_URLS_TESTNET if testnet else STREAM_URLS
         template = urls.get(venue_kind) or STREAM_URLS.get(venue_kind)
-        if template:
-            url = template.format(symbol_lower=str(contract).lower())
-            subscribe = delta_subscribe(contract) if venue_kind == "delta" else None
-            return WebSocketTickFeed(url, source, contract, parser,
-                                     subscribe=subscribe, max_age=max_age,
-                                     connect_fn=connect_fn)
+        if not template:
+            return None
+        url = template.format(symbol_lower=str(contract).lower())
+        subscribe = delta_subscribe(contract) if venue_kind == "delta" else None
+        return WebSocketTickFeed(url, source, contract, parser,
+                                 subscribe=subscribe, max_age=max_age,
+                                 connect_fn=connect_fn)
 
-    if kind in ("websocket", "rest") and client is not None:
+    def _rest() -> Optional[RestTickFeed]:
+        if client is None:
+            return None
         return RestTickFeed(lambda: client.fetch_mark_price(symbol), source, contract,
                             interval=interval, max_age=max_age)
+
+    if kind == "auto":
+        socket, poller = _websocket(), _rest()
+        if socket is not None and poller is not None:
+            return FailoverTickFeed(socket, poller, source, contract, max_age=max_age)
+        # Venue has only one live transport (or none): use what exists.
+        return socket or poller or NullTickFeed(source, contract, max_age=max_age)
+
+    if kind == "websocket":
+        socket = _websocket()
+        if socket is not None:
+            return socket
+
+    if kind in ("websocket", "rest"):
+        poller = _rest()
+        if poller is not None:
+            return poller
 
     return NullTickFeed(source, contract, max_age=max_age)

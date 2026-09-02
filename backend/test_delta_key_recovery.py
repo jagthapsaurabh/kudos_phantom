@@ -381,7 +381,10 @@ check("the verdict no longer tells the operator to restart as the primary fix",
 # ===========================================================================
 section("3. the worker holds entries, spends nothing, and says so")
 # ===========================================================================
-BASE = datetime(2024, 1, 1)
+# Anchor the synthetic candles to the current hour: the workers now refuse to
+# OPEN trades on candles hours behind the wall clock (the stale-data gate), so
+# a fixture dated in the past would test a state production never trades in.
+BASE = pd.Timestamp.utcnow().tz_localize(None).floor("h") - timedelta(hours=119)
 
 
 def candles(bars=120, last_bar=0, seed=7):

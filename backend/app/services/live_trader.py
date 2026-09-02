@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import time
 from typing import Any, Dict
 import pandas as pd
@@ -269,9 +270,25 @@ class LiveTradeService:
         self.validator = ValidatorService()
         self.oms = OrderManager(self.config)
         self.is_running = False
+        # Set by the start endpoint while the background task has not yet run,
+        # so a double-clicked Start cannot register a second worker.
+        self.pending_start = False
+        # Data freshness: the newest 1h candle may be at most this old before
+        # the worker refuses to open NEW positions on it (the candle fetch can
+        # fall back to seeded/stored data when the venue feed fails — fine for
+        # a chart, never for real orders). A 1h candle set is normally at most
+        # ~1h behind; 3h means the feed has genuinely gone dark. Tests may set
+        # None to disable.
+        self.max_candle_age_hours = 3.0
+        self.candles_stale = False
+        self._stale_notice = None
         self.initial_capital = initial_capital
         self.margin_pct = margin_pct
-        self.conversion_rate = 85.0
+        # USD->INR used for sizing and INR PnL. Admin-saved setting first
+        # (editable from the panel), then the USD_INR_RATE env var, then the
+        # default — a wrong rate misstates every rupee figure shown.
+        from app.services.app_settings import get_usd_inr_rate
+        self.conversion_rate = get_usd_inr_rate()
         # ---- BTC perpetual pricing (mark price) -----------------------
         if use_mark_price is not None:
             try:
@@ -610,6 +627,9 @@ class LiveTradeService:
 
     async def start(self):
         self.is_running = True
+        # The start endpoint set this to block duplicate starts in the window
+        # before this background task ran; is_running carries it from here.
+        self.pending_start = False
         self.stop_reason = None
         COORDINATOR.register(self)
         print(f"🚀 LIVE Trading Started for {self.broker_name}/{self.strategy_id}")
@@ -758,6 +778,7 @@ class LiveTradeService:
 
     async def stop(self, reason="stopped by user"):
         self.is_running = False
+        self.pending_start = False
         self.stop_reason = reason
         COORDINATOR.unregister(self)
         if self.heartbeat is not None:
@@ -859,6 +880,32 @@ class LiveTradeService:
         self.mark_price_basis = bool(use_mark)
         self.last_checked = datetime.utcnow().isoformat(timespec="seconds")
 
+        # ---- Data freshness gate ----------------------------------------
+        # The candle fetch silently falls back to seeded/stored data when the
+        # venue feed fails. That fallback is fine for a chart — it is NOT fine
+        # for real money: signals, ATR and stop levels computed from hours-old
+        # candles would size and place REAL orders at today's prices. When the
+        # newest candle is too old, entries are held and say so; open
+        # positions keep being managed only if a FRESH mark price is available.
+        stale_candles = self._candles_stale(current_time)
+        self.candles_stale = bool(stale_candles)
+        if stale_candles:
+            if self._stale_notice != stale_candles:
+                print(f"⚠ [{self.strategy_id}] {stale_candles} — entries held; "
+                      f"exits manage on the live mark price only")
+                self._log("warn", f"{stale_candles} — entries held")
+                self._stale_notice = stale_candles
+            if not use_mark:
+                # No fresh candle AND no fresh mark price: there is nothing
+                # trustworthy to act on at all. Doing nothing is the only
+                # honest move; the venue-side SL/TP still protect the position.
+                self.last_skip_reason = stale_candles
+                return
+        elif self._stale_notice:
+            print(f"✅ [{self.strategy_id}] candle feed recovered — trading resumes")
+            self._log("info", "Candle feed recovered — trading resumes")
+            self._stale_notice = None
+
         # ---- Candle clock ---------------------------------------------
         # This worker polls every 60s, so one 1h candle is normally seen dozens
         # of times. Everything measured in *candles* — the holding-time clock,
@@ -872,6 +919,14 @@ class LiveTradeService:
         # ---- Manage open positions ------------------------------------
         self._manage_open_positions(decision_price, current_atr, current_time,
                                     trade_price, mark_price, new_bar)
+
+        # A stale candle set must never OPEN anything: the signal, the ATR the
+        # stop distance comes from, even the notional sizing would be built on
+        # data the market has long since left behind.
+        if stale_candles:
+            self.skipped_entries += 1
+            self.last_skip_reason = stale_candles
+            return
 
         # ---- Credentials gate ------------------------------------------
         # Public data (candles, mark price) is what the lines above needed, and
@@ -1036,16 +1091,28 @@ class LiveTradeService:
 
         Same dict shape as PaperTradeService._record_closed (entry/exit candle
         times as IST-offset ISO strings, stop plan at entry vs the levels in
-        force at exit, PnL on the pricing basis). Commissions live on the
-        exchange fills, so `fees` stays None here. Never raises — bookkeeping
-        must not kill the trading loop.
+        force at exit). PnL is booked from the TRADED fill prices when the
+        venue reported them — the OMS levels are the plan, the fills are what
+        actually happened — and the fee schedule is subtracted, so the session
+        equity curve tracks what the account really made instead of a fee-free
+        ideal. Never raises — bookkeeping must not kill the trading loop.
         """
         try:
             rate = float(getattr(self, "conversion_rate", 85.0) or 85.0)
             entry = float(trade.entry_price or 0.0)
             exit_price = float(trade.exit_price or trade.entry_price or 0.0)
             lots = float(getattr(trade, "lots", 0.0) or 0.0)
-            pnl = (exit_price - entry) * int(trade.direction) * lots * rate
+            # Actual fills first; the planned levels only when no fill came back.
+            entry_fill = float(getattr(trade, "entry_trade_price", None) or entry or 0.0)
+            exit_fill = float(getattr(trade, "exit_trade_price", None) or exit_price or 0.0)
+            gross_pnl = (exit_fill - entry_fill) * int(trade.direction) * lots * rate
+            taker = float(getattr(self.config, "taker_fee_bps", 0.0) or 0.0)
+            maker = float(getattr(self.config, "maker_fee_bps", 0.0) or 0.0)
+            notional = float(getattr(trade, "notional_usd", 0.0) or 0.0)
+            entry_fee = notional * taker / 10000.0 * rate
+            exit_fee = notional * (maker if trade.exit_reason == "TP" else taker) / 10000.0 * rate
+            fees = entry_fee + exit_fee
+            pnl = gross_pnl - fees
             f = lambda v: None if v is None else float(v)
             self.closed_trades.append({
                 "symbol": trade.symbol,
@@ -1058,8 +1125,10 @@ class LiveTradeService:
                 "exit_mark_price": f(getattr(trade, "exit_mark_price", None)),
                 "mark_price_basis": bool(getattr(trade, "mark_price_basis", False)),
                 "pnl": pnl,
-                "gross_pnl": pnl,
-                "fees": None,
+                "gross_pnl": gross_pnl,
+                # Estimated from the fee schedule (the exact commission lives
+                # on the exchange fills); estimated beats pretending zero.
+                "fees": fees,
                 "reason": trade.exit_reason,
                 "exit_detail": getattr(trade, "exit_detail", "") or "",
                 "sl": f(getattr(trade, "sl_entry", None) if getattr(trade, "sl_entry", None) else trade.sl),
@@ -1350,6 +1419,31 @@ class LiveTradeService:
             print(f"⚠️ [{self.strategy_id}] LIVE protection legs NOT cancelled — "
                   f"{'; '.join(failed)}. This position may still be open on the venue.")
         return {"cancelled": cancelled, "failed": failed}
+
+    def _candles_stale(self, newest_candle_time):
+        """A message naming how stale the candle set is, or ``None`` when fresh.
+
+        ``newest_candle_time`` is the open time of the newest 1h candle. On a
+        healthy feed it is at most ~1 hour behind the wall clock; several
+        hours means the venue fetch failed and the seeded-data fallback (or a
+        frozen endpoint) is being served. Real orders must never be sized or
+        signalled from that.
+        """
+        limit_hours = getattr(self, "max_candle_age_hours", 3.0)
+        if not limit_hours or limit_hours <= 0:
+            return None
+        try:
+            newest = pd.Timestamp(newest_candle_time).to_pydatetime()
+            if newest.tzinfo is not None:
+                newest = newest.replace(tzinfo=None)
+            age = (datetime.utcnow() - newest).total_seconds()
+        except Exception:
+            return None
+        if age <= float(limit_hours) * 3600.0:
+            return None
+        hours = age / 3600.0
+        return (f"candle data is {hours:.1f}h old (limit {limit_hours:g}h) — the venue "
+                f"feed is down or a stored fallback is being served")
 
     def _fetch_mark_price(self):
         """Current mark price of the BTC perpetual; ``None`` when unavailable."""

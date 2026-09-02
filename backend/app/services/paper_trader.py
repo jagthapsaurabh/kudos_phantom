@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import traceback
 import pandas as pd
@@ -9,7 +10,6 @@ from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.broker_client import BrokerClient
-from app.database.models import SessionLocal, Klines
 import requests
 from app.core.indicators import compute_indicators
 
@@ -86,9 +86,14 @@ class PaperTradeService:
         self.validator = ValidatorService()
         self.oms = OrderManager(self.config)
         self.is_running = False
+        # Set by the start endpoint while the background task has not yet run,
+        # so a double-clicked Start cannot register a second worker.
+        self.pending_start = False
         self.equity_inr = initial_capital
         self.margin_pct = margin_pct
-        self.conversion_rate = 85.0
+        # USD->INR: admin-saved setting -> USD_INR_RATE env -> default.
+        from app.services.app_settings import get_usd_inr_rate
+        self.conversion_rate = get_usd_inr_rate()
         if fee_schedule:
             self.config.taker_fee_bps = float(getattr(fee_schedule, "taker_fee_bps", self.config.taker_fee_bps))
             self.config.maker_fee_bps = float(getattr(fee_schedule, "maker_fee_bps", self.config.maker_fee_bps))
@@ -129,6 +134,11 @@ class PaperTradeService:
         self._bars_since_exit = None      # candles since the last close
         self.skipped_entries = 0          # entries held back by the guards
         self.last_skip_reason = None
+        # Data freshness: same rule as the live worker — a candle set older
+        # than this opens no NEW simulated trades (None disables, for tests).
+        self.max_candle_age_hours = 3.0
+        self.candles_stale = False
+        self._stale_notice = None
         self._last_skip_notice = None     # de-duplicates the "held back" log
         self.last_checked = None
         self._last_atr = None             # ATR of the last 1h candle, reused by fast ticks
@@ -286,6 +296,7 @@ class PaperTradeService:
         ends the session.
         """
         self.is_running = True
+        self.pending_start = False
         self.stop_reason = None
         self._log("info", f"🟢 Paper trading started — strategy={self.strategy_id}")
         print(f"🟢 Paper Trading Started for Strategy: {self.strategy_id}")
@@ -434,6 +445,7 @@ class PaperTradeService:
 
     async def stop(self, reason="stopped by user"):
         self.is_running = False
+        self.pending_start = False
         self.stop_reason = reason
         if self.tick_feed is not None:
             try:
@@ -484,6 +496,26 @@ class PaperTradeService:
         self._last_atr = current_atr
         trade_event = False  # a fill this tick forces an immediate DB snapshot
 
+        # ---- Data freshness gate -------------------------------------
+        # Paper trading is a rehearsal with REAL market data. When the candle
+        # set is hours old (venue feed down, stored fallback being served),
+        # opening simulated trades on it would manufacture results nobody
+        # could reproduce live — exactly the kind of "paper profit" that
+        # cannot be trusted. Entries are held and say so; open positions keep
+        # being managed only on a fresh mark price.
+        stale_candles = self._candles_stale(current_time)
+        self.candles_stale = bool(stale_candles)
+        if stale_candles:
+            if self._stale_notice != stale_candles:
+                self._log("warn", f"{stale_candles} — entries held")
+                self._stale_notice = stale_candles
+            if not use_mark:
+                self.last_skip_reason = stale_candles
+                return
+        elif self._stale_notice:
+            self._log("info", "Candle feed recovered — trading resumes")
+            self._stale_notice = None
+
         # ---- Candle clock -------------------------------------------
         # This worker ticks every 60s, so one 1h candle is seen many times.
         # Everything measured in candles (holding time, one entry per signal,
@@ -498,6 +530,13 @@ class PaperTradeService:
         if self._manage_open_positions(decision_price, current_atr, current_time,
                                        trade_price, mark_price, new_bar):
             trade_event = True
+
+        # A stale candle set must never OPEN anything — the signal and the
+        # ATR-derived stop plan describe a market that has moved on.
+        if stale_candles:
+            self.skipped_entries += 1
+            self.last_skip_reason = stale_candles
+            return
 
         # ---- New entries --------------------------------------------
         # "Skip new trades" schedule: an existing position keeps running (its
@@ -663,6 +702,30 @@ class PaperTradeService:
                     f"candles since the last close")
         return None
 
+    def _candles_stale(self, newest_candle_time):
+        """A message naming how stale the candle set is, or ``None`` when fresh.
+
+        Same rule as ``LiveTradeService``: on a healthy 1h feed the newest
+        candle is at most ~1 hour behind the wall clock; several hours means
+        the venue fetch failed and stored data is being served. Simulated
+        trades opened on that would report results nobody can reproduce.
+        """
+        limit_hours = getattr(self, "max_candle_age_hours", 3.0)
+        if not limit_hours or limit_hours <= 0:
+            return None
+        try:
+            newest = pd.Timestamp(newest_candle_time).to_pydatetime()
+            if newest.tzinfo is not None:
+                newest = newest.replace(tzinfo=None)
+            age = (datetime.utcnow() - newest).total_seconds()
+        except Exception:
+            return None
+        if age <= float(limit_hours) * 3600.0:
+            return None
+        hours = age / 3600.0
+        return (f"candle data is {hours:.1f}h old (limit {limit_hours:g}h) — the venue "
+                f"feed is down or a stored fallback is being served")
+
     def _fetch_mark_price(self):
         """Current mark + last price of the BTC perpetual on this source.
 
@@ -677,40 +740,23 @@ class PaperTradeService:
             return None
 
     def _fetch_candles(self, interval, limit):
-        """Use candles seeded for this source, then the source public API."""
-        df = self._get_data_from_db("BTCUSDT", interval, limit)
-        if df is not None and not df.empty:
-            return df
+        """The venue's LIVE feed — and nothing else.
+
+        Paper trading is a rehearsal with real market data and simulated
+        money. It used to fall back to the seeded database when the venue
+        fetch failed, so a session could quietly replay stored candles while
+        presenting itself as live — results nobody could reproduce with real
+        orders. Now a dead feed simply means no candles: the tick logs the
+        failure and retries, exactly like the live worker would.
+        """
         try:
             rows = BrokerClient(broker_name=self.market_source, definition=self.broker_definition).fetch_klines("BTCUSDT", interval, limit)
             df = pd.DataFrame(rows)
-            if df.empty:
-                return df
-            df.set_index('event_time', inplace=True)
-            return df.sort_index()
+            if not df.empty:
+                df.set_index('event_time', inplace=True)
+                return df.sort_index()
         except Exception as exc:
             # Do not swallow the reason silently — a quiet None here becomes
             # "Data fetch failed" with no way to diagnose it.
             print(f"[{self.strategy_id}] Candle fetch failed for {self.market_source} {interval}: {exc}")
-            return None
-
-    def _get_data_from_db(self, symbol, interval, limit=500):
-        """Return the most recent candles for the selected source."""
-        try:
-            db = SessionLocal()
-            data = db.query(Klines).filter(
-                Klines.symbol == symbol, Klines.interval == interval,
-                Klines.source == self.market_source
-            ).order_by(Klines.event_time.desc()).limit(limit).all()
-            db.close()
-            if not data:
-                return pd.DataFrame()
-            df = pd.DataFrame([
-                {'event_time': k.event_time, 'open': k.open, 'high': k.high,
-                 'low': k.low, 'close': k.close, 'volume': k.volume}
-                for k in data
-            ])
-            df.set_index('event_time', inplace=True)
-            return df.sort_index()
-        except Exception:
-            return pd.DataFrame()
+        return None

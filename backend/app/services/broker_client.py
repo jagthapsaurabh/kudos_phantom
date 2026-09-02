@@ -1265,9 +1265,15 @@ class BrokerClient:
                             dry_run: bool = False):
         """Entry order with an attached stop-loss and take-profit.
 
-        Delta supports this natively (``POST /v2/orders/bracket``) and cancels
-        the unused leg when the other fills. ``trail_amount`` is sent as a
-        string on the stop-loss leg so it matches the Phantom ATR trail
+        Delta supports this natively on the entry itself: ``POST /v2/orders``
+        accepts ``bracket_stop_loss_price`` / ``bracket_take_profit_price`` /
+        ``bracket_trail_amount`` on the order that OPENS the position
+        (docs.delta.exchange, CreateOrderRequest), and cancels the unused leg
+        when the other fills. ``POST /v2/orders/bracket`` is a different
+        operation — it attaches TP/SL to an *existing* position and answers
+        HTTP 400 ``{"code": "no_open_position"}`` when none is open, which
+        rejected every live entry sent through it. ``trail_amount`` is sent
+        as a string so it matches the Phantom ATR trail
         (``trail_distance_atr × ATR``). Binance has no bracket endpoint, so
         the entry is sent first and the two protection legs are placed as
         reduce-only STOP_MARKET / TAKE_PROFIT_MARKET orders afterwards.
@@ -1278,55 +1284,29 @@ class BrokerClient:
             return {"error": "Order size too small for the contract's minimum"}
         close_side = "sell" if str(side).lower() == "buy" else "buy"
         if self.kind == "delta":
-            instrument = self._instrument_cache.get(perp) or {}
-            pid = instrument.get("product_id") if isinstance(instrument, dict) else None
-            body: Dict[str, Any] = {
-                "product_symbol": perp,
-                "size": int(round(size)),
-                "side": str(side).lower(),
-                "order_type": "market_order" if price is None else "limit_order",
-                "bracket_stop_trigger_method": trigger_method or "mark_price",
-            }
-            if pid:
-                try:
-                    body["product_id"] = int(pid)
-                except Exception:
-                    pass
-            if price is not None:
-                limit = self._delta_limit_price(price)
-                if limit is None:
-                    return {"error": "limit orders require a positive limit_price "
-                                     "(Delta changelog 15.04.26)"}
-                body["limit_price"] = limit
-            if stop_loss_price is not None:
-                # Delta rejects a bracket stop-loss leg that carries BOTH a
-                # stop_price and a trail_amount:
-                #   "Only stop_price or trail_amount should be specified for
-                #    bracket stop loss order"
-                # …which silently killed every entry on a strategy with an ATR
-                # trail configured. A trailing stop is the strictly better
-                # protection of the two, so when a trail distance is supplied
-                # it wins and the fixed stop is dropped from the leg.
-                sl_leg: Dict[str, Any] = {"order_type": "market_order"}
+            bracket_kwargs: Dict[str, Any] = {}
+            if stop_loss_price is not None or trail_amount is not None:
+                # Delta rejects a bracket stop-loss that carries BOTH a
+                # stop price and a trail amount ("Only stop_price or
+                # trail_amount should be specified for bracket stop loss
+                # order"). A trailing stop is the strictly better protection
+                # of the two, so when a trail distance is supplied it wins
+                # and the fixed stop is dropped.
                 if trail_amount is not None:
-                    sl_leg["trail_amount"] = str(trail_amount)
+                    bracket_kwargs["bracket_trail_amount"] = str(trail_amount)
                 else:
-                    sl_leg["stop_price"] = str(stop_loss_price)
-                body["stop_loss_order"] = sl_leg
+                    bracket_kwargs["bracket_stop_loss_price"] = str(stop_loss_price)
             if take_profit_price is not None:
-                body["take_profit_order"] = {"order_type": "market_order",
-                                             "stop_price": str(take_profit_price)}
-            if client_order_id:
-                body["client_order_id"] = str(client_order_id)[:32]
-            if dry_run:
-                return {"dry_run": True, "method": "POST", "path": "/v2/orders/bracket",
-                        "body": body, "product_symbol": perp}
-            response, error = self._delta_request("POST", "/v2/orders/bracket", body=body,
-                                                  weight=20, is_order=True)
-            payload = self._json_body(response, error)
-            if isinstance(payload, dict) and not payload.get("error"):
-                payload["_bracket"] = True
-            return payload
+                bracket_kwargs["bracket_take_profit_price"] = str(take_profit_price)
+            if bracket_kwargs:
+                bracket_kwargs["bracket_stop_trigger_method"] = trigger_method or "mark_price"
+            result = self._delta_place_order(
+                perp, side, "market" if price is None else "limit", size,
+                price, None, False, client_order_id, "GTC", False, None, None,
+                dry_run=dry_run, **bracket_kwargs)
+            if isinstance(result, dict) and not result.get("error"):
+                result["_bracket"] = True
+            return result
         if self.kind == "binance":
             if dry_run:
                 return {"dry_run": True, "broker": "Binance", "symbol": perp, "side": side,
@@ -2359,6 +2339,16 @@ class BrokerClient:
             if not (isinstance(payload, dict) and payload.get("error")) \
                     and not (isinstance(result, dict) and result.get("error")):
                 return result if isinstance(result, dict) and result else {"ok": True}
+            # Delta answers HTTP 400 {"code": "same_margin_mode"} when the
+            # account is ALREADY in the requested mode — that is a
+            # confirmation, not a refusal (Binance's "-4046 No need to
+            # change margin type" equivalent). Report success instead of
+            # falling through to the legacy endpoint.
+            first_error = (result.get("error") if isinstance(result, dict)
+                           else payload.get("error") if isinstance(payload, dict) else None)
+            if "same_margin_mode" in str(first_error or "").lower():
+                return {"ok": True, "unchanged": True,
+                        "margin_mode": str(mode).lower()}
             legacy = {"product_symbol": perp, "margin_mode": str(mode).lower()}
             response2, error2 = self._delta_request("POST", "/v2/positions/margin_mode",
                                                     body=legacy, weight=5, is_order=True)

@@ -416,7 +416,10 @@ class PersistentSignal:
         return signals
 
 
-BASE = datetime(2024, 1, 1)
+# Anchor the synthetic candles to the current hour: the workers now refuse to
+# OPEN trades on candles hours behind the wall clock (the stale-data gate), so
+# a fixture dated in the past would test a state production never trades in.
+BASE = pd.Timestamp.utcnow().tz_localize(None).floor("h") - timedelta(hours=119)
 
 
 def candles(bars=120, last_bar=0):
@@ -536,10 +539,12 @@ class Payload:
         self.tick_interval = interval
 
 
-check("omitting price_feed means off",
-      _resolve_price_feed(Payload())[0] == "off")
-check("off keeps a usable default interval",
+check("omitting price_feed means auto (no transport decision for the user)",
+      _resolve_price_feed(Payload())[0] == "auto")
+check("auto keeps a usable default interval",
       _resolve_price_feed(Payload())[1] == 5.0)
+check("auto is accepted explicitly", _resolve_price_feed(Payload("AUTO", 2))[0] == "auto")
+check("off is still accepted", _resolve_price_feed(Payload("off", 2))[0] == "off")
 check("websocket is accepted", _resolve_price_feed(Payload("websocket", 2))[0] == "websocket")
 check("rest is accepted", _resolve_price_feed(Payload("REST", 10))[0] == "rest")
 check("the mode is normalised to lower case",
@@ -554,9 +559,10 @@ for bad_mode in ("carrier-pigeon", "socket"):
               "price_feed must be one of" in str(getattr(exc, "detail", exc)),
               getattr(exc, "detail", exc))
 
-# An empty string is what a blank <select> sends; it must mean "off", not a 400.
-check("an empty mode means off, not an error",
-      _resolve_price_feed(Payload("", 5))[0] == "off")
+# An empty string is what a blank <select> sends; it must mean the automatic
+# default, not a 400.
+check("an empty mode means auto, not an error",
+      _resolve_price_feed(Payload("", 5))[0] == "auto")
 
 for bad_interval in (0.2, MAX_TICK_INTERVAL + 1, "abc", None if False else -5):
     try:
@@ -584,6 +590,96 @@ check("no feed is started until the worker runs", configured.tick_feed is None)
 check("a worker defaults to off",
       LiveTradeService("D", [], "k", "s", is_custom=True,
                        broker_name="Binance").price_feed_mode == "off")
+
+# ===========================================================================
+section("11. auto mode: websocket first, REST failover, no user decision")
+# ===========================================================================
+# Non-technical operators should never pick a transport. "auto" (the API
+# default) takes the venue socket, fails over to REST polling by itself when
+# the socket goes quiet, and hands back the moment it recovers.
+from app.services.tick_feed import FailoverTickFeed  # noqa: E402
+
+
+class DeltaGlobalDef:
+    kind = "delta"
+    code = "DeltaGlobal"
+
+
+auto_built = build_tick_feed("auto", "Delta", "BTCUSD", DeltaDef(), client=FakeClient())
+check("auto on a socket venue builds the failover feed",
+      isinstance(auto_built, FailoverTickFeed), type(auto_built).__name__)
+check("auto reports the websocket while it is trusted", auto_built.kind == "websocket")
+check("auto stats carry mode=auto for the status card",
+      auto_built.stats().get("mode") == "auto", auto_built.stats())
+check("auto on a venue without a published socket degrades to rest",
+      build_tick_feed("auto", "DeltaGlobal", "BTCUSD", DeltaGlobalDef(),
+                      client=FakeClient()).kind == "rest")
+check("auto with no socket and no client degrades to none",
+      build_tick_feed("auto", "Unknown", "X", GenericDef()).kind == "none")
+check("auto without a client still gets the socket",
+      build_tick_feed("auto", "Binance", "BTCUSDT", BinanceDef()).kind == "websocket")
+
+
+async def _auto_failover_scenario():
+    out = {}
+
+    async def refuse(url):
+        raise OSError("connection refused")
+
+    socket = WebSocketTickFeed("ws://127.0.0.1:1", "Delta", "BTCUSD", parse_delta,
+                               connect_fn=refuse, backoff_cap=0.1)
+    polled = {"n": 0}
+
+    def fetch():
+        polled["n"] += 1
+        return MarkPriceQuote("Delta", "BTCUSD", mark_price=50000.0 + polled["n"])
+
+    poller = RestTickFeed(fetch, "Delta", "BTCUSD", interval=0.05)
+    feed = FailoverTickFeed(socket, poller, "Delta", "BTCUSD",
+                            grace=0.3, check_interval=0.05)
+    await feed.start()
+    out["kind_before"] = feed.kind
+    out["quote_before"] = feed.quote()
+    await asyncio.sleep(1.0)
+    out["kind_failed_over"] = feed.kind
+    out["quote_failed_over"] = feed.quote()
+    out["failovers"] = feed.failovers
+    out["polls"] = polled["n"]
+    out["stats"] = feed.stats()
+    # The socket comes back: its price must win again and the poller must be
+    # stopped so it stops burning the shared rate-limit budget.
+    socket.publish(MarkPriceQuote("Delta", "BTCUSD", mark_price=61000.0))
+    await asyncio.sleep(0.3)
+    out["kind_recovered"] = feed.kind
+    out["quote_recovered"] = feed.quote()
+    polls_at_recovery = polled["n"]
+    await asyncio.sleep(0.3)
+    out["polls_after_recovery"] = polled["n"] - polls_at_recovery
+    await feed.stop()
+    return out
+
+
+auto_run = asyncio.run(_auto_failover_scenario())
+check("auto starts on the websocket", auto_run["kind_before"] == "websocket")
+check("before any price there is nothing to trust", auto_run["quote_before"] is None)
+check("a quiet socket fails over to REST by itself",
+      auto_run["kind_failed_over"] == "rest", auto_run["kind_failed_over"])
+check("the failover is counted once, not per check",
+      auto_run["failovers"] == 1, auto_run["failovers"])
+check("REST prices flow to the worker during the outage",
+      auto_run["quote_failed_over"] is not None
+      and auto_run["quote_failed_over"].mark_price > 50000.0,
+      auto_run["quote_failed_over"])
+check("stats stay truthful during the outage (kind=rest, mode=auto)",
+      auto_run["stats"].get("kind") == "rest" and auto_run["stats"].get("mode") == "auto"
+      and auto_run["stats"].get("failovers") == 1, auto_run["stats"])
+check("a recovered socket wins back the feed",
+      auto_run["kind_recovered"] == "websocket"
+      and auto_run["quote_recovered"] is not None
+      and auto_run["quote_recovered"].mark_price == 61000.0,
+      (auto_run["kind_recovered"], auto_run["quote_recovered"]))
+check("the poller is stopped after recovery (rate budget released)",
+      auto_run["polls_after_recovery"] <= 1, auto_run["polls_after_recovery"])
 
 # ===========================================================================
 print(f"\n{'=' * 62}")

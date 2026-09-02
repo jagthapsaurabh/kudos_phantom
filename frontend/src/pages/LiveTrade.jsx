@@ -320,7 +320,7 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
   // the others re-check open positions on every live price so a stop is acted
   // on in seconds instead of up to a minute late. Entries still wait for a
   // closed 1h candle either way.
-  const [priceFeed, setPriceFeed] = useState('off');
+  const [priceFeed, setPriceFeed] = useState('auto');
   const [tickInterval, setTickInterval] = useState(5);
   const [tradingWindows, setTradingWindows] = useState(() => emptySchedule());
   const [showWindows, setShowWindows] = useState(false);
@@ -645,20 +645,11 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Exit checks</label>
             <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}
                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none"
-                    title="How often open positions are re-checked against the live price. Entries always wait for a closed 1h candle.">
-              <option value="off">Every 60s (default)</option>
-              <option value="websocket">Live ticks · WebSocket</option>
-              <option value="rest">Live ticks · polling</option>
+                    title="How often open positions are re-checked against the live price. Automatic picks the best connection for you and switches by itself if it drops. Entries always wait for a closed 1h candle.">
+              <option value="auto">Automatic (recommended)</option>
+              <option value="off">Basic · every 60s</option>
             </select>
           </div>
-          {priceFeed !== 'off' && (
-            <div className="flex flex-col">
-              <label className="text-xs text-gray-500 uppercase font-bold mb-1">Tick interval (s)</label>
-              <input type="number" min="1" max="60" step="1" value={tickInterval}
-                     onChange={e => setTickInterval(e.target.value)}
-                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-24 outline-none" />
-            </div>
-          )}
           {String(dataSource).toLowerCase() === 'delta' && (
             <label className="flex items-center gap-2 rounded-lg border border-cyan-800/60 bg-cyan-900/10 px-3 py-2 text-xs text-cyan-200"
                    title="If the worker crashes or disconnects, Delta cancels open orders. Required by the live-trading safety spec.">
