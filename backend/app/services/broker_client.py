@@ -320,6 +320,10 @@ class BrokerClient:
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
         # This key's own Delta account user id, resolved lazily (margin mode).
         self._own_user_id: Optional[str] = None
+        # `meta` block of the last /v2/wallet/balances read (net_equity), which
+        # the result unwrap throws away. Kept so the balance panel can show
+        # equity/unrealised PnL without a second signed call.
+        self.last_balance_meta: Optional[Dict[str, Any]] = None
         self._last_error: Optional[str] = None
         # ---- Credential latch (see the module docstring) --------------------
         # Short fingerprint of the key material this client signs with, so a
@@ -2158,6 +2162,12 @@ class BrokerClient:
         if self.kind == "delta":
             response, error = self._delta_request("GET", "/v2/wallet/balances", weight=5)
             payload = self._json_body(response, error)
+            # The envelope also carries meta.net_equity (wallet + unrealised
+            # PnL), which _delta_result drops along with the rest of the
+            # wrapper. Keep the last one so the balance panel can show equity
+            # and PnL without a second signed call.
+            if isinstance(payload, dict) and isinstance(payload.get("meta"), dict):
+                self.last_balance_meta = payload["meta"]
             return self._delta_result(payload)
         return {"error": f"No account adapter installed for '{self.broker_name}'"}
 

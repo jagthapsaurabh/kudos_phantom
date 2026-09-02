@@ -4341,6 +4341,12 @@ def live_account_balance(broker: Optional[str] = None, connection_id: Optional[i
     `state` the UI can render — `ok`, `no_credentials`, or `error` with the
     venue's own message — so the panel shows a number or a reason, never an
     eternal spinner.
+
+    `used_margin` is everything the venue is holding back, in whichever margin
+    mode holds it (Delta blocks isolated / cross / portfolio margin in
+    separate fields), and `reserved_margin` minus it lands in
+    `unattributed_margin` — so wallet, available and used always add up on
+    screen, or the panel says which cash it cannot account for.
     """
     from .services.broker_account import normalize_balance
     code = normalize_source(broker)
@@ -4356,7 +4362,7 @@ def live_account_balance(broker: Optional[str] = None, connection_id: Optional[i
         return {"state": "error", "broker": code, "connection_id": cid,
                 "error": f"{exc.__class__.__name__}: {exc}",
                 "wallet_balance": None, "available_balance": None}
-    balance = normalize_balance(payload, code)
+    balance = normalize_balance(payload, code, meta=getattr(client, "last_balance_meta", None))
     if isinstance(balance, dict) and balance.get("error"):
         return {"state": "error", "broker": code, "connection_id": cid,
                 "error": balance["error"], "wallet_balance": None,

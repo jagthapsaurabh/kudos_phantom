@@ -158,28 +158,46 @@ After stopping a live trading strategy, the UI showed:
 
 ### Root Cause
 
-1. **Delta Exchange includes commission** in available_balance calculation, but the UI was NOT showing it
-2. **Stop endpoint was NOT cancelling orders or closing positions**, leaving margin locked on the exchange
-3. **used_margin calculation** only included order_margin + position_margin, NOT commission
+1. **Delta blocks margin PER MODE** and `used_margin` was summed from the
+   isolated-mode fields only (`order_margin` + `position_margin` + `commission`).
+   This account trades in **cross** margin, where those three are all `0` and the
+   cash sits in `cross_position_margin` / `cross_commission`. The venue's own
+   total is `blocked_margin`, with `available_balance = balance − blocked_margin`
+2. **`unrealized_pnl` / `total` were Binance-only fields**, so both read `null` on
+   Delta even though the same response carries `meta.net_equity`
+3. **Stop endpoint was NOT cancelling orders or closing positions**, leaving margin
+   locked on the exchange
 
 ### Solution
 
-**1. Include Commission in used_margin** (broker_account.py)
+**1. Read every margin bucket, prefer the venue's total** (broker_account.py)
 ```python
-out["commission"] = _f(primary.get("commission"))
-out["used_margin"] = (
-    (_f(primary.get("order_margin"), 0.0) or 0.0) +
-    (_f(primary.get("position_margin"), 0.0) or 0.0) +
-    (_f(primary.get("commission"), 0.0) or 0.0)  # <-- Added
-)
+DELTA_ISOLATED_FIELDS  = ("order_margin", "position_margin", "commission")
+DELTA_CROSS_FIELDS     = ("cross_order_margin", "cross_position_margin",
+                          "cross_commission", "cross_locked_collateral")
+DELTA_PORTFOLIO_FIELDS = ("portfolio_margin",)
+# used_margin = blocked_margin when the venue sends it, else the sum of all three
 ```
+plus a reconciliation the panel can show: `reserved_margin` (`wallet − available`)
+minus `used_margin` is `unattributed_margin`, with `balances_reconciled` saying
+whether the venue's numbers add up. Cash nobody can name is reported, not hidden.
 
-**2. Show Commission in UI** (LiveTrade.jsx)
+**2. Show the buckets that actually hold money** (LiveTrade.jsx, LiveTerminal.jsx)
 ```javascript
-if (b.commission && b.commission > 0.001) {
-  rows.push(['Commission reserved', money(b.commission, cur)]);
+const buckets = [
+  ['Cross position margin', b.cross_position_margin],
+  ['Cross commission', b.cross_commission],
+  ['Position margin (isolated)', b.position_margin],
+  /* … every mode … */
+];
+for (const [label, value] of buckets) {
+  if (Number(value) > 0.001) rows.push([label, money(value, cur)]);
 }
 ```
+and equity / unrealised PnL from `meta.net_equity`, which the client now keeps
+instead of dropping with the envelope.
+
+Full write-up, verification numbers and the regression coverage: `BALANCE_FIX.md`.
 
 **3. Cancel Orders & Close Positions on Stop** (main.py)
 ```python

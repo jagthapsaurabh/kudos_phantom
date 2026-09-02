@@ -177,12 +177,28 @@ export const BalancePanel = ({ balance, marginUsed, broker, onRefresh }) => {
     ['Used margin', money(b.used_margin, cur)],
     ['Unrealised PnL', money(b.unrealized_pnl, cur)],
   ];
-  // Show commission as a separate line when it's non-zero. This explains the
-  // gap between wallet_balance and available_balance when there are no open
-  // positions or orders. Without this line, the UI looks broken — used_margin
-  // shows $0 but available is less than wallet.
-  if (b.commission && b.commission > 0.001) {
-    rows.push(['Commission reserved', money(b.commission, cur)]);
+  // Delta blocks margin per mode, and each mode has its own fields: on a
+  // cross-margin account the isolated ones (order/position/commission) are all
+  // zero while the cross ones hold everything. Listing the buckets that
+  // actually contain money is what makes "Wallet 27.29 / Available 16.31"
+  // explain itself instead of looking like $10.98 vanished.
+  const buckets = [
+    ['Cross position margin', b.cross_position_margin],
+    ['Cross order margin', b.cross_order_margin],
+    ['Cross commission', b.cross_commission],
+    ['Cross collateral', b.cross_locked_collateral],
+    ['Position margin (isolated)', b.position_margin],
+    ['Order margin (isolated)', b.order_margin],
+    ['Commission (isolated)', b.commission],
+    ['Portfolio margin', b.portfolio_margin],
+  ];
+  for (const [label, value] of buckets) {
+    if (Number(value) > 0.001) rows.push([label, money(value, cur)]);
+  }
+  // Cash the venue is holding back that no bucket accounts for. Shown rather
+  // than swallowed: a panel whose numbers add up is the whole point.
+  if (Number(b.unattributed_margin) > 0.01) {
+    rows.push(['Reserved (unattributed)', money(b.unattributed_margin, cur)]);
   }
   return (
     <div className="space-y-2.5">
@@ -204,7 +220,10 @@ export const BalancePanel = ({ balance, marginUsed, broker, onRefresh }) => {
         </span>
       </div>
       <div className="flex items-center justify-between">
-        <span className="text-[10px] text-gray-600">{b.asset} · {b.broker}</span>
+        <span className="text-[10px] text-gray-600">
+          {b.asset} · {b.broker}
+          {b.margin_mode ? ` · ${b.margin_mode} margin` : ''}
+        </span>
         {onRefresh && (
           <button onClick={onRefresh} className="text-[10px] text-gray-500 underline hover:text-gray-300">
             Refresh

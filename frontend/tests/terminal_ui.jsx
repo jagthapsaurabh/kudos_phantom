@@ -95,6 +95,30 @@ check('contract + mark price header', html.includes('BTCUSD') && html.includes('
 check('contract metadata shows the contract value', html.includes('0.001') && html.includes('perpetual'));
 check('wallet & margin panel', html.includes('Wallet &amp; Margin') && html.includes('1,000.00') && html.includes('940.00'));
 check('wallet shows used and order margin', html.includes('Used margin') && html.includes('Order margin') && html.includes('19.80'));
+// The wallet panel has to say WHERE margin is blocked: on a cross-margin
+// account every isolated figure is zero, so "Used margin" alone used to read
+// $0.00 next to an available balance $10.98 below the wallet.
+const crossSnapshot = {
+  ...snapshot,
+  balance: {
+    ...snapshot.balance, wallet_balance: 27.28607683, available_balance: 16.31092465171727,
+    used_margin: 10.97515217828273, blocked_margin: 10.97515217828273,
+    margin_mode: 'cross', cross_margin: 10.97515217828273, isolated_margin: 0,
+  },
+  risk: {
+    ...snapshot.risk, used_margin: 10.97515217828273, margin_mode: 'cross',
+    balances_reconciled: false, unattributed_margin: 0.5,
+  },
+};
+const crossHtml = renderToString(React.createElement(LiveTerminal, {
+  broker: 'Delta', connectionId: 1, snapshot: crossSnapshot, autoRefresh: false,
+}));
+check('wallet panel names the margin mode and what cross margin blocks',
+  crossHtml.includes('Margin mode:') && crossHtml.includes('cross blocked 10.98'));
+check('wallet panel flags margin it cannot attribute to a bucket',
+  crossHtml.includes('not attributed to any margin bucket'));
+check('a reconciled wallet shows no warning', !html.includes('not attributed to any margin bucket'));
+
 check('risk panel', html.includes('Risk') && html.includes('Effective lev') && html.includes('4.01'));
 check('risk flags margin utilisation', html.includes('Margin used') && html.includes('5.98'));
 check('rate-limit panel shows the local windows', html.includes('Rate limits') && html.includes('Per second') && html.includes('20'));

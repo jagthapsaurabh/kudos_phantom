@@ -686,6 +686,22 @@ const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initial
             <Stat label="uPnL" value={signed(risk.unrealized_pnl, 2)} tone={pnlClass(risk.unrealized_pnl)} />
             <Stat label="Equity" value={fmt(risk.equity, 2)} />
           </div>
+          {/* "Used margin" above is every bucket the venue blocks, in whichever
+              margin mode holds it — this says which modes those are, because on
+              a cross-margin account the isolated figures are all zero. */}
+          {balance.margin_mode ? (
+            <div className="mt-2 text-[10px] text-gray-500">
+              Margin mode: <span className="font-bold text-gray-300">{balance.margin_mode}</span>
+              {Number(balance.cross_margin) > 0.001 ? ` · cross blocked ${fmt(balance.cross_margin, 2)}` : ''}
+              {Number(balance.isolated_margin) > 0.001 ? ` · isolated blocked ${fmt(balance.isolated_margin, 2)}` : ''}
+              {Number(balance.portfolio_blocked) > 0.001 ? ` · portfolio blocked ${fmt(balance.portfolio_blocked, 2)}` : ''}
+            </div>
+          ) : null}
+          {risk.balances_reconciled === false && Number(risk.unattributed_margin) > 0.01 ? (
+            <div className="mt-1 text-[10px] text-amber-400">
+              {fmt(risk.unattributed_margin, 2)} withheld by the venue is not attributed to any margin bucket.
+            </div>
+          ) : null}
         </div>
 
         <div className="rounded-2xl border border-gray-700 bg-gray-800 p-4">
