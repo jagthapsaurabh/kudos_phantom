@@ -181,6 +181,10 @@ class PaperTradeService:
         # Keep this session alive across a server restart (see the startup
         # resume pass in app.main). Set by the API from the start payload.
         self.auto_resume = True
+        # Cached broker client reused across ticks. Creating a new BrokerClient
+        # on every _fetch_candles call allocates a rate limiter, normalises URLs
+        # and does other bookkeeping — for a fast tick loop that is pure waste.
+        self._broker_client = BrokerClient(broker_name=self.market_source, definition=self.broker_definition)
         self._log("info", f"Instance initialised — strategy={self.strategy_name}, capital=₹{initial_capital:,.0f}, margin={margin_pct}%")
         # The BTC perpetual is the only contract this tool trades; say which
         # one the venue uses and which price the maths runs on.
@@ -748,9 +752,12 @@ class PaperTradeService:
         presenting itself as live — results nobody could reproduce with real
         orders. Now a dead feed simply means no candles: the tick logs the
         failure and retries, exactly like the live worker would.
+
+        Reuses the cached broker client from __init__ to avoid per-tick
+        allocation overhead.
         """
         try:
-            rows = BrokerClient(broker_name=self.market_source, definition=self.broker_definition).fetch_klines("BTCUSDT", interval, limit)
+            rows = self._broker_client.fetch_klines("BTCUSDT", interval, limit)
             df = pd.DataFrame(rows)
             if not df.empty:
                 df.set_index('event_time', inplace=True)

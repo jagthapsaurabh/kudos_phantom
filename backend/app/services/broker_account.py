@@ -393,7 +393,17 @@ def normalize_balance(payload: Any, source: str, asset: str = None) -> dict:
         out["available_balance"] = _f(primary.get("available"))
         out["order_margin"] = _f(primary.get("order_margin"))
         out["position_margin"] = _f(primary.get("position_margin"))
-        out["used_margin"] = (_f(primary.get("order_margin"), 0.0) or 0.0) + (_f(primary.get("position_margin"), 0.0) or 0.0)
+        out["commission"] = _f(primary.get("commission"))
+        # Delta's available_balance accounts for commission (fees reserved for
+        # open positions or pending). Include it in used_margin so the UI shows
+        # where the money is actually locked. Without this, the balance panel
+        # shows "Used margin $0" while available is less than wallet — a gap
+        # that looks like a bug but is just unreported commission.
+        out["used_margin"] = (
+            (_f(primary.get("order_margin"), 0.0) or 0.0) +
+            (_f(primary.get("position_margin"), 0.0) or 0.0) +
+            (_f(primary.get("commission"), 0.0) or 0.0)
+        )
     else:
         payload = payload if isinstance(payload, dict) else {}
         out["asset"] = asset or "USDT"

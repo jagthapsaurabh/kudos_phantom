@@ -58,6 +58,11 @@ const ExchangeRegistry = () => {
   };
 
   const toggle = async (row) => {
+    const action = row.enabled ? 'DISABLE' : 'ENABLE';
+    const detail = row.enabled
+      ? `This will disable "${row.name}" (${row.code}). Any running paper/live instances using this exchange will lose their data feed and stop working.`
+      : `This will enable "${row.name}" (${row.code}). It will become available as a data source and trading venue.`;
+    if (!window.confirm(`${action} ${row.name}?\n\n${detail}\n\nAre you sure?`)) return;
     const res = await fetch(`${API_URL}/admin/brokers/${row.id}`, { method: 'PUT', headers: auth(), body: JSON.stringify({ ...row, enabled: !row.enabled }) });
     if (res.ok) load();
   };

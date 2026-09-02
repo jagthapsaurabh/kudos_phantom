@@ -4,6 +4,7 @@ import api from '../api';
 import useToast from '../hooks/useToast';
 import ToastContainer from '../components/ToastContainer';
 import ErrorBoundary from '../components/ErrorBoundary';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 const TradeCard = ({ trade, type }) => {
   const pnl = trade.pnl ?? trade.unrealized_pnl ?? 0;
@@ -39,6 +40,8 @@ const TradeCard = ({ trade, type }) => {
 };
 
 const TradingPageInner = ({ type }) => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [activeTrades, setActiveTrades] = useState([]);
   const [isRunning, setIsRunning] = useState(false);
   const [instances, setInstances] = useState([]);
@@ -101,12 +104,13 @@ const TradingPageInner = ({ type }) => {
   }, [historyEndpoint]);
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchStrategies();
     fetchStatus();
     fetchHistory();
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, [fetchStatus, fetchHistory, fetchStrategies]);
+  }, [fetchStatus, fetchHistory, fetchStrategies, isVisible]);
 
   const toggleTrade = async () => {
     setLoading(true);

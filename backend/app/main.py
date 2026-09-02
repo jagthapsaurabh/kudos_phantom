@@ -2865,9 +2865,12 @@ def get_paper_history(user=Depends(get_current_user), db=Depends(get_db)):
 
     Rows are written while the instance runs and finalised when it stops, so
     the client can review trades, equity curve and logs of a stopped session.
+
+    Only paper-mode sessions are returned here; live sessions live behind
+    ``/live-trade/history`` and the unified ``/sessions`` endpoint.
     """
     try:
-        return paper_history.list_sessions(user.id, db)
+        return paper_history.list_sessions(user.id, db, mode='paper')
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to load paper history: {str(exc)}")
 
@@ -3286,17 +3289,53 @@ def start_live_trade(
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
-async def stop_live_trade(instance_key: str, user=Depends(get_current_user)):
+async def stop_live_trade(instance_key: str, user=Depends(get_current_user), db=Depends(get_db)):
     """Stop a live instance and keep its complete result in History.
 
     Stopping used to drop the worker and everything it knew. The session is now
     finalised first, so the client can open the stopped run and review every
     trade, the equity curve, the log and the positions that were still open.
+
+    CRITICAL: This endpoint now cancels all open orders and closes all open
+    positions on the exchange to release locked margin. Without this, stopping
+    a strategy leaves orders/positions active, and the margin stays reserved
+    even though the UI shows "Used margin $0".
     """
     if f"_{user.username}_" not in instance_key:
         raise HTTPException(status_code=403, detail="Not your instance")
     if instance_key in live_trade_instances:
         service = live_trade_instances[instance_key]
+
+        # CRITICAL: Cancel all open orders to release order_margin before stopping
+        try:
+            from app.core.mark_price import perpetual_symbol
+            contract_symbol = perpetual_symbol(service.broker_name, service.symbol)
+            cancel_result = service.broker.cancel_all_orders(contract_symbol)
+            if cancel_result:
+                service._log("info", f"Cancelled all open orders on {contract_symbol}")
+        except Exception as exc:
+            print(f"[{service.strategy_id}] Failed to cancel orders on stop: {exc}")
+            service._log("warn", f"Failed to cancel open orders: {exc}")
+
+        # CRITICAL: Close all open positions to release position_margin
+        try:
+            positions = service.broker.get_positions(contract_symbol)
+            if positions and isinstance(positions, list):
+                for pos in positions:
+                    if isinstance(pos, dict):
+                        size = float(pos.get("size") or pos.get("quantity") or pos.get("positionAmt") or 0)
+                        if abs(size) > 0:
+                            # close_position auto-determines side from position direction
+                            close_result = service.broker.close_position(
+                                contract_symbol,
+                                size=abs(size),
+                                size_in_btc=True
+                            )
+                            service._log("info", f"Closed position: {size} {contract_symbol}")
+        except Exception as exc:
+            print(f"[{service.strategy_id}] Failed to close positions on stop: {exc}")
+            service._log("warn", f"Failed to close positions: {exc}")
+
         await service.stop()
         session_id = paper_history.finalize_session(instance_key, service)
         del live_trade_instances[instance_key]

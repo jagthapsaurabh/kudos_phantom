@@ -135,6 +135,32 @@ class MarkPriceService:
     """Fetch the current mark price (and mark-price candles) for a venue."""
 
     TIMEOUT = 15
+    # Cache mark price for a few seconds to avoid hammering the venue on every
+    # tick. Mark price changes slowly relative to tick frequency, so a short
+    # TTL trades a few seconds of staleness for significant latency reduction.
+    _cache: Dict[str, tuple] = {}  # key -> (timestamp, MarkPriceQuote)
+    CACHE_TTL_SECONDS = 5.0
+
+    @classmethod
+    def _cache_key(cls, source: str, symbol: str) -> str:
+        return f"{source}:{symbol}"
+
+    @classmethod
+    def _get_cached(cls, source: str, symbol: str) -> Optional[MarkPriceQuote]:
+        key = cls._cache_key(source, symbol)
+        entry = cls._cache.get(key)
+        if not entry:
+            return None
+        ts, quote = entry
+        if (datetime.now(timezone.utc) - ts).total_seconds() > cls.CACHE_TTL_SECONDS:
+            cls._cache.pop(key, None)
+            return None
+        return quote
+
+    @classmethod
+    def _set_cached(cls, source: str, symbol: str, quote: MarkPriceQuote):
+        key = cls._cache_key(source, symbol)
+        cls._cache[key] = (datetime.now(timezone.utc), quote)
 
     @classmethod
     def _binance(cls, base: str, perp: str) -> Optional[MarkPriceQuote]:
@@ -185,13 +211,27 @@ class MarkPriceService:
     @classmethod
     def current(cls, source: str = "Delta", symbol: str = "BTCUSD",
                 definition=None, client=None) -> Optional[MarkPriceQuote]:
-        """Current mark + last price. Returns ``None`` when the venue is unreachable."""
+        """Current mark + last price. Returns ``None`` when the venue is unreachable.
+
+        Uses a short TTL cache to avoid hammering the venue on every tick. Mark
+        price changes slowly relative to tick frequency, so a few seconds of
+        staleness trades for significant latency reduction.
+        """
         venue = normalize_source_name(source)
         perp = perpetual_symbol(venue, symbol)
+
+        # Check cache first — if we have a fresh quote, return it immediately
+        # without making an HTTP call. This is the biggest latency win on the
+        # tick path when the feed is healthy.
+        cached = cls._get_cached(venue, perp)
+        if cached is not None:
+            return cached
+
         try:
             if client is not None and hasattr(client, "fetch_mark_price"):
                 quote = client.fetch_mark_price(perp)
                 if quote:
+                    cls._set_cached(venue, perp, quote)
                     return quote
         except Exception:
             pass
@@ -205,9 +245,15 @@ class MarkPriceService:
             kind = "binance" if venue == "Binance" else "delta"
         try:
             if kind == "binance":
-                return cls._binance(base, perp)
+                quote = cls._binance(base, perp)
+                if quote:
+                    cls._set_cached(venue, perp, quote)
+                return quote
             if kind == "delta":
-                return cls._delta(base, perp)
+                quote = cls._delta(base, perp)
+                if quote:
+                    cls._set_cached(venue, perp, quote)
+                return quote
         except Exception as exc:  # never let a quote failure kill a tick
             print(f"[mark-price] {venue} mark price unavailable: {exc}")
         return None

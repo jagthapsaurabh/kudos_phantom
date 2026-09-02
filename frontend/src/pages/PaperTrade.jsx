@@ -8,6 +8,7 @@ import { FeedBadge, PreflightModal } from './LiveTrade';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
 // explicitly in India Standard Time (UTC+5:30). Guarantees the user always
@@ -215,12 +216,14 @@ const ClosedTradesPanel = ({ closedTrades }) => {
 
 // ---------- Log Panel ----------
 const LogPanel = ({ instanceKey }) => {
+  // Pause log polling when the tab is hidden to avoid UI lag.
+  const isVisible = useVisibilityPause();
   const [logs, setLogs] = useState([]);
   const scrollRef = useRef(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
   useEffect(() => {
-    if (!instanceKey) return;
+    if (!instanceKey || !isVisible) return;
     let alive = true;
     const fetchLogs = async () => {
       try {
@@ -234,9 +237,9 @@ const LogPanel = ({ instanceKey }) => {
       } catch (e) {}
     };
     fetchLogs();
-    const interval = setInterval(fetchLogs, 2000);
+    const interval = setInterval(fetchLogs, 5000);
     return () => { alive = false; clearInterval(interval); };
-  }, [instanceKey]);
+  }, [instanceKey, isVisible]);
 
   useEffect(() => {
     if (autoScroll && scrollRef.current) {
@@ -507,7 +510,7 @@ const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {
             <History size={20} className="text-blue-400" /> Paper Trade History ({history.length})
           </h3>
           <p className="mt-1 text-[11px] text-gray-500">
-            Every session is saved while it runs, so stopping or deleting a live instance never loses its
+            Every paper session is saved while it runs, so stopping or deleting an instance never loses its
             trades, equity curve or logs.
           </p>
         </div>
@@ -629,6 +632,8 @@ const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {
 
 // ---------- Main Page ----------
 const PaperTrade = () => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [status, setStatus] = useState([]);
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
@@ -670,16 +675,20 @@ const PaperTrade = () => {
         headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
       });
       const data = await res.json();
-      setHistory(Array.isArray(data) ? data : []);
+      // Paper Trade History must only show paper-mode sessions. Live sessions
+      // are stored in the same table, so filter defensively on the client too.
+      const list = Array.isArray(data) ? data : [];
+      setHistory(list.filter(r => (r.mode || 'paper') === 'paper'));
     } catch (e) { /* history is a read-only extra; never block the live view */ }
     setHistoryLoading(false);
   }, []);
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchHistory();
     const interval = setInterval(fetchHistory, 30000);
     return () => clearInterval(interval);
-  }, [fetchHistory]);
+  }, [fetchHistory, isVisible]);
 
   useEffect(() => {
     fetch(`${API_URL}/broker-definitions`, { headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` } })
@@ -727,10 +736,11 @@ const PaperTrade = () => {
   }, [selectedInstance]);
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchStatus();
-    const interval = setInterval(fetchStatus, 3000);
+    const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, [fetchStatus]);
+  }, [fetchStatus, isVisible]);
 
   // Ask the backend whether this strategy may start on this account before
   // sending anything, so a duplicate is explained up front instead of being

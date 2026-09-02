@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { API_URL } from '../api';
 import { TrendingUp, BarChart3, Target, Zap, Shield, AlertTriangle } from 'lucide-react';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 const num = (v, d = 2) => {
   const n = Number(v);
@@ -8,6 +9,8 @@ const num = (v, d = 2) => {
 };
 
 const Dashboard = () => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [stats, setStats] = useState({ best_roi: 0, total_runs: 0, avg_win_rate: 0, completed_runs: 0 });
   const [paperStatus, setPaperStatus] = useState([]);
   const [liveStatus, setLiveStatus] = useState([]);
@@ -73,9 +76,10 @@ const Dashboard = () => {
     fetchStats();
     fetchSessions();
     pingHealth();
+    if (!isVisible) return;
     const interval = setInterval(() => { fetchSessions(); pingHealth(); }, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isVisible]);
 
   const sessions = [...paperStatus, ...liveStatus];
   const runningInstances = sessions.filter(s => s.is_running).length;
