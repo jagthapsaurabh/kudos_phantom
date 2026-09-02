@@ -2929,6 +2929,16 @@ def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Instance not found")
     return {"instance_key": instance_key, "logs": service.logs[-150:]}
 
+def _benign_risk_rejection(error) -> bool:
+    """Venue answers that mean "already set that way", not a refusal.
+
+    Binance answers ``-4046: No need to change margin type`` when the account
+    already is in the requested mode — confirmation, not a failure; refusing
+    the start over it would block every idempotent restart.
+    """
+    return "no need to change" in str(error or "").lower()
+
+
 # --- LIVE TRADING ---
 @app.post("/live-trade/start")
 def start_live_trade(
@@ -2997,6 +3007,26 @@ def start_live_trade(
             raise HTTPException(status_code=ve.status_code, detail=ve.message)
         except Exception as exc:
             risk_setup["error"] = f"{exc.__class__.__name__}: {exc}"
+    # An explicitly requested leverage / margin mode the venue refused must
+    # not ride along silently: the position that comes back would not be the
+    # one the strategy sized (wrong leverage) or bracketed on the margin
+    # family the client asked for. Historically the start went ahead anyway
+    # and the instance card read "running" next to a small red note — call
+    # the start REFUSED instead, name the venue's answer, and never register
+    # the instance.
+    refusals = []
+    for setting in ("leverage", "margin_mode"):
+        pushed = risk_setup.get(setting)
+        if isinstance(pushed, dict) and pushed.get("status") == "rejected" \
+                and not _benign_risk_rejection(pushed.get("error")):
+            refusals.append(f"{setting.replace('_', ' ')}: {pushed.get('error')}")
+    if risk_setup.get("error"):
+        refusals.append(str(risk_setup["error"]))
+    if refusals:
+        raise HTTPException(
+            status_code=502,
+            detail="The venue refused the requested risk setup, so the live "
+                   "trade was NOT started — " + " · ".join(refusals))
 
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
@@ -3856,6 +3886,15 @@ class LiveMarginModeSyncRequest(BaseModel):
     dry_run: bool = False
 
 
+class LiveMarginModeAllRequest(BaseModel):
+    """Apply one margin mode to EVERY account under the key (main + subs)."""
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    mode: str = 'isolated'
+    dry_run: bool = False
+
+
 class LivePositionMarginRequest(BaseModel):
     broker: str
     connection_id: Optional[int] = None
@@ -4164,6 +4203,31 @@ def live_trade_results(strategy_id: Optional[str] = None, connection_id: Optiona
                     "open_position_count": len(group["open_positions"])})
     out.sort(key=lambda g: (g["strategy_name"], g["account_label"] or ""))
     return out
+
+
+@app.post('/live-account/margin-mode-all')
+def live_set_margin_mode_all(payload: LiveMarginModeAllRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Apply one margin mode to EVERY account under the key (main + all sub-accounts).
+
+    Delta India keeps margin mode per (sub)account, so a "portfolio mode"
+    switch is one PUT per account. The listing needs the main/parent key —
+    a sub-account key can only manage itself, and the result says so. Per-account
+    outcomes come back in ``response.results``; ``status`` rolls them up as
+    ok / partial / rejected.
+    """
+    try:
+        mode = validate_margin_mode(payload.mode)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    result = client.set_margin_mode_all(mode, symbol, payload.dry_run)
+    if isinstance(result, dict) and (result.get('error') or result.get('status') == 'rejected'):
+        cls = classify_broker_error(result.get('error', 'all accounts rejected'), broker=definition.code)
+        phantom_logger.warning(f"margin-mode-all failed [{cls['category']}]: {result.get('error') or result}")
+    return {"status": result.get("status", "rejected"),
+            "response": result, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/margin-mode-sync')

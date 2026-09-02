@@ -38,17 +38,29 @@ check('daily refresh action still available', /Run daily refresh now/.test(html)
 
 // Daily candles are part of the seed plan.
 check('daily (1d) interval selectable', html.includes('1d'));
-check('fetch-all label mentions the 2020 → today range', /Fetch all date windows \(2020 → today\)/.test(html));
 
 // The data-health columns make a corrupt seed visible at a glance.
 check('duplicate column in status table', /th[^>]*>Duplicates</.test(html));
 check('off-grid column in status table', /th[^>]*>Off-grid</.test(html));
 check('stored ticks inventory is shown', html.includes('Stored ticks'));
 
+// The default venue is Delta now, so its explainer shows first; the Binance
+// copy (fetch-all label + full-history explainer) appears when the source is
+// Binance. Render that view explicitly — the label and box are source-gated.
+check('Delta history mode explainer is the default', html.includes('Delta Exchange history mode'));
+let binanceHtml = '';
+try {
+  binanceHtml = renderToString(React.createElement(SeedDataTab, { initialSource: 'Binance' }));
+} catch (e) {
+  check('SeedDataTab renders for Binance', false, e.message);
+}
+
+check('fetch-all label mentions the 2020 → today range (Binance view)', /Fetch all date windows \(2020 → today\)/.test(binanceHtml));
 // Binance full-history mode explains the fetch (1500-candle windows, upsert,
 // repair-first) instead of only the generic daily-refresh note.
-check('Binance history mode explainer present', html.includes('Binance full-history mode') || html.includes('straight from Binance'));
-check('long-range reliability explained (background + retries)', /background/.test(html) && /retries|resumes/.test(html));
+check('Binance history mode explainer present (Binance view)',
+  binanceHtml.includes('Binance full-history mode') || binanceHtml.includes('straight from Binance'));
+check('long-range reliability explained (background + retries)', /background/.test(binanceHtml) && /retries|resumes/.test(binanceHtml));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

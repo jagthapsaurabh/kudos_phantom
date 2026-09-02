@@ -932,9 +932,14 @@ const PaperTrade = () => {
                       title="Which broker account this paper run is modelled on. Paper places no orders, but pinning it to an account keeps the result comparable with the live run."
                       className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white outline-none">
                 <option value="">Primary / legacy</option>
-                {connections.filter(c => c.broker_code === dataSource).map(c => (
-                  <option key={c.id} value={c.id}>{c.label}</option>
-                ))}
+                {connections.filter(c => c.broker_code === dataSource).map(c => {
+                  const self = (c.account_settings || {}).self_account || {};
+                  return (
+                    <option key={c.id} value={c.id}>
+                      {c.label}{self.account_name ? ` — ${self.account_name} (${self.is_sub_account ? 'sub' : 'main'})` : ''}
+                    </option>
+                  );
+                })}
               </select>
             </div>
             <button onClick={requestStart} disabled={loading || starting}

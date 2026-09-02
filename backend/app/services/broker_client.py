@@ -318,6 +318,8 @@ class BrokerClient:
         self.limiter_key = limiter_key or f"{self.broker_name}:{hashlib.sha1(self.api_key.encode()).hexdigest()[:8]}"
         self.limiter = get_limiter(self.limiter_key, self.rate_limit_config)
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
+        # This key's own Delta account user id, resolved lazily (margin mode).
+        self._own_user_id: Optional[str] = None
         self._last_error: Optional[str] = None
         # ---- Credential latch (see the module docstring) --------------------
         # Short fingerprint of the key material this client signs with, so a
@@ -2249,6 +2251,10 @@ class BrokerClient:
                 out["margin_mode"] = ours["margin_mode"]
                 out["margin_family"] = self._margin_family(ours["margin_mode"])
                 out["user_id"] = ours["id"] or None
+                # Exactly which account THIS key trades as — the connection
+                # card and the start form show it so several sub-accounts
+                # saved as separate connections stay tellable apart.
+                out["self_account"] = ours
             else:
                 # Sub-account keys cannot list the parent's accounts. An open
                 # position still carries its margin type on Delta.
@@ -2260,6 +2266,10 @@ class BrokerClient:
                     mode = str((positions[0] or {}).get("margin_type") or "").lower() or None
                     out["margin_mode"] = mode
                     out["margin_family"] = self._margin_family(mode)
+                # The wallet rows still carry this key's own account id.
+                own = self._delta_own_user_id()
+                if own:
+                    out["user_id"] = own
             lev = self.get_leverage(symbol)
             if isinstance(lev, dict) and not lev.get("error"):
                 out["leverage"] = self._i(lev.get("leverage"))
@@ -2276,6 +2286,46 @@ class BrokerClient:
                                     f"not the margin settings")
             return out
         return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
+
+    def _delta_own_user_id(self) -> Optional[str]:
+        """This API key's own Delta account user id.
+
+        ``PUT /v2/users/margin_mode`` requires ``subaccount_user_id`` **even
+        when the target is the key's own account** (without it the venue
+        answers ``bad_schema: subaccount_user_id is required``), while
+        ``GET /v2/profile`` is refused to API keys (changelog 19.08.26).
+        Wallet balances carry the owning account's ``user_id`` on every entry
+        and are readable by parent AND sub-account keys alike (a sub-account
+        key cannot list ``/v2/sub_accounts``), so that read always resolves.
+        Cached per client: the id never changes for a key, and this lookup
+        runs on the order path at instance start where a repeat call would
+        burn rate-limit weight for nothing.
+        """
+        if self.kind != "delta":
+            return None
+        if self._own_user_id:
+            return self._own_user_id
+        response, error = self._delta_request("GET", "/v2/wallet/balances", weight=5)
+        result = self._delta_result(self._json_body(response, error))
+        if isinstance(result, list):
+            for row in result:
+                if isinstance(row, dict) and row.get("user_id"):
+                    self._own_user_id = str(row["user_id"])
+                    return self._own_user_id
+        # Fallback for a key whose wallet read answers without a user_id (or
+        # fails outright): the main entry of the sub-account listing — a
+        # parent key resolves to itself there, a sub-account key cannot list
+        # it at all and stays unresolved.
+        response2, error2 = self._delta_request("GET", "/v2/sub_accounts", weight=5)
+        result2 = self._delta_result(self._json_body(response2, error2))
+        if isinstance(result2, list):
+            entries = [row for row in result2 if isinstance(row, dict)]
+            ours = next((row for row in entries if not row.get("is_sub_account")),
+                        entries[0] if entries else None)
+            if ours and ours.get("id"):
+                self._own_user_id = str(ours["id"])
+                return self._own_user_id
+        return None
 
     def set_margin_mode(self, symbol: str, mode: str = "isolated",
                         subaccount_user_id: Optional[str] = None,
@@ -2296,6 +2346,10 @@ class BrokerClient:
             # longer in the docs — kept as a fallback in case a deployment
             # still routes it.
             body: Dict[str, Any] = {"margin_mode": str(mode).lower()}
+            if not subaccount_user_id:
+                # The venue requires the target account id even for the key's
+                # own account (bad_schema otherwise) — resolve it.
+                subaccount_user_id = self._delta_own_user_id()
             if subaccount_user_id:
                 body["subaccount_user_id"] = str(subaccount_user_id)
             response, error = self._delta_request("PUT", "/v2/users/margin_mode",
@@ -2315,6 +2369,46 @@ class BrokerClient:
                 return result2 if isinstance(result2, dict) and result2 else {"ok": True}
             return result if isinstance(result, dict) else {"error": str(result)}
         return {"error": f"No margin-mode adapter installed for '{self.broker_name}'"}
+
+    def set_margin_mode_all(self, mode: str, symbol: str = "BTCUSDT",
+                            dry_run: bool = False):
+        """Apply one margin mode to EVERY account under this key (main + subs).
+
+        Delta India keeps margin mode per account, so "the whole setup should
+        run isolated" means one PUT per (sub)account. The sub-account listing
+        is a parent-key privilege; when it is missing the error says exactly
+        that instead of silently changing only the caller's own account.
+        Never raises: per-account outcomes land in ``results`` with a rollup
+        ``status`` of ok / partial / rejected.
+        """
+        if self.kind != "delta":
+            return {"error": f"bulk margin mode is a Delta feature; "
+                             f"'{self.broker_name}' is a {self.kind} adapter"}
+        settings = self.get_account_settings(symbol)
+        accounts = (settings or {}).get("accounts") or []
+        if not accounts:
+            detail = (settings or {}).get("error") if isinstance(settings, dict) else None
+            return {"error": "could not list the accounts under this key — the "
+                             "sub-account listing is a main/parent-key privilege, "
+                             "so a sub-account key can only manage itself"
+                             + (f" ({detail})" if detail else ""),
+                    "accounts": []}
+        targets = [{"id": str(a.get("id") or ""), "account_name": a.get("account_name"),
+                    "is_sub_account": bool(a.get("is_sub_account")),
+                    "before": a.get("margin_mode")}
+                   for a in accounts if a.get("id")]
+        if dry_run:
+            return {"dry_run": True, "margin_mode": str(mode).lower(), "targets": targets}
+        results = []
+        for account in targets:
+            result = self.set_margin_mode(symbol, mode, subaccount_user_id=account["id"])
+            rejected = isinstance(result, dict) and bool(result.get("error"))
+            results.append({**account, "status": "rejected" if rejected else "ok",
+                            "error": (result.get("error") if isinstance(result, dict) else None)})
+        ok = sum(1 for row in results if row["status"] == "ok")
+        status = "ok" if ok == len(results) else ("rejected" if ok == 0 else "partial")
+        return {"status": status, "margin_mode": str(mode).lower(),
+                "changed": ok, "total": len(results), "results": results}
 
     def sync_margin_mode(self, reference_user_id, target_user_id,
                          symbol: str = "BTCUSDT", dry_run: bool = False):

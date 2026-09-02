@@ -39,7 +39,8 @@ globalThis.fetch = (url) => {
   return Promise.resolve({ ok: true, json: async () => ({}) });
 };
 
-import BrokerSettings, { ConnectionCard } from '../src/pages/BrokerSettings.jsx';
+import BrokerSettings, { ConnectionCard, AccountManager } from '../src/pages/BrokerSettings.jsx';
+import Sessions from '../src/pages/Sessions.jsx';
 import LiveTrade, { CredentialsBadge, HeartbeatBadge, FeedBadge } from '../src/pages/LiveTrade.jsx';
 import LiveTerminal from '../src/components/LiveTerminal.jsx';
 
@@ -255,6 +256,43 @@ check('it shows the backoff the worker is sitting in', termHtml.includes('42s') 
   termHtml.slice(termHtml.indexOf('Signed calls are held') - 100, termHtml.indexOf('Signed calls are held') + 200));
 check('market data is still rendered — this is why the state was invisible before',
   termHtml.includes('77,981.87'));
+
+// ---------------------------------------------- account management panel ---
+console.log('\n== Broker Settings: manage every account under one key ==');
+// A parent key answer: the settings list the main account plus sub-accounts.
+const PARENT_CONNECTION = {
+  id: 12, broker_code: 'Delta', label: 'Delta main key', api_key: 'pa12••••••••90ab',
+  has_secret: true, is_testnet: false, is_active: true,
+  account_settings: {
+    margin_mode: 'cross', leverage: 7, user_id: '5112346',
+    self_account: { id: '5112346', account_name: 'Main', is_sub_account: false, margin_mode: 'cross' },
+    accounts: [
+      { id: '5112346', account_name: 'Main', is_sub_account: false, margin_mode: 'cross' },
+      { id: '5112347', account_name: 'Scalper', is_sub_account: true, margin_mode: 'isolated' },
+      { id: '5112348', account_name: 'Gold', is_sub_account: true, margin_mode: 'portfolio' },
+    ],
+  },
+  account_settings_at: '2026-09-01T09:00:00',
+};
+const mgr = render(React.createElement(AccountManager, { c: PARENT_CONNECTION, onDone: () => {} }));
+check('lists every account the key can see', mgr.includes('Main') && mgr.includes('Scalper') && mgr.includes('Gold'));
+check('marks which one THIS key trades as', mgr.includes('this key'));
+check('labels main vs sub accounts', mgr.includes('MAIN') && mgr.includes('SUB'));
+check('shows each account\'s current margin mode', mgr.includes('cross') && mgr.includes('isolated') && mgr.includes('portfolio'));
+check('offers one-per-account and apply-to-all controls',
+  mgr.includes('Apply') && mgr.includes('Apply isolated to all 3 accounts'));
+const parentCard = render(React.createElement(ConnectionCard, { ...cardProps, c: PARENT_CONNECTION, keysOpen: false }));
+check('the card says what the key trades as', parentCard.includes('trades as') && parentCard.includes('(main account)'));
+check('the card embeds the account manager', parentCard.includes('Accounts on this key'));
+const emptyMgr = render(React.createElement(AccountManager, { c: CONNECTIONS[0], onDone: () => {} }));
+check('a key that cannot list accounts shows nothing extra', !emptyMgr.includes('Accounts on this key'));
+
+// ------------------------------------------------------- Sessions history --
+console.log('\n== Sessions: live and paper histories are separate ==');
+const sess = render(React.createElement(Sessions));
+check('page header reads Trade History', sess.includes('Trade History'));
+check('live and paper histories are separate tabs',
+  sess.includes('Live Trade History') && sess.includes('Paper Trade History'));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

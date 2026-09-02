@@ -15,7 +15,9 @@ globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ({}) });
 
 import LiveTerminal, { fmt, fmtBtc, fmtSize, signed, pnlClass, perpetualFor, TABS, ORDER_TYPES,
   orderAgeSeconds, unfilledOrders, ageLabel, UNFILL_THRESHOLDS } from '../src/components/LiveTerminal.jsx';
-import TerminalPage from '../src/pages/Terminal.jsx';
+// The standalone Terminal page was folded into the LiveTrade page as a tab —
+// the shell checks below render that page straight onto the terminal tab.
+import LiveTradePage from '../src/pages/LiveTrade.jsx';
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = '') => {
@@ -240,11 +242,13 @@ check('the terminal has leverage and margin-type controls',
   && html.includes('Isolated') && html.includes('Cross'));
 
 // -------------------------------------------------------------- page shell --
-const pageHtml = renderToString(React.createElement(TerminalPage));
-check('terminal page renders the header', pageHtml.includes('Live Terminal'));
+// The terminal lives on the LiveTrade page's "Broker terminal" tab now; the
+// form above it keeps the broker + connection selectors.
+const pageHtml = renderToString(React.createElement(LiveTradePage, { initialView: 'terminal' }));
+check('terminal page renders the terminal tab', pageHtml.includes('Broker terminal'));
 check('terminal page has broker + connection selectors',
-  pageHtml.includes('Broker') && pageHtml.includes('Connection'));
-check('terminal page shows the perpetual contract', pageHtml.includes('BTCUSDT') && pageHtml.includes('perpetual'));
+  pageHtml.includes('Broker / Data') && pageHtml.includes('Connection'));
+check('terminal page shows the perpetual contract', pageHtml.includes('BTCUSDT'));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -90,7 +90,12 @@ for (const file of files) {
   }
   for (const m of src.matchAll(/\b([A-Za-z_$][\w$]*)\s*:/g)) params.add(m[1]); // object keys can shadow in JSX? no — skip
   const arrowArgs = new Set();
-  for (const m of src.matchAll(/(?:\(|,)\s*([A-Za-z_$][\w$]*)\s*(?:,|\)|=>)/g)) arrowArgs.add(m[1]);
+  // Trailing delimiter is a LOOKAHEAD: consuming it would swallow the comma
+  // that leads the next identifier, so `[k, label, Icon] =>` used to capture
+  // only every second element and flag real components (e.g. a destructured
+  // map variable used as <Icon/>) as missing. `[` is a leading delimiter too
+  // — the first element of an array destructure follows it, not `(`/`,`.
+  for (const m of src.matchAll(/(?:\(|,|\[)\s*([A-Za-z_$][\w$]*)\s*(?=,|\]|=>|\))/g)) arrowArgs.add(m[1]);
 
   // 3. Identifiers used as JSX components or referenced inside <>{expr}</>.
   const used = new Set();
