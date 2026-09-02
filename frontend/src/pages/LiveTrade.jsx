@@ -220,7 +220,8 @@ export const PreflightModal = ({ check, onCancel, onConfirm, busy }) => {
            onClick={e => e.stopPropagation()}>
         <h3 className={`mb-2 flex items-center gap-2 text-lg font-bold ${blocked ? 'text-red-400' : 'text-white'}`}>
           {blocked ? <AlertCircle size={20} /> : <ShieldCheck size={20} className="text-green-400" />}
-          {blocked ? 'This strategy cannot start' : 'Confirm start'}
+          {blocked ? (check.kind === 'funding' ? 'Not enough margin — cannot start'
+                                                : 'This strategy cannot start') : 'Confirm start'}
         </h3>
         <div className={`mb-4 rounded-lg border p-3 text-sm leading-relaxed ${
           blocked ? 'border-red-900/50 bg-red-900/20 text-red-200'
@@ -229,6 +230,22 @@ export const PreflightModal = ({ check, onCancel, onConfirm, busy }) => {
                     : 'border-gray-700 bg-gray-900 text-gray-300'}`}>
           {check.reason || 'Ready to start on ' + (check.account_label || 'the primary account') + '.'}
         </div>
+        {/* Funding: what one entry posts vs what the wallet holds. A start
+            refused for margin shows the numbers, not just the sentence. */}
+        {check.funding && typeof check.funding.required_usd === 'number' && (
+          <dl className="mb-4 grid grid-cols-3 gap-2 text-xs">
+            {[['Needed / trade', `${check.funding.required_usd.toFixed(2)} ${check.funding.asset || 'USD'}`],
+              ['Available', check.funding.available_usd != null
+                ? `${Number(check.funding.available_usd).toFixed(2)} ${check.funding.asset || 'USD'}` : '—'],
+              ['Short by', check.funding.shortfall_usd != null
+                ? `${Number(check.funding.shortfall_usd).toFixed(2)} ${check.funding.asset || 'USD'}` : '—']].map(([k, v]) => (
+              <div key={k} className="rounded border border-gray-700 bg-gray-900 p-2">
+                <dt className="text-[9px] font-bold uppercase text-gray-500">{k}</dt>
+                <dd className="truncate font-mono text-gray-200">{v}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
         {!blocked && (
           <dl className="mb-5 grid grid-cols-2 gap-2 text-xs">
             {[['Broker', check.broker], ['Account', check.account_label],
@@ -433,8 +450,14 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
       const res = await fetch(`${API_URL}/trade/preflight`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+        // Sizing goes with the check: the backend compares the margin this
+        // capital / margin % / leverage will post against the live wallet, so
+        // "insufficient margin" is reported here instead of by every order.
         body: JSON.stringify({ mode: 'live', strategy_id: selectedStrategy, broker_name: dataSource,
-                               data_source: dataSource, connection_id: connectionId ? Number(connectionId) : null }),
+                               data_source: dataSource, connection_id: connectionId ? Number(connectionId) : null,
+                               initial_capital: Number(capital) || null,
+                               margin_pct: Number(marginPct) || null,
+                               leverage: Number(leverage) || null }),
       });
       const data = await res.json();
       setPreflight(res.ok ? data : { blocking: true, reason: data.detail || 'Pre-flight check failed' });

@@ -28,6 +28,8 @@ from .core.secrets import encrypt_secret, decrypt_secret, SecretDecryptionError
 from .services.paper_trader import PaperTradeService, _to_ist
 from .services import paper_history
 from .services.live_trader import LiveTradeService, COORDINATOR
+from .services.margin_preflight import check_affordable, estimate_order_margin
+from .services.app_settings import get_usd_inr_rate
 from .services.data_sync import DataSyncService
 from .services.broker_client import BrokerClient
 from .database.models import (
@@ -2640,6 +2642,12 @@ class PreflightRequest(BaseModel):
     # resolve_broker_context() reads this off the payload when no saved
     # connection is selected; it must exist here too.
     testnet: bool = False
+    # Sizing the Start button is about to send. Optional: when present, the
+    # live pre-flight also checks the wallet can fund one entry, so the user
+    # is told "not enough margin" BEFORE an instance exists.
+    initial_capital: Optional[float] = None
+    margin_pct: Optional[float] = None
+    leverage: Optional[int] = None
 
 
 @app.post("/trade/preflight")
@@ -2672,8 +2680,34 @@ def trade_preflight(payload: PreflightRequest, user=Depends(get_current_user), d
                for k, s in pool.items()
                if f"_{user.username}_" in k and getattr(s, "is_running", False)
                and _instance_account_identity(s, user.id) == wanted]
+    # Live only: will the first order actually be funded? An account that
+    # cannot post the margin produces an instance that rejects every signal
+    # candle forever, so the answer belongs here, before the Start.
+    funding = None
+    if mode == 'live':
+        try:
+            capital, margin_pct = _resolve_sizing(payload, user)
+            leverage = int(payload.leverage) if payload.leverage else \
+                int(getattr(_load_champion_config() if payload.strategy_id == 'PhantomV2'
+                            else PhantomV2Config(), 'leverage', 7) or 7)
+            client, _d, _c = _live_client(db, user, source, payload.connection_id)
+            funding = check_affordable(client, broker=source, capital_inr=capital,
+                                       margin_pct=margin_pct, leverage=leverage,
+                                       conversion_rate=get_usd_inr_rate())
+        except HTTPException as exc:
+            funding = {"ok": False, "state": "balance_unavailable",
+                       "message": str(exc.detail)}
+        except Exception as exc:
+            funding = {"ok": False, "state": "balance_unavailable",
+                       "message": f"Could not verify funds on {source}: "
+                                  f"{exc.__class__.__name__}: {exc}"}
+        if funding and not funding.get("ok") and funding.get("state") != "skipped":
+            return {"can_start": False, "blocking": True, "kind": "funding",
+                    "mode": mode, "broker": source, "funding": funding,
+                    "reason": funding.get("message")}
     return {
         "can_start": True, "blocking": False, "mode": mode,
+        "funding": funding,
         "kind": "shared" if sharing else "ok",
         "account_label": (getattr(connection, "label", None) or "Primary"),
         "connection_id": (connection.id if connection else None),
@@ -3151,6 +3185,29 @@ def start_live_trade(
             detail="The venue refused the requested risk setup, so the live "
                    "trade was NOT started — " + " · ".join(refusals))
 
+    # ---- Funding pre-check: can the FIRST order even be placed? ---------
+    # Reported bug: an account holding 27.33 USD started an instance that then
+    # answered `insufficient_margin` on every single signal candle, forever.
+    # The instance read "running" while it could never trade. Read the wallet
+    # here, compare it with what this capital / margin % / leverage will post,
+    # and REFUSE the start with a message naming the shortfall and the fix.
+    funding = None
+    try:
+        pre_client, _pdef, _pcid = _live_client(db, user, source, payload.connection_id)
+        funding = check_affordable(
+            pre_client, broker=source, capital_inr=capital, margin_pct=margin_pct,
+            leverage=getattr(config, "leverage", 1) or 1,
+            conversion_rate=get_usd_inr_rate())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        funding = {"ok": False, "state": "balance_unavailable",
+                   "message": (f"Could not verify funds on {source} before starting, so the "
+                               f"live trade was NOT started: {exc.__class__.__name__}: {exc}")}
+    if funding and not funding.get("ok"):
+        raise HTTPException(status_code=400, detail=funding.get("message") or
+                            "The live trade was NOT started: the account funding check failed.")
+
     instance_id = str(uuid.uuid4())[:8]
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
@@ -3222,6 +3279,10 @@ def start_live_trade(
             "margin_pct": margin_pct,
             # What the exchange said when leverage / margin mode were pushed.
             "risk_setup": risk_setup,
+            # What the funding pre-check found (available balance vs the margin
+            # one entry posts). Shown on the card so "why did it not trade" is
+            # answered before the venue ever rejects an order.
+            "funding": funding,
             "taker_fee_bps": fees.taker_fee_bps, "maker_fee_bps": fees.maker_fee_bps}
 
 @app.post("/live-trade/stop")
