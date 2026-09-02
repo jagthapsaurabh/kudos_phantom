@@ -145,12 +145,32 @@ with_trail = client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100
 body = with_trail["body"]
 check("entry bracket goes to POST /v2/orders (bracket_* on the entry order)",
       with_trail.get("path") == "/v2/orders", str(with_trail)[:200])
+# Delta signs the trail against the CLOSING leg: a buy entry's stop-loss is a
+# sell below the market, so the distance must travel as a negative number or
+# the venue answers HTTP 400 bad_schema "bracket_trail_amount should be
+# negative for buy orders" — the bug that blocked every trailing live entry.
 check("trailing bracket sends bracket_trail_amount",
-      body.get("bracket_trail_amount") == "15.0", str(body))
+      body.get("bracket_trail_amount") == "-15.0", str(body))
 check("trailing bracket omits bracket_stop_loss_price",
       "bracket_stop_loss_price" not in body, str(body))
 check("take-profit is untouched",
       body.get("bracket_take_profit_price") == "200.0", str(body))
+
+short_trail = client.place_bracket_order("BTCUSD", "sell", 10, stop_loss_price=300.0,
+                                         take_profit_price=200.0, trail_amount=15.0,
+                                         size_in_btc=False, dry_run=True)
+check("a short entry's bracket trail is positive (stop sits above the market)",
+      short_trail["body"].get("bracket_trail_amount") == "15.0", str(short_trail["body"]))
+check("an already-signed trail distance is not double-negated",
+      client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100.0,
+                                 take_profit_price=200.0, trail_amount=-15.0,
+                                 size_in_btc=False, dry_run=True)["body"].get("bracket_trail_amount")
+      == "-15.0", "idempotent sign")
+check("a zero trail falls back to the fixed stop instead of dropping protection",
+      client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100.0,
+                                 take_profit_price=200.0, trail_amount=0,
+                                 size_in_btc=False, dry_run=True)["body"].get("bracket_stop_loss_price")
+      == "100.0", "zero trail")
 
 no_trail = client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100.0,
                                       take_profit_price=200.0, size_in_btc=False,

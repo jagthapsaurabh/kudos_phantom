@@ -1007,12 +1007,16 @@ class LiveTradeService:
         if planned is None:
             return
         lots = float(planned.lots)
+        # A plain distance (trail_distance_atr × ATR) — the broker client signs
+        # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
+        # and a positive one on a sell entry.
+        trail_distance = self._trail_amount(current_atr) if self.bracket_orders else None
         if self.bracket_orders:
             res = self.broker.place_bracket_order(
                 self.contract_symbol, side, lots, price=None,
                 stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
                 trigger_method="mark_price" if use_mark else "last_traded_price",
-                size_in_btc=True, trail_amount=self._trail_amount(current_atr))
+                size_in_btc=True, trail_amount=trail_distance)
         else:
             res = self.broker.place_order(self.contract_symbol, side, "MARKET", lots,
                                           size_in_btc=True)
@@ -1031,7 +1035,11 @@ class LiveTradeService:
             entry_note = price_note(mark_price, filled, current_price, use_mark)
             protection = ""
             if self.bracket_orders:
-                protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}"
+                # The venue trails the stop from the fill when a distance is
+                # sent; the local book keeps trailing on its own rules, so both
+                # the fixed level and the trail distance are worth showing.
+                trailing = f" · trail {trail_distance:,.2f}" if trail_distance else ""
+                protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}{trailing}"
                               f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
             print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
             self._log("trade", f"OPENED {side} {lots} BTC at {entry_note}{protection}")

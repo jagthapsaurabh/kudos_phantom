@@ -1159,6 +1159,45 @@ class BrokerClient:
                                                 weight=2, is_order=True)
         return self._json_body(response, error)
 
+    @staticmethod
+    def _delta_trail_amount(trail_amount, side=None, opposite_side: bool = False) -> Optional[str]:
+        """Signed Delta trail amount as a string, or ``None`` when unusable.
+
+        Delta expresses a trail amount as the SIGNED distance from the market
+        price to the stop trigger: a stop BELOW the market (the one that
+        protects a long) is negative, a stop ABOVE the market (protecting a
+        short) is positive. The venue enforces that server-side and answers
+        HTTP 400 ``bad_schema`` — "bracket_trail_amount should be negative
+        for buy orders" — which is what rejected every live entry opened with
+        an ATR trail: the distance was always sent as a positive number.
+
+        ``side`` is the side of the order the field travels on. A bracket
+        field describes the PROTECTION leg, which sits on the opposite side
+        of the entry (``opposite_side=True``): a buy entry's stop-loss is a
+        sell stop below the market, hence negative. A ``trail_amount`` on a
+        standalone stop order belongs to that order itself, so the sign
+        follows the order's own side (Delta user docs: trail amount 40 on a
+        buy trailing stop, negative on a sell one).
+
+        The magnitude is what callers mean — ``trail_distance_atr × ATR`` —
+        so an already-signed value is accepted and normalised, which keeps
+        the helper idempotent.
+        """
+        if trail_amount is None:
+            return None
+        try:
+            distance = abs(float(trail_amount))
+        except (TypeError, ValueError):
+            return None
+        if distance <= 0:
+            return None
+        leg_side = str(side or "").strip().lower()
+        if opposite_side:
+            leg_side = {"buy": "sell", "sell": "buy"}.get(leg_side, leg_side)
+        if leg_side == "sell":      # stop sits below the market -> negative
+            return str(round(-distance, 8))
+        return str(round(distance, 8))
+
     def _delta_place_order(self, symbol, side, order_type, size, price, stop_price,
                            reduce_only, client_order_id, time_in_force, post_only,
                            stop_side, trail_amount, size_in_btc: bool = False,
@@ -1216,12 +1255,16 @@ class BrokerClient:
             if is_stop:
                 body["stop_order_type"] = "take_profit_order" if take_profit_leg else "stop_loss_order"
         if is_stop:
-            if stop_price is None and trail_amount is None:
-                return {"error": "stop orders require a stop_price (or trail_amount)"}
+            # Delta wants the trail signed against the direction of the stop
+            # (see _delta_trail_amount): a sell stop sits below the market and
+            # must carry a negative trail amount.
+            signed_trail = self._delta_trail_amount(trail_amount, side)
+            if stop_price is None and signed_trail is None:
+                return {"error": "stop orders require a stop_price (or a non-zero trail_amount)"}
             if stop_price is not None:
                 body["stop_price"] = str(stop_price)
-            if trail_amount is not None:
-                body["trail_amount"] = str(trail_amount)
+            if signed_trail is not None:
+                body["trail_amount"] = signed_trail
             # Price risk is managed on the mark price (see app.core.mark_price).
             body["stop_trigger_method"] = "mark_price"
         if reduce_only:
@@ -1242,8 +1285,14 @@ class BrokerClient:
             body["bracket_take_profit_price"] = str(bracket_take_profit_price)
         if bracket_take_profit_limit_price is not None:
             body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
-        if bracket_trail_amount is not None:
-            body["bracket_trail_amount"] = str(bracket_trail_amount)
+        # The bracket stop-loss leg CLOSES the entry, so it sits on the
+        # opposite side: a buy entry's stop is a sell below the market and
+        # Delta requires a NEGATIVE trail amount for it (HTTP 400 bad_schema
+        # "bracket_trail_amount should be negative for buy orders").
+        signed_bracket_trail = self._delta_trail_amount(bracket_trail_amount, side,
+                                                        opposite_side=True)
+        if signed_bracket_trail is not None:
+            body["bracket_trail_amount"] = signed_bracket_trail
         if bracket_stop_trigger_method is not None:
             body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if client_order_id:
@@ -1272,11 +1321,15 @@ class BrokerClient:
         when the other fills. ``POST /v2/orders/bracket`` is a different
         operation — it attaches TP/SL to an *existing* position and answers
         HTTP 400 ``{"code": "no_open_position"}`` when none is open, which
-        rejected every live entry sent through it. ``trail_amount`` is sent
-        as a string so it matches the Phantom ATR trail
-        (``trail_distance_atr × ATR``). Binance has no bracket endpoint, so
-        the entry is sent first and the two protection legs are placed as
-        reduce-only STOP_MARKET / TAKE_PROFIT_MARKET orders afterwards.
+        rejected every live entry sent through it. ``trail_amount`` is a
+        plain distance (the Phantom ATR trail, ``trail_distance_atr × ATR``)
+        and is signed for you against the closing leg: Delta wants a
+        NEGATIVE bracket trail amount on a buy entry and a positive one on a
+        sell entry, and answers HTTP 400 ``bad_schema`` — "bracket_trail_amount
+        should be negative for buy orders" — otherwise. Binance has no bracket
+        endpoint, so the entry is sent first and the two protection legs are
+        placed as reduce-only STOP_MARKET / TAKE_PROFIT_MARKET orders
+        afterwards.
         """
         perp = self.perpetual_symbol(symbol)
         size = self.base_to_venue_size(qty, symbol) if size_in_btc else float(qty)
@@ -1292,9 +1345,15 @@ class BrokerClient:
                 # order"). A trailing stop is the strictly better protection
                 # of the two, so when a trail distance is supplied it wins
                 # and the fixed stop is dropped.
-                if trail_amount is not None:
-                    bracket_kwargs["bracket_trail_amount"] = str(trail_amount)
-                else:
+                # Signed against the closing leg (a buy entry's stop is a
+                # sell below the market -> negative). Only a usable, non-zero
+                # trail displaces the fixed stop; a zero/blank distance would
+                # otherwise leave the entry with no protection at all.
+                signed_trail = self._delta_trail_amount(trail_amount, side,
+                                                        opposite_side=True)
+                if signed_trail is not None:
+                    bracket_kwargs["bracket_trail_amount"] = signed_trail
+                elif stop_loss_price is not None:
                     bracket_kwargs["bracket_stop_loss_price"] = str(stop_loss_price)
             if take_profit_price is not None:
                 bracket_kwargs["bracket_take_profit_price"] = str(take_profit_price)
@@ -1556,6 +1615,7 @@ class BrokerClient:
                            stop_loss_price: Optional[float] = None,
                            take_profit_price: Optional[float] = None,
                            trail_amount: Optional[float] = None,
+                           side: Optional[str] = None,
                            # MCP-aligned top-level bracket fields
                            bracket_stop_loss_price: Optional[str] = None,
                            bracket_stop_loss_limit_price: Optional[str] = None,
@@ -1567,6 +1627,12 @@ class BrokerClient:
         """``PUT /v2/orders/bracket`` — adjust SL / TP / trail after entry.
         Supports both legacy (stop_loss_price/take_profit_price) and MCP-aligned
         bracket_* top-level fields. MCP: edit_bracket_order {id, bracket_stop_loss_price, ...}
+
+        ``side`` is the side of the ORIGINAL ENTRY (``buy`` / ``sell``). Pass
+        it whenever a trail amount is edited: the bracket stop-loss closes the
+        entry, so Delta expects the trail distance signed against that closing
+        leg — negative for a buy entry, positive for a sell entry. Without it
+        the value is forwarded exactly as given.
         """
         if self.kind != "delta":
             return {"error": "Editing a bracket is only supported on Delta Exchange."}
@@ -1584,14 +1650,19 @@ class BrokerClient:
             except Exception:
                 pass
         # Legacy form (used by live_trader)
+        # Signed against the closing leg when the entry side is known (see the
+        # docstring): a long's trailing stop sits below the market, so the
+        # distance must travel as a negative number.
+        signed_trail = self._delta_trail_amount(trail_amount, side, opposite_side=True) \
+            if trail_amount is not None else None
         if stop_loss_price is not None:
             sl_leg: Dict[str, Any] = {"order_type": "market_order",
                                       "stop_price": str(stop_loss_price)}
-            if trail_amount is not None:
-                sl_leg["trail_amount"] = str(trail_amount)
+            if signed_trail is not None:
+                sl_leg["trail_amount"] = signed_trail
             body["stop_loss_order"] = sl_leg
-        elif trail_amount is not None:
-            body["stop_loss_order"] = {"trail_amount": str(trail_amount)}
+        elif signed_trail is not None:
+            body["stop_loss_order"] = {"trail_amount": signed_trail}
         if take_profit_price is not None:
             body["take_profit_order"] = {"order_type": "market_order",
                                          "stop_price": str(take_profit_price)}
@@ -1604,8 +1675,10 @@ class BrokerClient:
             body["bracket_take_profit_price"] = str(bracket_take_profit_price)
         if bracket_take_profit_limit_price is not None:
             body["bracket_take_profit_limit_price"] = str(bracket_take_profit_limit_price)
-        if bracket_trail_amount is not None:
-            body["bracket_trail_amount"] = str(bracket_trail_amount)
+        signed_bracket_trail = self._delta_trail_amount(bracket_trail_amount, side,
+                                                        opposite_side=True)
+        if signed_bracket_trail is not None:
+            body["bracket_trail_amount"] = signed_bracket_trail
         if bracket_stop_trigger_method is not None:
             body["bracket_stop_trigger_method"] = str(bracket_stop_trigger_method)
         if dry_run:
