@@ -425,6 +425,7 @@ def normalize_balance(payload: Any, source: str, asset: str = None,
         "blocked_margin": None,
         "blocked_margin_reported": None,
         "margin_mode": None,
+        "margin_mode_source": None,
         "reserved_margin": None,
         "unattributed_margin": None,
         "balances_reconciled": None,
@@ -468,6 +469,10 @@ def normalize_balance(payload: Any, source: str, asset: str = None,
         # per-mode buckets instead — the UI can say which of the two it shows.
         out["blocked_margin_reported"] = view["blocked_margin_reported"]
         out["margin_mode"] = view["margin_mode"]
+        # Where that mode came from: the buckets that are actually holding
+        # cash. A flat wallet blocks nothing and so cannot answer this — the
+        # caller then falls back to the account's configured mode.
+        out["margin_mode_source"] = "blocked_margin" if view["margin_mode"] else None
         # Everything the venue is holding back, whichever mode holds it.
         out["used_margin"] = view["blocked_margin"] if rows else None
 

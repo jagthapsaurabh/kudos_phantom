@@ -107,6 +107,14 @@ of all three modes, and the response names which of the two it is
 subtotals (`isolated_margin`, `cross_margin`, `portfolio_blocked`) and every
 individual bucket, per asset as well as for the primary one.
 
+`margin_mode` is inferred from the buckets that are actually holding cash, and
+`margin_mode_source` says so (`blocked_margin`). A **flat** wallet blocks
+nothing and therefore cannot answer which mode the account trades in, so
+`GET /live-account/balance` falls back to the connection's cached
+`account_settings.margin_mode` (`margin_mode_source: "connection_settings"`) —
+read from the database, so the 30-second balance poll costs no API weight. The
+terminal's caption does the same from the snapshot's `account_settings`.
+
 ### Fix 2: reconcile instead of trusting (`broker_account.py`)
 
 ```
@@ -170,15 +178,18 @@ open position.
 
 Regression coverage:
 
-- `backend/test_live_account.py` (269 checks) — cross / isolated / mixed /
+- `backend/test_live_account.py` (272 checks) — cross / isolated / mixed /
   portfolio wallets, `blocked_margin` preferred over the component sum, the sum
   used when `blocked_margin` is absent, unattributed cash reported rather than
   hidden, `meta.net_equity` → `total` + `unrealized_pnl`, Binance
-  reconciliation, risk utilisation per mode, and the HTTP endpoint + snapshot
-  against a mock exchange that now answers like a real cross-margin account.
-- `frontend` (`npm test`, 378 checks) — `BalancePanel` names the cross buckets,
+  reconciliation, risk utilisation per mode, a flat wallet reconciling at zero
+  with the mode taken from the connection's cached settings, and the HTTP
+  endpoint + snapshot against a mock exchange that now answers like a real
+  cross-margin account.
+- `frontend` (`npm test`, 380 checks) — `BalancePanel` names the cross buckets,
   hides empty ones, shows the margin mode, and surfaces unattributed cash; the
-  terminal's Wallet & Margin panel does the same.
+  terminal's Wallet & Margin panel does the same and falls back to the
+  snapshot's configured mode when the wallet is flat.
 
 ## Impact
 

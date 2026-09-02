@@ -119,6 +119,32 @@ check('wallet panel flags margin it cannot attribute to a bucket',
   crossHtml.includes('not attributed to any margin bucket'));
 check('a reconciled wallet shows no warning', !html.includes('not attributed to any margin bucket'));
 
+// A flat wallet blocks nothing, so its buckets cannot name the mode; the
+// snapshot's account_settings (what the venue is configured for) keeps the
+// caption from going quiet on a real account.
+const flatSnapshot = {
+  ...snapshot,
+  balance: {
+    ...snapshot.balance, wallet_balance: 27.52626866, available_balance: 27.52626866,
+    used_margin: 0, blocked_margin: 0, margin_mode: null, cross_margin: 0,
+    isolated_margin: 0, portfolio_blocked: 0, balances_reconciled: true,
+    reserved_margin: 0, unattributed_margin: 0,
+  },
+  risk: {
+    ...snapshot.risk, used_margin: 0, margin_mode: null, balances_reconciled: true,
+    unattributed_margin: 0,
+  },
+  account_settings: { margin_mode: 'cross', margin_family: 'cross' },
+};
+const flatHtml = renderToString(React.createElement(LiveTerminal, {
+  broker: 'Delta', connectionId: 1, snapshot: flatSnapshot, autoRefresh: false,
+}));
+check('a flat wallet still shows the configured margin mode',
+  flatHtml.includes('Margin mode:') && flatHtml.includes('text-gray-300">cross</span>'));
+check('a flat wallet shows no blocked-margin figures and no warning',
+  !flatHtml.includes('cross blocked') && !flatHtml.includes('isolated blocked')
+  && !flatHtml.includes('not attributed to any margin bucket'));
+
 check('risk panel', html.includes('Risk') && html.includes('Effective lev') && html.includes('4.01'));
 check('risk flags margin utilisation', html.includes('Margin used') && html.includes('5.98'));
 check('rate-limit panel shows the local windows', html.includes('Rate limits') && html.includes('Per second') && html.includes('20'));

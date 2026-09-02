@@ -4367,6 +4367,17 @@ def live_account_balance(broker: Optional[str] = None, connection_id: Optional[i
         return {"state": "error", "broker": code, "connection_id": cid,
                 "error": balance["error"], "wallet_balance": None,
                 "available_balance": None}
+    # A flat wallet blocks no margin, so it cannot say which mode the account
+    # trades in — and "USD · Delta" with no mode is exactly the panel that made
+    # a cross-margin account look isolated. The connection's cached account
+    # settings know it, and reading them costs no API call.
+    if isinstance(balance, dict) and not balance.get("margin_mode"):
+        connection, _problem = _pick_connection(db, user, code, cid)
+        saved = (_connection_dict(connection).get("account_settings") or {}) if connection else {}
+        configured = saved.get("margin_mode")
+        if configured:
+            balance["margin_mode"] = configured
+            balance["margin_mode_source"] = "connection_settings"
     return {"state": "ok", "broker": code, "connection_id": cid,
             "testnet": bool(getattr(client, "testnet", False)), **balance}
 

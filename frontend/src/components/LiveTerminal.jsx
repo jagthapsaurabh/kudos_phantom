@@ -689,9 +689,12 @@ const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initial
           {/* "Used margin" above is every bucket the venue blocks, in whichever
               margin mode holds it — this says which modes those are, because on
               a cross-margin account the isolated figures are all zero. */}
-          {balance.margin_mode ? (
+          {(balance.margin_mode || (account && account.margin_mode)) ? (
             <div className="mt-2 text-[10px] text-gray-500">
-              Margin mode: <span className="font-bold text-gray-300">{balance.margin_mode}</span>
+              {/* A flat wallet blocks nothing, so it cannot name the mode; the
+                  snapshot's account_settings (what the venue is configured for)
+                  can, and the caption should never go quiet on a real account. */}
+              Margin mode: <span className="font-bold text-gray-300">{balance.margin_mode || account.margin_mode}</span>
               {Number(balance.cross_margin) > 0.001 ? ` · cross blocked ${fmt(balance.cross_margin, 2)}` : ''}
               {Number(balance.isolated_margin) > 0.001 ? ` · isolated blocked ${fmt(balance.isolated_margin, 2)}` : ''}
               {Number(balance.portfolio_blocked) > 0.001 ? ` · portfolio blocked ${fmt(balance.portfolio_blocked, 2)}` : ''}

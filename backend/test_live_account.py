@@ -325,6 +325,16 @@ class Handler(BaseHTTPRequestHandler):
             # flag simulates a deployment whose rows come back without it so
             # the sub-accounts fallback gets exercised.
             uid = None if STATE.get("wallet_no_user_id") else "5112346"
+            if STATE.get("wallet_flat"):
+                # A flat account: nothing blocked anywhere, so the wallet itself
+                # cannot say which margin mode the account is configured for.
+                flat = [{"asset_symbol": "USD", "balance": "1000.00",
+                         "available_balance": "1000.00", "blocked_margin": "0.00",
+                         "cross_position_margin": "0", "cross_commission": "0"}]
+                if uid:
+                    flat[0]["user_id"] = uid
+                return self._send({"success": True, "error": None, "result": flat,
+                                   "meta": {"net_equity": "1000.00"}})
             # This account trades in CROSS margin mode (see /v2/sub_accounts
             # below), and Delta blocks margin per mode: the isolated fields are
             # all zero here while everything withheld sits in the cross_*
@@ -1286,6 +1296,37 @@ check("GET /live-account/balance reports margin blocked in every mode",
 check("GET /live-account/balance carries equity + uPnL instead of null",
       abs(body["total"] - 1003.0) < 1e-9 and abs(body["unrealized_pnl"] - 3.0) < 1e-9,
       r.text[:300])
+
+# A flat wallet blocks no margin, so its buckets cannot name the mode the
+# account trades in. The connection's cached account settings can — read from
+# the database, not the venue, so the 30-second balance poll costs nothing.
+db = SessionLocal()
+delta_conn = db.query(BrokerConnection).filter(
+    BrokerConnection.user_id == TRADER_ID,
+    BrokerConnection.broker_code == "Delta").order_by(BrokerConnection.id).first()
+delta_conn.account_settings = json.dumps({"margin_mode": "cross", "margin_family": "cross"})
+db.commit()
+delta_cid = delta_conn.id
+db.close()
+
+STATE["wallet_flat"] = True
+r = api.get("/live-account/balance", headers=H,
+            params={"broker": "Delta", "connection_id": delta_cid})
+body = r.json()
+check("a flat wallet reconciles at zero used margin",
+      body["state"] == "ok" and body["used_margin"] == 0.0
+      and body["reserved_margin"] == 0.0 and body["balances_reconciled"] is True
+      and abs(body["wallet_balance"] - body["available_balance"]) < 1e-9, r.text[:300])
+check("a flat wallet still reports the account's margin mode",
+      body["margin_mode"] == "cross"
+      and body["margin_mode_source"] == "connection_settings", r.text[:300])
+STATE["wallet_flat"] = False
+r = api.get("/live-account/balance", headers=H,
+            params={"broker": "Delta", "connection_id": delta_cid})
+body = r.json()
+check("with margin blocked, the mode comes from the buckets themselves",
+      body["margin_mode"] == "cross" and body["margin_mode_source"] == "blocked_margin"
+      and abs(body["used_margin"] - 60.0) < 1e-9, r.text[:300])
 
 # Connections are saved with the account details the venue just reported —
 # per connection, because each sub-account has its own margin mode.
