@@ -142,18 +142,24 @@ client._instrument_cache["BTCUSD"] = {"product_id": 27, "contract_value": 0.001}
 with_trail = client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100.0,
                                         take_profit_price=200.0, trail_amount=15.0,
                                         size_in_btc=False, dry_run=True)
-sl = with_trail["body"]["stop_loss_order"]
-check("trailing leg sends trail_amount", sl.get("trail_amount") == "15.0", str(sl))
-check("trailing leg omits stop_price", "stop_price" not in sl, str(sl))
-check("take-profit leg is untouched",
-      with_trail["body"]["take_profit_order"].get("stop_price") == "200.0", str(with_trail["body"]))
+body = with_trail["body"]
+check("entry bracket goes to POST /v2/orders (bracket_* on the entry order)",
+      with_trail.get("path") == "/v2/orders", str(with_trail)[:200])
+check("trailing bracket sends bracket_trail_amount",
+      body.get("bracket_trail_amount") == "15.0", str(body))
+check("trailing bracket omits bracket_stop_loss_price",
+      "bracket_stop_loss_price" not in body, str(body))
+check("take-profit is untouched",
+      body.get("bracket_take_profit_price") == "200.0", str(body))
 
 no_trail = client.place_bracket_order("BTCUSD", "buy", 10, stop_loss_price=100.0,
                                       take_profit_price=200.0, size_in_btc=False,
                                       dry_run=True)
-sl2 = no_trail["body"]["stop_loss_order"]
-check("without a trail the fixed stop is sent", sl2.get("stop_price") == "100.0", str(sl2))
-check("without a trail there is no trail_amount", "trail_amount" not in sl2, str(sl2))
+body2 = no_trail["body"]
+check("without a trail the fixed stop is sent",
+      body2.get("bracket_stop_loss_price") == "100.0", str(body2))
+check("without a trail there is no trail_amount",
+      "bracket_trail_amount" not in body2, str(body2))
 
 # ---------------------------------------------------------------------------
 print("\n== Delta is the default broker ==", flush=True)
@@ -267,6 +273,203 @@ check("after a restart it becomes resumable", spec is not None)
 check("the spec carries the broker", spec and spec["data_source"] == "Delta", str(spec)[:200])
 check("the spec carries the connection", spec and spec["connection_id"] == 2)
 check("the spec carries the feed", spec and spec["price_feed"] == "websocket")
+
+# ---------------------------------------------------------------------------
+print("\n== honesty: intra-candle stops trigger; both-hit books the STOP ==", flush=True)
+# A stop pierced INSIDE a candle used to be survived when the close recovered
+# — profits a venue-side stop order would never have allowed. The engine now
+# hands the candle's high/low to the OMS, and when both the stop and the
+# target sit inside one bar the STOP fills (worst case, never the best).
+from datetime import datetime as _dt
+from app.services.order_manager import OrderManager
+from app.core.strategy import PhantomV2Config as _Cfg
+
+_oms = OrderManager(_Cfg())
+_t = _oms.create_order("BTCUSDT", 1, 100000, atr_usd=1000, timestamp=_dt(2026, 8, 1),
+                       margin_inr=25000, conversion_rate=85.0)
+_sl, _tp = _t.sl, _t.tp
+# Close recovers above the stop, but the LOW pierced it.
+_r = _oms.update_trade("BTCUSDT", _sl + 500, _t.atr_at_entry, _dt(2026, 8, 2),
+                       bar_high_usd=_sl + 600, bar_low_usd=_sl - 1)
+check("a stop pierced inside the candle closes the trade",
+      _r is not None and _r.exit_reason == "SL", getattr(_r, "exit_reason", None))
+check("the stop fills at the stop level, not the friendlier close",
+      _r is not None and abs(_r.exit_price - _sl) < 1e-9,
+      f"{getattr(_r, 'exit_price', None)} vs {_sl}")
+
+_oms2 = OrderManager(_Cfg())
+_t2 = _oms2.create_order("BTCUSDT", 1, 100000, atr_usd=1000, timestamp=_dt(2026, 8, 1),
+                         margin_inr=25000, conversion_rate=85.0)
+# One violent candle spans BOTH the stop and the target.
+_r2 = _oms2.update_trade("BTCUSDT", 100000, _t2.atr_at_entry, _dt(2026, 8, 2),
+                         bar_high_usd=_t2.tp + 1, bar_low_usd=_t2.sl - 1)
+check("when one candle spans SL and TP, the STOP is booked (never the best case)",
+      _r2 is not None and _r2.exit_reason == "SL", getattr(_r2, "exit_reason", None))
+
+_oms3 = OrderManager(_Cfg())
+_t3 = _oms3.create_order("BTCUSDT", -1, 100000, atr_usd=1000, timestamp=_dt(2026, 8, 1),
+                         margin_inr=25000, conversion_rate=85.0)
+_r3 = _oms3.update_trade("BTCUSDT", _t3.sl - 500, _t3.atr_at_entry, _dt(2026, 8, 2),
+                         bar_high_usd=_t3.sl + 1, bar_low_usd=_t3.sl - 600)
+check("a short's stop pierced by the candle HIGH closes too",
+      _r3 is not None and _r3.exit_reason == "SL", getattr(_r3, "exit_reason", None))
+
+_oms4 = OrderManager(_Cfg())
+_t4 = _oms4.create_order("BTCUSDT", 1, 100000, atr_usd=1000, timestamp=_dt(2026, 8, 1),
+                         margin_inr=25000, conversion_rate=85.0)
+_r4 = _oms4.update_trade("BTCUSDT", 100000, _t4.atr_at_entry, _dt(2026, 8, 2))
+check("live/paper ticks without candle extremes behave exactly as before",
+      _r4 is None and "BTCUSDT" in _oms4.active_trades)
+
+# ---------------------------------------------------------------------------
+print("\n== honesty: no NEW trades on stale candles (live and paper) ==", flush=True)
+# The candle fetch falls back to seeded/stored data when the venue feed is
+# down. A worker that keeps opening trades on that data manufactures results
+# real trading can never see — live it would place REAL orders sized from a
+# market that no longer exists.
+import numpy as _np
+import pandas as _pd
+from datetime import timedelta as _tdelta
+from app.services.live_trader import LiveTradeService
+from app.services.paper_trader import PaperTradeService
+
+
+class _AlwaysLong:
+    def generate_signals(self, df_1h, df_4h):
+        return _np.ones(len(df_1h), dtype=int)
+
+
+def _frames(hours_old):
+    end = _pd.Timestamp.utcnow().tz_localize(None).floor("h") - _tdelta(hours=hours_old)
+    idx = _pd.date_range(end - _tdelta(hours=119), end, freq="1h")
+    close = _np.full(len(idx), 60000.0)
+    return _pd.DataFrame({"open": close, "high": close + 30, "low": close - 30,
+                          "close": close, "volume": 10.0}, index=idx)
+
+
+async def _held(self):
+    # Test stand-in for the credentials gate: always hold, so a "fresh" live
+    # tick proves the STALE gate let it through without touching a venue.
+    return True
+
+
+def _gated_worker(cls, hours_old):
+    if cls is LiveTradeService:
+        svc = cls("StaleTest", _Cfg(), "test-key", "test-secret",
+                  initial_capital=20000, margin_pct=25, broker_name="Binance",
+                  bracket_orders=False)
+        svc._hold_for_credentials = _held.__get__(svc)
+    else:
+        svc = cls("StaleTest", _Cfg(), initial_capital=20000, margin_pct=25,
+                  market_source="Binance")
+    svc.strategy = _AlwaysLong()
+    # A fresh mark price is available, so the stale gate exercises its deeper
+    # path: manage open positions on the live mark, but still hold entries.
+    from types import SimpleNamespace as _NS
+    svc.use_mark_price = True
+    svc._fetch_candles = lambda interval, limit: _frames(hours_old)
+    svc._fetch_mark_price = lambda: _NS(mark_price=60000.0, last_price=60000.0)
+    return svc
+
+
+for cls, name in ((LiveTradeService, "live"), (PaperTradeService, "paper")):
+    stale = _gated_worker(cls, hours_old=30)
+    asyncio.run(stale.tick())
+    check(f"{name}: 30h-old candles open NOTHING",
+          not stale.oms.active_trades, str(list(stale.oms.active_trades)))
+    check(f"{name}: the hold is visible, not silent",
+          bool(stale.candles_stale) and "old" in str(stale.last_skip_reason or ""),
+          str(stale.last_skip_reason))
+    check(f"{name}: the skipped-entry counter moved",
+          int(getattr(stale, "skipped_entries", 0)) >= 1,
+          str(getattr(stale, "skipped_entries", None)))
+    fresh = _gated_worker(cls, hours_old=0)
+    asyncio.run(fresh.tick())
+    check(f"{name}: fresh candles are not blocked by the gate",
+          not fresh.candles_stale, str(fresh.last_skip_reason))
+
+check("the stale gate names its threshold in the reason",
+      "limit 3" in str(_gated_worker(LiveTradeService, 30)._candles_stale(
+          _pd.Timestamp.utcnow().tz_localize(None) - _tdelta(hours=30))))
+
+# ---------------------------------------------------------------------------
+print("\n== honesty: paper candles come from the venue, never the DB ==", flush=True)
+# The stored-candle fallback is gone entirely: a paper session either sees
+# the venue's live feed or sees nothing and says so. Replaying seeded
+# history while presenting itself as live is exactly the 'simulation'
+# this platform must not do.
+svc_nofb = PaperTradeService("NoFallback", _Cfg(), initial_capital=20000,
+                             margin_pct=25, market_source="Binance")
+check("the DB-candle reader is gone from the paper worker",
+      not hasattr(svc_nofb, "_get_data_from_db"))
+
+
+class _DeadVenue:
+    def __init__(self, *a, **k):
+        pass
+
+    def fetch_klines(self, *a, **k):
+        raise ConnectionError("venue unreachable")
+
+
+_real_broker_client = pt.BrokerClient
+pt.BrokerClient = _DeadVenue
+try:
+    got = svc_nofb._fetch_candles("1h", 50)
+finally:
+    pt.BrokerClient = _real_broker_client
+check("a dead venue feed yields NO candles instead of stored history", got is None)
+
+# ---------------------------------------------------------------------------
+print("\n== admin-controlled USD→INR rate ==", flush=True)
+from app.database.models import init_db
+init_db()
+import app.services.app_settings as app_settings
+from app.services.app_settings import get_usd_inr_rate, set_usd_inr_rate, usd_inr_setting
+
+_saved_env = os.environ.pop("USD_INR_RATE", None)
+try:
+    r, src, _ = usd_inr_setting()
+    check("no admin value, no env -> built-in default", r == 85.0 and src == "default", f"{r} {src}")
+
+    os.environ["USD_INR_RATE"] = "90.5"
+    r, src, _ = usd_inr_setting()
+    check("env var beats the default", r == 90.5 and src == "env", f"{r} {src}")
+
+    set_usd_inr_rate(88.25)
+    r, src, _ = usd_inr_setting()
+    check("admin-saved value beats the env var", r == 88.25 and src == "admin", f"{r} {src}")
+
+    for bad in (8.5, 8500, 0, -85, "abc"):
+        try:
+            set_usd_inr_rate(bad)
+            check(f"insane rate {bad!r} rejected", False, "no error raised")
+        except ValueError:
+            check(f"insane rate {bad!r} rejected", True)
+
+    svc_rate = PaperTradeService("RateTest", _Cfg(), initial_capital=20000,
+                                 margin_pct=25, market_source="Binance")
+    check("a new paper worker starts with the admin rate",
+          svc_rate.conversion_rate == 88.25, str(svc_rate.conversion_rate))
+
+    import app.main as main_mod
+    main_mod.paper_trade_instances["_rate_test"] = svc_rate
+    try:
+        out = main_mod.update_usd_inr(main_mod.UsdInrPayload(rate=86.0), admin=None)
+        check("admin endpoint saves and reports the rate", out["rate"] == 86.0, str(out))
+        check("admin endpoint updates RUNNING sessions",
+              svc_rate.conversion_rate == 86.0 and out["applied_to_running"] >= 1,
+              f"{svc_rate.conversion_rate} / {out.get('applied_to_running')}")
+        got = main_mod.get_usd_inr(admin=None)
+        check("admin endpoint reads back the saved rate",
+              got["rate"] == 86.0 and got["source"] == "admin", str(got))
+    finally:
+        main_mod.paper_trade_instances.pop("_rate_test", None)
+finally:
+    if _saved_env is not None:
+        os.environ["USD_INR_RATE"] = _saved_env
+    else:
+        os.environ.pop("USD_INR_RATE", None)
 
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 62)

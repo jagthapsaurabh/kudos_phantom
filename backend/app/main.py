@@ -217,21 +217,66 @@ def resolve_use_mark_price(payload, user) -> bool:
     return True if value is None else bool(value)
 
 
-PRICE_FEED_MODES = ("off", "websocket", "rest")
+PRICE_FEED_MODES = ("auto", "off", "websocket", "rest")
 # A sub-second interval buys nothing — entries wait for a closed 1h candle —
 # and on the REST feed it would burn the shared rate-limit budget for no gain.
 MIN_TICK_INTERVAL = 1.0
 MAX_TICK_INTERVAL = 60.0
 
 
+def _resolve_sizing(payload, user):
+    """Capital and margin % resolved with the mistakes a human makes refused.
+
+    Both fields come straight from a form. Historically they were cast and
+    trusted, so ``initial_capital: -5000`` or ``margin_pct: 2500`` started an
+    instance that either never trades (order size computes to zero — the card
+    just sits at 0 trades forever) or has its very first order bounced by the
+    venue for insufficient margin. A wrong number must be refused AT START,
+    with a message naming the field, not discovered days later.
+    """
+    import math
+
+    def _field(value, name, upper, unit):
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must be a number, got {value!r}")
+        # A cleared form field arrives as 0 and has always meant "use the
+        # account default" — keep that. Everything else wrong is refused.
+        if number == 0:
+            return None
+        if not math.isfinite(number) or number < 0:
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must be a positive number, got {value}")
+        if number > upper:
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must be at most {upper:g}{unit}, got {number:g}")
+        return number
+
+    capital = _field(payload.initial_capital, "initial_capital", 1e9, " INR")
+    margin_pct = _field(payload.margin_pct, "margin_pct", 100.0, "%")
+    if capital is None:
+        capital = float(user.initial_capital or 20000.0)
+    if margin_pct is None:
+        margin_pct = float(user.margin_deployment_pct or 25.0)
+    return capital, margin_pct
+
+
 def _resolve_price_feed(payload):
     """Validate the live-price-feed request into ``(mode, interval)``.
 
-    Rejects a bad mode rather than silently falling back: a client asking for
-    websocket exits and quietly getting the 60-second cadence would believe a
-    stop is being watched continuously when it is not.
+    Omitted means ``auto`` — the operator is a trader, not a network engineer:
+    the worker takes the venue websocket and fails over to REST polling by
+    itself, so nobody has to know what either word means. The explicit modes
+    stay accepted for power users and old clients. A *bad* mode is rejected
+    rather than silently downgraded: a client asking for websocket exits and
+    quietly getting the 60-second cadence would believe a stop is being
+    watched continuously when it is not.
     """
-    mode = str(getattr(payload, "price_feed", None) or "off").strip().lower()
+    mode = str(getattr(payload, "price_feed", None) or "auto").strip().lower()
     if mode not in PRICE_FEED_MODES:
         raise HTTPException(
             status_code=400,
@@ -913,6 +958,54 @@ def update_fee_setting(fee_id: int, payload: FeeSettingPayload, admin=Depends(re
     row.enabled = int(payload.enabled); row.updated_at = datetime.utcnow()
     db.commit(); db.refresh(row)
     return _fee_dict(row)
+
+
+# ------------------------------------------------------------------
+# Platform settings: the USD→INR conversion rate
+# ------------------------------------------------------------------
+class UsdInrPayload(BaseModel):
+    rate: float
+
+
+def _usd_inr_dict():
+    from .services.app_settings import usd_inr_setting, USD_INR_MIN, USD_INR_MAX
+    rate, source, updated_at = usd_inr_setting()
+    return {
+        "rate": rate,
+        # 'admin' when saved from the panel, 'env' for USD_INR_RATE, else
+        # 'default' — so the UI can say whether anyone actually chose this.
+        "source": source,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "min": USD_INR_MIN,
+        "max": USD_INR_MAX,
+    }
+
+
+@app.get('/admin/settings/usd-inr')
+def get_usd_inr(admin=Depends(require_admin)):
+    return _usd_inr_dict()
+
+
+@app.put('/admin/settings/usd-inr')
+def update_usd_inr(payload: UsdInrPayload, admin=Depends(require_admin)):
+    from .services.app_settings import set_usd_inr_rate
+    try:
+        rate = set_usd_inr_rate(payload.rate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    # Running workers pick the new rate up immediately: it is the CURRENT
+    # market fact used to convert margin and PnL from here on. Trades already
+    # closed keep the numbers they were booked with.
+    applied = 0
+    for svc in list(paper_trade_instances.values()) + list(live_trade_instances.values()):
+        try:
+            svc.conversion_rate = rate
+            applied += 1
+        except Exception:
+            pass
+    out = _usd_inr_dict()
+    out["applied_to_running"] = applied
+    return out
 
 
 class BrokerConnectionPayload(BaseModel):
@@ -2025,15 +2118,21 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
                         self.validator_service = ValidatorService()
                         from .services.order_manager import OrderManager
                         self.oms = OrderManager(self.config)
-                    def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None):
+                    def run(self, symbol="BTCUSDT", initial_capital_inr=20000, start_date=None, end_date=None, conversion_rate=None):
                         original_engine = BacktestEngine(self.config, fee_schedule=fees, data_source=source)
                         original_engine.strategy_service = self.strategy_service
+                        from .services.app_settings import get_usd_inr_rate
+                        rate = float(conversion_rate) if conversion_rate else get_usd_inr_rate()
                         # NOTE: pass by keyword - the engine signature is
                         # run(symbol, initial_capital_inr, conversion_rate, start_date, end_date, ...)
-                        return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, start_date=start_date, end_date=end_date)
+                        return original_engine.run(symbol=symbol, initial_capital_inr=initial_capital_inr, conversion_rate=rate, start_date=start_date, end_date=end_date)
                 engine = DynamicBacktestEngine(payload)
 
-        results = engine.run(symbol="BTCUSDT", initial_capital_inr=capital, start_date=start_date_str, end_date=end_date_str)
+        # The same admin-controlled USD->INR rate the workers use, so a
+        # backtest's rupee figures line up with what paper/live would report.
+        from .services.app_settings import get_usd_inr_rate
+        results = engine.run(symbol="BTCUSDT", initial_capital_inr=capital, conversion_rate=get_usd_inr_rate(),
+                             start_date=start_date_str, end_date=end_date_str)
         
         run = db.query(BacktestRun).filter(BacktestRun.id == run_id).first()
         if run:
@@ -2269,7 +2368,9 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         cap = float(req.initial_capital) if req.initial_capital else float(user.initial_capital or 50000.0)
         if cap < 20000:
             cap = 50000.0
+        from .services.app_settings import get_usd_inr_rate
         results = engine.run(symbol=req.symbol, initial_capital_inr=cap,
+                             conversion_rate=get_usd_inr_rate(),
                              start_date=start, end_date=end)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Filter preview error: {str(e)}")
@@ -2418,11 +2519,12 @@ class TradeStartRequest(BaseModel):
     # "Skip new trades" schedule. Omitted → the account default is used.
     # Open positions keep running; only new entries are refused.
     trading_windows: Optional[TradingWindowConfig] = None
-    # Live price feed for exit checks. "off" (default) keeps the original
-    # 60-second cadence; "websocket" subscribes to the venue stream; "rest"
-    # polls the mark-price endpoint. Only exits speed up — entries still wait
-    # for a closed 1h candle either way.
-    price_feed: str = 'off'
+    # Live price feed for exit checks. "auto" (default) takes the venue
+    # websocket and fails over to REST polling by itself — no transport
+    # decision for the operator. "off" keeps the original 60-second cadence;
+    # "websocket" / "rest" force one transport (power users / old clients).
+    # Only exits speed up — entries still wait for a closed 1h candle.
+    price_feed: str = 'auto'
     tick_interval: float = 5.0
     # Deadman switch (Delta Exchange India). None = ON for Delta, OFF otherwise.
     heartbeat: Optional[bool] = None
@@ -2506,7 +2608,13 @@ def running_conflict(mode, user, strategy_id, source, connection):
             continue
         if _instance_account_identity(service, user.id) != wanted:
             continue
-        if not getattr(service, "is_running", False):
+        # `is_running` is flipped by the background task, which runs AFTER the
+        # start response is sent — a double-clicked Start button would pass
+        # this check twice and put two workers on one netted position. An
+        # instance that is registered but not yet started (`pending_start`)
+        # blocks a duplicate exactly like a running one.
+        if not (getattr(service, "is_running", False)
+                or getattr(service, "pending_start", False)):
             continue
         return key, service
     return None
@@ -2595,8 +2703,17 @@ def start_paper_trade(
                             detail=_conflict_detail('paper', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'paper')
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
-    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
-    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+    capital, margin_pct = _resolve_sizing(payload, user)
+    # Paper is the rehearsal for live: a leverage or margin mode the venue
+    # would refuse must be refused here too, not silently simulated so the
+    # mistake only surfaces on the first real order.
+    try:
+        if payload.leverage is not None:
+            payload.leverage = int(validate_leverage(payload.leverage))
+        if payload.margin_mode is not None:
+            payload.margin_mode = validate_margin_mode(payload.margin_mode)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
     strategy_id = str(payload.strategy_id)
     strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
@@ -2656,6 +2773,8 @@ def start_paper_trade(
     service.user_id = user.id
     service.auto_resume = bool(payload.auto_resume if payload.auto_resume is not None else True)
     session_id = paper_history.start_session(user.id, instance_key, service)
+    # Blocks a double-clicked Start until the background task flips is_running.
+    service.pending_start = True
     paper_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Paper trade started", "instance_key": instance_key, "strategy_id": strategy_id,
@@ -2908,6 +3027,9 @@ def get_paper_status(user=Depends(get_current_user)):
                 # running. Surfaced so "why is it not trading?" is answerable.
                 "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
                 "last_skip_reason": getattr(service, 'last_skip_reason', None),
+                # Data honesty: true while the candle set is too old to open
+                # trades on (venue feed down / stored fallback being served).
+                "candles_stale": bool(getattr(service, 'candles_stale', False)),
                 "price_feed": {
                     "mode": getattr(service, "price_feed_mode", "off"),
                     "tick_interval": getattr(service, "tick_interval", 60.0),
@@ -2932,11 +3054,13 @@ def get_paper_logs(instance_key: str, user=Depends(get_current_user)):
 def _benign_risk_rejection(error) -> bool:
     """Venue answers that mean "already set that way", not a refusal.
 
-    Binance answers ``-4046: No need to change margin type`` when the account
+    Binance answers ``-4046: No need to change margin type`` and Delta
+    answers ``HTTP 400 {"code": "same_margin_mode"}`` when the account
     already is in the requested mode — confirmation, not a failure; refusing
     the start over it would block every idempotent restart.
     """
-    return "no need to change" in str(error or "").lower()
+    text = str(error or "").lower()
+    return "no need to change" in text or "same_margin_mode" in text
 
 
 # --- LIVE TRADING ---
@@ -2957,8 +3081,7 @@ def start_live_trade(
     fees = resolve_fees(db, source, 'live')
     config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
     strategy_id = payload.strategy_id
-    capital = float(payload.initial_capital) if payload.initial_capital else float(user.initial_capital or 20000.0)
-    margin_pct = float(payload.margin_pct) if payload.margin_pct else float(user.margin_deployment_pct or 25.0)
+    capital, margin_pct = _resolve_sizing(payload, user)
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
@@ -3079,6 +3202,8 @@ def start_live_trade(
     service.user_id = user.id
     service.account_label_for_history = account_label
     session_id = paper_history.start_session(user.id, instance_key, service)
+    # Blocks a double-clicked Start until the background task flips is_running.
+    service.pending_start = True
     live_trade_instances[instance_key] = service
     background_tasks.add_task(service.start)
     return {"status": "Live trade started", "session_id": session_id, "instance_key": instance_key, "broker_name": source,
@@ -3362,6 +3487,9 @@ def get_live_status(user=Depends(get_current_user)):
                 # a post-exit cooldown is running.
                 "skipped_entries": int(getattr(service, 'skipped_entries', 0) or 0),
                 "last_skip_reason": getattr(service, 'last_skip_reason', None),
+                # Data honesty: true while the candle set is too old to open
+                # trades on (venue feed down / stored fallback being served).
+                "candles_stale": bool(getattr(service, 'candles_stale', False)),
                 # Shared account: how many live runs point at this same API key.
                 # They share ONE netted position per contract, so they take
                 # turns — surfaced here so "why is my strategy idle?" is

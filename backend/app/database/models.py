@@ -178,6 +178,20 @@ class FeeSetting(Base):
     __table_args__ = (UniqueConstraint('broker_code', 'mode', name='uq_fee_broker_mode'),)
 
 
+class AppSetting(Base):
+    """Tiny key/value store for platform-wide admin settings.
+
+    First user: the USD→INR conversion rate every worker prices margin and
+    PnL with. A row here beats the ``USD_INR_RATE`` environment variable,
+    which in turn beats the built-in default — so the admin can correct the
+    rate from the panel without touching the server.
+    """
+    __tablename__ = 'app_settings'
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 class Klines(Base):
     __tablename__ = 'klines'
     id = Column(Integer, primary_key=True)

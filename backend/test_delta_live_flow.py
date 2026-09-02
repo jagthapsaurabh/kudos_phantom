@@ -246,28 +246,31 @@ payload = rec.place_bracket_order(
     stop_loss_price=59000, take_profit_price=62000,
     trail_amount=250.5, size_in_btc=True)
 call = CAPTURE2["calls"][-1]
-sl = (call["body"] or {}).get("stop_loss_order") or {}
-check("bracket posts to /v2/orders/bracket",
-      call["method"] == "POST" and call["path"] == "/v2/orders/bracket", call)
-# Delta rejects a bracket SL leg carrying BOTH stop_price and trail_amount
-# ("Only stop_price or trail_amount should be specified for bracket stop loss
-# order"), which failed every entry on a trailing strategy. The trail wins.
-check("trail_amount is a string on the SL leg",
-      sl.get("trail_amount") == "250.5", sl)
-check("a trailing SL leg omits stop_price (Delta bad_schema)",
-      "stop_price" not in sl, sl)
+body = call["body"] or {}
+# Delta's POST /v2/orders/bracket only ATTACHES TP/SL to an existing position
+# and answers no_open_position otherwise — the entry must be POST /v2/orders
+# with the bracket_* fields on the order itself (CreateOrderRequest).
+check("entry bracket posts to /v2/orders (not the attach-only /v2/orders/bracket)",
+      call["method"] == "POST" and call["path"] == "/v2/orders", call)
+# Delta rejects a bracket SL carrying BOTH bracket_stop_loss_price and
+# bracket_trail_amount ("Required if bracket stop price is empty"), which
+# failed every entry on a trailing strategy. The trail wins.
+check("trail_amount is a string bracket_trail_amount on the entry",
+      body.get("bracket_trail_amount") == "250.5", body)
+check("a trailing bracket omits bracket_stop_loss_price (Delta bad_schema)",
+      "bracket_stop_loss_price" not in body, body)
 
 # Without a trail distance the fixed stop is still sent, as a string.
 rec.place_bracket_order("BTCUSDT", "buy", 0.01, price=None,
                         stop_loss_price=59000, take_profit_price=62000,
                         size_in_btc=True)
-sl_fixed = (CAPTURE2["calls"][-1]["body"] or {}).get("stop_loss_order") or {}
-check("SL stop_price is a string (decimal gotcha)",
-      sl_fixed.get("stop_price") == "59000", sl_fixed)
-check("a fixed SL leg carries no trail_amount", "trail_amount" not in sl_fixed, sl_fixed)
-check("TP stop_price is a string",
-      (call["body"] or {}).get("take_profit_order", {}).get("stop_price") == "62000",
-      call["body"])
+body_fixed = CAPTURE2["calls"][-1]["body"] or {}
+check("without a trail the fixed bracket_stop_loss_price is a string (decimal gotcha)",
+      body_fixed.get("bracket_stop_loss_price") == "59000", body_fixed)
+check("a fixed bracket carries no bracket_trail_amount",
+      "bracket_trail_amount" not in body_fixed, body_fixed)
+check("bracket_take_profit_price is a string",
+      body.get("bracket_take_profit_price") == "62000", body)
 check("bracket is flagged native", payload.get("_bracket") is True)
 
 rec.edit_bracket_order(42, symbol="BTCUSDT", stop_loss_price=59100, trail_amount=180)

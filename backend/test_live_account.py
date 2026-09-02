@@ -210,6 +210,12 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "bad_schema", "context": {"schema_errors": [
                         {"code": "validation_error",
                          "message": "margin_mode change is disabled for this account", "param": ""}]}}}, 400)
+            if STATE.get("same_margin_mode"):
+                # Production behaviour: Delta answers HTTP 400
+                # {"code": "same_margin_mode"} when the account is ALREADY in
+                # the requested mode — a confirmation, not a refusal.
+                return self._send({"success": False,
+                                   "error": {"code": "same_margin_mode"}}, 400)
             # Production behaviour (the reported bug): the venue requires
             # subaccount_user_id even for the key's own account.
             if not (body or {}).get("subaccount_user_id"):
@@ -238,21 +244,33 @@ class Handler(BaseHTTPRequestHandler):
                 stop_order_type=body.get("stop_order_type"),
                 stop_trigger_method=body.get("stop_trigger_method"),
                 client_order_id=body.get("client_order_id"),
-                limit_price=body.get("limit_price"))))
+                limit_price=body.get("limit_price"),
+                # Entry-order bracket: the venue echoes the bracket_* fields
+                # back on the created order (docs.delta.exchange).
+                **{k: body.get(k) for k in (
+                    "bracket_stop_loss_price", "bracket_stop_loss_limit_price",
+                    "bracket_take_profit_price", "bracket_take_profit_limit_price",
+                    "bracket_trail_amount", "bracket_stop_trigger_method")
+                   if body.get(k) is not None})))
         if path == "/v2/orders/bracket" and method == "POST":
-            entry = _delta_order(size=body.get("size"), side=body.get("side"),
-                                 client_order_id=body.get("client_order_id"))
-            legs = []
+            # Production behaviour (the reported bug): this endpoint only
+            # ATTACHES a TP/SL pair to an EXISTING position. An entry-shaped
+            # body (size/side) proves the caller tried to OPEN a position
+            # here — Delta answers exactly like the live venue did, so any
+            # regression fails the suite the way it failed in production.
+            if (body or {}).get("size") or (body or {}).get("side"):
+                return self._send({"success": False,
+                                   "error": {"code": "no_open_position"}}, 400)
+            legs = {}
             if body.get("stop_loss_order"):
-                legs.append(_delta_order(size=body.get("size"), side="sell",
-                                         stop_price=body["stop_loss_order"].get("stop_price"),
-                                         stop_order_type="stop_loss_order"))
+                legs["stop_loss_order"] = _delta_order(
+                    side="sell", stop_price=body["stop_loss_order"].get("stop_price"),
+                    stop_order_type="stop_loss_order")
             if body.get("take_profit_order"):
-                legs.append(_delta_order(size=body.get("size"), side="sell",
-                                         stop_price=body["take_profit_order"].get("stop_price"),
-                                         stop_order_type="take_profit_order"))
-            return self._send(self._delta({"entry_order": entry, "stop_loss_order": legs[0] if legs else None,
-                                           "take_profit_order": legs[1] if len(legs) > 1 else None}))
+                legs["take_profit_order"] = _delta_order(
+                    side="sell", stop_price=body["take_profit_order"].get("stop_price"),
+                    stop_order_type="take_profit_order")
+            return self._send(self._delta(legs or {"error": "no legs"}))
         if path == "/v2/orders" and method == "GET":
             return self._send(self._delta([
                 _delta_order(state="open", order_type="limit_order", limit_price="60000"),
@@ -691,11 +709,19 @@ check("Delta stop-limit stays a limit order with both prices",
 STATE["requests"].clear()
 bracket = delta.place_bracket_order("BTCUSDT", "buy", 0.03, stop_loss_price=65000.0,
                                     take_profit_price=70000.0, size_in_btc=True)
-sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders/bracket"][-1]
-check("Delta uses the native bracket endpoint", sent is not None)
-check("bracket carries both protection legs",
-      sent["body"]["stop_loss_order"]["stop_price"] == "65000.0"
-      and sent["body"]["take_profit_order"]["stop_price"] == "70000.0", str(sent["body"]))
+# Delta's POST /v2/orders/bracket only attaches TP/SL to an EXISTING position
+# (it answers no_open_position otherwise) — the entry must go to POST
+# /v2/orders with the bracket_* fields on the order itself.
+sent = [r for r in STATE["requests"]
+        if r["path"] == "/v2/orders" and r["method"] == "POST"][-1]
+check("Delta entry bracket goes through POST /v2/orders (not the attach-only endpoint)",
+      sent is not None and not any(r["path"] == "/v2/orders/bracket"
+                                   for r in STATE["requests"]),
+      str([r["path"] for r in STATE["requests"]]))
+check("bracket carries both protection prices on the entry order",
+      sent["body"].get("bracket_stop_loss_price") == "65000.0"
+      and sent["body"].get("bracket_take_profit_price") == "70000.0"
+      and sent["body"].get("bracket_stop_trigger_method") == "mark_price", str(sent["body"]))
 check("bracket size is in contracts", sent["body"].get("size") == 30, str(sent["body"]))
 check("bracket result is flagged", bracket.get("_bracket") is True, str(bracket)[:200])
 
@@ -1177,7 +1203,9 @@ check("POST /live-account/orders places a bracket in BTC",
 check("client order id generated for tracking", body["client_order_id"].startswith("ph-"),
       str(body.get("client_order_id")))
 check("placed orders are mirrored locally", len(body["orders"]) >= 1, str(body["orders"])[:200])
-sent = [x for x in STATE["requests"] if x["path"] == "/v2/orders/bracket"][-1]
+sent = [x for x in STATE["requests"]
+        if x["path"] == "/v2/orders" and x["method"] == "POST"
+        and (x["body"] or {}).get("bracket_take_profit_price")][-1]
 check("BTC size reached the exchange as contracts", sent["body"]["size"] == 30, str(sent["body"]))
 check("rate limits returned with the order ack", "limits" in body["rate_limits"])
 
@@ -1391,15 +1419,121 @@ try:
     finally:
         main._live_client = _orig_client
 
-    # 4. Binance-style "already set that way" answers are NOT refusals.
+    # 4. Binance/Delta "already set that way" answers are NOT refusals.
     check("idempotent venue answers are not treated as refusals",
           main._benign_risk_rejection("Binance HTTP 400: No need to change margin type.")
+          and main._benign_risk_rejection('Delta HTTP 400: {"code": "same_margin_mode"}')
           and not main._benign_risk_rejection("Delta HTTP 400: bad_schema"))
+
+    # 5. The reported bug: Delta answers HTTP 400 {"code": "same_margin_mode"}
+    # when the account is ALREADY in the requested mode. That is a
+    # confirmation, not a refusal — the start must go ahead.
+    STATE["fail_margin_mode"] = False
+    STATE["same_margin_mode"] = True
+    STATE["legacy_margin_mode_gone"] = True
+    STATE["requests"].clear()
+    try:
+        r = api.post("/live-trade/start", headers=H, json={
+            "strategy_id": "PhantomV2", "broker_name": "Delta",
+            "data_source": "Delta", "margin_mode": "isolated"})
+        body = r.json()
+        check("Delta same_margin_mode (already in that mode) does NOT refuse the start",
+              r.status_code == 200 and body.get("status") == "Live trade started",
+              f"{r.status_code} {r.text[:300]}")
+        started_key = body.get("instance_key") if r.status_code == 200 else None
+        check("the same_margin_mode instance is registered as running",
+              started_key in main.live_trade_instances, str(started_key))
+        legacy_calls = [x for x in STATE["requests"]
+                        if x["path"] == "/v2/positions/margin_mode"]
+        check("same_margin_mode is accepted without falling back to the legacy endpoint",
+              not legacy_calls, str(legacy_calls)[:200])
+        main.live_trade_instances.pop(started_key, None)
+        # And the client itself reports it as success, not an error — so the
+        # bulk apply / sync paths count it as ok too.
+        mm_res = delta.set_margin_mode("BTCUSD", "isolated")
+        check("BrokerClient.set_margin_mode reports same_margin_mode as ok/unchanged",
+              isinstance(mm_res, dict) and not mm_res.get("error")
+              and mm_res.get("unchanged") is True, str(mm_res)[:200])
+    finally:
+        STATE["same_margin_mode"] = False
+        STATE["legacy_margin_mode_gone"] = False
 finally:
     _BackgroundTasks.add_task = _orig_add_task
     STATE["fail_margin_mode"] = False
+    STATE["same_margin_mode"] = False
     STATE["legacy_margin_mode_gone"] = False
     main.live_trade_instances.clear()
+
+# ===========================================================================
+section("10c. user-mistake inputs are refused AT START, with the field named")
+# ===========================================================================
+# Every field on the start form gets the wrong value a human actually types.
+# Historically a negative capital or a 2500% margin started an instance that
+# either never trades (size computes to zero — the card sits at 0 trades
+# forever) or has its first order bounced by the venue days later.
+_BackgroundTasks.add_task = lambda self, func, *args, **kwargs: None
+try:
+    bad_starts = [
+        ({"initial_capital": -5000}, "initial_capital", "negative capital"),
+        ({"initial_capital": "nan"}, "initial_capital", "NaN capital"),
+        ({"initial_capital": 10**12}, "initial_capital", "absurd capital"),
+        ({"margin_pct": -10}, "margin_pct", "negative margin %"),
+        ({"margin_pct": 2500}, "margin_pct", "margin % above 100"),
+        ({"leverage": 500}, "everage", "leverage above the venue cap"),
+        ({"leverage": 0}, "everage", "zero leverage"),
+        ({"leverage": "ten"}, "everage", "non-numeric leverage"),
+        ({"margin_mode": "yolo"}, "argin", "made-up margin mode"),
+        ({"price_feed": "carrier-pigeon"}, "price_feed", "made-up price feed"),
+        ({"price_feed": "rest", "tick_interval": 0.01}, "tick_interval",
+         "sub-second polling (rate-limit burn)"),
+        ({"price_feed": "rest", "tick_interval": 900}, "tick_interval",
+         "quarter-hour 'live' ticks"),
+    ]
+    for extra, needle, label in bad_starts:
+        for endpoint in ("/live-trade/start", "/paper-trade/start"):
+            r = api.post(endpoint, headers=H, json={
+                "strategy_id": "PhantomV2", "broker_name": "Delta",
+                "data_source": "Delta", **extra})
+            body = r.json()
+            check(f"{endpoint} refuses {label} and names the field",
+                  r.status_code in (400, 422)
+                  and needle in json.dumps(body),
+                  f"{r.status_code} {r.text[:200]}")
+            check(f"{label}: nothing is registered as running ({endpoint})",
+                  not main.live_trade_instances and not main.paper_trade_instances,
+                  str(list(main.live_trade_instances) + list(main.paper_trade_instances)))
+
+    # A cleared form field arrives as 0 and has always meant "use the account
+    # default" — that must keep starting, not turn into a 400.
+    r = api.post("/live-trade/start", headers=H, json={
+        "strategy_id": "PhantomV2", "broker_name": "Delta", "data_source": "Delta",
+        "initial_capital": 0, "margin_pct": 0})
+    check("a cleared capital/margin field falls back to the account default",
+          r.status_code == 200 and r.json().get("status") == "Live trade started",
+          f"{r.status_code} {r.text[:250]}")
+    started = r.json().get("instance_key")
+
+    # The same strategy on the same account cannot be started twice: two
+    # workers would fight over one netted position.
+    r = api.post("/live-trade/start", headers=H, json={
+        "strategy_id": "PhantomV2", "broker_name": "Delta", "data_source": "Delta"})
+    check("a duplicate start of the same strategy is refused (409)",
+          r.status_code == 409, f"{r.status_code} {r.text[:200]}")
+    main.live_trade_instances.pop(started, None)
+
+    # Stopping things that are not yours / not there.
+    r = api.post("/live-trade/stop", headers=H,
+                 params={"instance_key": "live_trader_Delta_PhantomV2_gone9999"})
+    check("stopping a vanished instance is a clean 404", r.status_code == 404,
+          f"{r.status_code} {r.text[:150]}")
+    r = api.post("/live-trade/stop", headers=H,
+                 params={"instance_key": "live_someoneelse_Delta_PhantomV2_x1"})
+    check("stopping another user's instance is refused (403)",
+          r.status_code == 403, f"{r.status_code} {r.text[:150]}")
+finally:
+    _BackgroundTasks.add_task = _orig_add_task
+    main.live_trade_instances.clear()
+    main.paper_trade_instances.clear()
 
 # --- credentials are required ---------------------------------------------
 main._live_client = _original_live_client

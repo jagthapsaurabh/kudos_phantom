@@ -644,7 +644,7 @@ const PaperTrade = () => {
   const [showWindows, setShowWindows] = useState(false);
   // Live ticks for paper exits — same options as Live Trade. Entries still
   // wait for a closed 1h candle either way.
-  const [priceFeed, setPriceFeed] = useState('off');
+  const [priceFeed, setPriceFeed] = useState('auto');
   const [tickInterval, setTickInterval] = useState(5);
   // Sizing leverage for new paper sessions (mirrors the live form so a paper
   // result is comparable with the live run of the same strategy).
@@ -883,20 +883,11 @@ const PaperTrade = () => {
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Exit checks</label>
             <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}
                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
-                    title="How often open paper positions are re-checked against the live price. Entries always wait for a closed 1h candle.">
-              <option value="off">Every 60s (default)</option>
-              <option value="websocket">Live ticks · WebSocket</option>
-              <option value="rest">Live ticks · polling</option>
+                    title="How often open paper positions are re-checked against the live price. Automatic picks the best connection for you and switches by itself if it drops. Entries always wait for a closed 1h candle.">
+              <option value="auto">Automatic (recommended)</option>
+              <option value="off">Basic · every 60s</option>
             </select>
           </div>
-          {priceFeed !== 'off' && (
-            <div className="flex flex-col">
-              <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Tick interval (s)</label>
-              <input type="number" min="1" max="60" step="1" value={tickInterval}
-                     onChange={e => setTickInterval(e.target.value)}
-                     className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white w-20 outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-          )}
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Pricing &amp; windows</label>
             <button onClick={() => setShowWindows(!showWindows)}

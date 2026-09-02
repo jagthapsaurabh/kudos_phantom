@@ -503,6 +503,51 @@ const PaperTab = () => {
   );
 };
 
+// ------------------------------------------------------- USD→INR conversion --
+export const UsdInrCard = () => {
+  const [setting, setSetting] = useState(null);
+  const [rate, setRate] = useState('');
+  const [msg, setMsg] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const load = async () => {
+    try {
+      const s = await fetch(`${API_URL}/admin/settings/usd-inr`, { headers: authHeaders() }).then(r => r.json());
+      if (s && s.rate != null) { setSetting(s); setRate(String(s.rate)); }
+    } catch { /* card shows once the API answers */ }
+  };
+  useEffect(() => { load(); }, []);
+  const save = async () => {
+    setSaving(true); setMsg(null);
+    try {
+      const res = await fetch(`${API_URL}/admin/settings/usd-inr`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ rate: Number(rate) }) });
+      const body = await res.json();
+      if (res.ok) {
+        setSetting(body); setRate(String(body.rate));
+        setMsg({ ok: true, text: `Saved ₹${body.rate}/USD — applied to ${body.applied_to_running ?? 0} running session(s); backtests and new sessions use it from now on.` });
+      } else {
+        setMsg({ ok: false, text: body.detail || 'Save failed' });
+      }
+    } catch { setMsg({ ok: false, text: 'Save failed — is the API reachable?' }); }
+    setSaving(false);
+  };
+  const sourceLabel = setting?.source === 'admin' ? `set from this panel${setting.updated_at ? ` (${setting.updated_at.split('T')[0]})` : ''}`
+    : setting?.source === 'env' ? 'from the USD_INR_RATE environment variable — saving here overrides it'
+    : 'built-in default — nobody has set a rate yet';
+  return <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+    <h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><RefreshCw size={16} className="text-green-400" /> USD → INR conversion rate</h3>
+    <p className="text-xs text-gray-500 mt-2">Every rupee figure on the platform — margin sizing, backtest equity, paper and live PnL — is converted with this rate. Changing it applies immediately to new calculations; already-closed trades keep the numbers they were booked with.</p>
+    <div className="mt-4 flex items-center gap-3 flex-wrap">
+      <span className="text-gray-400 text-sm">₹</span>
+      <input type="number" min={setting?.min ?? 10} max={setting?.max ?? 500} step="0.01" value={rate} onChange={e => setRate(e.target.value)}
+        className="w-32 bg-gray-900 border border-gray-700 rounded p-2 text-sm" aria-label="USD to INR rate" />
+      <span className="text-gray-500 text-xs">per USD</span>
+      <button onClick={save} disabled={saving || !rate} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2 rounded text-xs font-bold flex items-center gap-1"><Save size={12} /> {saving ? 'Saving…' : 'Save rate'}</button>
+      {setting && <span className="text-[11px] text-gray-500">Current source: {sourceLabel}</span>}
+    </div>
+    {msg && <div className={`mt-3 text-xs font-semibold ${msg.ok ? 'text-green-400' : 'text-red-400'}`}>{msg.text}</div>}
+  </div>;
+};
+
 // ------------------------------------------------------------- Fee schedules --
 const FeeSettingsTab = () => {
   const [fees, setFees] = useState([]);
@@ -525,6 +570,7 @@ const FeeSettingsTab = () => {
     if (res.ok) load();
   };
   return <div className="space-y-5 max-w-6xl">
+    <UsdInrCard />
     <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700"><h3 className="text-sm font-bold text-gray-200 uppercase flex items-center gap-2"><Percent size={16} className="text-yellow-400" /> Exchange fee schedules</h3><p className="text-xs text-gray-500 mt-2">These basis-point values are applied to every new backtest, paper session and live session. TP exits use the maker rate; all other fills use the taker rate. Existing runs keep their recorded schedule.</p></div>
     <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden"><div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="bg-gray-900 text-gray-500 text-[10px] uppercase"><tr><th className="p-3">Broker / data</th><th className="p-3">Mode</th><th className="p-3">Taker (bps)</th><th className="p-3">Maker (bps)</th><th className="p-3">Status</th><th className="p-3"></th></tr></thead><tbody>{fees.map(row => <tr key={row.id} className="border-t border-gray-700"><td className="p-3 font-bold text-gray-200">{row.broker_code}</td><td className="p-3"><span className="px-2 py-1 rounded bg-blue-900/30 text-blue-300 text-xs uppercase">{row.mode}</span></td><td className="p-3"><input type="number" min="0" step="0.01" value={row.taker_fee_bps} onChange={e => update(row.id, 'taker_fee_bps', e.target.value)} className="w-28 bg-gray-900 border border-gray-700 rounded p-2" /></td><td className="p-3"><input type="number" min="0" step="0.01" value={row.maker_fee_bps} onChange={e => update(row.id, 'maker_fee_bps', e.target.value)} className="w-28 bg-gray-900 border border-gray-700 rounded p-2" /></td><td className="p-3"><button onClick={() => update(row.id, 'enabled', !row.enabled)} className={`text-[10px] font-bold px-2 py-1 rounded border ${row.enabled ? 'text-green-400 border-green-800 bg-green-900/20' : 'text-gray-500 border-gray-700'}`}>{row.enabled ? 'ACTIVE' : 'DISABLED'}</button></td><td className="p-3"><button onClick={() => save(row)} className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded text-xs font-bold flex items-center gap-1"><Save size={12} /> Save</button></td></tr>)}</tbody></table></div>{fees.length === 0 && <div className="p-8 text-center text-gray-500 text-sm">No schedules found. Restart the API to seed the built-in defaults.</div>}</div>
     {msg && <div className={msg.ok ? 'text-green-400 text-xs font-semibold' : 'text-red-400 text-xs font-semibold'}>{msg.text}</div>}
