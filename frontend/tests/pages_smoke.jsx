@@ -75,7 +75,9 @@ check('flow tab maps the venue symbol difference',
 
 // Backtest must show the new perpetual + window controls.
 const html = renderToString(React.createElement(Backtest));
-check('Backtest shows the perpetual contract', html.includes('BTCUSDT') && html.includes('perpetual'));
+// The app's default venue is Delta, whose BTC perpetual lists as BTCUSD
+// (BTCUSDT is Binance's spelling of the same contract).
+check('Backtest shows the perpetual contract', html.includes('BTCUSD') && html.includes('perpetual'));
 check('Backtest shows the mark-price switch', html.includes('Use mark price'));
 check('Backtest shows the trading windows editor', html.includes('Trading windows'));
 // The preset row only appears once the schedule switch is ON (default OFF,

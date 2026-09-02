@@ -203,7 +203,21 @@ class Handler(BaseHTTPRequestHandler):
                  "margin_mode": "isolated", "is_sub_account": True, "is_kyc_done": True},
             ]))
         if path == "/v2/users/margin_mode" and method == "PUT":
-            return self._send(self._delta({"id": "5112346",
+            if STATE.get("fail_margin_mode"):
+                # The venue refusing the push outright (rate limit, schema
+                # change, permission) — must abort a live start.
+                return self._send({"success": False, "error": {
+                    "code": "bad_schema", "context": {"schema_errors": [
+                        {"code": "validation_error",
+                         "message": "margin_mode change is disabled for this account", "param": ""}]}}}, 400)
+            # Production behaviour (the reported bug): the venue requires
+            # subaccount_user_id even for the key's own account.
+            if not (body or {}).get("subaccount_user_id"):
+                return self._send({"success": False, "error": {
+                    "code": "bad_schema", "context": {"schema_errors": [
+                        {"code": "validation_error",
+                         "message": "subaccount_user_id is required", "param": ""}]}}}, 400)
+            return self._send(self._delta({"id": (body or {}).get("subaccount_user_id"),
                                            "margin_mode": (body or {}).get("margin_mode")}))
         if path.startswith("/v2/products/"):
             return self._send(self._delta({
@@ -279,15 +293,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v2/positions/change_margin":
             return self._send(self._delta({"delta_margin": body.get("delta_margin")}))
         if path == "/v2/positions/margin_mode":
+            if STATE.get("legacy_margin_mode_gone"):
+                # Current production: the legacy per-position route no longer
+                # exists, so the fallback cannot hide a refused modern PUT.
+                return self._send({"success": False,
+                                   "error": {"code": "not_found", "message": "endpoint no longer available"}}, 404)
             return self._send(self._delta({"margin_mode": body.get("margin_mode")}))
         if path == "/v2/orders/leverage":
             return self._send(self._delta({"leverage": (body or {}).get("leverage") or
                                            query.get("leverage", [None])[0]}))
         if path == "/v2/wallet/balances":
-            return self._send(self._delta([
+            # Delta wallet entries carry the owning account's user_id; the
+            # flag simulates a deployment whose rows come back without it so
+            # the sub-accounts fallback gets exercised.
+            uid = None if STATE.get("wallet_no_user_id") else "5112346"
+            rows = [
                 {"asset_symbol": "USD", "balance": "1000.00", "available_balance": "940.00",
                  "order_margin": "19.80", "position_margin": "40.20", "commission": "0.10"},
-                {"asset_symbol": "BTC", "balance": "0.01", "available_balance": "0.01"}]))
+                {"asset_symbol": "BTC", "balance": "0.01", "available_balance": "0.01"}]
+            if uid:
+                for row in rows:
+                    row["user_id"] = uid
+            return self._send(self._delta(rows))
         if path == "/v2/rate_limits/quota":
             return self._send(self._delta({"current_quota": 6420.0,
                                            "remaining_time_in_milliseconds": 123000}))
@@ -964,12 +991,49 @@ STATE["requests"].clear()
 mode_resp = delta.set_margin_mode("BTCUSD", "isolated")
 sent_mode = [r for r in STATE["requests"] if r["path"] == "/v2/users/margin_mode"]
 check("Delta: set margin mode uses the documented account-level PUT /v2/users/margin_mode",
-      len(sent_mode) == 1 and sent_mode[0]["method"] == "PUT"
-      and sent_mode[0]["body"] == {"margin_mode": "isolated"},
+      len(sent_mode) == 1 and sent_mode[0]["method"] == "PUT",
       str(sent_mode)[:200])
+check("Delta: the PUT carries the key's own account id (venue requires it even for self)",
+      sent_mode and sent_mode[0]["body"] == {"margin_mode": "isolated",
+                                             "subaccount_user_id": "5112346"},
+      str(sent_mode)[:250])
 check("Delta: set margin mode returns the venue's confirmation",
       isinstance(mode_resp, dict) and mode_resp.get("margin_mode") == "isolated"
       and not mode_resp.get("error"), str(mode_resp)[:200])
+check("Delta: the own-account id resolved from the wallet rows (profile is key-refused)",
+      delta._own_user_id == "5112346", str(delta._own_user_id))
+
+# The id is cached per client: a second set must not ask the venue again.
+STATE["requests"].clear()
+delta.set_margin_mode("BTCUSD", "isolated")
+wallet_reads = [r for r in STATE["requests"] if r["path"] == "/v2/wallet/balances"]
+check("Delta: the resolved account id is cached between margin-mode pushes",
+      not wallet_reads, str(wallet_reads)[:200])
+
+# Fallback path: a wallet read without user_id resolves via the sub-account
+# listing's main entry (parent key) — a fresh client so the cache is cold.
+fresh = BrokerClient("key", "secret", "Delta", definition=DELTA_DEF)
+STATE["wallet_no_user_id"] = True
+resolved = fresh._delta_own_user_id()
+STATE["wallet_no_user_id"] = False
+check("Delta: own id falls back to the main sub-account entry when the wallet omits it",
+      resolved == "5112346", str(resolved))
+
+# Unresolvable (sub-account key: no wallet user_id, no listing) and the
+# legacy route gone like production: the PUT goes out without the id and the
+# venue's own bad_schema refusal comes back — no silent legacy rescue.
+orphan = BrokerClient("key", "secret", "Delta", definition=DELTA_DEF)
+STATE["wallet_no_user_id"] = True
+STATE["fail_sub_accounts"] = True
+STATE["legacy_margin_mode_gone"] = True
+orphan_resp = orphan.set_margin_mode("BTCUSD", "isolated")
+STATE["wallet_no_user_id"] = False
+STATE["fail_sub_accounts"] = False
+STATE["legacy_margin_mode_gone"] = False
+check("Delta: an unresolvable account id surfaces the venue refusal instead of guessing",
+      isinstance(orphan_resp, dict) and "error" in orphan_resp
+      and "subaccount_user_id is required" in str(orphan_resp.get("error")),
+      str(orphan_resp)[:250])
 check("margin family collapses venue spellings",
       delta._margin_family("portfolio") == "cross"
       and delta._margin_family("Cross ") == "cross"
@@ -1201,6 +1265,93 @@ check("GET /live-account/orders returns the local audit trail",
 r = api.get("/live-account/fills", headers=H, params={"broker": "Delta"})
 check("GET /live-account/fills returns local executions",
       r.status_code == 200 and any(row["trade_id"] == "90001" for row in r.json()), r.text[:200])
+
+# ===========================================================================
+section("10b. /live-trade/start honours or refuses the requested risk setup")
+# ===========================================================================
+# The reported bug in one line: the venue refused the margin-mode push at
+# start (subaccount_user_id is required), yet the instance registered as
+# "running" in the UI. Now: the push carries the account id (and succeeds),
+# and any refusal of an explicitly requested setting refuses the START — no
+# instance is registered, so the workspace can never show it running.
+from fastapi import BackgroundTasks as _BackgroundTasks  # noqa: E402
+_orig_add_task = _BackgroundTasks.add_task
+# The endpoint schedules service.start() as a background task; in a test that
+# would run the trading loop forever, so the task registry is stubbed out.
+_BackgroundTasks.add_task = lambda self, func, *args, **kwargs: None
+try:
+    main.live_trade_instances.clear()
+    STATE["requests"].clear()
+
+    # 1. Venue accepts the requested leverage + margin mode → instance starts.
+    r = api.post("/live-trade/start", headers=H, json={
+        "strategy_id": "PhantomV2", "broker_name": "Delta", "data_source": "Delta",
+        "leverage": 5, "margin_mode": "isolated"})
+    body = r.json()
+    check("start succeeds when the venue accepts leverage + margin mode",
+          r.status_code == 200 and body.get("status") == "Live trade started"
+          and (body.get("risk_setup") or {}).get("leverage", {}).get("status") == "ok"
+          and (body.get("risk_setup") or {}).get("margin_mode", {}).get("status") == "ok",
+          f"{r.status_code} {r.text[:250]}")
+    started_key = body.get("instance_key") if r.status_code == 200 else None
+    check("the accepted instance is registered as running",
+          started_key in main.live_trade_instances, str(started_key))
+    sent_mm = [x for x in STATE["requests"]
+               if x["path"] == "/v2/users/margin_mode" and x["method"] == "PUT"]
+    check("the start-path margin push carried the account id (schema-valid)",
+          sent_mm and (sent_mm[-1].get("body") or {}).get("subaccount_user_id") == "5112346",
+          str(sent_mm[-1] if sent_mm else None)[:200])
+    main.live_trade_instances.pop(started_key, None)
+
+    # 2. The venue refuses the margin-mode push → the start is refused with
+    # the venue's reason and NOTHING is registered as running.
+    STATE["fail_margin_mode"] = True
+    STATE["legacy_margin_mode_gone"] = True
+    r = api.post("/live-trade/start", headers=H, json={
+        "strategy_id": "RefusedMarginStrategy", "broker_name": "Delta",
+        "data_source": "Delta", "margin_mode": "cross"})
+    body = r.json()
+    check("a refused margin-mode push refuses the start (502 + venue reason)",
+          r.status_code == 502 and "NOT started" in str(body.get("detail"))
+          and "margin mode" in str(body.get("detail")),
+          f"{r.status_code} {r.text[:300]}")
+    check("no instance is registered after the refused start",
+          not any(getattr(s, "strategy_id", None) == "RefusedMarginStrategy"
+                  for s in main.live_trade_instances.values()),
+          str(list(main.live_trade_instances)))
+
+    # 3. A generic risk-setup exception also refuses the start instead of
+    # being banked silently into the response payload.
+    unroutable = BrokerClient("key", "secret", "Delta",
+                              definition=_Def(code="Delta", kind="delta",
+                                              market_data_url="http://127.0.0.1:1",
+                                              trading_api_url="http://127.0.0.1:1"),
+                              rate_limit=RateLimitConfig(
+                                  requests_per_second=100, requests_per_minute=1200,
+                                  weight_per_5min=None, orders_per_minute=None,
+                                  orders_per_10s=None, max_retries=1))
+    _orig_client = _mock_live_client
+    main._live_client = lambda db_, user_, code, connection_id=None, require_credentials=True: \
+        (unroutable, unroutable.definition, connection_id or 1)
+    try:
+        r = api.post("/live-trade/start", headers=H, json={
+            "strategy_id": "UnreachableVenueStrategy", "broker_name": "Delta",
+            "data_source": "Delta", "margin_mode": "isolated"})
+        check("an unreachable venue refuses the start too (instead of a silent run)",
+              r.status_code == 502 and "NOT started" in str(r.json().get("detail")),
+              f"{r.status_code} {r.text[:300]}")
+    finally:
+        main._live_client = _orig_client
+
+    # 4. Binance-style "already set that way" answers are NOT refusals.
+    check("idempotent venue answers are not treated as refusals",
+          main._benign_risk_rejection("Binance HTTP 400: No need to change margin type.")
+          and not main._benign_risk_rejection("Delta HTTP 400: bad_schema"))
+finally:
+    _BackgroundTasks.add_task = _orig_add_task
+    STATE["fail_margin_mode"] = False
+    STATE["legacy_margin_mode_gone"] = False
+    main.live_trade_instances.clear()
 
 # --- credentials are required ---------------------------------------------
 main._live_client = _original_live_client

@@ -299,7 +299,9 @@ const TradeCard = ({ trade }) => (
   </div>
 );
 
-const LiveTrade = () => {
+// `initialView` lets a caller (and the page-shell test) land straight on the
+// terminal tab instead of the default automation view.
+const LiveTrade = ({ initialView = 'automation' } = {}) => {
   const [status, setStatus] = useState([]);
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
@@ -336,7 +338,7 @@ const LiveTrade = () => {
   const [results, setResults] = useState([]);
   // The broker terminal is no longer a separate page — it is the second view
   // of live trading, on the same broker/connection already selected above.
-  const [view, setView] = useState('automation');
+  const [view, setView] = useState(initialView);
   const [reloading, setReloading] = useState(null);
   const [reloadNote, setReloadNote] = useState(null);
 

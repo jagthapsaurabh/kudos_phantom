@@ -318,6 +318,8 @@ class BrokerClient:
         self.limiter_key = limiter_key or f"{self.broker_name}:{hashlib.sha1(self.api_key.encode()).hexdigest()[:8]}"
         self.limiter = get_limiter(self.limiter_key, self.rate_limit_config)
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
+        # This key's own Delta account user id, resolved lazily (margin mode).
+        self._own_user_id: Optional[str] = None
         self._last_error: Optional[str] = None
         # ---- Credential latch (see the module docstring) --------------------
         # Short fingerprint of the key material this client signs with, so a
@@ -2277,6 +2279,46 @@ class BrokerClient:
             return out
         return {"error": f"No account-settings adapter installed for '{self.broker_name}'"}
 
+    def _delta_own_user_id(self) -> Optional[str]:
+        """This API key's own Delta account user id.
+
+        ``PUT /v2/users/margin_mode`` requires ``subaccount_user_id`` **even
+        when the target is the key's own account** (without it the venue
+        answers ``bad_schema: subaccount_user_id is required``), while
+        ``GET /v2/profile`` is refused to API keys (changelog 19.08.26).
+        Wallet balances carry the owning account's ``user_id`` on every entry
+        and are readable by parent AND sub-account keys alike (a sub-account
+        key cannot list ``/v2/sub_accounts``), so that read always resolves.
+        Cached per client: the id never changes for a key, and this lookup
+        runs on the order path at instance start where a repeat call would
+        burn rate-limit weight for nothing.
+        """
+        if self.kind != "delta":
+            return None
+        if self._own_user_id:
+            return self._own_user_id
+        response, error = self._delta_request("GET", "/v2/wallet/balances", weight=5)
+        result = self._delta_result(self._json_body(response, error))
+        if isinstance(result, list):
+            for row in result:
+                if isinstance(row, dict) and row.get("user_id"):
+                    self._own_user_id = str(row["user_id"])
+                    return self._own_user_id
+        # Fallback for a key whose wallet read answers without a user_id (or
+        # fails outright): the main entry of the sub-account listing — a
+        # parent key resolves to itself there, a sub-account key cannot list
+        # it at all and stays unresolved.
+        response2, error2 = self._delta_request("GET", "/v2/sub_accounts", weight=5)
+        result2 = self._delta_result(self._json_body(response2, error2))
+        if isinstance(result2, list):
+            entries = [row for row in result2 if isinstance(row, dict)]
+            ours = next((row for row in entries if not row.get("is_sub_account")),
+                        entries[0] if entries else None)
+            if ours and ours.get("id"):
+                self._own_user_id = str(ours["id"])
+                return self._own_user_id
+        return None
+
     def set_margin_mode(self, symbol: str, mode: str = "isolated",
                         subaccount_user_id: Optional[str] = None,
                         dry_run: bool = False):
@@ -2296,6 +2338,10 @@ class BrokerClient:
             # longer in the docs — kept as a fallback in case a deployment
             # still routes it.
             body: Dict[str, Any] = {"margin_mode": str(mode).lower()}
+            if not subaccount_user_id:
+                # The venue requires the target account id even for the key's
+                # own account (bad_schema otherwise) — resolve it.
+                subaccount_user_id = self._delta_own_user_id()
             if subaccount_user_id:
                 body["subaccount_user_id"] = str(subaccount_user_id)
             response, error = self._delta_request("PUT", "/v2/users/margin_mode",

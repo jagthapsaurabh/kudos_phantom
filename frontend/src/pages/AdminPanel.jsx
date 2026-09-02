@@ -532,7 +532,9 @@ const FeeSettingsTab = () => {
 };
 
 // --------------------------------------------------------------- Seed data --
-export const SeedDataTab = () => {
+// `initialSource` lets a caller (and the seed-tab test) render the tab for a
+// non-default venue; the production default stays Delta.
+export const SeedDataTab = ({ initialSource = 'Delta' } = {}) => {
   const ALL_INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
   const DELTA_INTERVALS = ['15m', '1h', '4h', '1d'];
   const BINANCE_HISTORY_INTERVALS = ['15m', '1h', '4h', '1d'];
@@ -555,7 +557,7 @@ export const SeedDataTab = () => {
   // Seed the mark-price series of the BTC perpetual alongside the traded
   // OHLCV — risk (stops/targets/PnL) is priced on the mark price.
   const [includeMarkPrice, setIncludeMarkPrice] = useState(true);
-  const [source, setSource] = useState('Delta');
+  const [source, setSource] = useState(initialSource);
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [intervals, setIntervals] = useState(ALL_INTERVALS);
   const [start, setStart] = useState('');
