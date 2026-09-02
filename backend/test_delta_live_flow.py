@@ -255,8 +255,13 @@ check("entry bracket posts to /v2/orders (not the attach-only /v2/orders/bracket
 # Delta rejects a bracket SL carrying BOTH bracket_stop_loss_price and
 # bracket_trail_amount ("Required if bracket stop price is empty"), which
 # failed every entry on a trailing strategy. The trail wins.
-check("trail_amount is a string bracket_trail_amount on the entry",
-      body.get("bracket_trail_amount") == "250.5", body)
+# Delta signs a trail amount against the leg that carries the trigger. The
+# bracket stop-loss CLOSES the entry, so a buy entry's trail is a sell stop
+# below the market and must be negative — otherwise the venue answers
+# HTTP 400 bad_schema "bracket_trail_amount should be negative for buy
+# orders", which is exactly what the live account reported.
+check("trail_amount is a signed string bracket_trail_amount on the entry",
+      body.get("bracket_trail_amount") == "-250.5", body)
 check("a trailing bracket omits bracket_stop_loss_price (Delta bad_schema)",
       "bracket_stop_loss_price" not in body, body)
 
@@ -273,12 +278,13 @@ check("bracket_take_profit_price is a string",
       body.get("bracket_take_profit_price") == "62000", body)
 check("bracket is flagged native", payload.get("_bracket") is True)
 
-rec.edit_bracket_order(42, symbol="BTCUSDT", stop_loss_price=59100, trail_amount=180)
+rec.edit_bracket_order(42, symbol="BTCUSDT", stop_loss_price=59100,
+                       trail_amount=180, side="buy")
 edit = CAPTURE2["calls"][-1]
 check("edit uses PUT /v2/orders/bracket",
       edit["method"] == "PUT" and edit["path"] == "/v2/orders/bracket", edit)
-check("edit trail_amount stays a string",
-      edit["body"]["stop_loss_order"]["trail_amount"] == "180", edit["body"])
+check("edit trail_amount stays a signed string (buy entry -> negative)",
+      edit["body"]["stop_loss_order"]["trail_amount"] == "-180.0", edit["body"])
 
 rec.create_heartbeat("bot1", product_symbols=["BTCUSD"],
                      contract_types=["perpetual_futures"])

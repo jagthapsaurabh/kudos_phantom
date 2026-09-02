@@ -691,10 +691,13 @@ check("Delta take-profit is a market order with the take-profit trigger",
 trail = delta.place_order("BTCUSDT", "sell", "trailing_stop", 0.03, stop_price=66000.0,
                           trail_amount=250.0, size_in_btc=True)
 sent = [r for r in STATE["requests"] if r["path"] == "/v2/orders"][-1]
-check("Delta standalone trailing stop is a market stop with a trail amount",
+# A standalone trail is signed against the order's OWN side (Delta user docs:
+# trail amount 40 on a buy trailing stop, negative on a sell one), which is the
+# mirror image of a bracket trail that rides on the entry order.
+check("Delta standalone trailing stop is a market stop with a signed trail amount",
       sent["body"].get("order_type") == "market_order"
       and sent["body"].get("stop_order_type") == "stop_loss_order"
-      and sent["body"].get("trail_amount") == "250.0"
+      and sent["body"].get("trail_amount") == "-250.0"
       and "limit_price" not in sent["body"], str(sent["body"]))
 
 sl_limit = delta.place_order("BTCUSDT", "sell", "stop_limit", 0.03, price=64500.0,

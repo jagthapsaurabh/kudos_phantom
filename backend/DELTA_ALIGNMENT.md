@@ -119,6 +119,27 @@ accept the key; a freshly created key proves itself on the next signed call).
 - **Entry bracket via POST /v2/orders/bracket** (our live_trader): {product_id/product_symbol, size, side, order_type, limit_price?, bracket_stop_trigger_method, stop_loss_order:{order_type, stop_price, trail_amount}, take_profit_order:{order_type, stop_price}, client_order_id}
 - **Position bracket via POST /v2/orders/bracket** (MCP): {product_id/product_symbol, stop_loss_order, take_profit_order, bracket_stop_trigger_method} — no size/side, closes entire position.
 
+### Trail amounts are SIGNED (fixed 2026-09-02)
+
+Delta reads a trail amount as the signed distance from the market price to the
+stop trigger, and rejects the wrong sign with HTTP 400 `bad_schema` —
+*"bracket_trail_amount should be negative for buy orders"*. That error blocked
+every live entry opened with an ATR trail, because the distance
+(`trail_distance_atr × ATR`) was always sent positive.
+
+- `bracket_trail_amount` rides on the ENTRY order but describes the stop-loss
+  leg, which CLOSES the entry: **buy entry → negative, sell entry → positive**.
+- `trail_amount` on a standalone trailing stop belongs to that order itself, so
+  the sign follows the order's own side: **buy → positive, sell → negative**
+  (Delta user docs: trail amount 40 on a buy, negative on a sell).
+- `BrokerClient._delta_trail_amount()` applies the rule from the plain distance
+  callers pass, and is idempotent — an already-signed value is normalised, not
+  double-negated. A zero/blank distance now falls back to the fixed
+  `bracket_stop_loss_price` instead of leaving the entry unprotected.
+- `edit_bracket_order(..., side=...)` takes the side of the original entry so an
+  edited trail is signed the same way; without it the value is forwarded as
+  given.
+
 ## Error Handling (added 2026-08-31)
 
 ### Server-Side
