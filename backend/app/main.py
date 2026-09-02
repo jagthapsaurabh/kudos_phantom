@@ -3886,6 +3886,15 @@ class LiveMarginModeSyncRequest(BaseModel):
     dry_run: bool = False
 
 
+class LiveMarginModeAllRequest(BaseModel):
+    """Apply one margin mode to EVERY account under the key (main + subs)."""
+    broker: str
+    connection_id: Optional[int] = None
+    symbol: str = 'BTCUSDT'
+    mode: str = 'isolated'
+    dry_run: bool = False
+
+
 class LivePositionMarginRequest(BaseModel):
     broker: str
     connection_id: Optional[int] = None
@@ -4194,6 +4203,31 @@ def live_trade_results(strategy_id: Optional[str] = None, connection_id: Optiona
                     "open_position_count": len(group["open_positions"])})
     out.sort(key=lambda g: (g["strategy_name"], g["account_label"] or ""))
     return out
+
+
+@app.post('/live-account/margin-mode-all')
+def live_set_margin_mode_all(payload: LiveMarginModeAllRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    """Apply one margin mode to EVERY account under the key (main + all sub-accounts).
+
+    Delta India keeps margin mode per (sub)account, so a "portfolio mode"
+    switch is one PUT per account. The listing needs the main/parent key —
+    a sub-account key can only manage itself, and the result says so. Per-account
+    outcomes come back in ``response.results``; ``status`` rolls them up as
+    ok / partial / rejected.
+    """
+    try:
+        mode = validate_margin_mode(payload.mode)
+        symbol = validate_symbol(payload.symbol)
+        broker_code = validate_broker_code(payload.broker)
+    except PhantomValidationError as ve:
+        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+    client, definition, _ = _live_client(db, user, payload.broker, payload.connection_id)
+    result = client.set_margin_mode_all(mode, symbol, payload.dry_run)
+    if isinstance(result, dict) and (result.get('error') or result.get('status') == 'rejected'):
+        cls = classify_broker_error(result.get('error', 'all accounts rejected'), broker=definition.code)
+        phantom_logger.warning(f"margin-mode-all failed [{cls['category']}]: {result.get('error') or result}")
+    return {"status": result.get("status", "rejected"),
+            "response": result, "rate_limits": client.rate_limit_usage()}
 
 
 @app.post('/live-account/margin-mode-sync')

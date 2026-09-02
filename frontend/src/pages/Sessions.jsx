@@ -373,7 +373,9 @@ const SessionDetail = ({ detail }) => {
 const Sessions = () => {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [modeFilter, setModeFilter] = useState('all');
+  // Live and paper histories are kept apart: this page is one tab per mode,
+  // never a merged table. Default to live — the real-money record.
+  const [tab, setTab] = useState('live');
   const [strategyFilter, setStrategyFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
   const [query, setQuery] = useState('');
@@ -424,8 +426,15 @@ const Sessions = () => {
     [rows],
   );
 
+  // Counts for the tab buttons — history size per mode at a glance.
+  const counts = useMemo(() => rows.reduce((m, r) => {
+    const k = (r.mode || 'paper');
+    m[k] = (m[k] || 0) + 1;
+    return m;
+  }, { live: 0, paper: 0 }), [rows]);
+
   const filtered = useMemo(() => rows.filter((r) => {
-    if (modeFilter !== 'all' && (r.mode || 'paper') !== modeFilter) return false;
+    if ((r.mode || 'paper') !== tab) return false;
     if (statusFilter !== 'all' && r.status !== statusFilter) return false;
     if (strategyFilter !== 'all' && (r.strategy_name || r.strategy_id) !== strategyFilter) return false;
     if (query) {
@@ -433,7 +442,7 @@ const Sessions = () => {
       if (!hay.includes(query.toLowerCase())) return false;
     }
     return true;
-  }), [rows, modeFilter, statusFilter, strategyFilter, query]);
+  }), [rows, tab, statusFilter, strategyFilter, query]);
 
   // Roll-up across whatever is currently filtered, so "how has this ONE
   // strategy done overall" is answerable by picking it in the filter.
@@ -472,25 +481,32 @@ const Sessions = () => {
 
       <div className="mb-6">
         <h1 className="flex items-center gap-3 text-2xl font-bold text-purple-400 sm:text-3xl">
-          <FileText size={28} /> Session Results
+          <FileText size={28} /> Trade History
         </h1>
         <p className="mt-1 text-sm text-gray-400">
-          Every paper and live run you have started, kept after it stops. Open one to see its
-          trades, stop plan, equity curve and log in full.
+          Live trades and paper runs are kept in separate histories — pick a tab. Every run is
+          kept after it stops: open one to see its trades, stop plan, equity curve and log in full.
         </p>
+      </div>
+
+      {/* Live and paper histories stay separate — one tab per mode. */}
+      <div className="mb-5 flex gap-2">
+        {[['live', 'Live Trade History', Radio], ['paper', 'Paper Trade History', Activity]].map(([key, label, TabIcon]) => (
+          <button key={key} onClick={() => setTab(key)}
+                  className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-bold transition ${
+                    tab === key
+                      ? (key === 'live' ? 'bg-green-600 text-white shadow' : 'bg-blue-600 text-white shadow')
+                      : 'border border-gray-700 bg-gray-800 text-gray-400 hover:text-white'}`}>
+            <TabIcon size={14} /> {label}
+            <span className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${tab === key ? 'bg-black/30' : 'bg-gray-900'}`}>
+              {counts[key] || 0}
+            </span>
+          </button>
+        ))}
       </div>
 
       {/* Filters + roll-up */}
       <div className="mb-5 flex flex-wrap items-end gap-3">
-        <div className="flex flex-col">
-          <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Mode</label>
-          <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value)}
-                  className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm outline-none">
-            <option value="all">Paper + Live</option>
-            <option value="paper">Paper only</option>
-            <option value="live">Live only</option>
-          </select>
-        </div>
         <div className="flex flex-col">
           <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Strategy</label>
           <select value={strategyFilter} onChange={(e) => setStrategyFilter(e.target.value)}
@@ -545,7 +561,6 @@ const Sessions = () => {
           <thead className="bg-gray-900/60 text-[10px] uppercase text-gray-500">
             <tr>
               <th className="p-3">Strategy</th>
-              <th className="p-3">Mode</th>
               <th className="p-3">Account</th>
               <th className="p-3">Status</th>
               <th className="p-3">Started</th>
@@ -561,18 +576,18 @@ const Sessions = () => {
           </thead>
           <tbody>
             {loading && (
-              <tr><td colSpan={13} className="p-8 text-center text-gray-500">Loading sessions…</td></tr>
+              <tr><td colSpan={12} className="p-8 text-center text-gray-500">Loading sessions…</td></tr>
             )}
             {!loading && filtered.length === 0 && (
-              <tr><td colSpan={13} className="p-8 text-center text-gray-500">
-                No sessions match these filters. Start a paper or live instance and it will
-                appear here — and stay here after you stop it.
+              <tr><td colSpan={12} className="p-8 text-center text-gray-500">
+                {tab === 'live'
+                  ? 'No live trade sessions match these filters. Start a live instance and its record will stay here after it stops.'
+                  : 'No paper sessions match these filters. Start a paper instance and its record will stay here after you stop it.'}
               </td></tr>
             )}
             {filtered.map((row) => {
               const st = statusMeta(row.status);
               const isOpen = openId === row.id;
-              const isLive = (row.mode || 'paper') === 'live';
               return (
                 <React.Fragment key={row.id}>
                   <tr className={`border-b border-gray-700/60 align-top transition hover:bg-gray-700/20 ${isOpen ? 'bg-gray-900/40' : ''}`}>
@@ -583,14 +598,6 @@ const Sessions = () => {
                       <div className="text-[9px] text-gray-600">
                         #{String(row.instance_key || '').split('_').pop()} · {row.data_source}
                       </div>
-                    </td>
-                    <td className="p-3">
-                      <span className={`flex w-fit items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold ${
-                        isLive ? 'border-green-700 bg-green-900/30 text-green-300'
-                               : 'border-blue-700 bg-blue-900/30 text-blue-300'}`}>
-                        {isLive ? <Radio size={9} /> : <Activity size={9} />}
-                        {isLive ? 'LIVE' : 'PAPER'}
-                      </span>
                     </td>
                     <td className="max-w-[130px] truncate p-3 text-gray-400" title={row.account_label}>
                       {row.account_label || 'Primary'}
@@ -639,7 +646,7 @@ const Sessions = () => {
                   </tr>
                   {isOpen && (
                     <tr className="border-b border-gray-700/60">
-                      <td colSpan={13} className="p-0">
+                      <td colSpan={12} className="p-0">
                         {detailLoading && !detail ? (
                           <div className="p-6 text-center text-xs text-gray-500">Loading full result…</div>
                         ) : detail ? (

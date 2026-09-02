@@ -206,6 +206,112 @@ const ExchangeRegistry = () => {
   );
 };
 
+/* ------------------------------------------------- Account management -- */
+/* Margin mode is per ACCOUNT on Delta India (main account and every        */
+/* sub-account has its own). When the saved key is a parent key, the venue  */
+/* lists every account under it; this panel manages all of them from one    */
+/* place — each row sets one account's mode, the footer applies one mode to */
+/* the whole key. Exported for the offline UI test (the page itself loads   */
+/* connections in an effect, unreachable under a server render).            */
+export const AccountManager = ({ c, onDone }) => {
+  const settings = c.account_settings || {};
+  const accounts = settings.accounts || [];
+  const [modes, setModes] = useState({});
+  const [bulkMode, setBulkMode] = useState('isolated');
+  const [busyId, setBusyId] = useState(null);
+  const [note, setNote] = useState(null);
+  if (!accounts.length) return null;
+  const selfId = settings.user_id || (settings.self_account || {}).id || null;
+
+  const modeFor = (a) => modes[a.id] || a.margin_mode || 'isolated';
+
+  const applyOne = async (a) => {
+    setBusyId(a.id); setNote(null);
+    try {
+      const res = await fetch(`${API_URL}/live-account/margin-mode`, {
+        method: 'POST', headers: auth(),
+        body: JSON.stringify({ broker: c.broker_code, connection_id: c.id,
+                               mode: modeFor(a), subaccount_user_id: a.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const ok = res.ok && data.status === 'ok';
+      setNote({ ok, text: `${a.account_name || a.id}: ${ok ? `margin mode set to ${modeFor(a)}` : (data.response?.error || data.detail || 'rejected')}` });
+      if (ok && onDone) onDone();
+    } catch (e) { setNote({ ok: false, text: `${a.account_name || a.id}: ${e.message}` }); }
+    setBusyId(null);
+  };
+
+  const applyAll = async () => {
+    setBusyId('all'); setNote(null);
+    try {
+      const res = await fetch(`${API_URL}/live-account/margin-mode-all`, {
+        method: 'POST', headers: auth(),
+        body: JSON.stringify({ broker: c.broker_code, connection_id: c.id, mode: bulkMode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const r = data.response || {};
+      const ok = res.ok && data.status === 'ok';
+      const text = data.status === 'ok'
+        ? `All ${r.total ?? accounts.length} accounts set to ${bulkMode}.`
+        : data.status === 'partial'
+          ? `Only ${r.changed}/${r.total} accounts switched — ${((r.results || []).find(x => x.status !== 'ok') || {}).error || 'see per-account errors'}`
+          : (r.error || data.detail || 'rejected');
+      setNote({ ok: res.ok && data.status === 'ok', text });
+      if (res.ok && (data.status === 'ok' || data.status === 'partial') && onDone) onDone();
+    } catch (e) { setNote({ ok: false, text: e.message }); }
+    setBusyId(null);
+  };
+
+  return (
+    <div className="mt-2 rounded-lg border border-gray-700 bg-gray-800/60 p-3">
+      <div className="mb-2 text-[10px] font-bold uppercase text-gray-500">
+        Accounts on this key — margin mode is per account on Delta India
+      </div>
+      <div className="space-y-1.5">
+        {accounts.map((a) => (
+          <div key={a.id} className="flex flex-wrap items-center gap-2">
+            <span className={`rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+              a.is_sub_account ? 'border-blue-800 bg-blue-900/20 text-blue-300'
+                               : 'border-green-800 bg-green-900/20 text-green-300'}`}>
+              {a.is_sub_account ? 'SUB' : 'MAIN'}
+            </span>
+            <span className="min-w-[90px] truncate text-xs text-gray-200" title={String(a.id)}>
+              {a.account_name || a.id}
+              {String(a.id) === String(selfId) ? ' · this key' : ''}
+            </span>
+            <span className="text-[10px] text-gray-500">{a.margin_mode || '—'}</span>
+            <select value={modeFor(a)}
+                    onChange={(e) => setModes(m => ({ ...m, [a.id]: e.target.value }))}
+                    className="rounded border border-gray-700 bg-gray-900 px-1.5 py-1 text-[10px] text-gray-200 outline-none">
+              <option value="isolated">isolated</option>
+              <option value="cross">cross</option>
+              <option value="portfolio">portfolio</option>
+            </select>
+            <button onClick={() => applyOne(a)} disabled={busyId !== null}
+                    className="rounded border border-gray-700 px-2 py-1 text-[10px] font-bold text-gray-300 transition hover:border-blue-500 hover:text-white disabled:opacity-40">
+              {busyId === a.id ? 'Applying…' : 'Apply'}
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-gray-700 pt-2">
+        <span className="text-[10px] text-gray-500">Apply to every account:</span>
+        <select value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}
+                className="rounded border border-gray-700 bg-gray-900 px-1.5 py-1 text-[10px] text-gray-200 outline-none">
+          <option value="isolated">isolated</option>
+          <option value="cross">cross</option>
+          <option value="portfolio">portfolio</option>
+        </select>
+        <button onClick={applyAll} disabled={busyId !== null}
+                className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-1 text-[10px] font-bold text-amber-300 transition hover:bg-amber-900/40 disabled:opacity-40">
+          {busyId === 'all' ? 'Applying…' : `Apply ${bulkMode} to all ${accounts.length} accounts`}
+        </button>
+      </div>
+      {note && <div className={`mt-2 text-[10px] leading-snug ${note.ok ? 'text-green-400' : 'text-red-400'}`}>{note.text}</div>}
+    </div>
+  );
+};
+
 /* ------------------------------------------------------ Connection card -- */
 /* Exported for the offline UI test: the page loads its connections in an
    effect, which a server render never runs, so the actions an operator needs
@@ -369,11 +475,15 @@ export const ConnectionCard = ({ c, busy, keysOpen, keyForm, setKeyForm, onToggl
     <div className="mt-1.5 text-[10px] text-gray-400 leading-relaxed">
       <span className="font-bold text-green-400">{c.account_settings.margin_mode || 'margin mode unknown'}</span>
       {c.account_settings.leverage ? ` · ${c.account_settings.leverage}x` : ''}
+      {(c.account_settings.self_account || {}).account_name
+        ? <> · trades as <span className="text-gray-200">{c.account_settings.self_account.account_name}</span> ({c.account_settings.self_account.is_sub_account ? 'sub-account' : 'main account'})</>
+        : c.account_settings.user_id ? ` · trades as account ${c.account_settings.user_id}` : ''}
       {c.account_settings.accounts && c.account_settings.accounts.length > 1
         ? ` · ${c.account_settings.accounts.length} accounts on this key` : ''}
       {c.account_settings_at ? ` · verified ${String(c.account_settings_at).slice(0, 16).replace('T', ' ')}` : ''}
     </div>
   )}
+  <AccountManager c={c} onDone={onRefresh} />
   {c.account_settings && c.account_settings.error && (
     <div className="mt-1.5 text-[10px] text-amber-500 leading-relaxed">
       Could not read account details: {String(c.account_settings.error).slice(0, 140)}

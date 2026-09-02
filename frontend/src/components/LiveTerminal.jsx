@@ -373,6 +373,10 @@ const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initial
   const [configProblems, setConfigProblems] = useState([]);
   const [leverage, setLeverage] = useState(10);
   const [marginMode, setMarginMode] = useState('isolated');
+  // Margin mode is per (sub)account on Delta India: 'self' = this key's own
+  // account, an account id = that sub-account (parent key), 'all' = every
+  // account under the key in one call.
+  const [marginTarget, setMarginTarget] = useState('self');
   // Margin mode + leverage now come from the exchange account itself (see
   // account_settings on the snapshot) — the select/input only keep a local
   // override once the user touches them. Switching broker or connection
@@ -495,10 +499,19 @@ const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initial
   );
   const applyMarginMode = () => act(
     async () => {
-      await call('/live-account/margin-mode', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', mode: marginMode });
+      if (marginTarget === 'all') {
+        await call('/live-account/margin-mode-all', { broker, connection_id: connectionId || null, symbol: 'BTCUSDT', mode: marginMode });
+      } else {
+        await call('/live-account/margin-mode', {
+          broker, connection_id: connectionId || null, symbol: 'BTCUSDT', mode: marginMode,
+          ...(marginTarget === 'self' ? {} : { subaccount_user_id: marginTarget }),
+        });
+      }
       touched.current.margin = false;
     },
-    `Margin mode set to ${marginMode}.`,
+    marginTarget === 'all'
+      ? `Margin mode set to ${marginMode} on every account on this key.`
+      : `Margin mode set to ${marginMode}.`,
   );
 
   const data = snapshot || EMPTY;
@@ -820,10 +833,40 @@ const LiveTerminal = ({ broker = 'Delta', connectionId = null, snapshot: initial
                 Apply
               </button>
             </div>
+            {/* Margin mode is per (sub)account on Delta India — pick which one
+                this applies to. Only a parent key's list offers the others. */}
+            {(account?.accounts || []).length > 0 && (
+              <div className="mt-3">
+                <Field label="Apply margin mode to">
+                  <select value={marginTarget} onChange={(e) => setMarginTarget(e.target.value)}
+                          className="w-full rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs text-white outline-none focus:border-blue-500">
+                    <option value="self">
+                      This account{(account.self_account || {}).account_name
+                        ? ` (${(account.self_account || {}).account_name})`
+                        : account.user_id ? ` (${account.user_id})` : ''}
+                    </option>
+                    {account.accounts
+                      .filter((a) => String(a.id) !== String(account.user_id))
+                      .map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {(a.account_name || a.id)}{a.is_sub_account ? ' (sub)' : ' (main)'} — {a.margin_mode || '—'}
+                        </option>
+                      ))}
+                    <option value="all">All {account.accounts.length} accounts on this key</option>
+                  </select>
+                </Field>
+                <p className="mt-1 text-[10px] text-gray-600">
+                  Leverage applies to this key's account; margin mode can target any account on a parent key.
+                </p>
+              </div>
+            )}
             <p className="mt-2 text-[10px] leading-relaxed text-gray-500">
               {account && !account.error && (account.margin_mode || account.leverage)
                 ? <>Read from your exchange account: <b className="text-gray-300">{account.margin_mode || '—'}</b>
                    {account.leverage ? <> · <b className="text-gray-300">{account.leverage}x</b></> : null}
+                   {(account.self_account || {}).account_name
+                     ? <> · trading as <b className="text-gray-300">{(account.self_account || {}).account_name}</b> ({(account.self_account || {}).is_sub_account ? 'sub' : 'main'})</>
+                     : null}
                    {account.accounts && account.accounts.length > 1
                      ? <> · {account.accounts.length} accounts on this key</> : null}
                    {account.margin_mode === 'portfolio' ? ' (portfolio margin)' : ''}</>

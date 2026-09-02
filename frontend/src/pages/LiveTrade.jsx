@@ -582,7 +582,15 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
             <label className="text-xs text-gray-500 uppercase font-bold mb-1">Connection</label>
             <select value={connectionId} onChange={e => setConnectionId(e.target.value)} className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
               <option value="">Primary / legacy</option>
-              {connections.filter(c => c.broker_code === dataSource).map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+              {/* Saved connections map 1:1 to venue accounts (one key = one
+                  (sub)account on Delta India), so the option names the account
+                  the instance would trade as. */}
+              {connections.filter(c => c.broker_code === dataSource).map(c => {
+                const self = (c.account_settings || {}).self_account || {};
+                return <option key={c.id} value={c.id}>
+                  {c.label}{self.account_name ? ` — ${self.account_name} (${self.is_sub_account ? 'sub' : 'main'})` : ''}
+                </option>;
+              })}
             </select>
           </div>
           {view === 'automation' && (<>

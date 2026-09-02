@@ -958,6 +958,10 @@ settings_d = delta.get_account_settings("BTCUSD")
 check("Delta: parent key reads the main account's cross margin mode",
       settings_d["margin_mode"] == "cross" and settings_d["margin_family"] == "cross"
       and settings_d["user_id"] == "5112346", str(settings_d)[:250])
+check("Delta: the settings name the account this key trades as (main vs sub)",
+      (settings_d.get("self_account") or {}).get("account_name") == "Main"
+      and (settings_d.get("self_account") or {}).get("is_sub_account") is False,
+      str(settings_d.get("self_account"))[:200])
 check("Delta: sub-account list comes back so each account's mode is visible",
       len(settings_d["accounts"]) == 2
       and settings_d["accounts"][1]["margin_mode"] == "isolated"
@@ -1225,6 +1229,30 @@ check("an unknown reference says so and names the main-key requirement",
       bad_sync.get("error") and "main/parent" in str(bad_sync.get("error")),
       str(bad_sync)[:250])
 
+# ---- Bulk: one margin mode for EVERY account under the key ----------------
+STATE["requests"].clear()
+bulk = delta.set_margin_mode_all("isolated")
+puts = [r for r in STATE["requests"] if r["path"] == "/v2/users/margin_mode" and r["method"] == "PUT"]
+check("set_margin_mode_all pushes the mode to every account under the key (main + subs)",
+      bulk.get("status") == "ok" and bulk.get("changed") == 2 and bulk.get("total") == 2
+      and [p["body"].get("subaccount_user_id") for p in puts] == ["5112346", "5112347"],
+      str(puts)[:250])
+check("the bulk result names each account with its own outcome",
+      all(row.get("status") == "ok" for row in bulk.get("results", []))
+      and {row.get("id") for row in bulk.get("results", [])} == {"5112346", "5112347"},
+      str(bulk.get("results"))[:250])
+STATE["requests"].clear()
+dry = delta.set_margin_mode_all("cross", dry_run=True)
+check("bulk dry_run previews the targets without touching the venue",
+      dry.get("dry_run") is True and len(dry.get("targets", [])) == 2
+      and not [r for r in STATE["requests"] if r["path"] == "/v2/users/margin_mode"])
+STATE["fail_sub_accounts"] = True
+subkey = BrokerClient("key", "secret", "Delta", definition=DELTA_DEF)
+sub_bulk = subkey.set_margin_mode_all("isolated")
+STATE["fail_sub_accounts"] = False
+check("a sub-account key cannot bulk-manage siblings — the error says main/parent",
+      sub_bulk.get("error") and "main/parent" in str(sub_bulk.get("error")), str(sub_bulk)[:250])
+
 STATE["requests"].clear()
 r = api.post("/live-account/margin-mode", headers=H,
              json={"broker": "Delta", "mode": "portfolio", "subaccount_user_id": "5112347"})
@@ -1235,6 +1263,26 @@ put_body2 = next((r_["body"] for r_ in STATE["requests"]
 check("the targeted call carries the sub-account user id",
       put_body2 == {"margin_mode": "portfolio", "subaccount_user_id": "5112347"},
       str(put_body2))
+
+STATE["requests"].clear()
+r = api.post("/live-account/margin-mode-all", headers=H,
+             json={"broker": "Delta", "mode": "cross"})
+check("POST /live-account/margin-mode-all applies to every account on the key",
+      r.status_code == 200 and r.json()["status"] == "ok"
+      and r.json()["response"]["changed"] == 2 and r.json()["response"]["total"] == 2,
+      r.text[:300])
+check("every listed account got its own PUT on the bulk endpoint",
+      {x["body"].get("subaccount_user_id")
+       for x in STATE["requests"] if x["path"] == "/v2/users/margin_mode" and x["method"] == "PUT"}
+      == {"5112346", "5112347"},
+      str(STATE["requests"][-4:])[:250])
+STATE["requests"].clear()
+r = api.post("/live-account/margin-mode-all", headers=H,
+             json={"broker": "Delta", "mode": "isolated", "dry_run": True})
+check("the bulk endpoint honours dry_run (no venue writes)",
+      r.status_code == 200 and r.json()["response"].get("dry_run") is True
+      and not [x for x in STATE["requests"] if x["path"] == "/v2/users/margin_mode"],
+      r.text[:250])
 
 r = api.post("/live-account/margin-mode-sync", headers=H,
              json={"broker": "Delta", "reference_user_id": "5112346",
