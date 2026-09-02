@@ -7,6 +7,7 @@ import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 import { API_URL } from '../api';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -371,6 +372,8 @@ const SessionDetail = ({ detail }) => {
 // Page
 // ---------------------------------------------------------------------------
 const Sessions = () => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   // Live and paper histories are kept apart: this page is one tab per mode,
@@ -396,10 +399,11 @@ const Sessions = () => {
   }, []);
 
   useEffect(() => {
+    if (!isVisible) return;
     load();
     const id = setInterval(load, 15000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, isVisible]);
 
   const openDetail = async (row) => {
     if (openId === row.id) { setOpenId(null); setDetail(null); return; }

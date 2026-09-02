@@ -7,6 +7,7 @@ import EntryGuardBadges from '../components/EntryGuardBadges';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
 // BTCUSDT, Delta as BTCUSD.
@@ -176,6 +177,13 @@ export const BalancePanel = ({ balance, marginUsed, broker, onRefresh }) => {
     ['Used margin', money(b.used_margin, cur)],
     ['Unrealised PnL', money(b.unrealized_pnl, cur)],
   ];
+  // Show commission as a separate line when it's non-zero. This explains the
+  // gap between wallet_balance and available_balance when there are no open
+  // positions or orders. Without this line, the UI looks broken — used_margin
+  // shows $0 but available is less than wallet.
+  if (b.commission && b.commission > 0.001) {
+    rows.push(['Commission reserved', money(b.commission, cur)]);
+  }
   return (
     <div className="space-y-2.5">
       {b.testnet && (
@@ -319,6 +327,8 @@ const TradeCard = ({ trade }) => (
 // `initialView` lets a caller (and the page-shell test) land straight on the
 // terminal tab instead of the default automation view.
 const LiveTrade = ({ initialView = 'automation' } = {}) => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [status, setStatus] = useState([]);
   const [selectedStrategy, setSelectedStrategy] = useState('PhantomV2');
   const [loading, setLoading] = useState(false);
@@ -407,10 +417,11 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
   }, [dataSource, connectionId]);
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchBalance();
     const id = setInterval(fetchBalance, 30000);
     return () => clearInterval(id);
-  }, [fetchBalance]);
+  }, [fetchBalance, isVisible]);
 
   // Per-strategy live results, so a client can judge ONE strategy on ONE
   // account rather than reading a merged blob of every instance.
@@ -424,10 +435,11 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
   }, []);
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchResults();
     const id = setInterval(fetchResults, 10000);
     return () => clearInterval(id);
-  }, [fetchResults]);
+  }, [fetchResults, isVisible]);
 
   const startPayload = () => ({
     strategy_id: selectedStrategy, broker_name: dataSource, data_source: dataSource,
@@ -542,10 +554,11 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
   };
 
   useEffect(() => {
+    if (!isVisible) return;
     fetchStatus();
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isVisible]);
 
   // Every broker/strategy worker is independent; show all of them so an
   // operator can monitor Binance and Delta concurrently.
@@ -561,8 +574,8 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
       <ConfirmModal
         open={!!confirm}
         title="Stop Live Trade Instance?"
-        message={`This will stop instance "${confirm?.instanceKey?.split('_').pop()}" and attempt to close any open positions. Confirmation required.`}
-        confirmLabel="Yes, Stop"
+        message={`This will stop instance "${confirm?.instanceKey?.split('_').pop()}" and:\n\n• Cancel all open orders (releases order margin)\n• Close all open positions (releases position margin)\n\nAll locked margin will be freed. Are you sure?`}
+        confirmLabel="Yes, Stop & Close"
         confirmColor="bg-red-600 hover:bg-red-500"
         onCancel={() => setConfirm(null)}
         onConfirm={stopTrade}

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { API_URL } from '../api';
 import { Users, Activity, Plus, RefreshCw, Key, Eye, EyeOff, ShieldCheck, ChevronDown, ChevronRight, Lock, Percent, Database, Upload, Save, Pencil, X, Trash2, StopCircle } from 'lucide-react';
 import DateInput from '../components/DateInput';
+import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -415,6 +416,8 @@ const ChangePasswordTab = () => {
 
 // -------------------------------------------------------------- Paper tab --
 const PaperTab = () => {
+  // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
+  const isVisible = useVisibilityPause();
   const [paperStatus, setPaperStatus] = useState([]);
   const [msg, setMsg] = useState('');
   const [confirm, setConfirm] = useState(null);
@@ -426,10 +429,11 @@ const PaperTab = () => {
     } catch (e) {}
   };
   useEffect(() => {
+    if (!isVisible) return;
     fetchStatus();
     const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isVisible]);
 
   const start = async (strategy_id) => {
     const res = await fetch(`${API_URL}/paper-trade/start`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ strategy_id }) });
