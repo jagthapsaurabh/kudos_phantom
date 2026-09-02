@@ -13,6 +13,7 @@ from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.paper_trader import _to_ist
 from app.services.broker_client import BrokerClient, is_auth_rejection
+from app.services.margin_preflight import describe_margin_error, is_insufficient_margin
 from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
 from app.core.indicators import compute_indicators
@@ -1053,6 +1054,19 @@ class LiveTradeService:
             print(f"❌ [{self.strategy_id}] LIVE order failed: {res['error']}")
             self._log("error", f"Entry order REJECTED by {self.broker_name}: {res['error']}")
             self._persist_history(force=True)
+            # An account that cannot fund the order will reject the NEXT one
+            # identically, and the one after that — the log fills with the
+            # same `insufficient_margin` body while the card still reads
+            # "running". Stop the instance instead, with a message that says
+            # what is short and what to do about it.
+            if is_insufficient_margin(res.get("error")):
+                reason = describe_margin_error(res.get("error"), broker=self.broker_name,
+                                               strategy_id=self.strategy_id)
+                self.last_error = reason
+                self.last_order_error = reason
+                self._log("error", reason)
+                print(f"🛑 {reason}")
+                await self.stop(reason="insufficient margin — see the instance log")
 
     # ------------------------------------------------------------------
     # Session recording (mirrors PaperTradeService so History is identical)
