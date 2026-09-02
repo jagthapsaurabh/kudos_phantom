@@ -410,7 +410,8 @@ python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_seed_repair.py        # 57 checks: full-history seed + corrupt-candle repair
 python test_mark_price_and_windows.py  # 99 checks: BTC perpetual mark price + skip-new-trade windows
-python test_live_account.py       # 166 checks: rate limits, order lifecycle, terminal schema, live API
+python test_live_account.py       # 272 checks: rate limits, order lifecycle, terminal schema, margin
+                                  # blocked per mode (isolated/cross/portfolio), live API
 python test_live_entry_guard.py   # 44 checks: one live/paper order per signal candle, exchange-position guard
 python test_broker_connections.py # 40 checks: which saved credentials a live call uses, and why not
 python test_delta_key_recovery.py # 73 checks: rejected API key — hold entries, park the deadman switch, reload credentials
@@ -418,8 +419,9 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 345 checks: trade-log table + CSV export, trading windows, page
-                                   # smoke, live terminal, broker key replacement + credential badges
+cd frontend && npm test            # 380 checks: trade-log table + CSV export, trading windows, page
+                                   # smoke, live terminal (incl. the per-mode margin breakdown), broker
+                                   # key replacement + credential badges
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

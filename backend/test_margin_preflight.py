@@ -50,18 +50,29 @@ def section(title):
 class _Wallet:
     """Minimal stand-in for BrokerClient.get_account_balance()."""
 
-    def __init__(self, available, balance=None, raises=False, error=None):
+    def __init__(self, available, balance=None, raises=False, error=None,
+                 cross_blocked=None):
         self.available, self.balance = available, balance
         self.raises, self.error = raises, error
+        # Set for a CROSS-margin account: the isolated fields are zero there and
+        # whatever the venue withholds sits in the cross buckets, with
+        # blocked_margin as its own total across every mode.
+        self.cross_blocked = cross_blocked
 
     def get_account_balance(self, asset="USD"):
         if self.raises:
             raise ConnectionError("connection refused")
         if self.error:
             return {"error": self.error}
-        return [{"asset_symbol": "USD", "balance": str(self.balance if self.balance is not None else self.available),
-                 "available_balance": str(self.available), "order_margin": "0",
-                 "position_margin": "0"}]
+        row = {"asset_symbol": "USD",
+               "balance": str(self.balance if self.balance is not None else self.available),
+               "available_balance": str(self.available), "order_margin": "0",
+               "position_margin": "0"}
+        if self.cross_blocked is not None:
+            row.update({"cross_position_margin": str(self.cross_blocked),
+                        "cross_commission": "0",
+                        "blocked_margin": str(self.cross_blocked)})
+        return [row]
 
 
 RATE = 88.0
@@ -101,6 +112,27 @@ suggested = check_affordable(_Wallet(27.33121655), broker="Delta", capital_inr=1
 check("the suggested margin % actually fits in the wallet", suggested["ok"], str(suggested)[:200])
 check("the refusal also offers a capital figure",
       thin["suggested_capital_inr"] and "lower capital" in thin["message"], thin["message"])
+
+# ===========================================================================
+section("2b. a wallet that is short because margin is already blocked")
+# ===========================================================================
+# The reported account: $27.29 wallet, $16.31 available, and the $10.98 gap is
+# cross-margin blocked by an open position — not missing money.
+blocked_wallet = _Wallet(16.31092465171727, balance=27.28607683,
+                         cross_blocked=10.97515217828273)
+held = check_affordable(blocked_wallet, broker="Delta", capital_inr=10000,
+                        margin_pct=24, leverage=7, conversion_rate=RATE)
+check("the check reads available, not the wallet total",
+      not held["ok"] and held["state"] == "insufficient_margin"
+      and abs(held["available_usd"] - 16.31092465171727) < 1e-9
+      and abs(held["wallet_usd"] - 27.28607683) < 1e-9, str(held)[:250])
+check("the refusal reports what the venue is already blocking, and in which mode",
+      abs(held["blocked_margin"] - 10.97515217828273) < 1e-9
+      and held["margin_mode"] == "cross"
+      and "10.98" in held["message"] and "cross margin" in held["message"], held["message"])
+check("freeing the blocked margin is offered as a fix",
+      "free the" in held["message"] and "close open positions" in held["message"],
+      held["message"])
 
 # ===========================================================================
 section("3. an unverifiable wallet is a refusal, never a silent start")

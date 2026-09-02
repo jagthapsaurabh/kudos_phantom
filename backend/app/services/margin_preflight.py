@@ -132,7 +132,8 @@ def check_affordable(client, *, broker: str, capital_inr: float, margin_pct: flo
                           f"to tell whether this order size can be funded — the live trade "
                           f"was NOT started. {out['error']}")
         return out
-    balance = normalize_balance(payload, broker, asset)
+    balance = normalize_balance(payload, broker, asset,
+                                meta=getattr(client, "last_balance_meta", None))
     if isinstance(balance, dict) and balance.get("error"):
         out["error"] = str(balance["error"])
         out["message"] = (f"{broker} refused the wallet-balance request, so the order size "
@@ -144,6 +145,15 @@ def check_affordable(client, *, broker: str, capital_inr: float, margin_pct: flo
     wallet = _f(balance.get("wallet_balance"))
     asset_code = balance.get("asset") or asset or "USD"
     out.update({"available_usd": available, "wallet_usd": wallet, "asset": asset_code})
+    # Margin the venue is ALREADY holding back, and the mode holding it. On a
+    # cross-margin account the isolated fields read zero, so this is the only
+    # thing that explains a wallet bigger than what can actually be traded with
+    # — and freeing it is a fix the operator can apply without depositing.
+    blocked = _f(balance.get("blocked_margin"))
+    mode = balance.get("margin_mode")
+    if blocked:
+        out["blocked_margin"] = blocked
+        out["margin_mode"] = mode
     if available is None:
         out["error"] = "wallet balance did not include an available balance"
         out["message"] = (f"{broker} did not report an available balance for {asset_code}, so "
@@ -162,6 +172,10 @@ def check_affordable(client, *, broker: str, capital_inr: float, margin_pct: flo
     suggest_pct = _affordable_margin_pct(available, capital_inr, conversion_rate)
     suggest_capital = _affordable_capital_inr(available, margin_pct, conversion_rate)
     fixes = [f"add about {shortfall:,.2f} {asset_code} to the account"]
+    if blocked and blocked > 0.01:
+        fixes.append(f"free the {blocked:,.2f} {asset_code} the venue is already blocking"
+                     + (f" in {mode} margin" if mode else "")
+                     + " (cancel open orders, close open positions)")
     if suggest_pct and suggest_pct > 0:
         fixes.append(f"lower margin % from {need['margin_pct']:g}% to {suggest_pct:g}% or less")
     if suggest_capital and suggest_capital > 0:

@@ -4341,6 +4341,12 @@ def live_account_balance(broker: Optional[str] = None, connection_id: Optional[i
     `state` the UI can render — `ok`, `no_credentials`, or `error` with the
     venue's own message — so the panel shows a number or a reason, never an
     eternal spinner.
+
+    `used_margin` is everything the venue is holding back, in whichever margin
+    mode holds it (Delta blocks isolated / cross / portfolio margin in
+    separate fields), and `reserved_margin` minus it lands in
+    `unattributed_margin` — so wallet, available and used always add up on
+    screen, or the panel says which cash it cannot account for.
     """
     from .services.broker_account import normalize_balance
     code = normalize_source(broker)
@@ -4356,11 +4362,22 @@ def live_account_balance(broker: Optional[str] = None, connection_id: Optional[i
         return {"state": "error", "broker": code, "connection_id": cid,
                 "error": f"{exc.__class__.__name__}: {exc}",
                 "wallet_balance": None, "available_balance": None}
-    balance = normalize_balance(payload, code)
+    balance = normalize_balance(payload, code, meta=getattr(client, "last_balance_meta", None))
     if isinstance(balance, dict) and balance.get("error"):
         return {"state": "error", "broker": code, "connection_id": cid,
                 "error": balance["error"], "wallet_balance": None,
                 "available_balance": None}
+    # A flat wallet blocks no margin, so it cannot say which mode the account
+    # trades in — and "USD · Delta" with no mode is exactly the panel that made
+    # a cross-margin account look isolated. The connection's cached account
+    # settings know it, and reading them costs no API call.
+    if isinstance(balance, dict) and not balance.get("margin_mode"):
+        connection, _problem = _pick_connection(db, user, code, cid)
+        saved = (_connection_dict(connection).get("account_settings") or {}) if connection else {}
+        configured = saved.get("margin_mode")
+        if configured:
+            balance["margin_mode"] = configured
+            balance["margin_mode_source"] = "connection_settings"
     return {"state": "ok", "broker": code, "connection_id": cid,
             "testnet": bool(getattr(client, "testnet", False)), **balance}
 

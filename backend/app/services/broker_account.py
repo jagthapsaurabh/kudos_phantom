@@ -352,8 +352,64 @@ def normalize_fill(row: dict, source: str, contract_value: float = 1.0) -> dict:
 # ---------------------------------------------------------------------------
 # Balances / margin
 # ---------------------------------------------------------------------------
-def normalize_balance(payload: Any, source: str, asset: str = None) -> dict:
-    """Wallet balances and margin breakdown for one venue."""
+# Delta splits blocked margin across THREE buckets, one per margin mode, and
+# only the isolated-mode ones live in the fields this app used to read:
+#
+#   isolated  -> order_margin, position_margin, commission
+#   cross     -> cross_order_margin, cross_position_margin, cross_commission,
+#                cross_locked_collateral
+#   portfolio -> portfolio_margin
+#
+# and `blocked_margin` is the venue's own sum of all of them ("Total blocked
+# margin including commissions for all modes"), with
+# `available_balance = balance - blocked_margin`.
+#
+# Reading only the isolated fields therefore reports "Used margin 0.00" on a
+# cross-margin account while $10.98 of a $27.29 wallet is still locked — the
+# panel looked broken because the money was in a bucket nobody read. So: sum
+# every bucket, prefer the venue's own `blocked_margin` when it answers with
+# one, and report whatever still does not reconcile instead of hiding it.
+DELTA_ISOLATED_FIELDS = ("order_margin", "position_margin", "commission")
+DELTA_CROSS_FIELDS = ("cross_order_margin", "cross_position_margin",
+                      "cross_commission", "cross_locked_collateral")
+DELTA_PORTFOLIO_FIELDS = ("portfolio_margin",)
+DELTA_MARGIN_FIELDS = DELTA_ISOLATED_FIELDS + DELTA_CROSS_FIELDS + DELTA_PORTFOLIO_FIELDS
+# Venues round to 8 decimals and we sum four of their numbers; anything below
+# this is rounding, not withheld cash.
+MARGIN_EPSILON = 0.01
+
+
+def _delta_margin_breakdown(row: dict) -> dict:
+    """Per-mode margin for one Delta wallet row, plus the venue's own total."""
+    parts = {field: _f(row.get(field), 0.0) or 0.0 for field in DELTA_MARGIN_FIELDS}
+    isolated = sum(parts[field] for field in DELTA_ISOLATED_FIELDS)
+    cross = sum(parts[field] for field in DELTA_CROSS_FIELDS)
+    portfolio = sum(parts[field] for field in DELTA_PORTFOLIO_FIELDS)
+    reported = _f(row.get("blocked_margin"))
+    modes = [name for name, amount in (("isolated", isolated), ("cross", cross),
+                                       ("portfolio", portfolio)) if amount > 1e-9]
+    return {
+        **parts,
+        "isolated_margin": isolated,
+        "cross_margin": cross,
+        "portfolio_blocked": portfolio,
+        # The venue's own total wins; older payloads (and mocks) omit it, and
+        # then the per-mode components are the next best thing.
+        "blocked_margin": reported if reported is not None else isolated + cross + portfolio,
+        "blocked_margin_reported": reported,
+        "margin_mode": modes[0] if len(modes) == 1 else ("mixed" if modes else None),
+    }
+
+
+def normalize_balance(payload: Any, source: str, asset: str = None,
+                      meta: Any = None) -> dict:
+    """Wallet balances and margin breakdown for one venue.
+
+    ``meta`` is the envelope block Delta answers ``/v2/wallet/balances`` with
+    (``{"net_equity": ...}``); the client's unwrap drops it, so callers that
+    still have it pass it in and the panel gets equity + unrealised PnL
+    without a second signed call.
+    """
     if _is_error(payload):
         return {"error": _error_text(payload)}
     source = str(source)
@@ -365,45 +421,70 @@ def normalize_balance(payload: Any, source: str, asset: str = None) -> dict:
         "used_margin": None,
         "order_margin": None,
         "position_margin": None,
+        "commission": None,
+        "blocked_margin": None,
+        "blocked_margin_reported": None,
+        "margin_mode": None,
+        "margin_mode_source": None,
+        "reserved_margin": None,
+        "unattributed_margin": None,
+        "balances_reconciled": None,
+        "net_equity": None,
         "unrealized_pnl": None,
         "total": None,
         "balances": [],
     }
     if source == "Delta":
+        envelope_meta = payload.get("meta") if isinstance(payload, dict) else None
         rows = payload if isinstance(payload, list) else (payload or {}).get("result", [])
-        rows = rows if isinstance(rows, list) else []
+        rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            out["balances"].append({
+            view = _delta_margin_breakdown(row)
+            entry = {
                 "asset": row.get("asset_symbol"),
                 "balance": _f(row.get("balance")),
                 "available": _f(row.get("available_balance")),
-                "order_margin": _f(row.get("order_margin")),
-                "position_margin": _f(row.get("position_margin")),
-                "commission": _f(row.get("commission")),
-            })
-        primary = None
-        for row in out["balances"]:
-            if (row.get("asset") or "").upper() == (asset or "USD").upper():
-                primary = row
-                break
-        primary = primary or (out["balances"][0] if out["balances"] else {})
+                "isolated_margin": view["isolated_margin"],
+                "cross_margin": view["cross_margin"],
+                "portfolio_blocked": view["portfolio_blocked"],
+                "blocked_margin": view["blocked_margin"],
+                "margin_mode": view["margin_mode"],
+            }
+            entry.update({field: view[field] for field in DELTA_MARGIN_FIELDS})
+            out["balances"].append(entry)
+
+        want = (asset or "USD").upper()
+        primary = next((row for row in rows
+                        if str(row.get("asset_symbol") or "").upper() == want), None)
+        primary = primary or (rows[0] if rows else {})
+        view = _delta_margin_breakdown(primary)
         out["wallet_balance"] = _f(primary.get("balance"))
-        out["available_balance"] = _f(primary.get("available"))
-        out["order_margin"] = _f(primary.get("order_margin"))
-        out["position_margin"] = _f(primary.get("position_margin"))
-        out["commission"] = _f(primary.get("commission"))
-        # Delta's available_balance accounts for commission (fees reserved for
-        # open positions or pending). Include it in used_margin so the UI shows
-        # where the money is actually locked. Without this, the balance panel
-        # shows "Used margin $0" while available is less than wallet — a gap
-        # that looks like a bug but is just unreported commission.
-        out["used_margin"] = (
-            (_f(primary.get("order_margin"), 0.0) or 0.0) +
-            (_f(primary.get("position_margin"), 0.0) or 0.0) +
-            (_f(primary.get("commission"), 0.0) or 0.0)
-        )
+        out["available_balance"] = _f(primary.get("available_balance"))
+        out.update({field: view[field] for field in DELTA_MARGIN_FIELDS})
+        out["isolated_margin"] = view["isolated_margin"]
+        out["cross_margin"] = view["cross_margin"]
+        out["portfolio_blocked"] = view["portfolio_blocked"]
+        out["blocked_margin"] = view["blocked_margin"]
+        # None when the venue did not send its own total and we summed the
+        # per-mode buckets instead — the UI can say which of the two it shows.
+        out["blocked_margin_reported"] = view["blocked_margin_reported"]
+        out["margin_mode"] = view["margin_mode"]
+        # Where that mode came from: the buckets that are actually holding
+        # cash. A flat wallet blocks nothing and so cannot answer this — the
+        # caller then falls back to the account's configured mode.
+        out["margin_mode_source"] = "blocked_margin" if view["margin_mode"] else None
+        # Everything the venue is holding back, whichever mode holds it.
+        out["used_margin"] = view["blocked_margin"] if rows else None
+
+        meta_row = meta if isinstance(meta, dict) else (
+            envelope_meta if isinstance(envelope_meta, dict) else {})
+        net_equity = _f(meta_row.get("net_equity"))
+        out["net_equity"] = net_equity
+        if net_equity is not None:
+            # Binance's totalMarginBalance analogue: wallet + unrealised PnL.
+            out["total"] = net_equity
+            if out["wallet_balance"] is not None:
+                out["unrealized_pnl"] = net_equity - out["wallet_balance"]
     else:
         payload = payload if isinstance(payload, dict) else {}
         out["asset"] = asset or "USDT"
@@ -426,9 +507,29 @@ def normalize_balance(payload: Any, source: str, asset: str = None) -> dict:
         out["unrealized_pnl"] = out["unrealized_pnl"] if out["unrealized_pnl"] is not None \
             else _f(payload.get("totalUnrealizedProfit"))
         out["total"] = _f(payload.get("totalMarginBalance"))
+        out["net_equity"] = out["total"]
         out["can_trade"] = bool(payload.get("canTrade"))
         out["can_withdraw"] = bool(payload.get("canWithdraw"))
         out["multi_asset_margin"] = bool(payload.get("multiAssetsMargin", False))
+
+    # Reconciliation, both venues: what the wallet is short of its available
+    # balance versus what we can name. A residual here means cash is locked for
+    # a reason this schema does not know about (a pending withdrawal, a spot
+    # order, a bucket the venue added) — reported, never silently swallowed,
+    # because "Used margin $0" next to a smaller available balance is what made
+    # this look like a bug in the first place.
+    wallet = _f(out.get("wallet_balance"))
+    available = _f(out.get("available_balance"))
+    if wallet is not None and available is not None:
+        reserved = wallet - available
+        attributed = _f(out.get("used_margin"), 0.0) or 0.0
+        if source != "Delta":
+            # Binance keeps open-order margin out of used_margin, but its
+            # availableBalance has already paid for it.
+            attributed += _f(out.get("order_margin"), 0.0) or 0.0
+        out["reserved_margin"] = reserved
+        out["unattributed_margin"] = reserved - attributed
+        out["balances_reconciled"] = abs(out["unattributed_margin"]) <= MARGIN_EPSILON
     return out
 
 
@@ -437,23 +538,39 @@ def normalize_balance(payload: Any, source: str, asset: str = None) -> dict:
 # ---------------------------------------------------------------------------
 def portfolio_risk(balance: dict, positions: List[dict]) -> dict:
     """Account-level risk numbers shown in the terminal's risk panel."""
+    balance = balance if isinstance(balance, dict) else {}
     wallet = _f(balance.get("wallet_balance")) or 0.0
     available = _f(balance.get("available_balance")) or 0.0
     used = _f(balance.get("used_margin")) or 0.0
-    unrealized = sum(_f(p.get("unrealized_pnl")) or 0.0 for p in positions if not p.get("error"))
-    long_notional = sum(p.get("notional") or 0.0 for p in positions
-                        if not p.get("error") and p.get("side") == "long")
-    short_notional = sum(p.get("notional") or 0.0 for p in positions
-                         if not p.get("error") and p.get("side") == "short")
+    open_positions = [p for p in positions if not p.get("error")]
+    reported = [_f(p.get("unrealized_pnl")) for p in open_positions]
+    known = [value for value in reported if value is not None]
+    # Delta's position rows do not carry unrealised PnL at all, so the
+    # per-position sum reads 0 there even with an open trade — while the wallet
+    # read still knows it (net_equity). Trust the positions when the venue
+    # reports them, otherwise fall back to the account-level figure.
+    unrealized = sum(known) if known else (_f(balance.get("unrealized_pnl")) or 0.0)
+    long_notional = sum(p.get("notional") or 0.0 for p in open_positions
+                        if p.get("side") == "long")
+    short_notional = sum(p.get("notional") or 0.0 for p in open_positions
+                         if p.get("side") == "short")
     notional = long_notional + short_notional
     net_notional = long_notional - short_notional
-    equity = wallet + unrealized
+    # The venue's own equity when it reports one (Delta meta.net_equity,
+    # Binance totalMarginBalance); wallet + PnL otherwise.
+    equity = _f(balance.get("net_equity"))
+    if equity is None:
+        equity = wallet + unrealized
     return {
         "wallet_balance": wallet,
         "equity": equity,
         "available_margin": available,
         "used_margin": used,
+        "blocked_margin": _f(balance.get("blocked_margin")),
+        "margin_mode": balance.get("margin_mode"),
         "order_margin": _f(balance.get("order_margin")) or 0.0,
+        "unattributed_margin": _f(balance.get("unattributed_margin")),
+        "balances_reconciled": balance.get("balances_reconciled"),
         "unrealized_pnl": unrealized,
         "gross_notional": notional,
         "net_notional": net_notional,
@@ -462,7 +579,7 @@ def portfolio_risk(balance: dict, positions: List[dict]) -> dict:
         "margin_utilisation_pct": (used / equity * 100.0) if equity else 0.0,
         "effective_leverage": (notional / equity) if equity else 0.0,
         "free_margin_pct": (available / equity * 100.0) if equity else 0.0,
-        "position_count": len([p for p in positions if not p.get("error")]),
+        "position_count": len(open_positions),
     }
 
 
@@ -567,7 +684,8 @@ def account_snapshot(client, symbol: str = "BTCUSDT", include_history: bool = Tr
     balance: Dict[str, Any] = {}
     balance_error = None
     try:
-        balance = normalize_balance(client.get_account_balance(), source) or {}
+        balance = normalize_balance(client.get_account_balance(), source,
+                                    meta=getattr(client, "last_balance_meta", None)) or {}
         if _is_error(balance):
             balance_error = _error_text(balance)
             balance = {}

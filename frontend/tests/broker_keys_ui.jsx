@@ -41,7 +41,7 @@ globalThis.fetch = (url) => {
 
 import BrokerSettings, { ConnectionCard, AccountManager } from '../src/pages/BrokerSettings.jsx';
 import Sessions from '../src/pages/Sessions.jsx';
-import LiveTrade, { CredentialsBadge, HeartbeatBadge, FeedBadge } from '../src/pages/LiveTrade.jsx';
+import LiveTrade, { BalancePanel, CredentialsBadge, HeartbeatBadge, FeedBadge } from '../src/pages/LiveTrade.jsx';
 import LiveTerminal from '../src/components/LiveTerminal.jsx';
 
 let pass = 0, fail = 0;
@@ -286,6 +286,41 @@ check('the card says what the key trades as', parentCard.includes('trades as') &
 check('the card embeds the account manager', parentCard.includes('Accounts on this key'));
 const emptyMgr = render(React.createElement(AccountManager, { c: CONNECTIONS[0], onDone: () => {} }));
 check('a key that cannot list accounts shows nothing extra', !emptyMgr.includes('Accounts on this key'));
+
+// ------------------------------------------------- Balance panel (margin) --
+// The reported panel: Wallet $27.29 / Available $16.31 / Used margin $0.00 on a
+// CROSS-margin Delta account. Delta blocks margin per mode and the isolated
+// fields are all zero there, so the cash sat in buckets the panel never named.
+console.log('\n== Balance panel: margin blocked per mode ==');
+const CROSS_BALANCE = {
+  state: 'ok', broker: 'Delta', asset: 'USD', testnet: false,
+  wallet_balance: 27.28607683, available_balance: 16.31092465171727,
+  used_margin: 10.97515217828273, blocked_margin: 10.97515217828273,
+  order_margin: 0, position_margin: 0, commission: 0,
+  cross_order_margin: 0, cross_position_margin: 10.8689,
+  cross_commission: 0.10625217828273, cross_locked_collateral: 0,
+  portfolio_margin: 0, margin_mode: 'cross',
+  reserved_margin: 10.97515217828273, unattributed_margin: 0,
+  balances_reconciled: true, unrealized_pnl: 0.61392317, total: 27.9,
+};
+const crossPanel = render(React.createElement(BalancePanel,
+  { balance: CROSS_BALANCE, marginUsed: 0, broker: 'Delta' }));
+check('used margin is the venue\'s blocked total, not $0.00', crossPanel.includes('$10.98'));
+check('names the cross-margin buckets holding the cash',
+  crossPanel.includes('Cross position margin') && crossPanel.includes('Cross commission'));
+check('leaves empty isolated buckets out',
+  !crossPanel.includes('Position margin (isolated)') && !crossPanel.includes('Commission (isolated)'));
+check('says which margin mode the account trades in', crossPanel.includes('cross margin'));
+check('unrealised PnL is a number, not a dash', crossPanel.includes('$0.61'));
+check('a reconciled wallet shows no warning row', !crossPanel.includes('Reserved (unattributed)'));
+
+const blindPanel = render(React.createElement(BalancePanel, {
+  balance: { ...CROSS_BALANCE, used_margin: 0, blocked_margin: 0, cross_position_margin: 0,
+             cross_commission: 0, margin_mode: null, unattributed_margin: 10.97515217828273,
+             balances_reconciled: false },
+  marginUsed: 0, broker: 'Delta' }));
+check('cash no bucket explains is still shown, not swallowed',
+  blindPanel.includes('Reserved (unattributed)') && blindPanel.includes('$10.98'));
 
 // ------------------------------------------------------- Sessions history --
 console.log('\n== Sessions: live and paper histories are separate ==');

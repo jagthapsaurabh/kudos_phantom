@@ -325,14 +325,34 @@ class Handler(BaseHTTPRequestHandler):
             # flag simulates a deployment whose rows come back without it so
             # the sub-accounts fallback gets exercised.
             uid = None if STATE.get("wallet_no_user_id") else "5112346"
+            if STATE.get("wallet_flat"):
+                # A flat account: nothing blocked anywhere, so the wallet itself
+                # cannot say which margin mode the account is configured for.
+                flat = [{"asset_symbol": "USD", "balance": "1000.00",
+                         "available_balance": "1000.00", "blocked_margin": "0.00",
+                         "cross_position_margin": "0", "cross_commission": "0"}]
+                if uid:
+                    flat[0]["user_id"] = uid
+                return self._send({"success": True, "error": None, "result": flat,
+                                   "meta": {"net_equity": "1000.00"}})
+            # This account trades in CROSS margin mode (see /v2/sub_accounts
+            # below), and Delta blocks margin per mode: the isolated fields are
+            # all zero here while everything withheld sits in the cross_*
+            # fields. blocked_margin is the venue's own total across every mode
+            # and available_balance = balance - blocked_margin. The envelope's
+            # meta carries net_equity (wallet + unrealised PnL).
             rows = [
                 {"asset_symbol": "USD", "balance": "1000.00", "available_balance": "940.00",
-                 "order_margin": "19.80", "position_margin": "40.20", "commission": "0.10"},
+                 "order_margin": "0.00", "position_margin": "0.00", "commission": "0.00",
+                 "cross_order_margin": "19.80", "cross_position_margin": "40.10",
+                 "cross_commission": "0.10", "cross_locked_collateral": "0.00",
+                 "blocked_margin": "60.00"},
                 {"asset_symbol": "BTC", "balance": "0.01", "available_balance": "0.01"}]
             if uid:
                 for row in rows:
                     row["user_id"] = uid
-            return self._send(self._delta(rows))
+            return self._send({"success": True, "error": None, "result": rows,
+                               "meta": {"net_equity": "1003.00", "robo_trading_equity": "0"}})
         if path == "/v2/rate_limits/quota":
             return self._send(self._delta({"current_quota": 6420.0,
                                            "remaining_time_in_milliseconds": 123000}))
@@ -851,8 +871,74 @@ check("Binance balance: used + order margin split",
 bal_d = broker_account.normalize_balance(
     [{"asset_symbol": "USD", "balance": "1000", "available_balance": "940",
       "order_margin": "19.8", "position_margin": "40.2"}], "Delta")
-check("Delta balance: order + position margin",
-      bal_d["wallet_balance"] == 1000.0 and abs(bal_d["used_margin"] - 60.0) < 1e-9, str(bal_d)[:300])
+check("Delta balance: isolated order + position margin",
+      bal_d["wallet_balance"] == 1000.0 and abs(bal_d["used_margin"] - 60.0) < 1e-9
+      and bal_d["margin_mode"] == "isolated" and bal_d["balances_reconciled"] is True,
+      str(bal_d)[:300])
+check("Binance balance: wallet - available is attributed to position + order margin",
+      bal_b["reserved_margin"] == 60.0 and bal_b["unattributed_margin"] == 0.0
+      and bal_b["balances_reconciled"] is True, str(bal_b)[:300])
+
+# ---------------------------------------------------------------------------
+# The reported panel: Wallet $27.29 / Available $16.31 / Used margin $0.00.
+# Delta blocks margin PER MODE and the isolated-only fields the normalizer used
+# to read are all zero on a cross-margin account, so $10.98 looked like it had
+# vanished. It is cross_position_margin + cross_commission.
+# ---------------------------------------------------------------------------
+cross_rows = [{"asset_symbol": "USD", "balance": "27.28607683",
+               "available_balance": "16.31092465171727",
+               "order_margin": "0", "position_margin": "0", "commission": "0",
+               "cross_order_margin": "0", "cross_position_margin": "10.8689",
+               "cross_commission": "0.10625217828273",
+               "cross_locked_collateral": "0",
+               "blocked_margin": "10.97515217828273"}]
+bal_cross = broker_account.normalize_balance(cross_rows, "Delta",
+                                             meta={"net_equity": "27.90000000"})
+check("Delta cross margin: used margin is the venue's blocked total, not the isolated fields",
+      abs(bal_cross["used_margin"] - 10.97515217828273) < 1e-9
+      and bal_cross["margin_mode"] == "cross", str(bal_cross)[:300])
+check("Delta cross margin: wallet = available + used",
+      abs(bal_cross["wallet_balance"]
+          - (bal_cross["available_balance"] + bal_cross["used_margin"])) < 1e-9
+      and bal_cross["balances_reconciled"] is True
+      and abs(bal_cross["unattributed_margin"]) < 1e-9, str(bal_cross)[:300])
+check("Delta cross margin: each cross bucket is reported on its own",
+      abs(bal_cross["cross_position_margin"] - 10.8689) < 1e-9
+      and abs(bal_cross["cross_commission"] - 0.10625217828273) < 1e-12
+      and bal_cross["isolated_margin"] == 0.0
+      and abs(bal_cross["cross_margin"] - 10.97515217828273) < 1e-9, str(bal_cross)[:300])
+check("Delta net_equity fills total + unrealised PnL (both used to be null)",
+      abs(bal_cross["total"] - 27.9) < 1e-9 and abs(bal_cross["net_equity"] - 27.9) < 1e-9
+      and abs(bal_cross["unrealized_pnl"] - (27.9 - 27.28607683)) < 1e-9, str(bal_cross)[:300])
+
+no_blocked = dict(cross_rows[0])
+no_blocked.pop("blocked_margin")
+bal_sum = broker_account.normalize_balance([no_blocked], "Delta")
+check("Delta: per-mode components are summed when blocked_margin is absent",
+      abs(bal_sum["used_margin"] - 10.97515217828273) < 1e-9
+      and bal_sum["blocked_margin_reported"] is None
+      and bal_sum["balances_reconciled"] is True, str(bal_sum)[:300])
+
+bal_blind = broker_account.normalize_balance(
+    [{"asset_symbol": "USD", "balance": "27.28607683",
+      "available_balance": "16.31092465171727", "order_margin": "0",
+      "position_margin": "0", "commission": "0"}], "Delta")
+check("Delta: cash no bucket explains is reported instead of hidden",
+      bal_blind["used_margin"] == 0.0
+      and abs(bal_blind["reserved_margin"] - 10.97515217828273) < 1e-9
+      and abs(bal_blind["unattributed_margin"] - 10.97515217828273) < 1e-9
+      and bal_blind["balances_reconciled"] is False, str(bal_blind)[:300])
+
+bal_mixed = broker_account.normalize_balance(
+    [{"asset_symbol": "USD", "balance": "1000", "available_balance": "900",
+      "order_margin": "10", "position_margin": "20", "commission": "0",
+      "cross_position_margin": "60", "portfolio_margin": "10",
+      "blocked_margin": "100"}], "Delta")
+check("Delta: isolated + cross + portfolio all count as used margin",
+      bal_mixed["margin_mode"] == "mixed" and bal_mixed["used_margin"] == 100.0
+      and bal_mixed["isolated_margin"] == 30.0 and bal_mixed["cross_margin"] == 60.0
+      and bal_mixed["portfolio_blocked"] == 10.0
+      and bal_mixed["balances_reconciled"] is True, str(bal_mixed)[:300])
 
 risk = broker_account.portfolio_risk(bal_d, [pos, short_pos])
 check("risk: equity and margin utilisation",
@@ -861,6 +947,27 @@ check("risk: equity and margin utilisation",
 check("risk: gross vs net exposure",
       abs(risk["gross_notional"] - (pos["notional"] + short_pos["notional"])) < 1e-6
       and risk["net_notional"] < risk["gross_notional"], str(risk)[:300])
+
+risk_cross = broker_account.portfolio_risk(bal_cross, [pos])
+check("risk: cross-margin utilisation uses the blocked margin and the venue's equity",
+      risk_cross["margin_mode"] == "cross" and abs(risk_cross["equity"] - 27.9) < 1e-9
+      and abs(risk_cross["margin_utilisation_pct"] - (10.97515217828273 / 27.9 * 100.0)) < 1e-6,
+      str(risk_cross)[:300])
+check("risk: the same account read as isolated-only reported 0% utilisation",
+      abs(broker_account.portfolio_risk(bal_blind, [pos])["margin_utilisation_pct"]) < 1e-9
+      and broker_account.portfolio_risk(bal_blind, [pos])["balances_reconciled"] is False,
+      str(risk_cross)[:300])
+
+# Delta position rows carry no unrealised PnL at all, so the per-position sum
+# reads zero even with an open trade — the wallet's net_equity still knows it.
+silent_pos = broker_account.normalize_position(
+    {"size": 30, "entry_price": "67000.5", "margin": "10.8689", "leverage": 10,
+     "product_symbol": "BTCUSD"}, "Delta", 0.001, 67100.5)
+risk_silent = broker_account.portfolio_risk(bal_cross, [silent_pos])
+check("risk: account-level PnL stands in when positions report none",
+      silent_pos["unrealized_pnl"] is None
+      and abs(risk_silent["unrealized_pnl"] - (27.9 - 27.28607683)) < 1e-9
+      and abs(risk_silent["equity"] - 27.9) < 1e-9, str(risk_silent)[:300])
 
 # ===========================================================================
 section("8. account snapshot (what the terminal renders)")
@@ -887,6 +994,13 @@ check("order history panel (closed orders)", len(snap["order_history"]) == 1,
       str(snap["order_history"])[:200])
 check("balance + risk panels", snap["balance"]["wallet_balance"] == 1000.0
       and snap["risk"]["equity"] > 0, str(snap["risk"])[:200])
+check("snapshot balance reads every margin mode + the envelope's net equity",
+      abs(snap["balance"]["used_margin"] - 60.0) < 1e-9
+      and abs(snap["balance"]["cross_position_margin"] - 40.10) < 1e-9
+      and snap["balance"]["margin_mode"] == "cross"
+      and snap["balance"]["balances_reconciled"] is True
+      and abs(snap["balance"]["total"] - 1003.0) < 1e-9
+      and snap["risk"]["margin_mode"] == "cross", str(snap["balance"])[:300])
 check("rate limits are reported to the UI", "limits" in snap["rate_limits"])
 check("no section errors", not snap["errors"], str(snap["errors"]))
 
@@ -1168,6 +1282,51 @@ check("snapshot carries the account's real margin mode for the terminal",
       (body.get("account_settings") or {}).get("margin_mode") == "cross"
       and (body.get("account_settings") or {}).get("margin_family") == "cross",
       str(body.get("account_settings"))[:250])
+
+# The panel the bug report was about: wallet / available / used margin have to
+# add up, and the used figure has to include margin blocked in cross mode.
+r = api.get("/live-account/balance", headers=H, params={"broker": "Delta"})
+body = r.json()
+check("GET /live-account/balance reports margin blocked in every mode",
+      r.status_code == 200 and body["state"] == "ok"
+      and abs(body["used_margin"] - 60.0) < 1e-9 and body["margin_mode"] == "cross"
+      and body["balances_reconciled"] is True
+      and abs(body["wallet_balance"]
+              - (body["available_balance"] + body["used_margin"])) < 1e-9, r.text[:300])
+check("GET /live-account/balance carries equity + uPnL instead of null",
+      abs(body["total"] - 1003.0) < 1e-9 and abs(body["unrealized_pnl"] - 3.0) < 1e-9,
+      r.text[:300])
+
+# A flat wallet blocks no margin, so its buckets cannot name the mode the
+# account trades in. The connection's cached account settings can — read from
+# the database, not the venue, so the 30-second balance poll costs nothing.
+db = SessionLocal()
+delta_conn = db.query(BrokerConnection).filter(
+    BrokerConnection.user_id == TRADER_ID,
+    BrokerConnection.broker_code == "Delta").order_by(BrokerConnection.id).first()
+delta_conn.account_settings = json.dumps({"margin_mode": "cross", "margin_family": "cross"})
+db.commit()
+delta_cid = delta_conn.id
+db.close()
+
+STATE["wallet_flat"] = True
+r = api.get("/live-account/balance", headers=H,
+            params={"broker": "Delta", "connection_id": delta_cid})
+body = r.json()
+check("a flat wallet reconciles at zero used margin",
+      body["state"] == "ok" and body["used_margin"] == 0.0
+      and body["reserved_margin"] == 0.0 and body["balances_reconciled"] is True
+      and abs(body["wallet_balance"] - body["available_balance"]) < 1e-9, r.text[:300])
+check("a flat wallet still reports the account's margin mode",
+      body["margin_mode"] == "cross"
+      and body["margin_mode_source"] == "connection_settings", r.text[:300])
+STATE["wallet_flat"] = False
+r = api.get("/live-account/balance", headers=H,
+            params={"broker": "Delta", "connection_id": delta_cid})
+body = r.json()
+check("with margin blocked, the mode comes from the buckets themselves",
+      body["margin_mode"] == "cross" and body["margin_mode_source"] == "blocked_margin"
+      and abs(body["used_margin"] - 60.0) < 1e-9, r.text[:300])
 
 # Connections are saved with the account details the venue just reported —
 # per connection, because each sub-account has its own margin mode.
