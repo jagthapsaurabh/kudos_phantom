@@ -3,6 +3,7 @@ import { API_URL } from '../api';
 import { BookOpen, Calculator, Plug } from 'lucide-react';
 import StrategyExplainedTab from './StrategyExplainedTab';
 import StrategyFlowTab from './StrategyFlowTab';
+import { PHANTOM_PRESETS, macdLineRuleText, setupModeLabel, tradeDirectionLabel } from '../utils/phantomPresets';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -27,7 +28,7 @@ const StrategyRulesTab = ({ profile, champion }) => {
   const interesting = [
     'adx_min', 'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min',
     'rsi_oversold', 'rsi_overbought', 'atr_regime_ratio',
-    'enable_momentum_entry', 'trend_ema_period', 'stop_loss_atr', 'take_profit_atr',
+    'enable_momentum_entry', 'setup_mode', 'trade_direction', 'trend_ema_period', 'stop_loss_atr', 'take_profit_atr',
     'trail_activation_atr', 'trail_distance_atr', 'breakeven_atr', 'timeout_bars',
     'cooldown_bars', 'leverage', 'margin_pct', 'reduced_margin_pct',
     'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct',
@@ -70,6 +71,72 @@ const StrategyRulesTab = ({ profile, champion }) => {
         <Rule name="6. RSI agreement">RSI(14) ≥ {cfg.momentum_rsi_min ?? 50} (long) / ≤ {cfg.momentum_rsi_min ? (100 - cfg.momentum_rsi_min) : 50} (short).</Rule>
       </DocSection>
 
+      <DocSection title="📊 MACD Settings — periods, histogram, line & signal (v3.5)" color="text-cyan-400">
+        {(() => {
+          const ec = cfg.entry_conditions || {};
+          const perSidePeriods = !!ec.use_direction_conditions;
+          const p = (side) => {
+            const b = perSidePeriods ? (ec[side] || {}) : {};
+            return `${b.macd_fast ?? cfg.macd_fast ?? 12} / ${b.macd_slow ?? cfg.macd_slow ?? 26} / ${b.macd_signal ?? cfg.macd_signal ?? 9}`;
+          };
+          const histSplit = !!(ec.use_direction_conditions || ec.use_direction_macd_hist);
+          const histLong = histSplit && ec.long?.macd_hist_min != null ? ec.long.macd_hist_min : Math.abs(cfg.macd_hist_min ?? 5);
+          const histShort = histSplit && ec.short?.macd_hist_min != null ? ec.short.macd_hist_min : -Math.abs(cfg.macd_hist_min ?? 5);
+          const lineLong = macdLineRuleText(cfg, 1);
+          const lineShort = macdLineRuleText(cfg, -1);
+          const lineOn = lineLong !== 'off' || lineShort !== 'off';
+          return (
+            <>
+              <p className="text-xs text-gray-500">
+                One MACD indicator feeds three separate checks. The <b>periods</b> shape the indicator; the <b>histogram threshold</b>,
+                the <b>confirmation / zero-cross</b> rules and the optional <b>line / signal rules</b> are the entry conditions read from it.
+                All of them are editable in Backtest → Strategy Configuration and saved with a named strategy.
+              </p>
+              <Rule name="MACD periods (fast / slow / signal)">
+                {perSidePeriods
+                  ? <>Long <b className="text-green-300">{p('long')}</b> · Short <b className="text-red-300">{p('short')}</b> (legacy per-side override active).</>
+                  : <>Currently <b className="text-white">{p('long')}</b> on the 1h close. MACD line = EMA(fast) − EMA(slow); signal = EMA(MACD line, signal); histogram = MACD line − signal.</>}
+              </Rule>
+              <Rule name="Histogram threshold (macd_hist_min)">
+                Reversal entries only: Long needs hist ≥ <b className="text-green-300">{histLong}</b>, Short needs hist ≤ <b className="text-red-300">{histShort}</b>.
+                Momentum entries use the histogram zero-cross instead.
+              </Rule>
+              <Rule name="MACD line / signal line rules (new, optional)">
+                {lineOn ? (
+                  <>Currently <b className="text-white">ON</b> — Long: <b className="text-green-300">{lineLong}</b> · Short: <b className="text-red-300">{lineShort}</b>. Applied to both setups on top of every existing filter.</>
+                ) : (
+                  <>Currently <b className="text-white">OFF</b> (default — behaviour unchanged). When enabled, each rule can require the MACD line to be
+                  <b> above / below the signal line</b>, <b>above / below zero</b>, the <b>signal line above / below zero</b>, or a <b>crossover on the signal candle</b>;
+                  optional minimum levels for the MACD line and the signal line can be added. Long reads the bullish side of each rule, Short the bearish side,
+                  and each side can carry its own rules.</>
+                )}
+              </Rule>
+            </>
+          );
+        })()}
+      </DocSection>
+
+      <DocSection title="🔀 Strategy Separation — setups and sides (v3.5)" color="text-amber-400">
+        <p className="text-xs text-gray-500">
+          The same tuned strategy can be run as one setup or one side only. Pick it in the Backtest form
+          (<b>Setup</b> / <b>Direction</b>) and save it as a named strategy, or choose a built-in preset in any strategy dropdown.
+          Default: <b className="text-white">{setupModeLabel(cfg.setup_mode || 'both')}</b> · <b className="text-white">{tradeDirectionLabel(cfg.trade_direction || 'both')}</b>.
+        </p>
+        <Rule name="Setup">Reversal + Momentum (original) · Reversal only (Setup A never lets Setup B fire) · Momentum only (Setup B fires even with the momentum box unticked).</Rule>
+        <Rule name="Direction">Long + Short (original) · Long only · Short only. The kept side's entries are exactly the ones the two-sided strategy takes — nothing is re-tuned.</Rule>
+        <Rule name="Built-in presets">
+          <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
+            {PHANTOM_PRESETS.map(p => (
+              <div key={p.id} className="flex items-center justify-between gap-2 rounded border border-gray-700/60 bg-gray-900/60 px-2 py-1">
+                <span className="text-gray-200">{p.name}</span>
+                <span className="font-mono text-[10px] text-gray-500">{p.id}</span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-gray-500">Each preset is the champion config with only the setup / direction narrowed; every other value on this page applies unchanged. Presets run side by side with the default on the same account because they are separate strategies.</p>
+        </Rule>
+      </DocSection>
+
       <DocSection title="🛡️ Risk, Exits & Drawdown Guard" color="text-red-400">
         <Rule name="Stop loss">{cfg.stop_loss_atr ?? 1.2}×ATR from entry, with a hard floor of {(cfg.sl_floor_pct ?? 0.016) * 100}% of price.</Rule>
         <Rule name="Take profit">{cfg.take_profit_atr ?? 14}×ATR from entry (maker fee on TP fills).</Rule>
@@ -86,7 +153,7 @@ const StrategyRulesTab = ({ profile, champion }) => {
         <p className="text-xs text-gray-500">This is the exact tuned parameter set currently powering backtests and the signal overlay.</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs">
           {interesting.map(k => {
-            const defaults = { macd_fast: 12, macd_slow: 26, macd_signal: 9, trend_ema_period: 50 };
+            const defaults = { macd_fast: 12, macd_slow: 26, macd_signal: 9, trend_ema_period: 50, setup_mode: 'both', trade_direction: 'both' };
             const val = cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : defaults[k];
             return (
               <div key={k} className="flex justify-between border-b border-gray-700/50 py-1">

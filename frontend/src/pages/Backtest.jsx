@@ -7,6 +7,11 @@ import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } from '../utils/tradingWindows';
 import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart } from 'lucide-react';
 import MarketOverlayChart from '../components/MarketOverlayChart';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import {
+  SETUP_MODES, TRADE_DIRECTIONS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS, DEFAULT_MACD_LINE_RULES,
+  parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, macdLineRuleText,
+} from '../utils/phantomPresets';
 
 const PARAM_META = {
   trend_ema_period: { label: 'Trend EMA', hint: 'How far back the 4h trend looks. Higher = slower, fewer trades.' },
@@ -31,6 +36,11 @@ const PARAM_META = {
   dd_soft_pct: { label: 'Soft drawdown %', hint: 'Past this equity drawdown, position size is reduced.' },
   dd_halt_pct: { label: 'Halt drawdown %', hint: 'Past this, new entries stop. 100 = guard off.' },
   dd_resume_pct: { label: 'Resume drawdown %', hint: 'Start entries again once drawdown falls below this.' },
+  // v3.5 — strategy separation + MACD line / signal line rules.
+  setup_mode: { label: 'Setup', hint: 'Which entry setup may fire: both (original), Reversal only (Setup A) or Momentum only (Setup B).' },
+  trade_direction: { label: 'Direction', hint: 'Which side may be opened: both (original), Long only or Short only.' },
+  macd_line_min: { label: 'MACD line level', hint: 'Optional. Longs need MACD line ≥ this, shorts ≤ minus this. Blank = off.' },
+  macd_signal_min: { label: 'Signal line level', hint: 'Optional. Longs need signal line ≥ this, shorts ≤ minus this. Blank = off.' },
 };
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
@@ -109,6 +119,10 @@ const buildTradesCSV = (trades) => {
     'SL at Entry', 'SL at Exit', 'Take Profit', 'Trail Stop', 'ATR at Entry', 'Peak Price',
     'Lots', 'Margin', 'Notional', 'Margin % Used', 'Drawdown at Entry %',
     'PnL (Gross)', 'Fees', 'Booked PnL (Net)', 'Equity After', 'Drawdown %', 'Bars Held',
+    // v3.5 — appended after the original layout so existing sheets keep their
+    // column positions: MACD line / signal at the signal candle and the
+    // optional MACD line-rule result (N/A for runs that did not use it).
+    'MACD Line', 'MACD Signal', 'Entry Cond 8 - MACD Line/Signal',
   ];
   // UTC, to the second, so a row in the sheet matches the on-screen log exactly.
   const fmtTime = (v) => fmtCandleTime(v, { seconds: true });
@@ -144,6 +158,7 @@ const buildTradesCSV = (trades) => {
       num(t.entry_dd_pct),
       num(t.gross_pnl), num(t.fees), num(t.net_pnl), num(t.equity_after),
       num(t.drawdown), t.hold_bars ?? '',
+      num(t.macd_line), num(t.macd_signal), condLabel(c.macd_line_ok),
     ];
   });
   // CRLF so Excel keeps one row per line; the caller prepends the UTF-8 BOM so
@@ -325,6 +340,9 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                         <CondChip ok={t.conditions?.rsi_ok} label={t.setup === 'MOMENTUM' ? 'RSI agreement' : 'RSI trigger'} />
                         <CondChip ok={t.conditions?.macd_confirm_ok} label={t.setup === 'MOMENTUM' ? 'MACD zero-cross' : 'MACD confirm'} />
                         <CondChip ok={t.conditions?.di_ok} label="DI confirm" />
+                        {t.conditions?.macd_line_ok !== undefined && t.conditions?.macd_line_ok !== null && (
+                          <CondChip ok={t.conditions?.macd_line_ok} label="MACD line/signal" />
+                        )}
                       </div>
                       <div className="mt-1.5 text-[9px] text-gray-500">
                         ATR test: <span className="font-mono text-gray-300">{atrRegimeRuleFor(params, t.direction)}</span>
@@ -340,6 +358,9 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                       <div className="mb-1 text-[9px] font-bold uppercase text-gray-500">Indicators @ Signal</div>
                       <div className="space-y-0.5 font-mono text-gray-300">
                         <div>MACD-hist: {t.macd_hist?.toFixed(2) ?? '—'}</div>
+                        {(t.macd_line != null || t.macd_signal != null) && (
+                          <div>MACD line / signal: {t.macd_line?.toFixed(2) ?? '—'} / {t.macd_signal?.toFixed(2) ?? '—'}</div>
+                        )}
                         <div>ATR14: {t.atr14?.toFixed(2) ?? '—'}</div>
                         <div>EMA50 1h: {t.ema50_1h?.toFixed(2) ?? '—'}</div>
                         <div>EMA50 4h: {t.ema50_4h?.toFixed(2) ?? '—'}</div>
@@ -400,14 +421,22 @@ const Backtest = () => {
     use_mark_price: true,
     // "Skip new trades" schedule (weekend / holiday blackout windows).
     trading_windows: emptySchedule(),
+    // v3.5 strategy separation — 'both' / 'both' is the original strategy.
+    setup_mode: 'both',
+    trade_direction: 'both',
+    // v3.5 MACD line / signal line rules — OFF unless the client enables them.
+    macd_line_rules: { ...DEFAULT_MACD_LINE_RULES },
     entry_conditions: {
       // The two direction toggles are intentionally independent. The legacy
       // use_direction_conditions flag is still accepted for older saved runs.
       use_direction_conditions: false,
       use_direction_macd_hist: false,
       use_direction_atr_floor: false,
-      long: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
-      short: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null },
+      use_direction_macd_line: false,
+      long: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null,
+              macd_line_vs_signal: null, macd_line_vs_zero: null, macd_signal_vs_zero: null, macd_line_min: null, macd_signal_min: null },
+      short: { macd_fast: null, macd_slow: null, macd_signal: null, macd_hist_min: null, stop_loss_atr: null, atr_regime_ratio: null, atr_regime_op: null, atr_regime_max: null, rsi_oversold: null, rsi_overbought: null, adx_min: null,
+               macd_line_vs_signal: null, macd_line_vs_zero: null, macd_signal_vs_zero: null, macd_line_min: null, macd_signal_min: null },
     },
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
@@ -483,9 +512,37 @@ const Backtest = () => {
   const useDirection = !!(params.entry_conditions && params.entry_conditions.use_direction_conditions);
   const useDirMacdHist = useDirection || !!(params.entry_conditions && params.entry_conditions.use_direction_macd_hist);
   const useDirAtrFloor = useDirection || !!(params.entry_conditions && params.entry_conditions.use_direction_atr_floor);
+  // v3.5 — MACD line / signal rules and the setup / direction selectors.
+  const macdLineRules = params.macd_line_rules || DEFAULT_MACD_LINE_RULES;
+  const useDirMacdLine = !!(macdLineRules.enabled && params.entry_conditions && params.entry_conditions.use_direction_macd_line);
+  // A built-in preset (e.g. PhantomV2:reversal:long) fixes setup / direction;
+  // the selectors then mirror the preset and are locked.
+  const presetVariant = parsePhantomVariant(selectedStrategyId);
+  const presetLocked = !!presetVariant && (presetVariant.setup_mode !== 'both' || presetVariant.trade_direction !== 'both');
 
   const toggleSection = (key) => setSectionVisibility(prev => ({ ...prev, [key]: !prev[key] }));
   const setSharedField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
+  const setMacdLineRule = (field, value) => setParams(prev => ({
+    ...prev,
+    macd_line_rules: { ...DEFAULT_MACD_LINE_RULES, ...(prev.macd_line_rules || {}), [field]: value },
+  }));
+  const setMacdLinePerSide = (value) => setParams(prev => {
+    const ec = prev.entry_conditions || {};
+    const rules = { ...DEFAULT_MACD_LINE_RULES, ...(prev.macd_line_rules || {}) };
+    const seed = (side) => {
+      const b = { ...(ec[side] || {}) };
+      if (value) {
+        // Start each side from the shared rule so switching the toggle on
+        // never changes the strategy until the client edits a side.
+        for (const spec of MACD_LINE_RULE_KEYS) {
+          const k = `macd_${spec.key}`;
+          if (!b[k]) b[k] = rules[spec.key] || 'off';
+        }
+      }
+      return b;
+    };
+    return { ...prev, entry_conditions: { ...ec, use_direction_macd_line: value, long: seed('long'), short: seed('short') } };
+  });
 
   // The client-facing switches are deliberately independent. Enabling one
   // copies the current shared value into each side only when that side does
@@ -533,7 +590,7 @@ const Backtest = () => {
 
   // The parameter form applies to PhantomV2 and to saved Kudos-style
   // strategies (params stored as an object, not Chartink rule arrays).
-  const showParamForm = selectedStrategyId === 'PhantomV2' ||
+  const showParamForm = isPhantomBuiltin(selectedStrategyId) ||
     strategies.some(s => String(s.id) === String(selectedStrategyId) &&
       s.rules && typeof s.rules === 'object' && !Array.isArray(s.rules) &&
       ('entry_conditions' in s.rules || 'rsi_oversold' in s.rules));
@@ -713,7 +770,8 @@ const Backtest = () => {
   const runBacktest = async () => {
     setLoading(true);
     try {
-      const strategyName = runName.trim() || (selectedStrategyId === 'PhantomV2' ? 'Kudos Optimization' : `Custom Run ${selectedStrategyId}`);
+      const strategyName = runName.trim() || (selectedStrategyId === 'PhantomV2' ? 'Kudos Optimization'
+        : (builtinStrategyName(selectedStrategyId) || `Custom Run ${selectedStrategyId}`));
       const response = await fetch(`${API_URL}/backtest`, {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
@@ -843,6 +901,10 @@ const Backtest = () => {
       ...saved,
       // Restored from the saved run when present, otherwise the form default.
       trading_windows: normalizeSchedule(saved.trading_windows ?? base.trading_windows),
+      // v3.5 fields: runs saved before them simply keep the inert defaults.
+      setup_mode: saved.setup_mode || base.setup_mode,
+      trade_direction: saved.trade_direction || base.trade_direction,
+      macd_line_rules: { ...base.macd_line_rules, ...((saved.macd_line_rules && typeof saved.macd_line_rules === 'object') ? saved.macd_line_rules : {}) },
       entry_conditions: {
         ...base.entry_conditions,
         ...savedConditions,
@@ -876,6 +938,14 @@ const Backtest = () => {
 
   const handleStrategySelect = (sid) => {
     setSelectedStrategyId(sid);
+    // Built-in preset (Kudos — Reversal only, Long only, …): mirror its
+    // setup / direction in the form. The plain default resets both to 'both'
+    // so switching back never leaves a preset's restriction behind.
+    const variant = parsePhantomVariant(sid);
+    if (variant) {
+      setParams(prev => ({ ...prev, setup_mode: variant.setup_mode, trade_direction: variant.trade_direction }));
+      return;
+    }
     // When a saved Kudos-style strategy is chosen, load its params into the
     // form so the admin can tweak it before re-running.
     const found = strategies.find(s => String(s.id) === String(sid));
@@ -1107,7 +1177,12 @@ const Backtest = () => {
             <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
               className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
-              {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              <PhantomPresetOptions />
+              {strategies.length > 0 && (
+                <optgroup label="Saved strategies">
+                  {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </optgroup>
+              )}
             </select>
           </div>
           <div className="flex flex-col">
@@ -1177,6 +1252,43 @@ const Backtest = () => {
             Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
             <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds — the ATR switch
             also lets each side pick its own comparison (<b className="text-white">&gt;, &lt;, ≥, ≤</b>) against the 50-bar ATR average.
+          </div>
+
+          {/* v3.5 — strategy separation: which setup and which side may trade. */}
+          <div className="mb-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="strategy-separation">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Strategy separation</h3>
+              {presetLocked ? (
+                <span className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[10px] text-amber-300">
+                  Fixed by the selected preset ({builtinStrategyName(selectedStrategyId)}). Pick <b>Kudos V2.5 (Default)</b> to change.
+                </span>
+              ) : (
+                <span className="text-[10px] text-gray-500">Both = the original strategy. Save the form as a strategy to reuse a split in Paper / Live.</span>
+              )}
+            </div>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              {[['setup_mode', SETUP_MODES], ['trade_direction', TRADE_DIRECTIONS]].map(([field, options]) => {
+                const meta = PARAM_META[field];
+                const current = options.find(o => o.value === (params[field] || 'both')) || options[0];
+                return (
+                  <div key={field} className="flex flex-col">
+                    <label className="mb-1 flex items-center gap-1 text-[10px] font-semibold text-gray-400">
+                      {meta.label}
+                      <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>
+                    </label>
+                    <select value={params[field] || 'both'} disabled={presetLocked}
+                      onChange={e => setSharedField(field, e.target.value)}
+                      className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none transition focus:border-blue-500 disabled:opacity-60">
+                      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                    <span className="mt-1 text-[10px] leading-snug text-gray-500">{current.hint}</span>
+                  </div>
+                );
+              })}
+            </div>
+            {(params.setup_mode === 'momentum' && params.enable_momentum_entry === false) && (
+              <p className="mt-2 text-[10px] text-amber-300">Momentum only overrides the unticked "Momentum entries" box — Setup B fires regardless.</p>
+            )}
           </div>
 
           <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
@@ -1260,6 +1372,93 @@ const Backtest = () => {
             ))}
           </div>
 
+          {/* v3.5 — optional MACD line / signal line entry rules. */}
+          <div className="mt-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="macd-line-rules">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">MACD line / signal line rules</h3>
+                <p className="mt-1 max-w-2xl text-[10px] leading-snug text-gray-500">
+                  Extra entry filters on the MACD <b className="text-gray-300">line</b> and its <b className="text-gray-300">signal line</b>
+                  (periods {params.macd_fast}/{params.macd_slow}/{params.macd_signal} from the MACD Indicator group). Off by default — the
+                  histogram threshold and the existing MACD confirmation / zero-cross checks are unchanged. Every rule is read on the
+                  bullish side for longs and the bearish side for shorts, and applies to both Reversal and Momentum entries.
+                </p>
+              </div>
+              <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs text-gray-200">
+                <input type="checkbox" checked={!!macdLineRules.enabled}
+                  onChange={e => setMacdLineRule('enabled', e.target.checked)} className="h-3.5 w-3.5 accent-blue-500" />
+                Enable MACD line rules
+              </label>
+            </div>
+            {macdLineRules.enabled && (
+              <div className="mt-4 space-y-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  {MACD_LINE_RULE_KEYS.map(spec => (
+                    <div key={spec.key} className="flex flex-col">
+                      <label className="mb-1 text-[10px] font-semibold text-gray-400">{spec.label}</label>
+                      <select value={macdLineRules[spec.key] || 'off'}
+                        onChange={e => setMacdLineRule(spec.key, e.target.value)}
+                        className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none focus:border-blue-500">
+                        {MACD_LINE_RULES.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  {renderNumberInput('macd_line_min', macdLineRules.line_min,
+                    e => setMacdLineRule('line_min', e.target.value === '' ? null : parseFloat(e.target.value)))}
+                  {renderNumberInput('macd_signal_min', macdLineRules.signal_min,
+                    e => setMacdLineRule('signal_min', e.target.value === '' ? null : parseFloat(e.target.value)))}
+                </div>
+                <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                  <input type="checkbox" checked={useDirMacdLine}
+                    onChange={e => setMacdLinePerSide(e.target.checked)} className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                  <span>
+                    <span className="block font-bold text-white">Use separate Long / Short MACD line rules</span>
+                    <span className="mt-0.5 block text-gray-500">Each side starts from the shared rules above; levels entered per side are used signed as typed (short levels are normally negative).</span>
+                  </span>
+                </label>
+                {useDirMacdLine && (
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                    {['long', 'short'].map(side => {
+                      const branch = params.entry_conditions?.[side] || {};
+                      return (
+                        <div key={side} className="space-y-2 rounded-lg border border-gray-700 bg-gray-900 p-3">
+                          <div className={`text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>{side}</div>
+                          {MACD_LINE_RULE_KEYS.map(spec => (
+                            <div key={spec.key} className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] text-gray-400">{spec.label}</span>
+                              <select value={branch[`macd_${spec.key}`] || macdLineRules[spec.key] || 'off'}
+                                onChange={e => setDirectionalValue(side, `macd_${spec.key}`, e.target.value)}
+                                className="w-44 rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500">
+                                {MACD_LINE_RULES.map(r => <option key={r.value} value={r.value}>{r.value === 'above_below' ? (side === 'long' ? 'Above' : 'Below') : r.label}</option>)}
+                              </select>
+                            </div>
+                          ))}
+                          <div className="grid grid-cols-2 gap-2">
+                            {[['macd_line_min', side === 'long' ? 'MACD line ≥' : 'MACD line ≤'], ['macd_signal_min', side === 'long' ? 'Signal line ≥' : 'Signal line ≤']].map(([field, label]) => (
+                              <div key={field}>
+                                <label className="mb-1 block text-[9px] font-bold uppercase text-gray-500">{label}</label>
+                                <input type="number" step="0.01" value={branch[field] ?? ''} placeholder="off"
+                                  onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
+                                  className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <p className="text-[10px] leading-snug text-gray-500">
+                  Applied as <span className="font-mono text-green-300">Long: {macdLineRuleText(params, 1)}</span>
+                  <span className="mx-2 text-gray-600">|</span>
+                  <span className="font-mono text-red-300">Short: {macdLineRuleText(params, -1)}</span>
+                </p>
+              </div>
+            )}
+          </div>
+
           {useDirection && (
             <div className="mt-5 rounded-lg border border-yellow-900/50 bg-yellow-900/10 p-3 text-[10px] text-yellow-300">
               This run contains the legacy full Long / Short override switch. Its additional RSI, ADX, MACD-period,
@@ -1312,6 +1511,18 @@ const Backtest = () => {
               {(preview.use_direction_conditions || preview.use_direction_macd_hist || preview.use_direction_atr_floor) && (
                 <span className="rounded border border-purple-800/40 bg-purple-900/40 px-2 py-0.5 text-[10px] text-purple-300">
                   {preview.use_direction_conditions ? 'direction-specific ON' : 'side thresholds ON'}
+                </span>
+              )}
+              {preview.setup_mode && preview.setup_mode !== 'both' && (
+                <span className="rounded border border-blue-800/40 bg-blue-900/40 px-2 py-0.5 text-[10px] text-blue-300">{preview.setup_label || preview.setup_mode}</span>
+              )}
+              {preview.trade_direction && preview.trade_direction !== 'both' && (
+                <span className="rounded border border-blue-800/40 bg-blue-900/40 px-2 py-0.5 text-[10px] text-blue-300">{preview.direction_label || preview.trade_direction}</span>
+              )}
+              {preview.macd_line_rules?.enabled && (
+                <span className="rounded border border-emerald-800/40 bg-emerald-900/40 px-2 py-0.5 text-[10px] text-emerald-300"
+                      title={`Long: ${preview.macd_line_rules.long} | Short: ${preview.macd_line_rules.short}`}>
+                  MACD line rules ON
                 </span>
               )}
               <button onClick={() => setPreview(null)} className="text-xs text-gray-500 transition hover:text-white">Close</button>
@@ -1434,6 +1645,31 @@ const Backtest = () => {
                   {stats.blockedEntries} new trades skipped
                 </span>
               )}
+              {/* v3.5 — which setups / sides this run traded and the MACD line rules it applied. */}
+              {(() => {
+                const runParams = results?.params && typeof results.params === 'object' ? results.params : {};
+                const variant = parsePhantomVariant(results?.strategy_id);
+                const setup = variant && variant.setup_mode !== 'both' ? variant.setup_mode : (runParams.setup_mode || 'both');
+                const dir = variant && variant.trade_direction !== 'both' ? variant.trade_direction : (runParams.trade_direction || 'both');
+                const setupLabel = (SETUP_MODES.find(m => m.value === setup) || SETUP_MODES[0]).label;
+                const dirLabel = (TRADE_DIRECTIONS.find(d => d.value === dir) || TRADE_DIRECTIONS[0]).label;
+                const lineOn = !!runParams.macd_line_rules?.enabled && (macdLineRuleText(runParams, 1) !== 'off' || macdLineRuleText(runParams, -1) !== 'off');
+                return (
+                  <>
+                    {(setup !== 'both' || dir !== 'both') && (
+                      <span className="rounded border border-blue-800/60 bg-blue-900/20 px-2 py-0.5 font-semibold text-blue-300">
+                        {setupLabel} · {dirLabel}
+                      </span>
+                    )}
+                    {lineOn && (
+                      <span className="rounded border border-emerald-800/60 bg-emerald-900/20 px-2 py-0.5 font-semibold text-emerald-300"
+                            title={`Long: ${macdLineRuleText(runParams, 1)} | Short: ${macdLineRuleText(runParams, -1)}`}>
+                        MACD line rules ON
+                      </span>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           </SectionCard>
 

@@ -48,6 +48,140 @@ def normalize_atr_regime_op(value):
     return op
 
 
+# ---------------------------------------------------------------------------
+# v3.5 — setup / direction separation
+# ---------------------------------------------------------------------------
+# ``setup_mode`` chooses WHICH entry setups may fire and ``trade_direction``
+# chooses WHICH sides may fire. Both default to ``'both'``, which is exactly
+# the behaviour every existing run / saved strategy / paper / live instance
+# already has, so nothing changes until a client picks another value.
+#
+#   setup_mode       both      -> Setup A always, Setup B when
+#                                 ``enable_momentum_entry`` is ON (legacy)
+#                    reversal  -> Setup A (RSI reversal) only
+#                    momentum  -> Setup B (momentum continuation) only — the
+#                                 momentum checkbox is treated as ON so a
+#                                 "momentum only" strategy can never be empty
+#   trade_direction  both / long / short
+SETUP_MODES = ('both', 'reversal', 'momentum')
+DEFAULT_SETUP_MODE = 'both'
+_SETUP_MODE_ALIASES = {
+    'both': 'both', 'all': 'both', 'any': 'both', 'a+b': 'both', 'ab': 'both',
+    'combined': 'both', 'reversal+momentum': 'both', 'momentum+reversal': 'both',
+    'reversal': 'reversal', 'reversal_only': 'reversal', 'reversal-only': 'reversal',
+    'rev': 'reversal', 'a': 'reversal', 'setup_a': 'reversal', 'setup-a': 'reversal',
+    'setupa': 'reversal', 'rsi': 'reversal', 'rsi_reversal': 'reversal',
+    'momentum': 'momentum', 'momentum_only': 'momentum', 'momentum-only': 'momentum',
+    'mom': 'momentum', 'b': 'momentum', 'setup_b': 'momentum', 'setup-b': 'momentum',
+    'setupb': 'momentum', 'continuation': 'momentum', 'trend': 'momentum',
+}
+SETUP_MODE_LABELS = {'both': 'Reversal + Momentum', 'reversal': 'Reversal only',
+                     'momentum': 'Momentum only'}
+
+TRADE_DIRECTIONS = ('both', 'long', 'short')
+DEFAULT_TRADE_DIRECTION = 'both'
+_TRADE_DIRECTION_ALIASES = {
+    'both': 'both', 'all': 'both', 'any': 'both', 'long_short': 'both',
+    'long+short': 'both', 'long-short': 'both', 'longshort': 'both', 'two_way': 'both',
+    'two-way': 'both', 'bidirectional': 'both', '0': 'both',
+    'long': 'long', 'long_only': 'long', 'long-only': 'long', 'longs': 'long',
+    'longonly': 'long', 'buy': 'long', 'bull': 'long', '1': 'long', '+1': 'long',
+    'short': 'short', 'short_only': 'short', 'short-only': 'short', 'shorts': 'short',
+    'shortonly': 'short', 'sell': 'short', 'bear': 'short', '-1': 'short',
+}
+TRADE_DIRECTION_LABELS = {'both': 'Long + Short', 'long': 'Long only', 'short': 'Short only'}
+
+
+def _normalize_choice(value, aliases, allowed, default, field_name):
+    """Shared normaliser: blank/None -> default, aliases -> canonical, else raise."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        # ``True``/``False`` mean nothing here; refuse rather than guess.
+        raise ValueError(f"{field_name} must be one of {', '.join(allowed)} (got {value!r})")
+    key = str(value).strip().lower().replace(' ', '_')
+    if not key:
+        return default
+    out = aliases.get(key)
+    if out is None:
+        raise ValueError(f"{field_name} must be one of {', '.join(allowed)} (got '{value}')")
+    return out
+
+
+def normalize_setup_mode(value):
+    """'both' | 'reversal' | 'momentum' (accepts A/B, rev/mom, blank = both)."""
+    return _normalize_choice(value, _SETUP_MODE_ALIASES, SETUP_MODES, DEFAULT_SETUP_MODE, 'setup_mode')
+
+
+def normalize_trade_direction(value):
+    """'both' | 'long' | 'short' (accepts long_only, buy/sell, 1/-1, blank = both)."""
+    return _normalize_choice(value, _TRADE_DIRECTION_ALIASES, TRADE_DIRECTIONS,
+                             DEFAULT_TRADE_DIRECTION, 'trade_direction')
+
+
+# ---------------------------------------------------------------------------
+# v3.5 — MACD line / signal line rules
+# ---------------------------------------------------------------------------
+# The strategy has always traded on the MACD *histogram* only. These optional
+# rules add the MACD *line* and the *signal line* as entry conditions. Every
+# rule is ``'off'`` by default; the whole block is also behind a master switch
+# (``macd_line_rules.enabled``) so an existing configuration is untouched.
+#
+#   above_below  LONG needs the bullish side (line > signal / line > 0 /
+#                signal > 0), SHORT the bearish side.
+#   cross        the same, but it must have happened ON the signal candle
+#                (previous bar on the other side) — a fresh crossover.
+MACD_LINE_RULES = ('off', 'above_below', 'cross')
+DEFAULT_MACD_LINE_RULE = 'off'
+_MACD_LINE_RULE_ALIASES = {
+    'off': 'off', 'none': 'off', 'no': 'off', 'false': 'off', '0': 'off', 'disabled': 'off',
+    'above_below': 'above_below', 'above/below': 'above_below', 'above-below': 'above_below',
+    'abovebelow': 'above_below', 'on': 'above_below', 'true': 'above_below', '1': 'above_below',
+    'trend': 'above_below', 'aligned': 'above_below', 'side': 'above_below',
+    'position': 'above_below', 'above': 'above_below', 'below': 'above_below',
+    'cross': 'cross', 'crossover': 'cross', 'crossed': 'cross', 'crossing': 'cross',
+    'cross_over': 'cross', 'x': 'cross',
+}
+MACD_LINE_RULE_LABELS = {'off': 'off', 'above_below': 'above / below', 'cross': 'cross'}
+# The three comparisons a rule can be applied to.
+MACD_LINE_RULE_KEYS = ('line_vs_signal', 'line_vs_zero', 'signal_vs_zero')
+
+
+def normalize_macd_line_rule(value):
+    """'off' | 'above_below' | 'cross' (blank = off)."""
+    return _normalize_choice(value, _MACD_LINE_RULE_ALIASES, MACD_LINE_RULES,
+                             DEFAULT_MACD_LINE_RULE, 'macd line rule')
+
+
+class MacdLineConditions(BaseModel):
+    """Optional MACD line / signal line entry conditions (``macd_line_rules``).
+
+    OFF by default (``enabled=False`` and every rule ``'off'``), so existing
+    runs keep trading on the histogram alone. When ON, each active rule is an
+    extra gate on BOTH setups for the side it applies to:
+
+    * ``line_vs_signal`` — LONG: MACD line > signal line, SHORT: line < signal
+      (``'cross'``: the line crossed the signal on this candle).
+    * ``line_vs_zero``   — LONG: MACD line > 0, SHORT: MACD line < 0
+      (``'cross'``: the line crossed zero on this candle).
+    * ``signal_vs_zero`` — LONG: signal line > 0, SHORT: signal line < 0.
+    * ``line_min``       — minimum distance: LONG line >= value, SHORT
+      line <= -value (``None`` = off). Per-side overrides are signed.
+    * ``signal_min``     — same for the signal line.
+    """
+    enabled: bool = False
+    line_vs_signal: str = DEFAULT_MACD_LINE_RULE
+    line_vs_zero: str = DEFAULT_MACD_LINE_RULE
+    signal_vs_zero: str = DEFAULT_MACD_LINE_RULE
+    line_min: Optional[float] = None
+    signal_min: Optional[float] = None
+
+    @field_validator('line_vs_signal', 'line_vs_zero', 'signal_vs_zero', mode='before')
+    @classmethod
+    def _validate_rules(cls, value):
+        return normalize_macd_line_rule(value)
+
+
 class BranchConditions(BaseModel):
     """Per-direction overrides for a single trade side (LONG / SHORT).
 
@@ -69,6 +203,15 @@ class BranchConditions(BaseModel):
     rsi_oversold: Optional[int] = None
     rsi_overbought: Optional[int] = None
     adx_min: Optional[float] = None
+    # v3.5 — per-side MACD line / signal line rules. Only consulted when
+    # ``macd_line_rules.enabled`` AND ``use_direction_macd_line`` are ON; a
+    # ``None`` falls back to the shared ``macd_line_rules`` value. The two
+    # thresholds are SIGNED per side (long: line >= v, short: line <= v).
+    macd_line_vs_signal: Optional[str] = None
+    macd_line_vs_zero: Optional[str] = None
+    macd_signal_vs_zero: Optional[str] = None
+    macd_line_min: Optional[float] = None
+    macd_signal_min: Optional[float] = None
 
     @field_validator('atr_regime_op')
     @classmethod
@@ -77,6 +220,14 @@ class BranchConditions(BaseModel):
         if value is None:
             return None
         return normalize_atr_regime_op(value)
+
+    @field_validator('macd_line_vs_signal', 'macd_line_vs_zero', 'macd_signal_vs_zero', mode='before')
+    @classmethod
+    def _validate_macd_line_rules(cls, value):
+        """``None`` keeps the shared rule; anything else must be a known rule."""
+        if value is None:
+            return None
+        return normalize_macd_line_rule(value)
 
 
 class EntryConditions(BaseModel):
@@ -96,6 +247,8 @@ class EntryConditions(BaseModel):
     # Independent switches used by the Backtest form.
     use_direction_macd_hist: bool = False
     use_direction_atr_floor: bool = False
+    # v3.5: Long / Short get their own MACD line / signal line rules.
+    use_direction_macd_line: bool = False
     long: BranchConditions = Field(default_factory=BranchConditions)
     short: BranchConditions = Field(default_factory=BranchConditions)
 
@@ -153,6 +306,15 @@ class PhantomV2Config(BaseModel):
     allow_reverse: bool = Field(default=False)   # close & reverse on opposite signal
     allow_overlap: bool = Field(default=False)   # v2.5 behaviour: overwrite open trade
     # ------------------------------------------------------------------
+    # v3.5 — strategy separation. Both default to 'both' = today's engine.
+    #   setup_mode:      'both' | 'reversal' (Setup A only) | 'momentum' (Setup B only)
+    #   trade_direction: 'both' | 'long' (longs only)       | 'short' (shorts only)
+    # ------------------------------------------------------------------
+    setup_mode: str = Field(default=DEFAULT_SETUP_MODE)
+    trade_direction: str = Field(default=DEFAULT_TRADE_DIRECTION)
+    # v3.5 — optional MACD line / signal line entry rules (OFF by default).
+    macd_line_rules: MacdLineConditions = Field(default_factory=MacdLineConditions)
+    # ------------------------------------------------------------------
     # Direction-specific condition overrides (default OFF = shared engine).
     # See EntryConditions / BranchConditions above.
     # ------------------------------------------------------------------
@@ -169,6 +331,18 @@ class PhantomV2Config(BaseModel):
     # Open positions keep being managed; only new entries are blocked.
     # ------------------------------------------------------------------
     trading_windows: TradingWindowConfig = Field(default_factory=TradingWindowConfig)
+
+    @field_validator('setup_mode', mode='before')
+    @classmethod
+    def _validate_setup_mode(cls, value):
+        """Canonical 'both' / 'reversal' / 'momentum'; unknown values raise."""
+        return normalize_setup_mode(value)
+
+    @field_validator('trade_direction', mode='before')
+    @classmethod
+    def _validate_trade_direction(cls, value):
+        """Canonical 'both' / 'long' / 'short'; unknown values raise."""
+        return normalize_trade_direction(value)
 
     @model_validator(mode="after")
     def _validate_macd_periods(self):
@@ -299,6 +473,251 @@ class PhantomV2Config(BaseModel):
     def rsi_overbought_for(self, direction: int) -> float:
         return self._pick(direction, 'rsi_overbought', 'rsi_overbought')
 
+    # ------------------------------------------------------------------
+    # v3.5 — setup / direction separation
+    # ------------------------------------------------------------------
+    def reversal_enabled(self) -> bool:
+        """Whether Setup A (RSI reversal) may fire."""
+        return self.setup_mode in ('both', 'reversal')
+
+    def momentum_enabled(self) -> bool:
+        """Whether Setup B (momentum continuation) may fire.
+
+        ``'momentum'`` forces it ON (a momentum-only strategy with the
+        momentum checkbox off would trade nothing); ``'reversal'`` forces it
+        OFF; ``'both'`` keeps the legacy ``enable_momentum_entry`` switch.
+        """
+        if self.setup_mode == 'momentum':
+            return True
+        if self.setup_mode == 'reversal':
+            return False
+        return bool(self.enable_momentum_entry)
+
+    def allows_direction(self, direction: int) -> bool:
+        """Whether trades on this side (+1 long / -1 short) may be opened."""
+        if self.trade_direction == 'long':
+            return direction == 1
+        if self.trade_direction == 'short':
+            return direction == -1
+        return True
+
+    def setup_label(self) -> str:
+        if self.setup_mode == 'both' and not self.enable_momentum_entry:
+            # Legacy way of running reversal-only: the momentum box unticked.
+            return 'Reversal only (momentum entries off)'
+        return SETUP_MODE_LABELS.get(self.setup_mode, self.setup_mode)
+
+    def direction_label(self) -> str:
+        return TRADE_DIRECTION_LABELS.get(self.trade_direction, self.trade_direction)
+
+    # ------------------------------------------------------------------
+    # v3.5 — MACD line / signal line rules
+    # ------------------------------------------------------------------
+    def macd_line_block_enabled(self) -> bool:
+        """The raw ``macd_line_rules.enabled`` switch (rules may still all be off)."""
+        return bool(self.macd_line_rules.enabled)
+
+    def uses_macd_line_rules(self) -> bool:
+        """Master switch: the block is ON *and* at least one rule / threshold
+        is active on either side. An enabled block with every rule ``'off'``
+        is treated exactly like a disabled one (no gate, no log line)."""
+        if not self.macd_line_block_enabled():
+            return False
+        return bool(self.macd_line_rule_parts_for(1) or self.macd_line_rule_parts_for(-1))
+
+    def uses_direction_macd_line(self) -> bool:
+        """Whether Long and Short carry their own MACD line / signal rules."""
+        return bool(self.macd_line_block_enabled() and self.entry_conditions.use_direction_macd_line)
+
+    def macd_line_rule_for(self, direction: int, which: str) -> str:
+        """Rule ('off' / 'above_below' / 'cross') for one comparison and side.
+
+        ``which`` is one of ``line_vs_signal`` / ``line_vs_zero`` /
+        ``signal_vs_zero``. Always ``'off'`` while the block is disabled.
+        """
+        if which not in MACD_LINE_RULE_KEYS:
+            raise ValueError(f"unknown MACD rule '{which}'")
+        if not self.macd_line_block_enabled():
+            return 'off'
+        if self.uses_direction_macd_line():
+            branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
+            override = getattr(branch, f'macd_{which}', None)
+            if override:
+                return normalize_macd_line_rule(override)
+        return getattr(self.macd_line_rules, which)
+
+    def _macd_level_for(self, direction: int, branch_attr: str, shared_attr: str) -> Optional[float]:
+        if not self.macd_line_block_enabled():
+            return None
+        if self.uses_direction_macd_line():
+            branch = self.entry_conditions.long if direction == 1 else self.entry_conditions.short
+            override = getattr(branch, branch_attr, None)
+            if override is not None:
+                return float(override)   # signed per side, like macd_hist_min
+        shared = getattr(self.macd_line_rules, shared_attr)
+        if shared is None:
+            return None
+        # Shared value is a magnitude: longs need >= |v|, shorts need <= -|v|.
+        return abs(float(shared)) if direction == 1 else -abs(float(shared))
+
+    def macd_line_min_for(self, direction: int) -> Optional[float]:
+        """Signed MACD-line threshold for the side (None = no threshold)."""
+        return self._macd_level_for(direction, 'macd_line_min', 'line_min')
+
+    def macd_signal_min_for(self, direction: int) -> Optional[float]:
+        """Signed signal-line threshold for the side (None = no threshold)."""
+        return self._macd_level_for(direction, 'macd_signal_min', 'signal_min')
+
+    def macd_line_rule_parts_for(self, direction: int) -> list:
+        """Human-readable list of the active MACD line / signal rules for a side."""
+        is_long = direction == 1
+        parts = []
+        names = {'line_vs_signal': ('MACD line', 'signal'),
+                 'line_vs_zero': ('MACD line', '0'),
+                 'signal_vs_zero': ('signal line', '0')}
+        for key in MACD_LINE_RULE_KEYS:
+            rule = self.macd_line_rule_for(direction, key)
+            if rule == 'off':
+                continue
+            left, right = names[key]
+            op = '>' if is_long else '<'
+            if rule == 'cross':
+                parts.append(f"{left} crosses {'above' if is_long else 'below'} {right}")
+            else:
+                parts.append(f"{left} {op} {right}")
+        thr = self.macd_line_min_for(direction)
+        if thr is not None:
+            parts.append(f"MACD line {'>=' if is_long else '<='} {thr:g}")
+        thr = self.macd_signal_min_for(direction)
+        if thr is not None:
+            parts.append(f"signal line {'>=' if is_long else '<='} {thr:g}")
+        return parts
+
+    def macd_line_rule_text_for(self, direction: int) -> str:
+        """e.g. ``MACD line > signal; MACD line > 0`` — ``off`` when nothing is active."""
+        parts = self.macd_line_rule_parts_for(direction)
+        return '; '.join(parts) if parts else 'off'
+
+
+# ---------------------------------------------------------------------------
+# v3.5 — built-in Phantom presets ("strategy separation" in every dropdown)
+# ---------------------------------------------------------------------------
+# A preset id is the champion strategy id followed by one or two variant
+# tokens: ``PhantomV2:reversal``, ``PhantomV2:long``, ``PhantomV2:momentum:short``.
+# The tokens map onto ``setup_mode`` / ``trade_direction``; everything else
+# (thresholds, risk, sizing) is the tuned champion config. ``PhantomV2`` on
+# its own is untouched and keeps meaning the full strategy.
+BUILTIN_PHANTOM_ID = 'PhantomV2'
+_PRESET_SEPARATORS = (':', '-', '.', '/')
+
+
+def parse_phantom_variant(strategy_id) -> Optional[dict]:
+    """``{'setup_mode': ..., 'trade_direction': ...}`` for a built-in id, else None.
+
+    ``'PhantomV2'`` -> both/both. Unknown tokens (or a saved-strategy id) return
+    ``None`` so the caller falls through to the custom-strategy lookup.
+    """
+    if strategy_id is None:
+        return None
+    sid = str(strategy_id).strip()
+    if not sid:
+        return None
+    if sid == BUILTIN_PHANTOM_ID:
+        return {'setup_mode': DEFAULT_SETUP_MODE, 'trade_direction': DEFAULT_TRADE_DIRECTION}
+    if not sid.lower().startswith(BUILTIN_PHANTOM_ID.lower()):
+        return None
+    rest = sid[len(BUILTIN_PHANTOM_ID):]
+    if not rest or rest[0] not in _PRESET_SEPARATORS:
+        return None
+    for sep in _PRESET_SEPARATORS:
+        rest = rest.replace(sep, ':')
+    tokens = [t for t in rest.split(':') if t]
+    if not tokens or len(tokens) > 2:
+        return None
+    setup_mode, trade_direction = DEFAULT_SETUP_MODE, DEFAULT_TRADE_DIRECTION
+    seen_setup = seen_dir = False
+    for token in tokens:
+        key = token.strip().lower()
+        if not key or key[0].isdigit() or key[0] in '+-':
+            # Numeric aliases ('1' / '-1') are for the config field only; an
+            # id such as 'PhantomV2-1' must never resolve to a preset.
+            return None
+        if key in _SETUP_MODE_ALIASES and _SETUP_MODE_ALIASES[key] != 'both' and not seen_setup:
+            setup_mode = _SETUP_MODE_ALIASES[key]
+            seen_setup = True
+        elif key in _TRADE_DIRECTION_ALIASES and _TRADE_DIRECTION_ALIASES[key] != 'both' and not seen_dir:
+            trade_direction = _TRADE_DIRECTION_ALIASES[key]
+            seen_dir = True
+        else:
+            return None
+    return {'setup_mode': setup_mode, 'trade_direction': trade_direction}
+
+
+def phantom_preset_id(setup_mode: str = 'both', trade_direction: str = 'both') -> str:
+    """Canonical built-in id for a setup / direction pair."""
+    setup_mode = normalize_setup_mode(setup_mode)
+    trade_direction = normalize_trade_direction(trade_direction)
+    parts = [BUILTIN_PHANTOM_ID]
+    if setup_mode != 'both':
+        parts.append(setup_mode)
+    if trade_direction != 'both':
+        parts.append(trade_direction)
+    return ':'.join(parts)
+
+
+def phantom_preset_name(strategy_id) -> Optional[str]:
+    """Display name for a built-in id ("Kudos — Reversal · Long only"), else None."""
+    variant = parse_phantom_variant(strategy_id)
+    if variant is None:
+        return None
+    if variant['setup_mode'] == 'both' and variant['trade_direction'] == 'both':
+        return 'Kudos V2.5 (Default)'
+    bits = []
+    if variant['setup_mode'] != 'both':
+        bits.append(SETUP_MODE_LABELS[variant['setup_mode']].replace(' only', ''))
+    if variant['trade_direction'] != 'both':
+        bits.append(TRADE_DIRECTION_LABELS[variant['trade_direction']])
+    if len(bits) == 1 and variant['setup_mode'] != 'both':
+        bits[0] = SETUP_MODE_LABELS[variant['setup_mode']]
+    return 'Kudos — ' + ' · '.join(bits)
+
+
+def apply_phantom_variant(config: 'PhantomV2Config', strategy_id) -> 'PhantomV2Config':
+    """Return ``config`` with the preset's setup / direction applied.
+
+    A plain ``PhantomV2`` (or a non-built-in id) returns the config unchanged,
+    so existing call sites keep their exact behaviour.
+    """
+    variant = parse_phantom_variant(strategy_id)
+    if not variant:
+        return config
+    if variant['setup_mode'] == 'both' and variant['trade_direction'] == 'both':
+        return config
+    return config.model_copy(update=dict(variant))
+
+
+def _build_presets():
+    presets = []
+    for setup_mode in SETUP_MODES:
+        for trade_direction in TRADE_DIRECTIONS:
+            if setup_mode == 'both' and trade_direction == 'both':
+                continue   # that is the default strategy itself
+            sid = phantom_preset_id(setup_mode, trade_direction)
+            presets.append({
+                'id': sid,
+                'name': phantom_preset_name(sid),
+                'setup_mode': setup_mode,
+                'trade_direction': trade_direction,
+                'setup_label': SETUP_MODE_LABELS[setup_mode],
+                'direction_label': TRADE_DIRECTION_LABELS[trade_direction],
+            })
+    return presets
+
+
+# Every separated variant of the tuned strategy, in dropdown order.
+PHANTOM_PRESETS = _build_presets()
+
+
 class StrategyService:
     def __init__(self, config: PhantomV2Config = PhantomV2Config()):
         self.config = config
@@ -362,14 +781,30 @@ class StrategyService:
         # Per-direction MACD periods are part of the legacy master switch.
         # The new MACD-hist-only switch keeps the shared indicator periods and
         # only changes the signed threshold for each side.
+        # The MACD line and signal line are kept next to the histogram (same
+        # call, same periods) for the v3.5 line / signal rules and the trade log.
+        line_v = ind_1h['macd_line']
+        sig_v = ind_1h['macd_signal']
         if use_dir:
             l_f, l_s, l_sig = cfg.macd_periods_for(1)
             s_f, s_s, s_sig = cfg.macd_periods_for(-1)
-            hist_long = _macd(close, fast=l_f, slow=l_s, signal_period=l_sig)[2]
-            hist_short = _macd(close, fast=s_f, slow=s_s, signal_period=s_sig)[2]
+            line_long, sig_long, hist_long = _macd(close, fast=l_f, slow=l_s, signal_period=l_sig)
+            line_short, sig_short, hist_short = _macd(close, fast=s_f, slow=s_s, signal_period=s_sig)
         else:
             hist_long = hist
             hist_short = hist
+            line_long = line_short = line_v
+            sig_long = sig_short = sig_v
+
+        # v3.5 MACD line / signal line gates — all-True (no-op) unless the
+        # client switched the block on.
+        macd_line_rules_on = cfg.uses_macd_line_rules()
+        if macd_line_rules_on:
+            macd_line_ok_l = self._macd_line_mask(cfg, 1, line_long, sig_long)
+            macd_line_ok_s = self._macd_line_mask(cfg, -1, line_short, sig_short)
+        else:
+            macd_line_ok_l = np.ones(n, dtype=bool)
+            macd_line_ok_s = np.ones(n, dtype=bool)
 
         use_dir_hist = cfg.uses_direction_macd_hist()
         if use_dir:
@@ -414,8 +849,28 @@ class StrategyService:
         cross_dn = (hist_short_prev >= 0) & (hist_short < 0)
         long_B = valid & (trend_col == 1) & adx_ok_l & regime_ok_l & (pdi > mdi) & cross_up & (rsi_v >= cfg.momentum_rsi_min)
         short_B = valid & (trend_col == -1) & adx_ok_s & regime_ok_s & (mdi > pdi) & cross_dn & (rsi_v <= 100.0 - cfg.momentum_rsi_min)
-        if not cfg.enable_momentum_entry:
+
+        # ---------------- v3.5 gates (all no-ops on a default config) -----
+        # MACD line / signal line rules apply to both setups on their side.
+        if macd_line_rules_on:
+            long_A = long_A & macd_line_ok_l
+            long_B = long_B & macd_line_ok_l
+            short_A = short_A & macd_line_ok_s
+            short_B = short_B & macd_line_ok_s
+        # Setup separation: momentum_enabled() is exactly the legacy
+        # enable_momentum_entry switch while setup_mode is 'both'.
+        if not cfg.momentum_enabled():
             long_B[:] = False
+            short_B[:] = False
+        if not cfg.reversal_enabled():
+            long_A[:] = False
+            short_A[:] = False
+        # Direction separation: long-only / short-only strategies.
+        if not cfg.allows_direction(1):
+            long_A[:] = False
+            long_B[:] = False
+        if not cfg.allows_direction(-1):
+            short_A[:] = False
             short_B[:] = False
 
         signals = np.zeros(n)
@@ -461,8 +916,59 @@ class StrategyService:
             'atr_regime_rule_short': cfg.atr_regime_rule_for(-1),
             'setup': setup,
             'long_A': long_A, 'short_A': short_A, 'long_B': long_B, 'short_B': short_B,
+            # v3.5 — MACD line / signal line values (shared and per side), the
+            # pass/fail of the optional line rules, and the separation settings
+            # this run was generated with.
+            'macd_line': line_v, 'macd_signal': sig_v,
+            'macd_line_long': line_long, 'macd_line_short': line_short,
+            'macd_signal_long': sig_long, 'macd_signal_short': sig_short,
+            'macd_line_long_prev': np.roll(line_long, 1), 'macd_line_short_prev': np.roll(line_short, 1),
+            'macd_signal_long_prev': np.roll(sig_long, 1), 'macd_signal_short_prev': np.roll(sig_short, 1),
+            'macd_line_rules_enabled': bool(macd_line_rules_on),
+            'cond_macd_line_ok_long': macd_line_ok_l, 'cond_macd_line_ok_short': macd_line_ok_s,
+            'macd_line_rule_long': cfg.macd_line_rule_text_for(1),
+            'macd_line_rule_short': cfg.macd_line_rule_text_for(-1),
+            'setup_mode': cfg.setup_mode, 'trade_direction': cfg.trade_direction,
         }
         return signals, meta
+
+    @staticmethod
+    def _macd_line_mask(cfg: PhantomV2Config, direction: int, line: np.ndarray, signal: np.ndarray) -> np.ndarray:
+        """Per-bar pass mask of the v3.5 MACD line / signal line rules for one side.
+
+        LONG needs the bullish side of each active comparison, SHORT the
+        bearish side; ``'cross'`` additionally requires the previous bar to
+        have been on the other side (a crossover ON the signal candle). Bar 0
+        has no previous bar; the caller's ``valid`` mask already excludes it.
+        """
+        is_long = direction == 1
+        ok = np.ones(len(line), dtype=bool)
+        line_prev = np.roll(line, 1)
+        sig_prev = np.roll(signal, 1)
+
+        def _apply(rule, now_bull, now_bear, prev_bull, prev_bear):
+            nonlocal ok
+            if rule == 'above_below':
+                ok &= now_bull if is_long else now_bear
+            elif rule == 'cross':
+                # Previous bar on/below the level, this bar above it (long) —
+                # mirrored for short.
+                ok &= (~prev_bull & now_bull) if is_long else (~prev_bear & now_bear)
+
+        _apply(cfg.macd_line_rule_for(direction, 'line_vs_signal'),
+               line > signal, line < signal, line_prev > sig_prev, line_prev < sig_prev)
+        _apply(cfg.macd_line_rule_for(direction, 'line_vs_zero'),
+               line > 0, line < 0, line_prev > 0, line_prev < 0)
+        _apply(cfg.macd_line_rule_for(direction, 'signal_vs_zero'),
+               signal > 0, signal < 0, sig_prev > 0, sig_prev < 0)
+
+        thr = cfg.macd_line_min_for(direction)
+        if thr is not None:
+            ok &= (line >= thr) if is_long else (line <= thr)
+        thr = cfg.macd_signal_min_for(direction)
+        if thr is not None:
+            ok &= (signal >= thr) if is_long else (signal <= thr)
+        return ok
 
     def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
         """Backward-compatible entry point used by API / paper / live traders."""

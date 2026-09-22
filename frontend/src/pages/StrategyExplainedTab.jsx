@@ -180,9 +180,10 @@ const StrategyExplainedTab = ({ champion }) => {
             <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
               <K>MACD indicator (the "MACD value")</K>
               <div className="text-gray-400 text-xs mt-1 leading-relaxed">
-                Config keys <K>macd_fast=12</K>, <K>macd_slow=26</K>, <K>macd_signal=9</K>. These are the
-                EMA periods that build the MACD oscillator. They are <b>not shown as inputs</b> on the
-                backtest form — they stay at their defaults (12, 26, 9).
+                Config keys <K>macd_fast={c('macd_fast', 12)}</K>, <K>macd_slow={c('macd_slow', 26)}</K>, <K>macd_signal={c('macd_signal', 9)}</K>.
+                These are the EMA periods that build the MACD oscillator. They are editable in the Backtest form
+                (<b>MACD Indicator</b> group), saved with a named strategy, and shown on the Paper / Live pages
+                under the strategy dropdown so the running values are never a guess.
               </div>
               <Formula>MACD_line = EMA(fast) − EMA(slow) = EMA(12) − EMA(26)</Formula>
               <Formula>Signal = EMA(MACD_line, signal) = EMA(MACD_line, 9)</Formula>
@@ -198,7 +199,7 @@ const StrategyExplainedTab = ({ champion }) => {
               <div className="text-gray-400 text-xs mt-1 leading-relaxed">
                 Config key <K>macd_hist_min</K> (default <K>{c('macd_hist_min', 5)}</K>). This is the
                 <b>input you tune</b> on the backtest form — the minimum size of the histogram required to
-                allow an entry. It is the only MACD knob exposed in the UI.
+                allow an entry. Since v3.5 the MACD <b>line</b> and <b>signal line</b> can be filtered too (below).
               </div>
               <Formula>Long:   MACD_histogram ≥ macd_hist_min</Formula>
               <Formula>Short:  MACD_histogram ≤ −macd_hist_min   (or ≤ the negative value when directional)</Formula>
@@ -230,6 +231,83 @@ const StrategyExplainedTab = ({ champion }) => {
                 </div>
               </div>
             </div>
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50" data-testid="macd-line-rules-doc">
+              <K>④ MACD line / signal line rules (v3.5 — optional, OFF by default)</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                A separate block, <K>macd_line_rules</K>, that reads the <b>MACD line</b> and the <b>signal line</b>
+                themselves rather than the histogram. Nothing changes until <K>macd_line_rules.enabled</K> is switched
+                on in Backtest → Strategy Configuration → <i>MACD line / signal line rules</i>; existing strategies,
+                saved runs and paper / live sessions keep their original behaviour. When on, every active rule must
+                pass on the signal candle for <b>both</b> Setup A and Setup B entries.
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-2 text-xs text-gray-400">
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">MACD line vs signal line</div>
+                  <K>line_vs_signal</K> · <b>above / below</b>: long needs MACD line &gt; signal, short needs &lt;.
+                  <b> cross</b>: the previous bar was on the other side (a crossover on the signal candle).
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">MACD line vs zero</div>
+                  <K>line_vs_zero</K> · long needs MACD line &gt; 0 (or a cross above 0), short needs &lt; 0 (cross below).
+                  Keeps entries on the bullish / bearish side of the oscillator.
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">Signal line vs zero</div>
+                  <K>signal_vs_zero</K> · same choices applied to the slower signal line — a stricter "trend of momentum" check.
+                </div>
+              </div>
+              <Formula>Levels (optional): Long  MACD_line ≥ line_min,  Signal ≥ signal_min</Formula>
+              <Formula>                   Short MACD_line ≤ −line_min, Signal ≤ −signal_min   (per-side values are used signed as typed)</Formula>
+              <div className="text-gray-400 text-xs mt-1">
+                Tick <i>Use separate Long / Short MACD line rules</i> (<K>entry_conditions.use_direction_macd_line</K>) to give each
+                side its own rules, stored under <K>entry_conditions.long.macd_*</K> / <K>entry_conditions.short.macd_*</K>.
+                The trade log gains a <b>MACD line/signal</b> PASS / FAIL flag, the MACD line and signal values at the signal
+                candle, and an "8. MACD line/signal" line in the entry-condition detail — only for runs that used the rules.
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* ------------------------------------------------- Separation (v3.5) -- */}
+      <div className="lg:col-span-2">
+        <Card title="🔀 Strategy separation (v3.5) — one setup, one side" color="text-amber-400">
+          <Note>
+            The two-sided, two-setup strategy can be split without re-tuning anything. Two config keys,
+            <K>setup_mode</K> and <K>trade_direction</K>, both default to <K>both</K> (the original behaviour);
+            the Backtest form exposes them as <b>Setup</b> and <b>Direction</b>, and the same splits exist as
+            built-in presets (<i>Kudos — Reversal only</i>, <i>Kudos — Momentum only</i>, <i>Kudos — Long only</i>,
+            <i>Kudos — Short only</i>, and the four combinations) in every strategy dropdown — Backtest, Paper, Live and Chart.
+          </Note>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>setup_mode — reversal / momentum</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                <b>Reversal only</b> keeps Setup A and never lets Setup B fire (identical to the legacy
+                "momentum entries" box unticked). <b>Momentum only</b> keeps Setup B and switches Setup A off —
+                it fires even when the momentum box is unticked, so a momentum-only strategy can never be empty.
+                On a candle where both setups qualify, the two-sided strategy labels the trade REVERSAL; the
+                momentum-only split takes the same candle as MOMENTUM.
+              </div>
+              <Formula>reversal:  signals = Setup A only</Formula>
+              <Formula>momentum:  signals = Setup B only</Formula>
+            </div>
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>trade_direction — long / short</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                <b>Long only</b> drops every short signal and keeps the longs exactly as the two-sided strategy
+                produced them; <b>Short only</b> is the mirror. Because the kept side is unchanged, the split's
+                trades are the same trades you would see on that side of a full run (apart from capital-path
+                effects such as drawdown sizing and overlapping positions).
+              </div>
+              <Formula>long:  signals[signals == −1] = 0</Formula>
+              <Formula>short: signals[signals == +1] = 0</Formula>
+            </div>
+          </div>
+          <div className="text-gray-400 text-xs mt-3">
+            Preset ids are <K>PhantomV2:&lt;setup&gt;</K>, <K>PhantomV2:&lt;direction&gt;</K> or <K>PhantomV2:&lt;setup&gt;:&lt;direction&gt;</K>
+            (e.g. <K>PhantomV2:reversal:long</K>). Each preset is a separate strategy id, so a preset and the default can run
+            side by side on one account, and History / Sessions show the preset's name.
           </div>
         </Card>
       </div>

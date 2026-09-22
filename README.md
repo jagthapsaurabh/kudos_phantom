@@ -370,6 +370,52 @@ configuration under a name for re-running or Paper / Live trading.
 Opening any saved Backtest history card now restores its saved dates, exchange, strategy, capital,
 and complete parameter snapshot before showing the result.
 
+### v3.5 addon: MACD line / signal rules, and Reversal · Momentum · Long · Short separation
+Everything in this addon is **additive**: every new key defaults to the original behaviour, so
+existing saved strategies, backtest runs and paper / live sessions produce identical signals.
+
+**MACD settings, all in one place.** The MACD periods (`macd_fast` / `macd_slow` / `macd_signal`) were
+always editable in the Backtest form's *MACD Indicator* group; they are now also documented on the
+Kudos Strategy page (*Strategy Rules → MACD Settings*) and shown, together with the histogram
+threshold and the line rules, under the strategy dropdown on the Paper and Live pages
+(`StrategyConfigSummary`, fed by `GET /phantom/config?strategy_id=…`).
+
+**MACD line / signal line entry rules (new, OFF by default).** `macd_line_rules` adds optional
+conditions on the MACD *line* and its *signal line* — separate from the histogram threshold:
+
+| key | choices | Long reads | Short reads |
+|---|---|---|---|
+| `line_vs_signal` | `off` · `above_below` · `cross` | MACD line > signal (or crosses above) | MACD line < signal (or crosses below) |
+| `line_vs_zero` | `off` · `above_below` · `cross` | MACD line > 0 | MACD line < 0 |
+| `signal_vs_zero` | `off` · `above_below` · `cross` | signal line > 0 | signal line < 0 |
+| `line_min` / `signal_min` | number or blank | line / signal ≥ value | line / signal ≤ −value |
+
+Switch the block on in *Backtest → Strategy Configuration → MACD line / signal line rules*; tick
+**Use separate Long / Short MACD line rules** (`entry_conditions.use_direction_macd_line`) to give
+each side its own rules under `entry_conditions.long.macd_*` / `.short.macd_*` (per-side levels are
+used signed as typed). Active rules apply to **both** setups. Runs that used them gain a
+`cond_macd_line_ok` flag, the `macd_line` / `macd_signal` values at the signal candle and an
+`8. MACD line/signal` line in the entry-condition detail (also in the CSV / Excel export); runs that
+did not show `N/A`.
+
+**Strategy separation.** Two new config keys, `setup_mode` (`both` · `reversal` · `momentum`) and
+`trade_direction` (`both` · `long` · `short`), appear as **Setup** and **Direction** selectors in the
+Backtest form and are saved with a named strategy, so a split can be re-run or traded in Paper / Live
+like any other saved strategy. `reversal` is exactly the legacy *momentum entries off*; `momentum`
+forces Setup B on even when that box is unticked; `long` / `short` keep that side's signals exactly
+as the two-sided strategy produced them. The same splits are available as **built-in presets** in
+every strategy dropdown (Backtest, Paper, Live, Chart), right after *Kudos V2.5 (Default)*:
+
+| id | name |
+|---|---|
+| `PhantomV2:reversal` / `PhantomV2:momentum` | Kudos — Reversal only / Kudos — Momentum only |
+| `PhantomV2:long` / `PhantomV2:short` | Kudos — Long only / Kudos — Short only |
+| `PhantomV2:reversal:long` … `PhantomV2:momentum:short` | Kudos — Reversal · Long only, … |
+
+A preset is the tuned champion config with only the setup / direction narrowed (`GET /phantom/presets`
+lists them). Presets are separate strategy ids, so a preset and the default can run side by side on
+one account, and History / Sessions show the preset's name.
+
 ### Trade log: which candle, which colour, and the full export
 The trade log answers three questions for every trade — **which candle raised the signal**, **which
 candle the entry actually filled on**, and **what colour each was**. The strategy fires on candle *i*
@@ -405,6 +451,7 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 cd backend
 python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 python test_atr_regime_op.py      # 32 checks: per-side ATR operator
+python test_macd_line_and_modes.py # 76 checks: MACD line/signal rules, setup + direction splits, presets
 python test_paper_history.py      # 63 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
@@ -419,9 +466,9 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 380 checks: trade-log table + CSV export, trading windows, page
+cd frontend && npm test            # 430 checks: trade-log table + CSV export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
-                                   # key replacement + credential badges
+                                   # key replacement + credential badges, Kudos presets + MACD line form
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

@@ -174,6 +174,14 @@ class BacktestEngine:
             rsi_ok = bool(meta['cond_long_rsi'][i]) if is_long else bool(meta['cond_short_rsi'][i])
             macd_ok = bool(meta['cond_long_macd'][i]) if is_long else bool(meta['cond_short_macd'][i])
             di_ok = None
+        # v3.5 — MACD line / signal line rules are an optional gate on both
+        # setups. N/A (None) while the block is off, so an old-style run never
+        # reports a PASS for a filter it was not tested against.
+        macd_line_ok = None
+        if meta.get('macd_line_rules_enabled'):
+            macd_line_ok = bool(meta['cond_macd_line_ok_long' if is_long else 'cond_macd_line_ok_short'][i])
+        macd_line_v = float(meta['macd_line'][i]) if 'macd_line' in meta else None
+        macd_signal_v = float(meta['macd_signal'][i]) if 'macd_signal' in meta else None
         return {
             "signal_candle_time": None,  # filled by caller (needs index)
             "signal_candle_type": cls._candle_color(meta, i),
@@ -193,7 +201,71 @@ class BacktestEngine:
             "cond_rsi_ok": rsi_ok,
             "cond_macd_confirm_ok": macd_ok,
             "cond_di_ok": di_ok,
+            # v3.5 — MACD line / signal line at the signal candle + rule result.
+            "macd_line": macd_line_v,
+            "macd_signal": macd_signal_v,
+            "cond_macd_line_ok": macd_line_ok,
         }
+
+    def _macd_line_conditions_text(self, meta, i, signal_dir, number):
+        """One log line per active v3.5 MACD line / signal rule (or None when off).
+
+        Mirrors ``StrategyService._macd_line_mask`` so the log always states
+        the exact comparison that was applied to this side.
+        """
+        cfg = self.config
+        if not getattr(cfg, 'uses_macd_line_rules', lambda: False)():
+            return []
+        is_long = signal_dir == 1
+        side_key = 'long' if is_long else 'short'
+        if f'macd_line_{side_key}' not in meta:
+            # Strategy services other than StrategyService do not publish the
+            # per-side MACD lines — nothing to explain.
+            return []
+        line_now = float(meta[f'macd_line_{side_key}'][i])
+        line_prev = float(meta[f'macd_line_{side_key}_prev'][i])
+        sig_now = float(meta[f'macd_signal_{side_key}'][i])
+        sig_prev = float(meta[f'macd_signal_{side_key}_prev'][i])
+
+        def num(v, digits=2):
+            try:
+                return f"{float(v):,.{digits}f}"
+            except (TypeError, ValueError):
+                return '—'
+
+        checks = []
+        specs = (
+            ('line_vs_signal', 'MACD line', 'signal', line_now, sig_now, line_prev, sig_prev),
+            ('line_vs_zero', 'MACD line', '0', line_now, 0.0, line_prev, 0.0),
+            ('signal_vs_zero', 'signal line', '0', sig_now, 0.0, sig_prev, 0.0),
+        )
+        for key, left, right, now_l, now_r, prev_l, prev_r in specs:
+            rule = cfg.macd_line_rule_for(signal_dir, key)
+            if rule == 'off':
+                continue
+            now_ok = now_l > now_r if is_long else now_l < now_r
+            if rule == 'cross':
+                prev_other = prev_l <= prev_r if is_long else prev_l >= prev_r
+                ok = now_ok and prev_other
+                checks.append(f"{left} {num(prev_l)} -> {num(now_l)} vs {right}"
+                              f"{'' if right == '0' else ' ' + num(now_r)} needs cross "
+                              f"{'above' if is_long else 'below'} -> {'PASS' if ok else 'FAIL'}")
+            else:
+                checks.append(f"{left} {num(now_l)} {'>' if is_long else '<'} {right}"
+                              f"{'' if right == '0' else ' ' + num(now_r)} -> {'PASS' if now_ok else 'FAIL'}")
+        thr = cfg.macd_line_min_for(signal_dir)
+        if thr is not None:
+            ok = line_now >= thr if is_long else line_now <= thr
+            checks.append(f"MACD line {num(line_now)} {'>=' if is_long else '<='} {num(thr)} -> "
+                          f"{'PASS' if ok else 'FAIL'}")
+        thr = cfg.macd_signal_min_for(signal_dir)
+        if thr is not None:
+            ok = sig_now >= thr if is_long else sig_now <= thr
+            checks.append(f"signal line {num(sig_now)} {'>=' if is_long else '<='} {num(thr)} -> "
+                          f"{'PASS' if ok else 'FAIL'}")
+        if not checks:
+            return [f"{number}. MACD line/signal rules: enabled but no rule active for this side -> N/A"]
+        return [f"{number}. MACD line/signal: {c}" for c in checks]
 
     def _entry_conditions_text(self, meta, i, signal_dir):
         """Spell out every entry condition for the trade log and Excel export.
@@ -304,6 +376,10 @@ class BacktestEngine:
             lines.append(f"7. MACD confirmation: hist {num(h_prev)} -> {num(h_now)} -> needs "
                          f"{'rising' if is_long else 'falling'} -> "
                          f"{'PASS' if confirm else 'FAIL'}")
+
+        # 8. v3.5 MACD line / signal line rules — only written when the block
+        # is switched on, so the log of an existing configuration is unchanged.
+        lines.extend(self._macd_line_conditions_text(meta, i, signal_dir, 8))
 
         return '\n'.join(lines)
 
@@ -631,6 +707,15 @@ class BacktestEngine:
             "mark_price_coverage": round(float(self.mark_price_coverage or 0.0) * 100.0, 2),
             # "Skip new trades" schedule actually applied to this run.
             "trading_windows": window_guard.summary(),
+            # v3.5 — which setups / sides this run was allowed to trade and
+            # the MACD line / signal rules it applied (text per side).
+            "setup_mode": getattr(cfg, 'setup_mode', 'both'),
+            "trade_direction": getattr(cfg, 'trade_direction', 'both'),
+            "macd_line_rules": {
+                "enabled": bool(getattr(cfg, 'uses_macd_line_rules', lambda: False)()),
+                "long": cfg.macd_line_rule_text_for(1) if hasattr(cfg, 'macd_line_rule_text_for') else 'off',
+                "short": cfg.macd_line_rule_text_for(-1) if hasattr(cfg, 'macd_line_rule_text_for') else 'off',
+            },
             "diagnostics": {
                 "skipped_overlap": skipped_overlap,
                 "halt_bars": halt_bars,
@@ -676,6 +761,9 @@ class BacktestEngine:
             'drawdown', 'hold_bars',
         ]
         cols = [c for c in cols if c in log_df.columns]
+        # Anything not pinned above (e.g. the v3.5 macd_line / macd_signal /
+        # cond_macd_line_ok columns) is appended after the original layout so
+        # existing sheets keep their column positions.
         log_df = log_df[cols + [c for c in log_df.columns if c not in cols]]
         log_df.to_csv(path, index=False)
         return path

@@ -4,6 +4,9 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import EntryGuardBadges from '../components/EntryGuardBadges';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import StrategyConfigSummary from '../components/StrategyConfigSummary';
+import { builtinStrategyName } from '../utils/phantomPresets';
 import { FeedBadge, PreflightModal } from './LiveTrade';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
@@ -283,7 +286,7 @@ const LogPanel = ({ instanceKey }) => {
 const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) => {
   const activeTrades = inst.active_trades || [];
   const lastChecked = fmtIST(inst.last_checked);
-  const strategyName = inst.strategy_name || (inst.strategy_id === 'PhantomV2' ? 'Kudos V2.5 (Default)' : inst.strategy_id);
+  const strategyName = inst.strategy_name || builtinStrategyName(inst.strategy_id) || inst.strategy_id;
   return (
     <div onClick={() => onSelect(inst.instance_key)}
          className={`min-w-0 rounded-xl border p-4 cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20 shadow-lg shadow-blue-950/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
@@ -886,8 +889,13 @@ const PaperTrade = () => {
           <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             <option value="PhantomV2">Kudos V2.5 (Default)</option>
+            <PhantomPresetOptions />
             <option value="FastTest">Fast Test Strategy</option>
-            {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {strategies.length > 0 && (
+              <optgroup label="Saved strategies">
+                {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </optgroup>
+            )}
           </select>
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Exit checks</label>
@@ -950,6 +958,9 @@ const PaperTrade = () => {
           </div>
         </div>
       </div>
+
+      {/* What the selected strategy trades on: MACD periods, MACD line rules, setup & side. */}
+      <StrategyConfigSummary strategyId={selectedStrategy} strategies={strategies} className="mb-6" />
 
       {/* Pricing basis + "skip new trades" schedule for new instances */}
       {showWindows && (

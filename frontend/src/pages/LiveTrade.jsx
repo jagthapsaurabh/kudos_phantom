@@ -4,6 +4,8 @@ import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import LiveTerminal from '../components/LiveTerminal';
 import EntryGuardBadges from '../components/EntryGuardBadges';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import StrategyConfigSummary from '../components/StrategyConfigSummary';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
@@ -680,8 +682,13 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
             <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
                     className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
+              <PhantomPresetOptions />
               <option value="FastTest">Fast Test Strategy (Quick Signals)</option>
-              {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              {strategies.length > 0 && (
+                <optgroup label="Saved strategies">
+                  {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </optgroup>
+              )}
             </select>
           </div>
           <div className="flex flex-col">
@@ -756,6 +763,9 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
       )}
 
       {view === 'automation' && (<>
+      {/* What the selected strategy trades on: MACD periods, MACD line rules, setup & side. */}
+      <StrategyConfigSummary strategyId={selectedStrategy} strategies={strategies} className="mb-8" />
+
       {/* Pricing basis + "skip new trades" schedule for new instances */}
       {showWindows && (
         <div className="mb-8 grid grid-cols-1 gap-4 xl:grid-cols-3">

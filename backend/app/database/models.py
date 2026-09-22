@@ -390,6 +390,11 @@ class Trade(Base):
     cond_atr_regime_ok = Column(Integer, nullable=True)
     cond_rsi_ok = Column(Integer, nullable=True)
     cond_macd_confirm_ok = Column(Integer, nullable=True)
+    # v3.5 — MACD line / signal line at the signal candle and the result of
+    # the optional line/signal rules (NULL = rules were off for that run).
+    macd_line = Column(Float, nullable=True)
+    macd_signal = Column(Float, nullable=True)
+    cond_macd_line_ok = Column(Integer, nullable=True)
     gross_pnl = Column(Float, nullable=True)
     sl = Column(Float, nullable=True)
     tp = Column(Float, nullable=True)

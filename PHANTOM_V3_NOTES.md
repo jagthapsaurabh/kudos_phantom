@@ -169,6 +169,63 @@ not hardcoded): SHORT `macd_hist_min` ≈ negative (e.g. `-8`) to require bearis
 momentum, SHORT `atr_regime_ratio` below the shared `0.5` to exclude the top
 volatility quartile where REVERSAL-SHORT's win rate drops to ~52%.
 
+## Addon: MACD line / signal rules + setup / direction separation (v3.5)
+
+Client asks: (1) "MACD signal and line settings", (2) separate momentum and
+reversal strategies, (3) long-only and short-only strategies — all "without
+disturbing the current codes". Every addition below is a new field with a
+default that reproduces the previous behaviour bit for bit (verified by hashing
+signals, setup labels and trade lists of six reference configs before / after).
+
+- **MACD line / signal line rules** (`PhantomV2Config.macd_line_rules`,
+  `MacdLineConditions`): `enabled` (default `False`), `line_vs_signal`,
+  `line_vs_zero`, `signal_vs_zero` (each `off` / `above_below` / `cross`),
+  `line_min`, `signal_min` (magnitudes; longs `>= v`, shorts `<= -v`). Applied
+  in `StrategyService._compute` as an extra AND-mask on both setups
+  (`_macd_line_mask`); LONG reads the bullish side, SHORT the bearish side,
+  `cross` requires the previous bar on the other side. Per-side overrides
+  follow the v3.2 pattern: `entry_conditions.use_direction_macd_line` +
+  `entry_conditions.long/short.macd_line_vs_signal|macd_line_vs_zero|
+  macd_signal_vs_zero|macd_line_min|macd_signal_min` (per-side levels are
+  signed as typed, like `macd_hist_min`). An enabled block with every rule
+  `off` is treated as disabled. The MACD *periods* are unchanged and now shown
+  on the docs page and the Paper / Live pages (`/phantom/config` → `summary`).
+- **Setup separation** (`setup_mode`: `both` / `reversal` / `momentum`).
+  `momentum_enabled()` keeps the legacy `enable_momentum_entry` switch while
+  `both`; `reversal` forces Setup B off (identical to the legacy switch off);
+  `momentum` forces Setup B on and Setup A off. On a candle where both setups
+  qualified, the two-sided run labels REVERSAL; momentum-only takes it as
+  MOMENTUM (Setup A priority is unchanged).
+- **Direction separation** (`trade_direction`: `both` / `long` / `short`):
+  the dropped side's masks are cleared after all filters, so the kept side's
+  signals are exactly those of the two-sided run.
+- **Built-in presets**: `parse_phantom_variant` accepts
+  `PhantomV2:<setup>[:<direction>]` / `PhantomV2:<direction>` (separators
+  `: - . /`), `apply_phantom_variant` narrows any config, `PHANTOM_PRESETS`
+  lists the 8 curated ids, `phantom_preset_name` names them
+  ("Kudos — Reversal · Long only"). `main.py` resolves them wherever
+  `PhantomV2` was special-cased (signals, backtest task, filter preview,
+  preflight, paper / live start + resume) via `_is_builtin_phantom` /
+  `_load_builtin_config` / `_builtin_strategy_name`; `GET /phantom/presets`
+  and `GET /phantom/config?strategy_id=` serve the UI. Presets are distinct
+  strategy ids for `running_conflict`, so they run next to the default.
+- **Logging**: `meta` gains `macd_line`, `macd_signal` (shared + per side),
+  `cond_macd_line_ok_long/short`, `macd_line_rules_enabled`, rule texts,
+  `setup_mode`, `trade_direction`. `engine._condition_snapshot` adds
+  `macd_line`, `macd_signal`, `cond_macd_line_ok` (None when the rules are
+  off); `_entry_conditions_text` appends "8. MACD line/signal …" only when
+  they are on; `Trade` gains the three nullable columns (additive migration);
+  CSV / Excel export and `/backtest/results` carry them; results also report
+  `setup_mode`, `trade_direction`, `macd_line_rules`.
+- **UI**: `utils/phantomPresets.js` (ids, names, labels, rule text mirror),
+  `PhantomPresetOptions` (optgroup in every dropdown), Backtest form
+  *Strategy separation* + *MACD line / signal line rules* blocks (locked to a
+  preset when one is selected), result / preview badges, trade-log chip,
+  `StrategyConfigSummary` on Paper / Live, Kudos Strategy docs (Rules +
+  Explained tabs).
+- **Tests**: `backend/test_macd_line_and_modes.py` (76 checks),
+  `frontend/tests/phantom_presets_ui.jsx` (50 checks).
+
 ## Reproduce
 ```bash
 python -m backend.app.scripts.run_baseline        # v2.5 parity numbers

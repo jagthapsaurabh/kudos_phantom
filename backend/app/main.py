@@ -11,6 +11,11 @@ import os
 from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
+from .core.strategy import (
+    PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
+    phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
+    TRADE_DIRECTION_LABELS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS,
+)
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
     TradingWindowConfig, TradingWindowGuard, default_config as default_window_config,
@@ -322,7 +327,46 @@ _PHANTOM_PARAM_KEYS = (
     'entry_conditions', 'use_direction_conditions', 'rsi_oversold',
     'rsi_overbought', 'stop_loss_atr', 'macd_hist_min', 'atr_regime_ratio',
     'adx_min', 'trend_ema_period', 'trading_windows', 'use_mark_price',
+    # v3.5 separation / MACD line settings
+    'setup_mode', 'trade_direction', 'macd_line_rules',
 )
+
+
+# ---------------------------------------------------------------------------
+# v3.5 — built-in Phantom presets
+# ---------------------------------------------------------------------------
+# ``PhantomV2`` stays the tuned champion. ``PhantomV2:reversal``,
+# ``PhantomV2:long``, ``PhantomV2:momentum:short`` … are the same champion with
+# only the setup / direction narrowed, so the separated strategies are
+# available in every dropdown (backtest, paper, live, chart) without a saved
+# copy. A saved custom strategy id never matches, so those paths are untouched.
+def _is_builtin_phantom(strategy_id) -> bool:
+    return parse_phantom_variant(strategy_id) is not None
+
+
+def _is_phantom_preset(strategy_id) -> bool:
+    """A built-in id OTHER than the plain champion (``PhantomV2``)."""
+    variant = parse_phantom_variant(strategy_id)
+    return bool(variant) and (variant['setup_mode'] != 'both' or variant['trade_direction'] != 'both')
+
+
+def _load_builtin_config(strategy_id) -> PhantomV2Config:
+    """Champion config with the preset's setup / direction applied.
+
+    For the plain ``PhantomV2`` id this is exactly ``_load_champion_config()``.
+    """
+    return apply_phantom_variant(_load_champion_config(), strategy_id)
+
+
+def _builtin_strategy_name(strategy_id) -> Optional[str]:
+    """Display name for a built-in id; None for saved / custom strategies."""
+    if str(strategy_id) == 'FastTest':
+        return 'Fast Test Strategy'
+    return phantom_preset_name(strategy_id)
+
+
+def _phantom_presets_payload() -> list:
+    return [dict(p) for p in PHANTOM_PRESETS]
 
 
 def _parse_run_params(config_json):
@@ -426,6 +470,11 @@ def _resume_paper_session(spec):
             service.strategy = FastTestStrategyService(service.config)
         elif strategy_id == "PhantomV2":
             service = PaperTradeService(strategy_id, _fee_config(_load_champion_config(), fees), **common)
+        elif _is_builtin_phantom(strategy_id):
+            # v3.5 preset (e.g. PhantomV2:reversal:long) — champion narrowed
+            # to that setup / direction.
+            common["strategy_name"] = common.get("strategy_name") or _builtin_strategy_name(strategy_id)
+            service = PaperTradeService(strategy_id, _fee_config(_load_builtin_config(strategy_id), fees), **common)
         else:
             resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
             if not resolved:
@@ -1963,12 +2012,66 @@ def _load_champion_config() -> PhantomV2Config:
             pass
     return PhantomV2Config()
 
+def _phantom_config_summary(cfg: PhantomV2Config) -> dict:
+    """Plain-language view of the settings a client asks about most:
+    the MACD indicator periods, the histogram threshold, the MACD line /
+    signal line rules, and which setups / sides the strategy trades."""
+    return {
+        "macd": {
+            "fast": cfg.macd_fast, "slow": cfg.macd_slow, "signal": cfg.macd_signal,
+            "hist_min": cfg.macd_hist_min,
+            "hist_min_long": cfg.macd_hist_min_for(1),
+            "hist_min_short": cfg.macd_hist_min_for(-1),
+            "periods_long": list(cfg.macd_periods_for(1)),
+            "periods_short": list(cfg.macd_periods_for(-1)),
+            "line_rules_enabled": cfg.uses_macd_line_rules(),
+            "line_rules": cfg.macd_line_rules.model_dump(),
+            "line_rule_long": cfg.macd_line_rule_text_for(1),
+            "line_rule_short": cfg.macd_line_rule_text_for(-1),
+        },
+        "setup_mode": cfg.setup_mode,
+        "setup_label": cfg.setup_label(),
+        "reversal_enabled": cfg.reversal_enabled(),
+        "momentum_enabled": cfg.momentum_enabled(),
+        "trade_direction": cfg.trade_direction,
+        "direction_label": cfg.direction_label(),
+    }
+
+
 @app.get("/phantom/config")
-def phantom_config(user=Depends(get_current_user)):
+def phantom_config(strategy_id: Optional[str] = None, user=Depends(get_current_user)):
+    """The tuned champion config (default) or one of its built-in presets.
+
+    ``strategy_id`` may name a preset such as ``PhantomV2:reversal:long``; the
+    returned ``config`` then carries that preset's setup / direction. The
+    response also lists every preset and a ``summary`` (MACD periods, MACD
+    line / signal rules, setup, direction) so the docs and the paper / live
+    pages can show what the selected strategy actually trades on.
+    """
     cfg = _load_champion_config()
     path = _champion_config_path()
+    if strategy_id and _is_builtin_phantom(strategy_id):
+        cfg = apply_phantom_variant(cfg, strategy_id)
     return {"profile": os.path.basename(path) if path else 'v2.5-defaults',
-            "config": cfg.model_dump()}
+            "config": cfg.model_dump(),
+            "strategy_id": strategy_id if (strategy_id and _is_builtin_phantom(strategy_id)) else BUILTIN_PHANTOM_ID,
+            "strategy_name": (_builtin_strategy_name(strategy_id) if (strategy_id and _is_builtin_phantom(strategy_id))
+                              else 'Kudos V2.5 (Default)'),
+            "summary": _phantom_config_summary(cfg),
+            "presets": _phantom_presets_payload(),
+            "options": {
+                "setup_modes": [{"value": m, "label": SETUP_MODE_LABELS[m]} for m in SETUP_MODES],
+                "trade_directions": [{"value": d, "label": TRADE_DIRECTION_LABELS[d]} for d in TRADE_DIRECTIONS],
+                "macd_line_rules": list(MACD_LINE_RULES),
+                "macd_line_rule_keys": list(MACD_LINE_RULE_KEYS),
+            }}
+
+
+@app.get("/phantom/presets")
+def phantom_presets(user=Depends(get_current_user)):
+    """Built-in separated variants of the tuned strategy for the dropdowns."""
+    return {"default": {"id": BUILTIN_PHANTOM_ID, "name": 'Kudos V2.5 (Default)'},
+            "presets": _phantom_presets_payload()}
 
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
@@ -1982,6 +2085,13 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
     """
     if strategy_id == "PhantomV2":
         cfg = _load_champion_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = engine.strategy_service
+        wants_metadata = True
+        label = None
+    elif _is_builtin_phantom(strategy_id):
+        # v3.5 preset: the champion narrowed to one setup / direction.
+        cfg = _load_builtin_config(strategy_id)
         engine = BacktestEngine(cfg)
         strategy_service = engine.strategy_service
         wants_metadata = True
@@ -2064,6 +2174,11 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
             except Exception:
                 pass
             try:
+                item["macd_line"] = round(float(meta['macd_line'][i]), 4)
+                item["macd_signal"] = round(float(meta['macd_signal'][i]), 4)
+            except Exception:
+                pass
+            try:
                 trend = int(meta['trend'][i])
                 item["trend"] = trend
                 item["trend_label"] = "UP" if trend == 1 else ("DOWN" if trend == -1 else "FLAT")
@@ -2102,6 +2217,11 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         fees = resolve_fees(db, source, req.fee_mode, req.params)
         config = _fee_config(req.params, fees)
         if req.strategy_id == "PhantomV2":
+            engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        elif _is_builtin_phantom(req.strategy_id):
+            # v3.5 preset: the form's parameters, narrowed to the preset's
+            # setup / direction so "Reversal · Long only" always means that.
+            config = apply_phantom_variant(config, req.strategy_id)
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         else:
             resolved = _resolve_strategy_payload(db, req.strategy_id, user_id, fees)
@@ -2250,12 +2370,16 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                     "exit_detail": t.exit_detail,
                     "rsi14": t.rsi14, "macd_hist": t.macd_hist, "adx": t.adx,
                     "atr14": t.atr14, "ema50_1h": t.ema50_1h, "ema50_4h": t.ema50_4h,
+                    # v3.5 — MACD line / signal line at the signal candle.
+                    "macd_line": getattr(t, 'macd_line', None),
+                    "macd_signal": getattr(t, 'macd_signal', None),
                     "conditions": {
                         "trend_ok": t.cond_trend_ok,
                         "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
                         "atr_regime_ok": t.cond_atr_regime_ok, "rsi_ok": t.cond_rsi_ok,
                         "macd_confirm_ok": t.cond_macd_confirm_ok,
                         "di_ok": t.cond_di_ok,
+                        "macd_line_ok": getattr(t, 'cond_macd_line_ok', None),
                     },
                     # BTC perpetual: the traded price and the exchange mark
                     # price are both persisted; entry/exit_price are the basis
@@ -2441,6 +2565,18 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'buckets': out,
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
+        # v3.5 — separation + MACD line / signal rules this preview ran with.
+        'setup_mode': config.setup_mode,
+        'setup_label': config.setup_label(),
+        'trade_direction': config.trade_direction,
+        'direction_label': config.direction_label(),
+        'macd_line_rules': {
+            'enabled': config.uses_macd_line_rules(),
+            'per_side': config.uses_direction_macd_line(),
+            'long': config.macd_line_rule_text_for(1),
+            'short': config.macd_line_rule_text_for(-1),
+        },
+        'macd_periods': {'fast': config.macd_fast, 'slow': config.macd_slow, 'signal': config.macd_signal},
     }
 
 
@@ -2486,6 +2622,10 @@ def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_u
                 try: item["adx"] = round(float(meta['adx'][i]), 3)
                 except Exception: pass
                 try: item["macd_hist"] = round(float(meta['macd_hist'][i]), 4)
+                except Exception: pass
+                try:
+                    item["macd_line"] = round(float(meta['macd_line'][i]), 4)
+                    item["macd_signal"] = round(float(meta['macd_signal'][i]), 4)
                 except Exception: pass
                 try:
                     trend = int(meta['trend'][i])
@@ -2688,7 +2828,7 @@ def trade_preflight(payload: PreflightRequest, user=Depends(get_current_user), d
         try:
             capital, margin_pct = _resolve_sizing(payload, user)
             leverage = int(payload.leverage) if payload.leverage else \
-                int(getattr(_load_champion_config() if payload.strategy_id == 'PhantomV2'
+                int(getattr(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
                             else PhantomV2Config(), 'leverage', 7) or 7)
             client, _d, _c = _live_client(db, user, source, payload.connection_id)
             funding = check_affordable(client, broker=source, capital_inr=capital,
@@ -2736,7 +2876,10 @@ def start_paper_trade(
         raise HTTPException(status_code=409,
                             detail=_conflict_detail('paper', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'paper')
-    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
+    # Built-in ids (PhantomV2 and its v3.5 presets) run the tuned champion,
+    # narrowed to the preset's setup / direction when one was picked.
+    config = _fee_config(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
+                         else PhantomV2Config(), fees)
     capital, margin_pct = _resolve_sizing(payload, user)
     # Paper is the rehearsal for live: a leverage or margin mode the venue
     # would refuse must be refused here too, not silently simulated so the
@@ -2749,7 +2892,7 @@ def start_paper_trade(
     except PhantomValidationError as ve:
         raise HTTPException(status_code=ve.status_code, detail=ve.message)
     strategy_id = str(payload.strategy_id)
-    strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
+    strategy_name = _builtin_strategy_name(strategy_id)
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
@@ -2771,7 +2914,7 @@ def start_paper_trade(
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
         service.strategy = FastTestStrategyService(service.config)
-    elif strategy_id != "PhantomV2":
+    elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
@@ -3116,7 +3259,10 @@ def start_live_trade(
         raise HTTPException(status_code=409,
                             detail=_conflict_detail('live', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'live')
-    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
+    # Built-in ids (PhantomV2 and its v3.5 presets) run the tuned champion,
+    # narrowed to the preset's setup / direction when one was picked.
+    config = _fee_config(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
+                         else PhantomV2Config(), fees)
     strategy_id = payload.strategy_id
     capital, margin_pct = _resolve_sizing(payload, user)
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
@@ -3225,7 +3371,7 @@ def start_live_trade(
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
         service.strategy = FastTestStrategyService(service.config)
-    elif strategy_id != "PhantomV2":
+    elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
@@ -3261,6 +3407,10 @@ def start_live_trade(
     # like a paper run, so stopping it later leaves a full reviewable record.
     service.user_id = user.id
     service.account_label_for_history = account_label
+    if _is_phantom_preset(strategy_id):
+        # v3.5 presets carry their display name into the session record so
+        # History / Sessions show "Kudos — Reversal only", not the raw id.
+        service.strategy_name = _builtin_strategy_name(strategy_id)
     session_id = paper_history.start_session(user.id, instance_key, service)
     # Blocks a double-clicked Start until the background task flips is_running.
     service.pending_start = True
