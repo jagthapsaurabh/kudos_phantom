@@ -7,17 +7,23 @@ import {
 
 // v3.6 — "Risk & Exit Model" editor.
 //
-// One row per protective level. Each row has its own ATR / Price % selector, so
-// the client can run every level in ATR units (the default — unchanged), every
-// level in % of price, or any mix ("Both — per level"). Both values are kept
-// while a level is switched, so toggling back and forth never loses a number.
+// The toggle at the top picks the model for the whole strategy:
+//
+//   [ ATR-based (default) ] [ Price-based (%) ] [ Both — per level ]
+//
+// ATR-based is what we have always used — it stays the default, so nothing
+// changes until the client flips the switch. Price-based measures every level
+// as a % of the entry price. "Both" exposes the per-level toggle on each row
+// (ATR | Price %), so a strategy can run an ATR stop with a price-based target.
+//
+// Each row keeps both values while it is switched, so toggling back and forth
+// never loses a number.
 //
 // Pure: it only calls `setParams` with the next params object. The maths that
 // decides what ATR vs price means lives on the backend (RiskExitModel in
 // app/core/strategy.py) and in src/utils/riskExit.js for the text.
 
 const inputCls = 'w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500';
-const selectCls = 'rounded border border-gray-700 bg-gray-800 p-1 text-[10px] font-bold text-white outline-none focus:border-blue-500';
 
 const Field = ({ label, hint, value, onChange, testid, step = '0.01' }) => (
   <div className="flex flex-col">
@@ -28,6 +34,15 @@ const Field = ({ label, hint, value, onChange, testid, step = '0.01' }) => (
     <input type="number" step={step} value={value ?? ''} data-testid={testid}
       onChange={onChange} className={inputCls} />
   </div>
+);
+
+// One side of a toggle. `aria-pressed` is what the tests read, and what a
+// screen reader announces, so the control is a real two/three-state toggle.
+const ToggleButton = ({ active, onClick, testid, title, children, activeCls = 'bg-blue-600 text-white' }) => (
+  <button type="button" data-testid={testid} title={title} aria-pressed={active} onClick={onClick}
+    className={`rounded px-2 py-1 text-[10px] font-bold transition ${active ? activeCls : 'text-gray-400 hover:text-white'}`}>
+    {children}
+  </button>
 );
 
 // Fractions are stored (0.016 = 1.6%), percent numbers are shown.
@@ -56,12 +71,16 @@ const RiskExitModelEditor = ({ params = {}, setParams, className = '' }) => {
 
   return (
     <div data-testid="risk-exit-model" className={`space-y-2 ${className}`}>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[10px] font-semibold text-gray-400">Risk &amp; Exit model</span>
-        <select data-testid="risk-exit-model-select" value={rx.model} title={model.hint}
-          aria-label="Risk and exit model" onChange={(e) => setModel(e.target.value)} className={selectCls}>
-          {RISK_EXIT_MODELS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
+      <div data-testid="risk-exit-model-toggle" role="group" aria-label="Risk and exit model"
+        className="flex flex-wrap items-center gap-1 rounded-lg border border-gray-700 bg-gray-900 p-1">
+        {RISK_EXIT_MODELS.map((o) => (
+          <ToggleButton key={o.value} testid={`risk-model-option-${o.value}`} title={o.hint}
+            active={o.value === rx.model} onClick={() => setModel(o.value)}
+            activeCls={o.value === RISK_EXIT_PRICE ? 'bg-amber-600 text-white'
+              : o.value === 'both' ? 'bg-purple-700 text-white' : 'bg-blue-600 text-white'}>
+            {o.label}
+          </ToggleButton>
+        ))}
       </div>
       <p className="text-[10px] leading-snug text-gray-500" data-testid="risk-exit-model-hint">{model.hint}</p>
 
@@ -71,14 +90,22 @@ const RiskExitModelEditor = ({ params = {}, setParams, className = '' }) => {
         return (
           <div key={level.key} data-testid={`risk-level-${level.key}`}
             className="space-y-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-[10px] font-bold text-gray-300">{level.label}</span>
-              <select data-testid={level.pin} value={mode} aria-label={`${level.label} model`}
-                onChange={(e) => setLevelMode(level.key, e.target.value)}
-                className={`${selectCls} ${priceMode ? 'text-amber-300' : 'text-blue-300'}`}>
-                <option value={RISK_EXIT_ATR}>ATR</option>
-                <option value={RISK_EXIT_PRICE}>Price %</option>
-              </select>
+              <div data-testid={level.pin} role="group" aria-label={`${level.label} model`}
+                className="flex items-center gap-0.5 rounded border border-gray-700 bg-gray-900 p-0.5">
+                <ToggleButton testid={`${level.pin}-atr`} active={!priceMode}
+                  title="Measure this level in ATR units (the original behaviour)"
+                  onClick={() => setLevelMode(level.key, RISK_EXIT_ATR)}>
+                  ATR
+                </ToggleButton>
+                <ToggleButton testid={`${level.pin}-price`} active={priceMode}
+                  activeCls="bg-amber-600 text-white"
+                  title="Measure this level as a % of the entry price"
+                  onClick={() => setLevelMode(level.key, RISK_EXIT_PRICE)}>
+                  Price %
+                </ToggleButton>
+              </div>
             </div>
             <div className={level.distance ? 'grid grid-cols-2 gap-2' : ''}>
               {priceMode ? (

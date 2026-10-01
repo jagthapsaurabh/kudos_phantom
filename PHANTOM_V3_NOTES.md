@@ -336,7 +336,7 @@ choosing the model level by level (e.g. an ATR stop with a price-based target).
   the all-ATR default keeps the trade-list parity dump byte-identical.
 - **Tests**: `backend/test_risk_exit_model.py` (48 checks: defaults, price model, per-level mix,
   per-side stops, trail / breakeven on both sides, live venue trail, legacy config fallback, V1 and
-  validation), `frontend/tests/risk_exit_model_ui.jsx` (37 checks: helpers, editor rendering in all
+  validation), `frontend/tests/risk_exit_model_ui.jsx` (40 checks: helpers, editor rendering in all
   three models, page wiring, docs tabs).
 
 ## Reproduce

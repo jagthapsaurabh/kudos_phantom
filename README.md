@@ -591,7 +591,7 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 519 checks (518 pass; the known PaperTrade live-tick smoke check fails on the
+cd frontend && npm test            # 522 checks (521 pass; the known PaperTrade live-tick smoke check fails on the
                                    # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker

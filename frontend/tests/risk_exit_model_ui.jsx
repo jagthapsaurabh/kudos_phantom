@@ -106,19 +106,33 @@ check('model text: breakeven 0 reads as off',
 
 // ------------------------------------------------------------------- editor --
 const atrHtml = flat(renderToString(<RiskExitModelEditor params={baseParams} setParams={noop} />));
-check('editor renders the model selector with all three choices',
-  atrHtml.includes('risk-exit-model-select') && atrHtml.includes('ATR-based (default)')
-  && atrHtml.includes('Price-based (%)') && atrHtml.includes('Both — per level'));
+check('editor renders the model as a toggle with all three choices',
+  atrHtml.includes('risk-exit-model-toggle') && atrHtml.includes('risk-model-option-atr')
+  && atrHtml.includes('risk-model-option-price') && atrHtml.includes('risk-model-option-both')
+  && atrHtml.includes('ATR-based (default)') && atrHtml.includes('Price-based (%)')
+  && atrHtml.includes('Both — per level'));
+check('ATR is the pressed side of the toggle by default',
+  /data-testid="risk-model-option-atr"[^>]*aria-pressed="true"/.test(atrHtml)
+  && /data-testid="risk-model-option-price"[^>]*aria-pressed="false"/.test(atrHtml),
+  'the default is the existing ATR-based risk & exit model');
 check('editor shows the ATR inputs by default (unchanged behaviour)',
   atrHtml.includes('risk-atr-stop_loss_atr') && atrHtml.includes('risk-atr-take_profit_atr')
   && atrHtml.includes('risk-atr-trail_activation_atr') && atrHtml.includes('risk-atr-trail_distance_atr')
   && atrHtml.includes('risk-atr-breakeven_atr') && !atrHtml.includes('risk-pct-stop_loss_pct'));
-check('editor keeps one ATR | Price switch per level',
-  RISK_EXIT_LEVELS.every((l) => atrHtml.includes(l.pin)));
+check('editor keeps one ATR | Price % toggle per level',
+  RISK_EXIT_LEVELS.every((l) => atrHtml.includes(l.pin)
+    && atrHtml.includes(`${l.pin}-atr`) && atrHtml.includes(`${l.pin}-price`)));
+check('every level starts on the ATR side of its toggle',
+  RISK_EXIT_LEVELS.every((l) => new RegExp(`data-testid="${l.pin}-atr"[^>]*aria-pressed="true"`).test(atrHtml)
+    && new RegExp(`data-testid="${l.pin}-price"[^>]*aria-pressed="false"`).test(atrHtml)));
 check('editor shows the active model on one line',
   atrHtml.includes('risk-exit-summary') && atrHtml.includes('Stop 1.2×ATR · TP 14×ATR'));
 
 const priceHtml = flat(renderToString(<RiskExitModelEditor params={priceParams} setParams={noop} />));
+check('price mode presses the Price side of the toggle',
+  /data-testid="risk-model-option-price"[^>]*aria-pressed="true"/.test(priceHtml)
+  && /data-testid="risk-model-option-atr"[^>]*aria-pressed="false"/.test(priceHtml)
+  && /data-testid="risk-mode-stop-price"[^>]*aria-pressed="true"/.test(priceHtml));
 check('editor in price mode shows percent inputs',
   priceHtml.includes('risk-pct-stop_loss_pct') && priceHtml.includes('risk-pct-take_profit_pct')
   && priceHtml.includes('risk-pct-trail_activation_pct') && priceHtml.includes('risk-pct-trail_distance_pct')
