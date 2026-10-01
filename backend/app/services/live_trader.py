@@ -15,6 +15,7 @@ from app.services.paper_trader import _to_ist
 # Close of the candle the clock just moved past — used by close-based strategy
 # rules (FastTest V1's 2H validation).
 from app.core.fast_test_v1 import completed_bar_close
+from app.core.fast_test_rules import fast_test_bar_state
 from app.services.broker_client import BrokerClient, is_auth_rejection
 from app.services.margin_preflight import describe_margin_error, is_insufficient_margin
 from app.services.heartbeat import DeadmanSwitch
@@ -945,18 +946,23 @@ class LiveTradeService:
         # Captured BEFORE the clock advances.
         completed_bar_time = self._last_bar_time
         completed_bar = None
+        completed_state = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
             completed_bar = completed_bar_close(df_1h, completed_bar_time)
+            # The same candle's RSI / MACD values, for the debug strategies'
+            # configurable signal-condition exits (None unless one is on).
+            completed_state = fast_test_bar_state(df_1h_with_ind, completed_bar_time, self.config)
 
         # ---- Manage open positions ------------------------------------
         self._manage_open_positions(decision_price, current_atr, current_time,
                                     trade_price, mark_price, new_bar,
                                     bar_close=completed_bar,
                                     bar_time=(completed_bar_time if completed_bar else None),
-                                    candle_color=candle_color)
+                                    candle_color=candle_color,
+                                    bar_state=completed_state)
 
         # A stale candle set must never OPEN anything: the signal, the ATR the
         # stop distance comes from, even the notional sizing would be built on
@@ -1051,14 +1057,21 @@ class LiveTradeService:
         # NEGATIVE bracket trail on a buy entry and a positive one on a sell
         # entry.
         trail_distance = self._trail_amount(current_atr, decision_price) if self.bracket_orders else None
+        # A strategy whose stop / trail / target is switched off must not rest
+        # that leg on the venue either, or live would protect a position the
+        # strategy itself no longer manages. Every other strategy keeps all
+        # three (the switches default to True and are never declared on it).
+        stop_price = self.oms.bracket_stop_loss(float(planned.sl))
+        trail_distance = self.oms.bracket_trail_amount(trail_distance)
         # The venue target is the strategy's own TP by default; FastTest V1
         # brackets at its +0.90% booking level instead. SL and trail distance
         # are unchanged either way.
-        bracket_tp = float(self.oms.bracket_take_profit(last_sig, decision_price, planned.tp))
+        bracket_tp_raw = self.oms.bracket_take_profit(last_sig, decision_price, planned.tp)
+        bracket_tp = float(bracket_tp_raw) if bracket_tp_raw is not None else None
         if self.bracket_orders:
             res = self.broker.place_bracket_order(
                 self.contract_symbol, side, lots, price=None,
-                stop_loss_price=float(planned.sl), take_profit_price=bracket_tp,
+                stop_loss_price=stop_price, take_profit_price=bracket_tp,
                 trigger_method="mark_price" if use_mark else "last_traded_price",
                 size_in_btc=True, trail_amount=trail_distance)
         else:
@@ -1295,7 +1308,8 @@ class LiveTradeService:
 
     def _manage_open_positions(self, decision_price, current_atr, current_time,
                                trade_price, mark_price, advance_bar,
-                               bar_close=None, bar_time=None, candle_color=None):
+                               bar_close=None, bar_time=None, candle_color=None,
+                               bar_state=None):
         """Mark every open position to market and send any exit it triggers.
 
         Split out of ``tick()`` so the same exit logic runs on the 60-second
@@ -1319,7 +1333,8 @@ class LiveTradeService:
                                            trade_price_usd=trade_price, mark_price_usd=mark_price,
                                            advance_bar=advance_bar,
                                            bar_close_usd=(float(bar_close[0]) if bar_close else None),
-                                           bar_time=bar_time)
+                                           bar_time=bar_time,
+                                           strategy_bar_state=bar_state)
             if not result:
                 continue
             if candle_color:

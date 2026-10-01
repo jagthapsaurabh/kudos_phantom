@@ -17,6 +17,7 @@ from app.core import trade_conditions
 # close of the candle the clock just moved past. Imported here so the import
 # graph stays one-way (fast_test_v1 -> order_manager only).
 from app.core.fast_test_v1 import completed_bar_close
+from app.core.fast_test_rules import fast_test_bar_state
 
 # India Standard Time is UTC+5:30. All timestamps shown in the paper-trade UI
 # (last checked, trade entry/exit, log lines) are emitted in IST so the user
@@ -595,18 +596,23 @@ class PaperTradeService:
         # timestamp is captured BEFORE the clock advances.
         completed_bar_time = self._last_bar_time
         completed_bar = None
+        completed_state = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
             completed_bar = completed_bar_close(df_1h, completed_bar_time)
+            # The same candle's RSI / MACD values, for the debug strategies'
+            # configurable signal-condition exits (None unless one is on).
+            completed_state = fast_test_bar_state(df_1h_with_ind, completed_bar_time, self.config)
 
         # ---- Manage open positions ----------------------------------
         if self._manage_open_positions(decision_price, current_atr, current_time,
                                        trade_price, mark_price, new_bar,
                                        bar_close=completed_bar,
                                        bar_time=(completed_bar_time if completed_bar else None),
-                                       candle_color=candle_color):
+                                       candle_color=candle_color,
+                                       bar_state=completed_state):
             trade_event = True
 
         # A stale candle set must never OPEN anything — the signal and the
@@ -715,7 +721,8 @@ class PaperTradeService:
     # ------------------------------------------------------------------
     def _manage_open_positions(self, decision_price, current_atr, current_time,
                                trade_price, mark_price, advance_bar,
-                               bar_close=None, bar_time=None, candle_color=None):
+                               bar_close=None, bar_time=None, candle_color=None,
+                               bar_state=None):
         """Mark every open paper position and book any exit it triggers.
 
         Shared by the 60-second candle tick and the live-tick path so a stop
@@ -730,6 +737,9 @@ class PaperTradeService:
 
         ``candle_color`` is the colour of the bar this tick is in, stamped on
         the trade when it closes so the trade log can name the exit candle.
+
+        ``bar_state`` carries that completed candle's RSI / MACD values for the
+        debug strategies' configurable exit conditions (``None`` otherwise).
         """
         closed = False
         for symbol in list(self.oms.active_trades.keys()):
@@ -738,7 +748,8 @@ class PaperTradeService:
                                            mark_price_usd=mark_price,
                                            advance_bar=advance_bar,
                                            bar_close_usd=(float(bar_close[0]) if bar_close else None),
-                                           bar_time=bar_time)
+                                           bar_time=bar_time,
+                                           strategy_bar_state=bar_state)
             if result:
                 closed = True
                 self._bars_since_exit = 0

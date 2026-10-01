@@ -128,6 +128,68 @@ check('the Strategies list says which family a saved strategy is',
   readSource('src/pages/Strategies.jsx').includes('familyLabel(s.strategy_id)')
   && readSource('src/pages/Strategies.jsx').includes('Parameter-based${familyLabel(s.strategy_id)}'));
 
+// ------------------------------- editable entry & exit rules (Task 10) ----
+check('the panel offers the entry rule with its own numbers',
+  backtestSrc.includes('data-testid="fast-test-entry-rule"')
+  && ['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min']
+      .every(f => backtestSrc.includes(`'${f}'`)));
+check('the entry rule exposes the direction filter',
+  backtestSrc.includes('data-testid="param-trade_direction"')
+  && backtestSrc.includes('value="long"') && backtestSrc.includes('value="short"'));
+check('the entry rule shows the rule it is running',
+  backtestSrc.includes('Now: RSI({params.entry_rsi_period})'));
+check('the panel offers every protective exit as a switch',
+  backtestSrc.includes('data-testid="fast-test-exit-rule"')
+  && ['use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout']
+      .every(f => backtestSrc.includes(`'${f}'`)));
+check('every exit condition is toggleable',
+  ['exit_on_opposite', 'exit_rsi_enabled', 'exit_macd_flip_enabled'].every(
+    f => backtestSrc.includes(`'${f}'`))
+  && backtestSrc.includes('data-testid="toggle-exit_rsi_enabled"')
+  && backtestSrc.includes('data-testid={`toggle-${field}`}'));
+check('the RSI exit level is only shown while that condition is on',
+  backtestSrc.includes("{params.exit_rsi_enabled && (")
+  && backtestSrc.includes("renderNumberInput('exit_rsi_level'"));
+check('the rule defaults are the shipped ones',
+  /entry_rsi_period:\s*14/.test(backtestSrc) && /entry_rsi_long_max:\s*50/.test(backtestSrc)
+  && /entry_rsi_short_min:\s*50/.test(backtestSrc)
+  && /use_stop_loss:\s*true/.test(backtestSrc) && /use_timeout:\s*true/.test(backtestSrc)
+  && /exit_on_opposite:\s*false/.test(backtestSrc) && /exit_rsi_level:\s*50/.test(backtestSrc)
+  && /exit_macd_flip_enabled:\s*false/.test(backtestSrc));
+check('the panel no longer tells the client the entry rule is fixed',
+  !backtestSrc.includes('The entry rule is fixed')
+  && backtestSrc.includes('are yours to change'));
+// The debug panels only render for a debug selection, so render the page with
+// that selection. This is the actual HTML the client sees.
+const debugHtml = flat(renderToString(React.createElement(Backtest, { initialStrategyId: 'FastTest' })));
+const v1DebugHtml = flat(renderToString(React.createElement(Backtest, { initialStrategyId: 'FastTestV1' })));
+check('the debug selection renders the entry rule with its fields',
+  debugHtml.includes('fast-test-entry-rule') && debugHtml.includes('Entry rule')
+  && ['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min']
+      .every(f => debugHtml.includes(`param-${f}`))
+  && debugHtml.includes('param-trade_direction'));
+check('the debug selection renders the exit rule with every switch and condition',
+  debugHtml.includes('fast-test-exit-rule')
+  && ['use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout',
+      'exit_on_opposite', 'exit_rsi_enabled', 'exit_macd_flip_enabled']
+      .every(f => debugHtml.includes(`toggle-${f}`)));
+check('the panel states the rule it is running',
+  /RSI\(14\)[^<]*long below 50, short at\/above 50/.test(debugHtml));
+check('the debug panel is free of the Kudos-only blocks and copy',
+  !debugHtml.includes('strategy-separation') && !debugHtml.includes('macd-line-rules')
+  && !debugHtml.includes('Preview Filters') && !debugHtml.includes('The entry rule is fixed')
+  && debugHtml.includes('runs the entry / exit rules above'));
+check('the debug panel still offers the shared Risk & Exit editor',
+  debugHtml.includes('risk-exit-model'));
+check('the V1 selection also renders its validation / booking block',
+  v1DebugHtml.includes('fast-test-v1-rules') && v1DebugHtml.includes('fast-test-entry-rule')
+  && v1DebugHtml.includes('fast-test-exit-rule'));
+check('the new exit conditions are labelled in the paper / sessions trade logs',
+  readSource('src/pages/PaperTrade.jsx').includes("OPP: { label: 'Opposite Signal'")
+  && readSource('src/pages/PaperTrade.jsx').includes("RSIX: { label: 'RSI Exit'")
+  && readSource('src/pages/PaperTrade.jsx').includes("MFLIP: { label: 'MACD Flip'")
+  && readSource('src/pages/Sessions.jsx').includes("OPP: { label: 'Opposite Signal'"));
+
 // ------------------------------------------------------------------- CSV ----
 const v1Trade = {
   direction: 1, setup: 'FASTTEST V1',

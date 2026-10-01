@@ -1245,14 +1245,47 @@ class StrategyService:
 class FastTestConfig(PhantomV2Config):
     """Config of the **Fast Test (debug)** strategy.
 
-    Every field is the PhantomV2 field — the debug strategy shares the same
-    risk / sizing / exit plan, it only replaces the entry rule. The *type* is
-    what marks the strategy family: a saved strategy stores the family id next
-    to its parameters (see ``/strategies/create``), so the API rebuilds this
-    class — or :class:`~app.core.fast_test_v1.FastTestV1Config`, which extends
-    it — and the backtest / paper / live workers then run the debug entry rule
-    with the client's own stop, target, sizing and timing values.
+    Every PhantomV2 field is inherited — the debug strategy shares the same
+    risk / sizing / exit plan. On top of that it declares the two things this
+    family lets the client change (all defaults are the shipped behaviour, so an
+    unedited strategy is byte-for-byte the original):
+
+    * the **entry rule** — ``entry_rsi_period`` / ``entry_rsi_long_max`` /
+      ``entry_rsi_short_min`` (RSI 14, long below 50, short at/above 50) and the
+      side filter the config already had (``trade_direction``),
+    * the **exit rule** — ``use_*`` switches for the stop, target, trailing
+      stop, breakeven and timeout, plus three optional signal conditions
+      (``exit_on_opposite``, ``exit_rsi_enabled`` + ``exit_rsi_level``,
+      ``exit_macd_flip_enabled``), all OFF by default.
+
+    The *type* is what marks the strategy family: a saved strategy stores the
+    family id next to its parameters (see ``/strategies/create``), so the API
+    rebuilds this class — or
+    :class:`~app.core.fast_test_v1.FastTestV1Config`, which extends it — and the
+    backtest / paper / live workers then run the configured entry rule with the
+    client's own stop, target, sizing and timing values.
     """
+
+    # ---- Entry rule (the debug rule, parameterised) -------------------
+    #: RSI period the debug entry rule reads on the 1h candles.
+    entry_rsi_period: int = Field(default=14, ge=2, le=200)
+    #: LONG while RSI is below this value (the original rule's 50).
+    entry_rsi_long_max: float = Field(default=50.0, ge=0.0, le=100.0)
+    #: SHORT while RSI is at or above this value (the original rule's 50).
+    entry_rsi_short_min: float = Field(default=50.0, ge=0.0, le=100.0)
+
+    # ---- Exit rule: which protective rules the order manager applies ---
+    use_stop_loss: bool = True
+    use_take_profit: bool = True
+    use_trailing_stop: bool = True
+    use_breakeven: bool = True
+    use_timeout: bool = True
+
+    # ---- Exit rule: optional signal conditions (all off by default) ----
+    exit_on_opposite: bool = False
+    exit_rsi_enabled: bool = False
+    exit_rsi_level: float = Field(default=50.0, ge=0.0, le=100.0)
+    exit_macd_flip_enabled: bool = False
 
 
 def _is_fast_test_config(config) -> bool:
@@ -1304,21 +1337,62 @@ class FastTestStrategyService:
         self.config = config or FastTestConfig()
 
     def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+        """The debug entry rule, with the client's own thresholds.
+
+        Shipped defaults: RSI(14) on the 1h candles, LONG below 50 / SHORT at or
+        above 50 — byte-for-byte the original loop. The period, the two
+        thresholds and the allowed sides (``trade_direction``) are editable per
+        saved strategy; the shape of the rule (one side per candle, decided on
+        that candle's RSI) never changes.
+        """
+        from .fast_test_rules import entry_rsi_long_max, entry_rsi_period, entry_rsi_short_min, fast_test_sides
+
         df_1h = df_1h.sort_index()
-        ind_1h = compute_indicators(df_1h, macd_fast=self.config.macd_fast, macd_slow=self.config.macd_slow, macd_signal=self.config.macd_signal)
+        ind_1h = compute_indicators(df_1h, macd_fast=self.config.macd_fast, macd_slow=self.config.macd_slow,
+                                    macd_signal=self.config.macd_signal,
+                                    rsi_period=entry_rsi_period(self.config))
 
         signals = np.zeros(len(df_1h))
         rsi = ind_1h['rsi14']
+        long_max = entry_rsi_long_max(self.config)
+        short_min = entry_rsi_short_min(self.config)
+        allow_long, allow_short = fast_test_sides(self.config)
 
         for i in range(1, len(df_1h)):
-            # For testing purposes, we use very loose bounds so signals happen almost every bar
-            # Long if RSI is below 55, Short if RSI is above 45.
-            # To avoid flickering, we'll just use a simple split:
-            if rsi[i] < 50:
+            # For testing purposes, we use very loose bounds so signals happen almost every bar.
+            # Long below the long threshold, short at or above the short threshold.
+            if allow_long and rsi[i] < long_max:
                 signals[i] = 1
-            elif rsi[i] >= 50:
+            elif allow_short and rsi[i] >= short_min:
                 signals[i] = -1
         return signals
+
+    def exit_state_series(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame = None):
+        """Per-bar values the configured exit conditions judge (``None`` when off).
+
+        The engine computes the series once and hands the order manager the
+        candle's scalars; the paper / live workers use
+        :func:`~app.core.fast_test_rules.fast_test_bar_state` instead. Nothing
+        is computed when no condition is switched on, so an unedited strategy
+        stays exactly as cheap as it was.
+        """
+        from .fast_test_rules import entry_rsi_period, exit_conditions_configured
+
+        if not exit_conditions_configured(self.config):
+            return None
+        try:
+            ind_1h = compute_indicators(
+                df_1h.sort_index(),
+                macd_fast=self.config.macd_fast, macd_slow=self.config.macd_slow,
+                macd_signal=self.config.macd_signal,
+                rsi_period=entry_rsi_period(self.config))
+            return {
+                'rsi': ind_1h['rsi14'],
+                'macd_line': ind_1h['macd_line'],
+                'macd_signal': ind_1h['macd_signal'],
+            }
+        except Exception:
+            return None
 
 @dataclass
 class ValidationResult:

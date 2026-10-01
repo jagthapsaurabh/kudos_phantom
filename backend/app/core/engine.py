@@ -249,6 +249,16 @@ class BacktestEngine:
         else:
             signals = self.strategy_service.generate_signals(df_1h, df_4h)
             meta = None
+
+        # The debug strategies' optional signal-condition exits (opposite
+        # signal / RSI level / MACD flip) are judged on a candle's own
+        # indicator values. The series is built only when one is switched on —
+        # every other strategy (and an unedited debug strategy) gets None and
+        # pays nothing.
+        state_series = None
+        state_fn = getattr(self.strategy_service, 'exit_state_series', None)
+        if callable(state_fn):
+            state_series = state_fn(df_1h, df_4h)
         equity_inr = initial_capital_inr
         peak_equity = initial_capital_inr
         equity_curve = [initial_capital_inr]
@@ -327,6 +337,12 @@ class BacktestEngine:
                 # the resting stop would have filled. A backtest that quietly
                 # survives those candles reports profits live trading cannot
                 # reproduce.
+                bar_state = None
+                if state_series is not None:
+                    try:
+                        bar_state = {k: float(v[i]) for k, v in state_series.items()}
+                    except (IndexError, TypeError, ValueError):
+                        bar_state = None
                 result = self.oms.update_trade(sym, current_price_usd, current_atr_usd, current_time,
                                                trade_price_usd=trade_price_usd,
                                                mark_price_usd=current_mark_usd,
@@ -337,7 +353,8 @@ class BacktestEngine:
                                                # are judged on it. Ignored by every other
                                                # strategy.
                                                bar_close_usd=current_price_usd,
-                                               bar_time=current_time)
+                                               bar_time=current_time,
+                                               strategy_bar_state=bar_state)
                 if result:
                     book_closed(result)
                     last_exit_i = i

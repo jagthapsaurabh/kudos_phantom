@@ -52,11 +52,19 @@ def macd(close: np.ndarray, fast=12, slow=26, signal_period=9):
     signal_line = ema(macd_line, signal_period)
     return macd_line, signal_line, macd_line - signal_line
 
-def compute_indicators(df: pd.DataFrame, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9) -> dict[str, np.ndarray]:
+def compute_indicators(df: pd.DataFrame, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9,
+                       rsi_period: int = 14) -> dict[str, np.ndarray]:
+    """Every indicator a run needs, one call.
+
+    ``rsi_period`` follows the strategy's own RSI setting (the debug entry rule
+    lets the client change it). The key stays ``rsi14`` for compatibility with
+    every existing consumer; with the default 14 it is byte-identical to the
+    original series.
+    """
     o, h, l, c, v = (df[col].values.astype(np.float64) for col in ("open", "high", "low", "close", "volume"))
     ind = {"o": o, "h": h, "l": l, "c": c, "v": v, "n": len(c)}
     ind["atr14"] = atr(h, l, c, 14)
-    ind["rsi14"] = rsi(c, 14)
+    ind["rsi14"] = rsi(c, max(2, int(rsi_period or 14)))
     ind["ema50"] = ema(c, 50)
     ind["adx"], ind["pdi"], ind["mdi"] = adx_di(h, l, c, 14)
     # MACD periods are user-configurable (config.macd_fast/slow/signal); pass

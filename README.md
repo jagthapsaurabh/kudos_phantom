@@ -514,11 +514,27 @@ reads for it:
 | **Risk & Exit Model** | the same editor as Kudos: ATR units (default) / price % / both per level, plus the ATR stop floor % |
 | **Exits & Timing** | timeout bars, cooldown bars |
 | **Sizing & Drawdown Guard** | leverage, margin %, lot size (BTC), reduced margin %, the three drawdown-guard levels |
+| **Entry rule** | RSI period, the long threshold (LONG below it) and the short threshold (SHORT at/above it), plus the allowed direction (both / long only / short only) |
+| **Exit rule** | on/off switches for the stop, take profit, trailing stop, breakeven and timeout |
+| **Exit conditions** | close the position on a completed candle when the entry rule points the other way, when RSI crosses back through a level, or when the MACD line flips against the trade — each switchable |
 | **V1.0 — validation & profit booking** (V1 only) | validation window (bars), validation close %, profit booking % |
 
-Defaults are the shipped values, so a strategy nobody edits behaves exactly as before (the 2H /
-+0.35% / +0.90% rules stay the V1 defaults). The entry rule itself is fixed and says so on the panel
-(RSI 14 — long below 50, short at/above 50).
+Defaults are the shipped values, so a strategy nobody edits behaves exactly as before (RSI 14 —
+long below 50 / short at/above 50, every protective rule on, no conditions, and the 2H / +0.35% /
++0.90% V1 rules). The panel always shows the rule it is running (`RSI(14) → long below 50, short
+at/above 50`), so an edit is visible before it is saved.
+
+**Entry rule.** One side per 1H candle, decided on that candle's RSI. Change the period or either
+threshold and the same rule runs with your numbers; a threshold band leaves the middle flat (no
+signal between the two). *Direction* reuses the strategy's existing side filter.
+
+**Exit rule.** Each protective rule can be switched off (the venue-side bracket drops the matching
+leg too, so live never rests protection the strategy itself no longer manages), and the three
+conditions are judged on a **completed candle's close** — after that candle's stop / target (a
+resting stop always keeps priority) and before the timeout. They are recorded with their own reason
+codes in the trade log, CSV / Excel export, Paper and Live History: `OPP` (opposite signal), `RSIX`
+(RSI level) and `MFLIP` (MACD flip). Nothing is computed while all three are off, so an unedited
+strategy costs exactly what it did before.
 
 Press **Save as strategy** and the saved strategy remembers which family it belongs to — it is
 labelled `· Fast Test Strategy V1.0` (or debug) in the Backtest, Paper, Live and Strategies lists,
@@ -528,7 +544,12 @@ and timing values. Auto-resume after a restart keeps the same strategy and value
 Under the hood each saved strategy stores `strategy_id` next to its parameters; the API rebuilds the
 typed config (`FastTestConfig` / `FastTestV1Config`), and one factory picks the matching signal
 service and order manager — so a saved V1.0 strategy keeps the validation / booking layer in every
-mode. A saved strategy with no marker stays a Kudos strategy, exactly as before.
+mode. The entry rule (period, thresholds, direction) lives on the signal service, the exit rule on
+the order manager (`use_*` switches) plus the close-based conditions in
+`backend/app/core/fast_test_rules.py`; Backtest, Paper and Live hand the completed candle's
+RSI / MACD values to the same evaluator. A saved strategy with no marker stays a Kudos strategy,
+exactly as before — and the **Kudos / Phantom strategy does not declare any of these fields**, so
+its form, signals and exits are untouched.
 
 **Audit fields.** Every V1 trade carries seven extra fields in the trade log, the CSV/Excel export
 (appended as the last seven columns, so existing sheets keep their positions) and the paper/live
@@ -625,6 +646,10 @@ python test_risk_exit_model.py   # 48 checks: ATR / price / per-level mix on eve
 python test_trade_conditions_shared.py  # 28 checks: the shared entry/exit-condition detail the
                                   # backtest / paper / live logs all use, end-to-end paper entry
 python test_paper_history.py      # 63 checks: paper history persistence
+python test_fast_test_rules.py    # 74 checks: the editable entry / exit rules — the original rule is
+                                  # reproduced byte-for-byte, then period / thresholds / direction,
+                                  # the five exit switches and the three signal conditions are pinned
+                                  # on the rule objects and through real engine runs (V1 included)
 python test_fast_test_config.py   # 68 checks: the configurable Fast Test / V1.0 values — builders,
                                   # saved-strategy family round trip, service / OMS factories, backtest,
                                   # paper, live, resume and chart-overlay wiring
@@ -643,13 +668,15 @@ python test_chart_overlay_api.py   # 18 checks: /klines window + chronological c
                                    # fallback included), signal fields for the chart overlay
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 586 checks (585 pass; the known PaperTrade live-tick smoke check fails on the
+cd frontend && npm test            # 601 checks (600 pass; the known PaperTrade live-tick smoke check fails on the
                                    # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
                                    # FastTest V1.0 dropdowns / audit columns / validation chips /
-                                   # configurable debug + V1.0 fields (fast_test_v1_ui.jsx),
+                                   # configurable debug + V1.0 fields and the editable entry / exit
+                                   # rules — including a real render of the debug panel
+                                   # (fast_test_v1_ui.jsx, 58 checks),
                                    # paper+live condition analysis (trade_conditions_ui.jsx),
                                    # Risk & Exit model editor + docs (risk_exit_model_ui.jsx),
                                    # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx),

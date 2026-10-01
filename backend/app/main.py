@@ -114,16 +114,37 @@ def _utc_ts(dt):
     return dt.timestamp()
 
 class StrategyParams(PhantomV2Config):
-    """Phantom parameters, plus the FastTest V1.0 rule overrides.
+    """Phantom parameters, plus the FastTest families' own fields.
 
-    The three V1 fields are ignored by every other strategy (they are only read
-    when the run's strategy_id is ``FastTestV1``); their defaults are exactly
-    the specified 2H / +0.35% / +0.90% rule, so a client that never sends them
-    gets the spec behaviour.
+    Every field below is ignored by the Kudos / Phantom strategy — it does not
+    declare them, and the run path copies only the keys a config knows. Their
+    defaults are the shipped behaviour, so a client that never sends them runs
+    exactly what it ran before.
+
+    * the three V1.0 rule values (2H window / +0.35% validation / +0.90%
+      booking),
+    * the debug **entry rule** (RSI period, long / short thresholds — the
+      allowed sides reuse the Phantom ``trade_direction`` field),
+    * the debug **exit rule** (which protective rules are live, plus the
+      optional signal conditions: opposite signal / RSI level / MACD flip).
     """
     validation_bars: int = 2
     validation_close_pct: float = 0.0035
     profit_book_pct: float = 0.009
+    # ---- Fast Test (debug) + V1.0 entry rule ---------------------------
+    entry_rsi_period: int = 14
+    entry_rsi_long_max: float = 50.0
+    entry_rsi_short_min: float = 50.0
+    # ---- Fast Test (debug) + V1.0 exit rule ----------------------------
+    use_stop_loss: bool = True
+    use_take_profit: bool = True
+    use_trailing_stop: bool = True
+    use_breakeven: bool = True
+    use_timeout: bool = True
+    exit_on_opposite: bool = False
+    exit_rsi_enabled: bool = False
+    exit_rsi_level: float = 50.0
+    exit_macd_flip_enabled: bool = False
 
 class StrategyCreate(BaseModel):
     name: str

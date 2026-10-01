@@ -144,6 +144,10 @@ const EXIT_REASONS = {
   // FastTest V1.0's own exits.
   TP090: { label: '+0.90% Profit Book', color: 'text-emerald-300 border-emerald-800 bg-emerald-900/20' },
   VALFAIL: { label: '2H Validation Fail', color: 'text-red-300 border-red-800 bg-red-900/20' },
+  // Fast Test (debug) + V1.0 configurable exit conditions.
+  OPP: { label: 'Opposite Signal', color: 'text-sky-300 border-sky-800 bg-sky-900/20' },
+  RSIX: { label: 'RSI Exit', color: 'text-indigo-300 border-indigo-800 bg-indigo-900/20' },
+  MFLIP: { label: 'MACD Flip', color: 'text-teal-300 border-teal-800 bg-teal-900/20' },
 };
 const reasonMeta = (r) => EXIT_REASONS[r] || { label: r || '—', color: 'text-gray-400 border-gray-700 bg-gray-900' };
 

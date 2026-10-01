@@ -57,7 +57,29 @@ const PARAM_META = {
   validation_bars: { label: 'Validation window (bars)', hint: 'Completed 1H candles watched before the 2H validation verdict. 2 = 2 hours.' },
   validation_close_pct: { label: 'Validation close %', hint: 'Favourable close the window must reach (0.35 = +0.35%).', percent: true },
   profit_book_pct: { label: 'Profit booking %', hint: 'A touch of entry ± this books the whole position (0.90 = +0.90%).', percent: true },
+  // ---- Fast Test (debug) + Fast Test V1.0 — the editable rules --------------
+  // The entry rule's own numbers and the exit rule's RSI level. Defaults are
+  // the original hardcoded rule: RSI(14), long below 50, short at/above 50.
+  entry_rsi_period: { label: 'RSI period', hint: 'Period of the RSI the debug entry rule reads (14 = the original).' },
+  entry_rsi_long_max: { label: 'Long below RSI', hint: 'LONG while RSI is below this value (50 = the original rule).' },
+  entry_rsi_short_min: { label: 'Short at/above RSI', hint: 'SHORT while RSI is at or above this value (50 = the original rule).' },
+  exit_rsi_level: { label: 'RSI exit level', hint: 'Close a long at/above this RSI, a short at/below it.' },
 };
+
+// Fast Test (debug) + Fast Test V1.0 — the protective rules the client can
+// switch off, and the optional signal conditions. Everything defaults to the
+// shipped behaviour, so an unedited strategy is unchanged.
+const DEBUG_EXIT_SWITCHES = [
+  ['use_stop_loss', 'Stop loss', 'The hard stop (and the venue-side stop leg). Off = a losing position is not stopped out.'],
+  ['use_take_profit', 'Take profit', 'The fixed target (and the venue-side target leg).'],
+  ['use_trailing_stop', 'Trailing stop', 'The trail that follows price once it is in profit.'],
+  ['use_breakeven', 'Breakeven', 'Ratchet the stop to entry once the trade is in profit.'],
+  ['use_timeout', 'Timeout', 'Close after the configured number of candles.'],
+];
+const DEBUG_EXIT_CONDITIONS = [
+  ['exit_on_opposite', 'Exit on opposite signal', 'Close when the entry rule above points the other way.'],
+  ['exit_macd_flip_enabled', 'Exit on MACD flip', 'Close when the MACD line crosses its signal against the position.'],
+];
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
 // BTCUSDT, Delta as BTCUSD. Dated futures are never substituted.
@@ -455,7 +477,10 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
   </div>
 );
 
-const Backtest = () => {
+// `initialStrategyId` lets a caller (the page-shell tests) open the form on a
+// specific strategy — including the two debug families, whose panels are only
+// rendered for that selection. The routed page passes nothing.
+const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
   const DEFAULT_PARAMS = {
     trend_ema_period: 50,
     macd_fast: 12, macd_slow: 26, macd_signal: 9,
@@ -475,6 +500,14 @@ const Backtest = () => {
     // Fast Test V1.0 rules (2H window / +0.35% validation / +0.90% booking).
     // Only the V1 strategy reads them; every other strategy ignores them.
     validation_bars: 2, validation_close_pct: 0.0035, profit_book_pct: 0.009,
+    // Fast Test (debug) + V1.0 — the editable ENTRY rule (RSI 14: long below
+    // 50, short at/above 50) and EXIT rule (every protective rule on, no
+    // signal conditions). Defaults = the original hardcoded behaviour.
+    entry_rsi_period: 14, entry_rsi_long_max: 50, entry_rsi_short_min: 50,
+    use_stop_loss: true, use_take_profit: true, use_trailing_stop: true,
+    use_breakeven: true, use_timeout: true,
+    exit_on_opposite: false, exit_rsi_enabled: false, exit_rsi_level: 50,
+    exit_macd_flip_enabled: false,
     // BTC perpetual: risk is managed on the exchange MARK price; the traded
     // price is recorded next to it (both are stored for every trade).
     use_mark_price: true,
@@ -498,7 +531,7 @@ const Backtest = () => {
                macd_line_vs_signal: null, macd_line_vs_zero: null, macd_signal_vs_zero: null, macd_line_min: null, macd_signal_min: null },
     },
   };
-  const [selectedStrategyId, setSelectedStrategyId] = useState('PhantomV2');
+  const [selectedStrategyId, setSelectedStrategyId] = useState(initialStrategyId);
   const [strategies, setStrategies] = useState([]);
   const [params, setParams] = useState({ ...DEFAULT_PARAMS });
   const [preview, setPreview] = useState(null);
@@ -1349,8 +1382,10 @@ const Backtest = () => {
         >
           {fastTestFamily ? (
             <div className="mb-5 rounded-xl border border-amber-900/40 bg-amber-900/10 p-3 text-xs text-gray-400" data-testid="fast-test-config-note">
-              The entry rule is fixed ({strategyFamily === FAST_TEST_V1_ID ? `${FAST_TEST_V1_NAME}: RSI 14 — long below 50, short at/above 50, plus the 2H validation and +0.90% booking` : `${FAST_TEST_NAME}: RSI 14 — long below 50, short at/above 50`}).
-              Everything below is the config the backend reads for this strategy — the same stop / target / trailing / sizing plan as Kudos, with your own values.
+              <b className="text-white">Entry rule</b> and <b className="text-white">Exit rule</b> below are yours to change —
+              the shipped values are the original rule ({strategyFamily === FAST_TEST_V1_ID ? `${FAST_TEST_V1_NAME}: RSI 14 — long below 50, short at/above 50, plus the 2H validation and +0.90% booking` : `${FAST_TEST_NAME}: RSI 14 — long below 50, short at/above 50`}),
+              so an unedited strategy behaves exactly as before.
+              Everything else is the config the backend reads for this strategy — the same stop / target / trailing / sizing plan as Kudos, with your own values.
               Press <b className="text-white">Save strategy</b> to reuse them in Backtest, Paper and Live.
             </div>
           ) : (
@@ -1429,6 +1464,88 @@ const Backtest = () => {
                   </div>
                 </div>
               </div>
+              <div className="rounded-xl border border-blue-900/40 bg-blue-900/10 p-4" data-testid="fast-test-entry-rule">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-300">Entry rule</h3>
+                <p className="mt-1 text-[10px] leading-snug text-gray-400">
+                  One side per 1H candle, decided on that candle's RSI. Change the period, either threshold or the allowed
+                  direction and the same rule runs with your numbers.
+                  <span className="ml-1 font-mono text-gray-300">
+                    Now: RSI({params.entry_rsi_period}) → long below {params.entry_rsi_long_max}, short at/above {params.entry_rsi_short_min}
+                    {params.trade_direction === 'long' ? ' · long only' : params.trade_direction === 'short' ? ' · short only' : ''}.
+                  </span>
+                </p>
+                <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  {['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min'].map(field => (
+                    <React.Fragment key={field}>
+                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                    </React.Fragment>
+                  ))}
+                  <div className="flex flex-col">
+                    <label className="text-[10px] text-gray-400 font-semibold mb-1">Direction</label>
+                    <select value={params.trade_direction || 'both'} data-testid="param-trade_direction"
+                      onChange={e => setFamilyField('trade_direction', e.target.value)}
+                      className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full">
+                      <option value="both">Both — long &amp; short</option>
+                      <option value="long">Long only</option>
+                      <option value="short">Short only</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="fast-test-exit-rule">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Exit rule</h3>
+                <p className="mt-1 text-[10px] leading-snug text-gray-400">
+                  Which protective rules this strategy runs, and the optional conditions that close a position on a
+                  completed candle. Everything is on / off exactly as the original strategy behaved — a switch only
+                  changes a run once you save this strategy. The stop still keeps priority over a condition, and a
+                  condition over the timeout.
+                </p>
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  {DEBUG_EXIT_SWITCHES.map(([field, label, hint]) => (
+                    <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                      <input type="checkbox" checked={params[field] !== false} data-testid={`toggle-${field}`}
+                        onChange={e => setFamilyField(field, e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                      <span>
+                        <span className="block font-bold text-white">{label}</span>
+                        <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                <h4 className="mt-4 text-[10px] font-bold uppercase tracking-wider text-gray-400">Exit conditions (on a completed candle)</h4>
+                <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  {DEBUG_EXIT_CONDITIONS.map(([field, label, hint]) => (
+                    <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                      <input type="checkbox" checked={!!params[field]} data-testid={`toggle-${field}`}
+                        onChange={e => setFamilyField(field, e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                      <span>
+                        <span className="block font-bold text-white">{label}</span>
+                        <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                      </span>
+                    </label>
+                  ))}
+                  <div className="rounded-lg border border-gray-700 bg-gray-900/80 p-2">
+                    <label className="flex cursor-pointer items-start gap-2 text-[10px] text-gray-300">
+                      <input type="checkbox" checked={!!params.exit_rsi_enabled} data-testid="toggle-exit_rsi_enabled"
+                        onChange={e => setFamilyField('exit_rsi_enabled', e.target.checked)}
+                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                      <span>
+                        <span className="block font-bold text-white">Exit on RSI level</span>
+                        <span className="mt-0.5 block leading-snug text-gray-500">Close a long at/above the level, a short at/below it.</span>
+                      </span>
+                    </label>
+                    {params.exit_rsi_enabled && (
+                      <div className="mt-2">
+                        {renderNumberInput('exit_rsi_level', params.exit_rsi_level, e => setFamilyField('exit_rsi_level', parseFloat(e.target.value)))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
               {strategyFamily === FAST_TEST_V1_ID && (
                 <div className="rounded-xl border border-emerald-900/40 bg-emerald-900/10 p-4" data-testid="fast-test-v1-rules">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-300">V1.0 — validation &amp; profit booking</h3>
@@ -1640,7 +1757,9 @@ const Backtest = () => {
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <p className="max-w-md text-[11px] text-gray-500">
             <SlidersHorizontal size={12} className="mr-1 inline text-gray-600" />
-            Preview Filters is a fast quality check. Run Backtest builds the full equity curve and trade log.
+            {fastTestFamily
+              ? `${strategyFamily === FAST_TEST_V1_ID ? FAST_TEST_V1_NAME : FAST_TEST_NAME} runs the entry / exit rules above — Run Backtest builds the full equity curve and trade log.`
+              : 'Preview Filters is a fast quality check. Run Backtest builds the full equity curve and trade log.'}
           </p>
           <div className="flex flex-col flex-wrap gap-2 sm:flex-row sm:items-center">
             <button onClick={resetParams} className="flex items-center justify-center gap-2 px-4 py-2 text-xs text-gray-500 transition hover:text-white">

@@ -61,7 +61,8 @@ from pydantic import Field
 
 from .indicators import compute_indicators
 from .strategy import FastTestConfig, FastTestStrategyService, PhantomV2Config, StrategyService
-from ..services.order_manager import OrderManager
+from ..services.order_manager import OrderManager, _flag
+from .fast_test_rules import FastTestOrderManager
 
 #: Strategy id used by the API / dropdowns. Kept separate from ``FastTest``.
 FAST_TEST_V1_ID = "FastTestV1"
@@ -134,10 +135,12 @@ def fast_test_v1_config(params=None, fees=None) -> FastTestV1Config:
 class FastTestV1StrategyService(FastTestStrategyService):
     """Signal service — the FastTest entry rule, copied verbatim.
 
-    Identical to ``FastTestStrategyService``: RSI(14) on the 1h candles, long
-    below 50 and short at/above 50, one signal every bar. It exposes no
-    Phantom condition metadata, exactly like FastTest, so the trade log never
-    reports RSI reversal / MACD conditions this strategy does not evaluate.
+    Identical to ``FastTestStrategyService``: RSI on the 1h candles, long below
+    the long threshold and short at/above the short threshold, one signal every
+    bar. The period and both thresholds are configurable per saved strategy
+    (shipped defaults 14 / 50 / 50 = the original rule). It exposes no Phantom
+    condition metadata, exactly like FastTest, so the trade log never reports
+    RSI reversal / MACD conditions this strategy does not evaluate.
     """
     #: Kept for parity with the other debug strategy on the trade log.
     label = FAST_TEST_V1_LABEL
@@ -167,10 +170,18 @@ def strategy_service_for(config, strategy_id=None):
 
 
 def order_manager_for(config, strategy_id=None, oms=None):
-    """The order manager that belongs to a config: V1.0 adds the validation /
-    profit-booking layer, every other strategy keeps the standard one."""
+    """The order manager that belongs to a config.
+
+    * V1.0 → the validation / +0.90% booking layer (which also carries the
+      configurable signal-condition exits, inherited),
+    * the plain debug strategy → the configurable signal-condition exits,
+    * anything else → the standard Phantom order manager (``oms`` when one was
+      supplied by the caller).
+    """
     if isinstance(config, FastTestV1Config) or is_fast_test_v1(strategy_id):
         return FastTestV1OrderManager(config)
+    if isinstance(config, FastTestConfig) or str(strategy_id) == 'FastTest':
+        return FastTestOrderManager(config)
     return oms or OrderManager(config)
 
 
@@ -184,8 +195,12 @@ def _config_payload(config):
     return {k: v for k, v in (dump or {}).items() if k in allowed}
 
 
-class FastTestV1OrderManager(OrderManager):
+class FastTestV1OrderManager(FastTestOrderManager):
     """OrderManager + the V1.0 validation / profit-booking layer.
+
+    Extends the debug order manager, so a V1.0 strategy also runs the
+    configurable signal-condition exits (opposite signal / RSI / MACD flip)
+    on a completed candle — after its own 2H validation verdict.
 
     The base class keeps every existing exit (SL, trailing SL, take profit,
     timeout) untouched; this subclass only fills in the two optional hooks the
@@ -300,7 +315,9 @@ class FastTestV1OrderManager(OrderManager):
         if favourable:
             trade.v1_status = STATUS_VALIDATED
             trade.v1_validation_close = close
-            return None
+            # Validated → the trade continues, and the client's own exit
+            # conditions (if any) still get their say on this candle.
+            return super().strategy_bar_close_exit(trade, bar_close_usd, bar_time)
 
         window = int(getattr(self.config, 'validation_bars', 2) or 2)
         if trade.v1_closes >= window:
@@ -314,7 +331,9 @@ class FastTestV1OrderManager(OrderManager):
                       f"{sign} {level:,.2f} (entry {trade.v1_entry:,.2f}). "
                       f"Exited at the {trade.v1_closes}H candle close.")
             return (close, REASON_VALIDATION_FAIL, detail)
-        return None
+        # Inside the window and nothing fired: the configurable conditions
+        # judge this candle's close last.
+        return super().strategy_bar_close_exit(trade, bar_close_usd, bar_time)
 
     # ------------------------------------------------------------------
     # Audit
@@ -326,6 +345,8 @@ class FastTestV1OrderManager(OrderManager):
         the protective stop and trailing distance sent with the bracket are
         unchanged.
         """
+        if not _flag(self.config, 'use_take_profit'):
+            return None
         sign = 1.0 if int(direction) == 1 else -1.0
         pct = float(getattr(self.config, 'profit_book_pct', 0.009) or 0.009)
         try:

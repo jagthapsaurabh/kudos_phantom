@@ -345,6 +345,16 @@ choosing the model level by level (e.g. an ATR stop with a price-based target).
   through an `autoscaleInfoProvider`, so the axis keeps following new candles while zoomed.
   `frontend/src/utils/chartZoom.js` holds the pure maths and `frontend/tests/chart_zoom_ui.jsx`
   (41 checks) covers the helpers, the rendered toolbar and the runtime wiring.
+- **Fast Test (debug) + Fast Test V1.0 — the entry and exit RULES themselves are editable**: the
+  entry rule's own numbers (RSI period, the long / short thresholds, and the allowed direction) and
+  the exit rule (on/off switches for stop / target / trailing / breakeven / timeout, plus three
+  optional signal conditions — opposite signal `OPP`, RSI level `RSIX`, MACD flip `MFLIP` — judged
+  on a completed candle, after that candle's stop and before the timeout). Every default is the
+  original hardcoded behaviour: a full trade-list dump of FastTest, FastTestV1 and PhantomV2 is
+  **byte-identical** to `5ce13ce` (7.5 MB, `cmp` clean). Live brackets drop a protection leg whose
+  switch is off, and nothing is computed while the conditions are off. New
+  `backend/test_fast_test_rules.py` (74 checks) pins the rule maths, the switches, the conditions and
+  the engine / worker wiring; `fast_test_v1_ui.jsx` grew to 58 checks (it now renders the debug panel for both families).
 - **Fast Test (debug) + Fast Test V1.0 are configurable** (same form as Kudos): selecting either
   strategy in **Backtest → Strategy Configuration** shows the fields the backend reads for it — the
   Risk & Exit model (ATR / price % / both, plus the stop floor), timeout / cooldown, leverage,
