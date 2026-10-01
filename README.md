@@ -542,7 +542,7 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 480 checks: trade-log table + CSV export, paper/live condition
+cd frontend && npm test            # 482 checks: trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
