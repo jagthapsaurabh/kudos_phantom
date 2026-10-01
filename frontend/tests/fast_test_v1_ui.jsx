@@ -78,6 +78,56 @@ check('the original FastTest option is untouched everywhere',
 check('the Admin panel can start a V1 debug session',
   readSource('src/pages/AdminPanel.jsx').includes("start('FastTestV1')"));
 
+// -------------------------------------------- configurable debug values ----
+// Both debug strategies are configurable from Backtest -> Strategy
+// Configuration, exactly like Kudos: the panel shows the fields the backend
+// reads for the selected strategy, and Save strategy remembers the family so
+// Paper / Live run the same values.
+const backtestSrc = readSource('src/pages/Backtest.jsx');
+check('Backtest offers the debug strategy as well',
+  backtestHtml.includes('value="FastTest"') && backtestHtml.includes('Fast Test Strategy (debug — configurable)'));
+check('the panel shows the debug groups',
+  backtestSrc.includes('data-testid="fast-test-config"')
+  && backtestSrc.includes('data-testid="fast-test-v1-rules"')
+  && backtestSrc.includes('data-testid="fast-test-config-note"'));
+check('the debug panel exposes the risk & exit model editor with the same editor component',
+  backtestSrc.includes('<RiskExitModelEditor params={params} setParams={setParams} />'));
+check('the debug panel exposes the timing / sizing fields the backend reads',
+  ['timeout_bars', 'cooldown_bars', 'leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct',
+   'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct', 'sl_floor_pct']
+    .every(f => backtestSrc.includes(`'${f}'`) || backtestSrc.includes(f)));
+check('the V1.0 rules are editable (window, validation close, booking)',
+  ['validation_bars', 'validation_close_pct', 'profit_book_pct'].every(f => backtestSrc.includes(f)));
+check('the V1 rules show as numbers the client types (percent in the form, fraction in the payload)',
+  backtestSrc.includes('meta.percent ? asPercent(value)')
+  && backtestSrc.includes('toFraction(e.target.value)'));
+check('the Kudos form keeps its own groups (the debug panel is a separate branch)',
+  backtestSrc.includes('Object.entries(sharedParamGroups).map') && backtestSrc.includes('fastTestFamily ? ('));
+check('the Kudos-only blocks are hidden for the debug family',
+  backtestSrc.includes('{!fastTestFamily && ('));
+check('the form detects the family of a saved strategy too',
+  backtestSrc.includes("const stored = saved && saved.rules && typeof saved.rules === 'object' ? saved.rules.strategy_id : ''"));
+check('the section title follows the selected strategy',
+  backtestSrc.includes('title={fastTestFamily ?') && backtestSrc.includes('FAST_TEST_V1_NAME : FAST_TEST_NAME} — Configuration'));
+check('Save strategy records which family the values are for',
+  backtestSrc.includes('strategy_id: strategyFamily || undefined'));
+check('the saved-strategy marker never leaks into the run parameters',
+  backtestSrc.includes('delete merged.strategy_id;'));
+check('the chart overlay follows the selected strategy',
+  backtestSrc.includes('strategy_id: results.strategy_id || selectedStrategyId'));
+check('the debug defaults are the backend defaults (nothing changes until edited)',
+  /timeout_bars:\s*72/.test(backtestSrc) && /lot_size_btc:\s*0\.001/.test(backtestSrc)
+  && /sl_floor_pct:\s*0\.016/.test(backtestSrc) && /reduced_margin_pct:\s*0\.125/.test(backtestSrc)
+  && /validation_bars:\s*2/.test(backtestSrc) && /validation_close_pct:\s*0\.0035/.test(backtestSrc)
+  && /profit_book_pct:\s*0\.009/.test(backtestSrc));
+check('a saved debug strategy is labelled in every dropdown',
+  backtestSrc.includes('isFastTestV1(s.strategy_id)')
+  && readSource('src/pages/PaperTrade.jsx').includes('isFastTestV1(s.strategy_id)')
+  && readSource('src/pages/LiveTrade.jsx').includes('isFastTestV1(s.strategy_id)'));
+check('the Strategies list says which family a saved strategy is',
+  readSource('src/pages/Strategies.jsx').includes('familyLabel(s.strategy_id)')
+  && readSource('src/pages/Strategies.jsx').includes('Parameter-based${familyLabel(s.strategy_id)}'));
+
 // ------------------------------------------------------------------- CSV ----
 const v1Trade = {
   direction: 1, setup: 'FASTTEST V1',

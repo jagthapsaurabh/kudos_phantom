@@ -17,12 +17,16 @@ from .core.strategy import PhantomV2Config, StrategyService
 from .core.fast_test_v1 import (
     FAST_TEST_V1_ID, FAST_TEST_V1_NAME, FastTestV1Config, FastTestV1OrderManager,
     FastTestV1StrategyService, fast_test_v1_config, is_fast_test_v1,
+    # One place decides which entry rule / order manager a config runs with,
+    # so a saved Fast Test / V1.0 strategy behaves like the built-in id.
+    order_manager_for, strategy_service_for,
 )
 from .core.strategy import (
     PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
     phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
     TRADE_DIRECTION_LABELS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS,
     RISK_EXIT_MODELS, RISK_EXIT_MODEL_LABELS, RISK_EXIT_LEVELS,
+    FastTestConfig, FastTestStrategyService, fast_test_config,
 )
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
@@ -129,6 +133,10 @@ class CustomStrategyCreate(BaseModel):
     name: str
     rules: Optional[List[Dict]] = None
     params: Optional[Dict] = None
+    # Which built-in strategy family these values belong to. Omitted → the
+    # Phantom (Kudos) family, exactly as before. ``FastTest`` / ``FastTestV1``
+    # make the saved strategy run the debug entry rule with these values.
+    strategy_id: Optional[str] = None
 
 
 class BacktestRequest(BaseModel):
@@ -340,6 +348,42 @@ def _fee_config(config, fees):
                                    'maker_fee_bps': float(fees.maker_fee_bps)})
 
 
+def _strategy_family(strategy_id) -> str:
+    """Normalize a strategy family id to '' (Phantom), 'FastTest' or 'FastTestV1'.
+
+    Only the two debug families are named; everything else — PhantomV2, its
+    presets, a numeric saved-strategy id, an empty value — is the Phantom
+    family, which is what every existing strategy already is.
+    """
+    value = str(strategy_id or '').strip()
+    if is_fast_test_v1(value):
+        return FAST_TEST_V1_ID
+    if value.lower() == 'fasttest':
+        return 'FastTest'
+    return ''
+
+
+def _family_config(data, fees=None):
+    """Rebuild the config a saved strategy was created for.
+
+    A saved Fast Test / V1.0 strategy stores ``strategy_id`` next to its
+    parameters, so opening it (backtest, paper, live, chart) runs that family
+    with the saved values instead of the Phantom rules. Returns ``None`` for
+    the Phantom family, where the caller keeps the existing lookup.
+    """
+    if not isinstance(data, dict):
+        return None
+    family = _strategy_family(data.get('strategy_id'))
+    if family == FAST_TEST_V1_ID:
+        # FastTestV1Config extends FastTestConfig and carries the three V1.0
+        # rule fields, so the saved values load back exactly as edited.
+        return fast_test_v1_config(data, fees=fees)
+    if family == 'FastTest':
+        cfg = fast_test_config(data)
+        return _fee_config(cfg, fees) if fees is not None else cfg
+    return None
+
+
 _PHANTOM_PARAM_KEYS = (
     'entry_conditions', 'use_direction_conditions', 'rsi_oversold',
     'rsi_overbought', 'stop_loss_atr', 'macd_hist_min', 'atr_regime_ratio',
@@ -426,6 +470,11 @@ def _resolve_strategy_payload(db, strategy_id, user_id, fees):
     if not strat:
         return None
     data = strat.rules
+    # A saved debug-strategy config (Fast Test / V1.0) knows its family; the
+    # typed config is what makes every run path pick the right entry rule.
+    family_cfg = _family_config(data, fees)
+    if family_cfg is not None:
+        return ('phantom', family_cfg, strat)
     if isinstance(data, dict) and any(k in data for k in _PHANTOM_PARAM_KEYS):
         cfg = PhantomV2Config(**{k: v for k, v in data.items() if k in PhantomV2Config.model_fields})
         if fees is not None:
@@ -485,16 +534,12 @@ def _resume_paper_session(spec):
                       connection_id=spec.get("connection_id"),
                       account_label=spec.get("account_label"))
         if strategy_id == "FastTest":
-            from .core.strategy import FastTestStrategyService
-            config = _fee_config(PhantomV2Config(), fees)
+            config = _fee_config(fast_test_config(), fees)
             service = PaperTradeService(strategy_id, config, **common)
-            service.strategy = FastTestStrategyService(service.config)
         elif is_fast_test_v1(strategy_id):
             # FastTest V1.0 — same signals, plus the validation / booking layer.
             config = fast_test_v1_config(fees=fees)
             service = PaperTradeService(strategy_id, config, **common)
-            service.strategy = FastTestV1StrategyService(service.config)
-            service.oms = FastTestV1OrderManager(service.config)
         elif strategy_id == "PhantomV2":
             service = PaperTradeService(strategy_id, _fee_config(_load_champion_config(), fees), **common)
         elif _is_builtin_phantom(strategy_id):
@@ -510,6 +555,12 @@ def _resume_paper_session(spec):
             common["strategy_name"] = strat.name
             service = PaperTradeService(strategy_id, strategy_payload,
                                         is_custom=(kind != 'phantom'), **common)
+        # The entry rule and the order manager follow the config, so a resumed
+        # session keeps running the strategy it was started with — including a
+        # saved Fast Test / V1.0 config with the client's own values.
+        if not service.is_custom:
+            service.strategy = strategy_service_for(service.config, strategy_id)
+            service.oms = order_manager_for(service.config, strategy_id)
         # Carry the banked result forward so the resumed session is continuous.
         service.instance_key = spec["instance_key"]
         service.user_id = spec["user_id"]
@@ -645,7 +696,12 @@ def health_check():
 def list_strategies(user=Depends(get_current_user), db=Depends(get_db)):
     try:
         strategies = db.query(CustomStrategy).filter(CustomStrategy.user_id == user.id).all()
-        return [{"id": s.id, "name": s.name, "rules": s.rules, "is_active": s.is_active, "created_at": s.created_at} for s in strategies]
+        return [{"id": s.id, "name": s.name, "rules": s.rules, "is_active": s.is_active,
+                 "created_at": s.created_at,
+                 # '' for a Kudos-style strategy, 'FastTest' / 'FastTestV1' for a
+                 # saved debug-strategy config (the UI labels + edits by family).
+                 "strategy_id": _strategy_family(
+                     (s.rules or {}).get('strategy_id') if isinstance(s.rules, dict) else None)} for s in strategies]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch strategies: {str(e)}")
 
@@ -655,6 +711,11 @@ def create_strategy(strategy: CustomStrategyCreate, user=Depends(get_current_use
         config_data = strategy.rules if strategy.rules is not None else strategy.params
         if config_data is None:
             raise HTTPException(status_code=400, detail="Either 'rules' or 'params' must be provided")
+        # Remember which strategy family the values were edited for. Phantom
+        # (the default) stores no marker, so existing strategies are untouched.
+        family = _strategy_family(strategy.strategy_id)
+        if family and isinstance(config_data, dict):
+            config_data = {**config_data, 'strategy_id': family}
         new_strat = CustomStrategy(user_id=user.id, name=strategy.name, rules=config_data)
         db.add(new_strat)
         db.commit()
@@ -670,7 +731,15 @@ def update_strategy(strat_id: int, strategy_data: dict, user=Depends(get_current
         if not strat: raise HTTPException(status_code=404, detail="Strategy not found")
         if "name" in strategy_data: strat.name = strategy_data["name"]
         config_update = strategy_data.get("rules") or strategy_data.get("params")
-        if config_update is not None: strat.rules = config_update
+        if config_update is not None:
+            # Editing a saved Fast Test / V1.0 config from the Strategies
+            # manager must not silently turn it into a Kudos strategy: keep the
+            # family marker when the update does not carry one itself.
+            if (isinstance(config_update, dict) and 'strategy_id' not in config_update
+                    and isinstance(strat.rules, dict)
+                    and _strategy_family(strat.rules.get('strategy_id'))):
+                config_update = {**config_update, 'strategy_id': _strategy_family(strat.rules['strategy_id'])}
+            strat.rules = config_update
         db.commit()
         return {"status": "Strategy updated successfully"}
     except Exception as e:
@@ -2129,10 +2198,9 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         wants_metadata = True
         label = None
     elif strategy_id == "FastTest":
-        cfg = PhantomV2Config()
+        cfg = fast_test_config()
         engine = BacktestEngine(cfg)
-        from .core.strategy import FastTestStrategyService
-        strategy_service = FastTestStrategyService(cfg)
+        strategy_service = strategy_service_for(cfg)
         wants_metadata = False
         label = "FastTest"
     elif is_fast_test_v1(strategy_id):
@@ -2141,7 +2209,7 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         # how long a trade is held once it is on.
         cfg = fast_test_v1_config()
         engine = BacktestEngine(cfg)
-        strategy_service = FastTestV1StrategyService(cfg)
+        strategy_service = strategy_service_for(cfg)
         wants_metadata = False
         label = FAST_TEST_V1_NAME
     else:
@@ -2158,8 +2226,11 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         if resolved and resolved[0] == 'phantom':
             cfg = resolved[1]
             engine = BacktestEngine(cfg)
-            strategy_service = engine.strategy_service
-            wants_metadata = True
+            # A saved Fast Test / V1.0 strategy overlays its own entry rule and
+            # reports no Phantom condition metadata, exactly like the builtin.
+            strategy_service = strategy_service_for(cfg, strategy_id)
+            wants_metadata = not isinstance(strategy_service, (FastTestStrategyService,
+                                                               FastTestV1StrategyService))
             label = strat.name
         else:
             from .core.dynamic_strategy import DynamicStrategyService
@@ -2259,11 +2330,18 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         config = _fee_config(req.params, fees)
         if is_fast_test_v1(req.strategy_id):
             # FastTest V1.0 — the FastTest signals with the validation /
-            # profit-booking order manager. Nothing else in the run changes.
+            # profit-booking order manager, on the client's own values.
             v1_config = fast_test_v1_config(req.params, fees=fees)
             engine = BacktestEngine(config=v1_config, fee_schedule=fees, data_source=source,
-                                    strategy_service=FastTestV1StrategyService(v1_config),
-                                    oms=FastTestV1OrderManager(v1_config))
+                                    strategy_service=strategy_service_for(v1_config),
+                                    oms=order_manager_for(v1_config))
+        elif req.strategy_id == "FastTest":
+            # The debug strategy: same loose entry rule, client-editable stop /
+            # target / sizing / timing from the Strategy Configuration panel.
+            ft_config = _fee_config(fast_test_config(req.params), fees)
+            engine = BacktestEngine(config=ft_config, fee_schedule=fees, data_source=source,
+                                    strategy_service=strategy_service_for(ft_config),
+                                    oms=order_manager_for(ft_config))
         elif req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         elif _is_builtin_phantom(req.strategy_id):
@@ -2276,8 +2354,11 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             if not resolved: return
             kind, payload, strat = resolved
             if kind == 'phantom':
-                # A saved Phantom params config (may include entry_conditions).
-                engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source)
+                # A saved params config (Phantom, or a saved Fast Test / V1.0
+                # strategy — the config type decides the entry rule).
+                engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source,
+                                        strategy_service=strategy_service_for(payload, req.strategy_id),
+                                        oms=order_manager_for(payload, req.strategy_id))
             else:
                 from .core.dynamic_strategy import DynamicStrategyService
                 class DynamicBacktestEngine:
@@ -2524,6 +2605,9 @@ def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(
 # --- FILTER PREVIEW (per bucket, before the full run) --------------------
 class FilterPreviewRequest(BaseModel):
     params: StrategyParams
+    # Which strategy the form is set to (the chart overlay uses it to plot the
+    # right entry rule; omitted = Phantom).
+    strategy_id: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     symbol: str = "BTCUSD"
@@ -2648,8 +2732,17 @@ def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_u
         req = _apply_run_overrides(req)
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
-        config = _fee_config(req.params, fees)
-        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        # The overlay follows the strategy the form is set to: a Fast Test /
+        # V1.0 selection plots that entry rule, not the Phantom one.
+        family = _strategy_family(getattr(req, 'strategy_id', None))
+        if family == FAST_TEST_V1_ID:
+            config = fast_test_v1_config(req.params, fees=fees)
+        elif family == 'FastTest':
+            config = _fee_config(fast_test_config(req.params), fees)
+        else:
+            config = _fee_config(req.params, fees)
+        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source,
+                                strategy_service=strategy_service_for(config, family or None))
         strategy_service = engine.strategy_service
         df_1h = engine._get_data_from_db(req.symbol, "1h", req.start_date, req.end_date, source)
         df_4h = engine._get_data_from_db(req.symbol, "4h", req.start_date, req.end_date, source)
@@ -2966,15 +3059,14 @@ def start_paper_trade(
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        from .core.strategy import FastTestStrategyService
-        service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
+        service = PaperTradeService(strategy_id, _fee_config(fast_test_config(), fees),
+                                    initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
                                     trading_windows=window_config, use_mark_price=use_mark,
                                     price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
-        service.strategy = FastTestStrategyService(service.config)
     elif is_fast_test_v1(strategy_id):
         service = PaperTradeService(strategy_id, fast_test_v1_config(fees=fees),
                                     initial_capital=capital, margin_pct=margin_pct,
@@ -2984,8 +3076,6 @@ def start_paper_trade(
                                     price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
-        service.strategy = FastTestV1StrategyService(service.config)
-        service.oms = FastTestV1OrderManager(service.config)
     elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
@@ -3016,6 +3106,12 @@ def start_paper_trade(
                                     price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
+    # The entry rule and the order manager follow the config: a saved Fast Test
+    # / V1.0 strategy trades its own entry rule with the saved values (V1.0
+    # additionally gets the validation + profit-booking order manager).
+    if not service.is_custom:
+        service.strategy = strategy_service_for(service.config, strategy_id)
+        service.oms = order_manager_for(service.config, strategy_id)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
@@ -3433,8 +3529,8 @@ def start_live_trade(
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        from .core.strategy import FastTestStrategyService
-        service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
+        service = LiveTradeService(strategy_id, _fee_config(fast_test_config(), fees),
+                                   api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
@@ -3442,7 +3538,6 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
-        service.strategy = FastTestStrategyService(service.config)
     elif is_fast_test_v1(strategy_id):
         service = LiveTradeService(strategy_id, fast_test_v1_config(fees=fees), api_key, api_secret,
                                    initial_capital=capital, margin_pct=margin_pct, broker_name=source,
@@ -3452,8 +3547,6 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
-        service.strategy = FastTestV1StrategyService(service.config)
-        service.oms = FastTestV1OrderManager(service.config)
     elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
@@ -3486,6 +3579,11 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
+    # The entry rule and the order manager follow the config (see the paper
+    # start): a saved Fast Test / V1.0 strategy lives trade its own values.
+    if not service.is_custom:
+        service.strategy = strategy_service_for(service.config, strategy_id)
+        service.oms = order_manager_for(service.config, strategy_id)
     # Mirror the live session into the sessions table from the start, exactly
     # like a paper run, so stopping it later leaves a full reviewable record.
     service.user_id = user.id

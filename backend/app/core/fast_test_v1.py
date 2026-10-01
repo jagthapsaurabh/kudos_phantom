@@ -60,7 +60,7 @@ import pandas as pd
 from pydantic import Field
 
 from .indicators import compute_indicators
-from .strategy import PhantomV2Config
+from .strategy import FastTestConfig, FastTestStrategyService, PhantomV2Config, StrategyService
 from ..services.order_manager import OrderManager
 
 #: Strategy id used by the API / dropdowns. Kept separate from ``FastTest``.
@@ -90,12 +90,14 @@ def fast_test_v1_name(strategy_id) -> Optional[str]:
     return FAST_TEST_V1_NAME if is_fast_test_v1(strategy_id) else None
 
 
-class FastTestV1Config(PhantomV2Config):
+class FastTestV1Config(FastTestConfig):
     """FastTest's config plus the three V1.0 rule parameters.
 
-    Everything else — entry condition fields, sizing, SL / trailing SL, fees,
-    mark price, trading windows — is inherited unchanged, so the existing
-    parameters cannot drift.
+    Everything else — sizing, SL / trailing SL / breakeven, the ATR or price
+    Risk & Exit model, cooldown / timeout, fees, mark price, trading windows —
+    is inherited unchanged, so the existing parameters cannot drift. Extending
+    :class:`~app.core.strategy.FastTestConfig` is also what marks a saved
+    strategy as a V1.0 strategy.
     """
     #: Number of completed 1h candles the validation window spans (the spec's 2H).
     validation_bars: int = Field(default=2, ge=1, le=24)
@@ -129,7 +131,7 @@ def fast_test_v1_config(params=None, fees=None) -> FastTestV1Config:
     return cfg
 
 
-class FastTestV1StrategyService:
+class FastTestV1StrategyService(FastTestStrategyService):
     """Signal service — the FastTest entry rule, copied verbatim.
 
     Identical to ``FastTestStrategyService``: RSI(14) on the 1h candles, long
@@ -141,28 +143,45 @@ class FastTestV1StrategyService:
     label = FAST_TEST_V1_LABEL
 
     def __init__(self, config: FastTestV1Config = None):
-        self.config = config or FastTestV1Config()
+        super().__init__(config or FastTestV1Config())
 
-    def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
-        df_1h = df_1h.sort_index()
-        ind_1h = compute_indicators(
-            df_1h,
-            macd_fast=self.config.macd_fast,
-            macd_slow=self.config.macd_slow,
-            macd_signal=self.config.macd_signal,
-        )
 
-        signals = np.zeros(len(df_1h))
-        rsi = ind_1h['rsi14']
+def strategy_service_for(config, strategy_id=None):
+    """The signal service that belongs to a config (or a strategy id).
 
-        for i in range(1, len(df_1h)):
-            # Same as FastTest: very loose bounds so a signal fires on almost
-            # every bar — long below 50, short at/above 50.
-            if rsi[i] < 50:
-                signals[i] = 1
-            elif rsi[i] >= 50:
-                signals[i] = -1
-        return signals
+    One place decides which entry rule a run uses, so a saved Fast Test / V1.0
+    strategy, the built-in ids and a plain Phantom config all resolve without
+    the caller having to know the family:
+
+      * ``FastTestV1Config`` / ``FastTestV1`` → the V1.0 service (FastTest's
+        entry rule + the validation layer on the order manager),
+      * ``FastTestConfig`` / ``FastTest``     → the FastTest debug service,
+      * anything else                         → the standard Phantom service.
+    """
+    if isinstance(config, FastTestV1Config) or is_fast_test_v1(strategy_id):
+        return FastTestV1StrategyService(config if isinstance(config, FastTestV1Config)
+                                         else FastTestV1Config(**_config_payload(config)))
+    if isinstance(config, FastTestConfig) or str(strategy_id) == 'FastTest':
+        return FastTestStrategyService(config)
+    return StrategyService(config)
+
+
+def order_manager_for(config, strategy_id=None, oms=None):
+    """The order manager that belongs to a config: V1.0 adds the validation /
+    profit-booking layer, every other strategy keeps the standard one."""
+    if isinstance(config, FastTestV1Config) or is_fast_test_v1(strategy_id):
+        return FastTestV1OrderManager(config)
+    return oms or OrderManager(config)
+
+
+def _config_payload(config):
+    """The declared fields of a config (or of a params dict)."""
+    try:
+        dump = config.model_dump() if hasattr(config, 'model_dump') else dict(config or {})
+    except Exception:
+        dump = {}
+    allowed = set(FastTestV1Config.model_fields)
+    return {k: v for k, v in (dump or {}).items() if k in allowed}
 
 
 class FastTestV1OrderManager(OrderManager):

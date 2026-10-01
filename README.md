@@ -500,9 +500,35 @@ sizing, initial SL, trailing SL, cooldown, timeout and fees are the same values 
 use, and **no new indicator or filter** was added.
 
 Where to pick it: **Paper**, **Live**, **Chart** and **Backtest** dropdowns, plus the admin panel's
-debug button. The three rule constants are fixed defaults (`validation_bars=2`,
-`validation_close_pct=0.0035`, `profit_book_pct=0.009`) and can be overridden per run from the
-params block.
+debug button.
+
+### Configuring the Fast Test strategies (debug + V1.0)
+
+Kudos values are edited in **Backtest → Strategy Configuration**. Both debug strategies are
+configured the same way: pick **Fast Test Strategy (debug)** or **Fast Test Strategy V1.0** in
+*Strategy to test* and the panel switches to that strategy's own fields — every value the backend
+reads for it:
+
+| Group | Fields |
+| --- | --- |
+| **Risk & Exit Model** | the same editor as Kudos: ATR units (default) / price % / both per level, plus the ATR stop floor % |
+| **Exits & Timing** | timeout bars, cooldown bars |
+| **Sizing & Drawdown Guard** | leverage, margin %, lot size (BTC), reduced margin %, the three drawdown-guard levels |
+| **V1.0 — validation & profit booking** (V1 only) | validation window (bars), validation close %, profit booking % |
+
+Defaults are the shipped values, so a strategy nobody edits behaves exactly as before (the 2H /
++0.35% / +0.90% rules stay the V1 defaults). The entry rule itself is fixed and says so on the panel
+(RSI 14 — long below 50, short at/above 50).
+
+Press **Save as strategy** and the saved strategy remembers which family it belongs to — it is
+labelled `· Fast Test Strategy V1.0` (or debug) in the Backtest, Paper, Live and Strategies lists,
+and starting it in **Paper** or **Live** runs that entry rule with your saved stop, target, sizing
+and timing values. Auto-resume after a restart keeps the same strategy and values.
+
+Under the hood each saved strategy stores `strategy_id` next to its parameters; the API rebuilds the
+typed config (`FastTestConfig` / `FastTestV1Config`), and one factory picks the matching signal
+service and order manager — so a saved V1.0 strategy keeps the validation / booking layer in every
+mode. A saved strategy with no marker stays a Kudos strategy, exactly as before.
 
 **Audit fields.** Every V1 trade carries seven extra fields in the trade log, the CSV/Excel export
 (appended as the last seven columns, so existing sheets keep their positions) and the paper/live
@@ -599,6 +625,9 @@ python test_risk_exit_model.py   # 48 checks: ATR / price / per-level mix on eve
 python test_trade_conditions_shared.py  # 28 checks: the shared entry/exit-condition detail the
                                   # backtest / paper / live logs all use, end-to-end paper entry
 python test_paper_history.py      # 63 checks: paper history persistence
+python test_fast_test_config.py   # 68 checks: the configurable Fast Test / V1.0 values — builders,
+                                  # saved-strategy family round trip, service / OMS factories, backtest,
+                                  # paper, live, resume and chart-overlay wiring
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_seed_repair.py        # 57 checks: full-history seed + corrupt-candle repair
@@ -614,12 +643,13 @@ python test_chart_overlay_api.py   # 18 checks: /klines window + chronological c
                                    # fallback included), signal fields for the chart overlay
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 570 checks (569 pass; the known PaperTrade live-tick smoke check fails on the
+cd frontend && npm test            # 586 checks (585 pass; the known PaperTrade live-tick smoke check fails on the
                                    # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
-                                   # FastTest V1.0 dropdowns / audit columns / validation chips,
+                                   # FastTest V1.0 dropdowns / audit columns / validation chips /
+                                   # configurable debug + V1.0 fields (fast_test_v1_ui.jsx),
                                    # paper+live condition analysis (trade_conditions_ui.jsx),
                                    # Risk & Exit model editor + docs (risk_exit_model_ui.jsx),
                                    # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx),

@@ -345,6 +345,17 @@ choosing the model level by level (e.g. an ATR stop with a price-based target).
   through an `autoscaleInfoProvider`, so the axis keeps following new candles while zoomed.
   `frontend/src/utils/chartZoom.js` holds the pure maths and `frontend/tests/chart_zoom_ui.jsx`
   (41 checks) covers the helpers, the rendered toolbar and the runtime wiring.
+- **Fast Test (debug) + Fast Test V1.0 are configurable** (same form as Kudos): selecting either
+  strategy in **Backtest → Strategy Configuration** shows the fields the backend reads for it — the
+  Risk & Exit model (ATR / price % / both, plus the stop floor), timeout / cooldown, leverage,
+  margin %, lot size, reduced margin and the drawdown guard, and for V1.0 the validation window,
+  validation close % and profit booking %. Defaults are the shipped values, so an unedited strategy
+  behaves exactly as before. **Save as strategy** stores the family marker
+  (`strategy_id` inside the saved rules) next to the values, so Backtest, Paper and Live rebuild a
+  `FastTestConfig` / `FastTestV1Config` and run that entry rule with the saved stop / target /
+  sizing / timing — V1.0 keeps its validation + booking order manager. New
+  `backend/test_fast_test_config.py` (67 checks) pins the builders, the family round trip, the
+  service / OMS factories and every run path; `fast_test_v1_ui.jsx` grew to 43 checks.
 - **Fix — "data must be asc ordered by time" on the Backtest candle pane**: Delta answers
   `/v2/history/candles` newest-first, and `/klines` returns that venue fallback whenever the local
   seed is empty for the window. lightweight-charts asserts its data is oldest-first, so the overlay

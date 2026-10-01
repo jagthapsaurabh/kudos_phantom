@@ -1242,10 +1242,66 @@ class StrategyService:
         """Signals plus the per-bar condition snapshot used for trade logging."""
         return self._compute(df_1h, df_4h)
 
+class FastTestConfig(PhantomV2Config):
+    """Config of the **Fast Test (debug)** strategy.
+
+    Every field is the PhantomV2 field — the debug strategy shares the same
+    risk / sizing / exit plan, it only replaces the entry rule. The *type* is
+    what marks the strategy family: a saved strategy stores the family id next
+    to its parameters (see ``/strategies/create``), so the API rebuilds this
+    class — or :class:`~app.core.fast_test_v1.FastTestV1Config`, which extends
+    it — and the backtest / paper / live workers then run the debug entry rule
+    with the client's own stop, target, sizing and timing values.
+    """
+
+
+def _is_fast_test_config(config) -> bool:
+    """True for the debug-strategy config family (FastTest and V1.0)."""
+    try:
+        from .fast_test_v1 import FastTestV1Config  # local import: avoids a cycle
+        if isinstance(config, FastTestV1Config):
+            return True
+    except Exception:
+        pass
+    return isinstance(config, FastTestConfig)
+
+
+def fast_test_config(params=None, fees=None) -> 'FastTestConfig':
+    """Build the FastTest config from a request / saved-strategy params block.
+
+    Only fields the config declares are copied, so a Phantom params block (or a
+    future form field) can never inject a value the debug strategy does not
+    have. Anything missing keeps the shipped default, so a params-less call
+    reproduces the current FastTest behaviour exactly.
+    """
+    payload = {}
+    if params is not None:
+        try:
+            dump = params.model_dump() if hasattr(params, "model_dump") else dict(params)
+        except Exception:
+            dump = {}
+        allowed = set(FastTestConfig.model_fields)
+        payload = {k: v for k, v in (dump or {}).items() if k in allowed}
+    cfg = FastTestConfig(**payload)
+    if fees is not None:
+        taker = float(getattr(fees, "taker_fee_bps", 0.0) or 0.0)
+        maker = float(getattr(fees, "maker_fee_bps", 0.0) or 0.0)
+        cfg = cfg.model_copy(update={"taker_fee_bps": taker, "maker_fee_bps": maker})
+    return cfg
+
+
 class FastTestStrategyService:
-    """Simple strategy to generate very frequent signals for testing Paper/Live trading."""
-    def __init__(self, config: PhantomV2Config = PhantomV2Config()):
-        self.config = config
+    """Simple strategy to generate very frequent signals for testing Paper/Live trading.
+
+    The entry rule (RSI 14 on the 1h candles: long below 50, short at/above 50)
+    is unchanged; the config now carries the risk / sizing / timing values the
+    client edits in the Strategy Configuration panel when this strategy — or a
+    saved copy of it — is selected.
+    """
+    label = 'FASTTEST'
+
+    def __init__(self, config: PhantomV2Config = None):
+        self.config = config or FastTestConfig()
 
     def generate_signals(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
         df_1h = df_1h.sort_index()

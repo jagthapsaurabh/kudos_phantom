@@ -10,6 +10,9 @@ import StrategyConfigSummary from '../components/StrategyConfigSummary';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
+import {
+  FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_NAME, isFastTestV1,
+} from '../utils/phantomPresets';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
@@ -793,7 +796,7 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
               <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
               {strategies.length > 0 && (
                 <optgroup label="Saved strategies">
-                  {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  {strategies.map(s => <option key={s.id} value={s.id}>{s.name}{isFastTestV1(s.strategy_id) ? ` · ${FAST_TEST_V1_NAME}` : String(s.strategy_id) === FAST_TEST_ID ? ` · ${FAST_TEST_NAME}` : ''}</option>)}
                 </optgroup>
               )}
             </select>

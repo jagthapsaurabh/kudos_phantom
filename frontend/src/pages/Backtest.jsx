@@ -13,6 +13,7 @@ import { DEFAULT_RISK_EXIT, RISK_EXIT_META, riskExitText } from '../utils/riskEx
 import {
   SETUP_MODES, TRADE_DIRECTIONS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS, DEFAULT_MACD_LINE_RULES,
   parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, macdLineRuleText,
+  FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_ID, FAST_TEST_V1_NAME, isFastTestV1,
 } from '../utils/phantomPresets';
 
 const PARAM_META = {
@@ -45,6 +46,17 @@ const PARAM_META = {
   trade_direction: { label: 'Direction', hint: 'Which side may be opened: both (original), Long only or Short only.' },
   macd_line_min: { label: 'MACD line level', hint: 'Optional. Longs need MACD line ≥ this, shorts ≤ minus this. Blank = off.' },
   macd_signal_min: { label: 'Signal line level', hint: 'Optional. Longs need signal line ≥ this, shorts ≤ minus this. Blank = off.' },
+  // ---- Fast Test (debug) + Fast Test V1.0 -----------------------------------
+  // The two debug strategies share the Phantom risk / sizing / timing plan, so
+  // every value here is a field the backend already reads for them. `percent`
+  // fields are stored as fractions (0.016) and shown as 1.6.
+  timeout_bars: { label: 'Timeout (bars)', hint: 'Close the trade after this many candles with no other exit.' },
+  lot_size_btc: { label: 'Lot size (BTC)', hint: 'Venue contract step — the position is rounded down to it.' },
+  reduced_margin_pct: { label: 'Reduced margin %', hint: 'Margin per trade once the soft drawdown limit is passed (12.5 = 12.5%).', percent: true },
+  sl_floor_pct: { label: 'Stop floor %', hint: 'The ATR stop is never tighter than this share of price (1.6 = 1.6%). ATR model only.', percent: true },
+  validation_bars: { label: 'Validation window (bars)', hint: 'Completed 1H candles watched before the 2H validation verdict. 2 = 2 hours.' },
+  validation_close_pct: { label: 'Validation close %', hint: 'Favourable close the window must reach (0.35 = +0.35%).', percent: true },
+  profit_book_pct: { label: 'Profit booking %', hint: 'A touch of entry ± this books the whole position (0.90 = +0.90%).', percent: true },
 };
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
@@ -457,6 +469,12 @@ const Backtest = () => {
     // Previous 20k*0.15*2 gave 0.0007 BTC -> LOT_TOO_SMALL -> 0 trades.
     leverage: 7, margin_pct: 0.25,
     dd_soft_pct: 8.0, dd_halt_pct: 100.0, dd_resume_pct: 100.0,
+    // Shared by Phantom and both debug strategies — the shipped defaults, so
+    // sending them never changes an existing run.
+    timeout_bars: 72, lot_size_btc: 0.001, reduced_margin_pct: 0.125, sl_floor_pct: 0.016,
+    // Fast Test V1.0 rules (2H window / +0.35% validation / +0.90% booking).
+    // Only the V1 strategy reads them; every other strategy ignores them.
+    validation_bars: 2, validation_close_pct: 0.0035, profit_book_pct: 0.009,
     // BTC perpetual: risk is managed on the exchange MARK price; the traded
     // price is recorded next to it (both are stored for every trade).
     use_mark_price: true,
@@ -629,12 +647,33 @@ const Backtest = () => {
     },
   }));
 
-  // The parameter form applies to PhantomV2 and to saved Kudos-style
-  // strategies (params stored as an object, not Chartink rule arrays).
-  const showParamForm = isPhantomBuiltin(selectedStrategyId) ||
+  // Which strategy *family* the form is editing. 'FastTest' / 'FastTestV1' make
+  // the panel show the debug strategy's own fields; a saved strategy remembers
+  // its family in `rules.strategy_id`, so re-opening it edits the same fields.
+  const familyOf = (sid) => {
+    if (isFastTestV1(sid)) return FAST_TEST_V1_ID;
+    if (String(sid) === FAST_TEST_ID) return FAST_TEST_ID;
+    const saved = strategies.find(s => String(s.id) === String(sid));
+    const stored = saved && saved.rules && typeof saved.rules === 'object' ? saved.rules.strategy_id : '';
+    if (isFastTestV1(stored)) return FAST_TEST_V1_ID;
+    if (String(stored) === FAST_TEST_ID) return FAST_TEST_ID;
+    return '';
+  };
+  const strategyFamily = familyOf(selectedStrategyId);
+  const fastTestFamily = !!strategyFamily;
+
+  // The parameter form applies to PhantomV2, to both debug strategies (their
+  // built-in ids or a saved copy of them) and to saved Kudos-style strategies
+  // (params stored as an object, not Chartink rule arrays).
+  const showParamForm = fastTestFamily || isPhantomBuiltin(selectedStrategyId) ||
     strategies.some(s => String(s.id) === String(selectedStrategyId) &&
       s.rules && typeof s.rules === 'object' && !Array.isArray(s.rules) &&
       ('entry_conditions' in s.rules || 'rsi_oversold' in s.rules));
+
+  // Percent fields are stored as fractions (0.016) and shown as percents (1.6),
+  // exactly like the Risk & Exit model editor.
+  const asPercent = (v) => (v === undefined || v === null || v === '' ? '' : Math.round(Number(v) * 1e6) / 1e4);
+  const toFraction = (raw) => (raw === '' ? 0 : Number(raw) / 100);
 
   const renderNumberInput = (field, value, onChange) => {
     const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
@@ -644,13 +683,17 @@ const Backtest = () => {
           {meta.label}
           {meta.hint && <span title={meta.hint} className="text-gray-600 hover:text-blue-400 cursor-help"><HelpCircle size={11} /></span>}
         </label>
-        <input type="number" step="0.01" value={value ?? ''}
-          onChange={onChange}
+        <input type="number" step="0.01" value={meta.percent ? asPercent(value) : (value ?? '')}
+          onChange={e => (meta.percent
+            ? onChange({ target: { value: toFraction(e.target.value) } })
+            : onChange(e))}
+          data-testid={`param-${field}`}
           className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
         {meta.hint && <span className="text-[10px] text-gray-600 mt-0.5 leading-snug hidden xl:block">{meta.hint}</span>}
       </div>
     );
   };
+  const setFamilyField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
 
   const renderCheckInput = (field, checked, onChange) => {
     const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
@@ -759,6 +802,7 @@ const Backtest = () => {
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({
         params: runParams,
+        strategy_id: results.strategy_id || selectedStrategyId,
         start_date: start,
         end_date: end,
         symbol,
@@ -891,11 +935,12 @@ const Backtest = () => {
       const res = await fetch(`${API_URL}/strategies/create`, {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, params }),
+        body: JSON.stringify({ name, params, strategy_id: strategyFamily || undefined }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to save strategy");
-      alert(`Strategy "${name}" saved successfully. You can now run it from the strategy dropdown, or Paper / Live trade it from the Trading page.`);
+      alert(`Strategy "${name}" saved successfully${fastTestFamily ? ` as a ${strategyFamily === FAST_TEST_V1_ID ? FAST_TEST_V1_NAME : FAST_TEST_NAME} configuration` : ''}. `
+        + 'You can now run it from the strategy dropdown, or Paper / Live trade it from the Trading page.');
       fetchStrategies();
       setRunName('');
     } catch (e) {
@@ -955,6 +1000,8 @@ const Backtest = () => {
         short: { ...base.entry_conditions.short, ...(savedConditions.short || {}) },
       },
     };
+    // `strategy_id` is the saved strategy's *family* marker, not a parameter.
+    delete merged.strategy_id;
     // Runs saved before the independent switches were introduced used the
     // legacy master switch. Surface that state in the new controls as well.
     if (savedConditions.use_direction_conditions) {
@@ -1221,10 +1268,16 @@ const Backtest = () => {
               className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <PhantomPresetOptions />
-              <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
+              <option value={FAST_TEST_ID}>{FAST_TEST_NAME} (debug — configurable)</option>
+              <option value={FAST_TEST_V1_ID}>{FAST_TEST_V1_NAME} (Validation + 0.90% TP)</option>
               {strategies.length > 0 && (
                 <optgroup label="Saved strategies">
-                  {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  {strategies.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}{isFastTestV1(s.strategy_id) ? ` · ${FAST_TEST_V1_NAME}`
+                        : String(s.strategy_id) === FAST_TEST_ID ? ` · ${FAST_TEST_NAME}` : ''}
+                    </option>
+                  ))}
                 </optgroup>
               )}
             </select>
@@ -1285,20 +1338,31 @@ const Backtest = () => {
 
       {showParamForm && (
         <SectionCard
-          title="Strategy Configuration"
-          subtitle="Tune Kudos parameters, then hide this section when you want more room for results."
+          title={fastTestFamily ? `${strategyFamily === FAST_TEST_V1_ID ? FAST_TEST_V1_NAME : FAST_TEST_NAME} — Configuration` : 'Strategy Configuration'}
+          subtitle={fastTestFamily
+            ? 'Every value the backend uses for this strategy. Save the form as a strategy to reuse it in Paper / Live.'
+            : 'Tune Kudos parameters, then hide this section when you want more room for results.'}
           icon={SlidersHorizontal}
           collapsed={!sectionVisibility.config}
           onToggle={() => toggleSection('config')}
           className="mb-8"
         >
+          {fastTestFamily ? (
+            <div className="mb-5 rounded-xl border border-amber-900/40 bg-amber-900/10 p-3 text-xs text-gray-400" data-testid="fast-test-config-note">
+              The entry rule is fixed ({strategyFamily === FAST_TEST_V1_ID ? `${FAST_TEST_V1_NAME}: RSI 14 — long below 50, short at/above 50, plus the 2H validation and +0.90% booking` : `${FAST_TEST_NAME}: RSI 14 — long below 50, short at/above 50`}).
+              Everything below is the config the backend reads for this strategy — the same stop / target / trailing / sizing plan as Kudos, with your own values.
+              Press <b className="text-white">Save strategy</b> to reuse them in Backtest, Paper and Live.
+            </div>
+          ) : (
           <div className="mb-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
             Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
             <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds — the ATR switch
             also lets each side pick its own comparison (<b className="text-white">&gt;, &lt;, ≥, ≤</b>) against the 50-bar ATR average.
           </div>
+          )}
 
           {/* v3.5 — strategy separation: which setup and which side may trade. */}
+          {!fastTestFamily && (
           <div className="mb-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="strategy-separation">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Strategy separation</h3>
@@ -1334,7 +1398,54 @@ const Backtest = () => {
               <p className="mt-2 text-[10px] text-amber-300">Momentum only overrides the unticked "Momentum entries" box — Setup B fires regardless.</p>
             )}
           </div>
+          )}
 
+          {fastTestFamily ? (
+            <div className="space-y-6" data-testid="fast-test-config">
+              <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-3">
+                <div className="space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Risk &amp; Exit Model</h3>
+                  <RiskExitModelEditor params={params} setParams={setParams} />
+                  <div className="pt-1">
+                    {renderNumberInput('sl_floor_pct', params.sl_floor_pct,
+                      e => setFamilyField('sl_floor_pct', parseFloat(e.target.value)))}
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Exits &amp; Timing</h3>
+                  <div className="space-y-3">
+                    {['timeout_bars', 'cooldown_bars'].map(field => <React.Fragment key={field}>
+                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                    </React.Fragment>)}
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Sizing &amp; Drawdown Guard</h3>
+                  <div className="space-y-3">
+                    {['leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct']
+                      .map(field => <React.Fragment key={field}>
+                        {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                      </React.Fragment>)}
+                  </div>
+                </div>
+              </div>
+              {strategyFamily === FAST_TEST_V1_ID && (
+                <div className="rounded-xl border border-emerald-900/40 bg-emerald-900/10 p-4" data-testid="fast-test-v1-rules">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-300">V1.0 — validation &amp; profit booking</h3>
+                  <p className="mt-1 text-[10px] leading-snug text-gray-400">
+                    The window is measured in completed 1H candles. A favourable close inside the window validates the trade and
+                    the normal exits continue; a close that never gets there exits at the window's last close.
+                    The booking percentage is checked on a price <b className="text-white">touch</b> and books the whole position first.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    {['validation_bars', 'validation_close_pct', 'profit_book_pct'].map(field => <React.Fragment key={field}>
+                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                    </React.Fragment>)}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
           <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
             {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
               <div key={groupName} className="space-y-3">
@@ -1419,8 +1530,10 @@ const Backtest = () => {
               </div>
             ))}
           </div>
+          )}
 
           {/* v3.5 — optional MACD line / signal line entry rules. */}
+          {!fastTestFamily && (
           <div className="mt-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="macd-line-rules">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -1506,8 +1619,9 @@ const Backtest = () => {
               </div>
             )}
           </div>
+          )}
 
-          {useDirection && (
+          {useDirection && !fastTestFamily && (
             <div className="mt-5 rounded-lg border border-yellow-900/50 bg-yellow-900/10 p-3 text-[10px] text-yellow-300">
               This run contains the legacy full Long / Short override switch. Its additional RSI, ADX, MACD-period,
               stop-loss and max-ATR overrides are still honoured by the engine; the two switches above control the
@@ -1532,10 +1646,12 @@ const Backtest = () => {
             <button onClick={resetParams} className="flex items-center justify-center gap-2 px-4 py-2 text-xs text-gray-500 transition hover:text-white">
               <RotateCcw size={14} /> Reset defaults
             </button>
-            <button onClick={runFilterPreview} disabled={previewLoading || loading}
-              className="flex items-center justify-center gap-2 rounded-xl border border-blue-800/50 px-4 py-2 text-xs font-semibold text-blue-300 transition hover:bg-blue-900/20 disabled:opacity-50">
-              {previewLoading ? <div className="h-3 w-3 rounded-full border-2 border-blue-400 border-t-transparent animate-spin"></div> : 'Preview Filters'}
-            </button>
+            {!fastTestFamily && (
+              <button onClick={runFilterPreview} disabled={previewLoading || loading}
+                className="flex items-center justify-center gap-2 rounded-xl border border-blue-800/50 px-4 py-2 text-xs font-semibold text-blue-300 transition hover:bg-blue-900/20 disabled:opacity-50">
+                {previewLoading ? <div className="h-3 w-3 rounded-full border-2 border-blue-400 border-t-transparent animate-spin"></div> : 'Preview Filters'}
+              </button>
+            )}
             <button onClick={saveAsNewStrategy} disabled={saving}
               className="flex items-center justify-center gap-2 rounded-xl bg-green-700 px-4 py-2 text-xs font-bold text-white transition hover:bg-green-600 disabled:opacity-50">
               <Download size={14} /> {saving ? 'Saving...' : 'Save as strategy'}

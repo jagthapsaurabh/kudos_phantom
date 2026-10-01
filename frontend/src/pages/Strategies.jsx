@@ -3,6 +3,7 @@ import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus
 import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../api';
 import { DEFAULT_RISK_EXIT } from '../utils/riskExit';
+import { FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_NAME, isFastTestV1 } from '../utils/phantomPresets';
 
 // --- Constants ---
 const FIELDS = [
@@ -339,6 +340,14 @@ const RuleGroup = ({ group, updateGroup, removeGroup, addRule, addGroup }) => {
   );
 };
 
+// Name shown for a saved strategy's family, so a saved Fast Test / V1.0
+// configuration is distinguishable from a Kudos one in the list.
+const familyLabel = (strategyId) => {
+  if (isFastTestV1(strategyId)) return ` · ${FAST_TEST_V1_NAME}`;
+  if (String(strategyId) === FAST_TEST_ID) return ` · ${FAST_TEST_NAME}`;
+  return '';
+};
+
 const Strategies = () => {
   const navigate = useNavigate();
   const [strategies, setStrategies] = useState([]);
@@ -542,7 +551,8 @@ const Strategies = () => {
               <tr key={s.id} className="border-b border-gray-700 hover:bg-gray-700/50 transition">
                 <td className="p-4 font-medium">{s.name}</td>
                 <td className="p-4 text-sm text-gray-400">
-                  {Array.isArray(s.rules) || (s.rules && s.rules.type === 'group') ? 'Rule-based' : 'Parameter-based'}
+                  {Array.isArray(s.rules) || (s.rules && s.rules.type === 'group') ? 'Rule-based'
+                    : `Parameter-based${familyLabel(s.strategy_id)}`}
                 </td>
                 <td className="p-4 text-gray-400 text-sm">{new Date(s.created_at).toLocaleDateString()}</td>
                 <td className="p-4">
