@@ -271,16 +271,20 @@ class PaperTradeService:
         # (signal candle + colour, every condition with PASS/FAIL) and the
         # candle the exit landed in. Records from older versions simply lack
         # these keys, so nothing already saved changes shape.
-        ctx = getattr(trade, 'entry_context', None) or {}
-        if ctx:
-            ctx = dict(ctx)
+        try:
+            # Convert the candle stamps first: safe_context keeps plain
+            # scalars and would otherwise drop a datetime it cannot classify.
+            ctx = dict(getattr(trade, 'entry_context', None) or {})
             for key in ('signal_candle_time', 'entry_candle_time'):
                 if ctx.get(key) is not None:
                     ctx[key] = _to_ist(ctx[key])
-            rec.update(ctx)
-        exit_color = getattr(trade, 'exit_candle_type', None)
-        if exit_color:
-            rec['exit_candle_type'] = exit_color
+            rec.update(trade_conditions.safe_context(ctx))
+            exit_color = getattr(trade, 'exit_candle_type', None)
+            if exit_color:
+                rec['exit_candle_type'] = exit_color
+        except Exception:
+            # Booking the trade must never fail on analysis detail.
+            pass
         self.closed_trades.append(rec)
         # Same accounting rule as the live worker: trades age out of memory,
         # but their PnL must not vanish from the session totals.
@@ -316,9 +320,10 @@ class PaperTradeService:
                 getattr(self.strategy, 'config', self.config), meta, i, signal_dir,
                 signal_candle_time=current_time, entry_candle_time=current_time,
                 entry_candle_type=color)
-        except Exception as exc:
-            # Never let bookkeeping stop a trade from being taken.
-            print(f"[{self.strategy_id}] Entry-condition snapshot failed: {exc}")
+        except Exception:
+            # Analysis must never disturb trading: a strategy whose metadata
+            # cannot be read simply gets no condition record. No exception and
+            # no error output — the order path is unaffected.
             return {}
 
     def _record_equity_point(self):
@@ -663,10 +668,6 @@ class PaperTradeService:
                         self._bars_since_exit = 0
                         self._book_close(closed)
                         trade_event = True
-                    # The entry-condition record goes on the trade together
-                    # with the order, so an exit hours later still exports the
-                    # conditions the entry was actually taken on.
-                    entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
                     margin_inr = self.equity_inr * (self.margin_pct / 100.0)
                     new_trade = self.oms.create_order(
                         "BTCUSDT", last_sig, decision_price, current_atr, current_time, margin_inr,
@@ -676,6 +677,11 @@ class PaperTradeService:
                         self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
                     else:
                         trade_event = True
+                        # The condition snapshot is taken only once the order
+                        # exists, so nothing in the analysis can sit in front of
+                        # (or disturb) the execution itself. An exit hours later
+                        # still exports the conditions the entry was taken on.
+                        entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
                         if entry_ctx:
                             new_trade.entry_context = entry_ctx
                         # This candle's signal is spent — the remaining ticks of

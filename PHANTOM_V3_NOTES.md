@@ -287,10 +287,14 @@ A **new, separate strategy** (`FastTestV1`, `backend/app/core/fast_test_v1.py`).
 - **Not invented where it does not exist.** `FastTest` / `FastTestV1` publish no
   condition metadata; their paper/live rows show the exit rule, candle colours
   and the V1 audit fields, with an explicit note instead of fake PASS/FAILs.
-- **Tests**: `backend/test_trade_conditions_shared.py` (28 checks, incl. a real
-  paper tick), `frontend/tests/trade_conditions_ui.jsx` (20 checks); the full
-  backend + frontend suites stay green and the 2.08 MB trade-list parity dump is
-  unchanged.
+- **Never in the way of execution.** The snapshot is taken *after* the
+  paper/live order exists, a strategy whose metadata raises yields `{}` with no
+  exception and no error output, and the merge into the closed-trade record is
+  wrapped so a malformed record can never stop a booking or an exit order.
+- **Tests**: `backend/test_trade_conditions_shared.py` (34 checks, incl. a real
+  paper tick and the failure paths), `frontend/tests/trade_conditions_ui.jsx`
+  (22 checks); the full backend + frontend suites stay green and the 2.08 MB
+  trade-list parity dump is unchanged.
 
 ## Reproduce
 ```bash

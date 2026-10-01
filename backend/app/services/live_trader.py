@@ -1023,12 +1023,6 @@ class LiveTradeService:
                                         mark_price_usd=mark_price, mark_price_basis=use_mark)
         if planned is None:
             return
-        # The entry-condition record is stored on the trade before the order
-        # goes out, so an exit hours later still exports the conditions the
-        # entry was actually taken on.
-        entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
-        if entry_ctx:
-            planned.entry_context = entry_ctx
         lots = float(planned.lots)
         # A plain distance (trail_distance_atr × ATR) — the broker client signs
         # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
@@ -1070,6 +1064,12 @@ class LiveTradeService:
                               f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
             print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
             self._log("trade", f"OPENED {side} {lots} BTC at {entry_note}{protection}")
+            # The condition snapshot is taken only after the order is out, so
+            # nothing in the analysis can sit in front of (or disturb) a real
+            # order. An exit hours later still exports the entry conditions.
+            entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
+            if entry_ctx:
+                planned.entry_context = entry_ctx
             self._persist_history(force=True)
         else:
             # No order left the building: roll the OMS trade back so the
@@ -1132,9 +1132,10 @@ class LiveTradeService:
                 getattr(self.strategy, 'config', self.config), meta, i, signal_dir,
                 signal_candle_time=current_time, entry_candle_time=current_time,
                 entry_candle_type=color)
-        except Exception as exc:
-            # Never let bookkeeping stop a real order from going out.
-            print(f"[{self.strategy_id}] Entry-condition snapshot failed: {exc}")
+        except Exception:
+            # Analysis must never disturb trading: a strategy whose metadata
+            # cannot be read simply gets no condition record. No exception and
+            # no error output — the order path is unaffected.
             return {}
 
     def _record_equity_point(self):
@@ -1230,16 +1231,20 @@ class LiveTradeService:
             # writes (signal candle + colour, every condition with PASS/FAIL)
             # and the candle the exit landed in. Older saved records simply
             # lack these keys, so nothing already stored changes shape.
-            ctx = getattr(trade, 'entry_context', None) or {}
-            if ctx:
-                ctx = dict(ctx)
+            try:
+                # Convert the candle stamps first: safe_context keeps plain
+                # scalars and would otherwise drop a datetime it cannot classify.
+                ctx = dict(getattr(trade, 'entry_context', None) or {})
                 for key in ('signal_candle_time', 'entry_candle_time'):
                     if ctx.get(key) is not None:
                         ctx[key] = _to_ist(ctx[key])
-                rec.update(ctx)
-            exit_color = getattr(trade, 'exit_candle_type', None)
-            if exit_color:
-                rec['exit_candle_type'] = exit_color
+                rec.update(trade_conditions.safe_context(ctx))
+                exit_color = getattr(trade, 'exit_candle_type', None)
+                if exit_color:
+                    rec['exit_candle_type'] = exit_color
+            except Exception:
+                # Booking the trade must never fail on analysis detail.
+                pass
             self.closed_trades.append(rec)
             # Trades are capped in memory, but the counters are not: dropping
             # old trades used to drop their PnL from net_pnl too, so after 100

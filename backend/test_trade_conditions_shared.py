@@ -119,6 +119,46 @@ check("one call returns everything a trade-log row needs",
 check("entry_context is empty for a metadata-less run (never invents conditions)",
       tc.entry_context(CFG, None, 1, 1) == {})
 
+print("\n== execution safety: the analysis can never disturb trading ==")
+check("safe_context keeps plain scalars",
+      tc.safe_context({'a': 1, 'b': 1.5, 'c': 'x', 'd': True, 'e': None}) ==
+      {'a': 1, 'b': 1.5, 'c': 'x', 'd': True, 'e': None})
+check("safe_context drops anything that could break JSON serialisation",
+      tc.safe_context({'keep': 1, 'drop': object()}) == {'keep': 1})
+check("safe_context tolerates a non-dict / empty value",
+      tc.safe_context(None) == {} and tc.safe_context('nope') == {})
+
+
+class BrokenMetaStrategy:
+    """A strategy whose metadata call raises — must never reach the trader."""
+    label = 'BROKEN'
+
+    def __init__(self):
+        self.config = PhantomV2Config()
+
+    def generate_signals(self, df_1h, df_4h):
+        return [1] * len(df_1h)
+
+    def generate_signals_with_metadata(self, df_1h, df_4h):
+        raise RuntimeError('metadata unavailable')
+
+
+_broken_paper = PaperTradeService('PhantomV2', PhantomV2Config(), initial_capital=20000, margin_pct=25)
+_broken_paper.strategy = BrokenMetaStrategy()
+check("a raising metadata call yields {} without raising (paper)",
+      _broken_paper._entry_condition_context(1, DF_1H, DF_4H, DF_1H.index[i]) == {})
+_broken_live = LiveTradeService('PhantomV2', PhantomV2Config(), 'k', 's')
+_broken_live.strategy = BrokenMetaStrategy()
+check("a raising metadata call yields {} without raising (live)",
+      _broken_live._entry_condition_context(1, DF_1H, DF_4H, DF_1H.index[i]) == {})
+
+_bad = _broken_paper.oms.create_order('BTCUSDT', 1, 100.0, 1.0, DF_1H.index[i], 5000.0, 85.0)
+_bad.entry_context = 'not-a-dict'
+_bad.exit_reason = 'SL'
+_broken_paper._record_closed(_bad, -10.0, 1.0, -9.0)
+check("a malformed entry context cannot stop a closed trade from being booked",
+      len(_broken_paper.closed_trades) == 1 and _broken_paper.closed_trades[-1]['reason'] == 'SL')
+
 print("\n== frame_candle_color (the exit-candle stamp) ==")
 frame = pd.DataFrame({'is_green': [0, 1, 0], 'is_red': [1, 0, 0]})
 check("GREEN / RED / DOJI are read off the indicator frame",

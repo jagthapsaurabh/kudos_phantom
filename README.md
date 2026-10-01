@@ -517,6 +517,12 @@ Strategies that publish no per-condition metadata (`FastTest`, `FastTestV1`) get
 conditions — exactly like a backtest run of those strategies. Their rows still show the exit rule,
 the candle colours and (for V1) the seven audit fields.
 
+**Execution safety.** The analysis can never disturb trading: the snapshot is taken **after** the
+paper order / live order has been sent, it is dropped silently if a strategy's metadata cannot be
+read (no exception, no error line, no blocked or altered order), and the merge into the closed-trade
+record is wrapped so a malformed record can never stop a trade from being booked or an exit order
+from being sent.
+
 ### Running the tests
 ```bash
 # backend (offline; no exchange or DB seed required)

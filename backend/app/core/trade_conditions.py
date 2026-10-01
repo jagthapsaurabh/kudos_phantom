@@ -304,6 +304,31 @@ def entry_context(config, meta, i, signal_dir, signal_candle_time=None,
     return ctx
 
 
+def safe_context(ctx):
+    """A JSON-safe copy of an entry context, or ``{}``.
+
+    The record is merged into paper / live closed-trade dicts that are served
+    by the API and persisted as JSON, so anything that is not a plain scalar is
+    dropped rather than risking a serialisation error on the trading path.
+    """
+    if not ctx:
+        return {}
+    out = {}
+    try:
+        items = dict(ctx).items()
+    except (TypeError, ValueError):
+        return {}
+    for key, value in items:
+        if value is None or isinstance(value, (str, bool, int, float)):
+            out[key] = value
+            continue
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def frame_candle_color(df, i=-1):
     """Colour of one row of an indicator frame, or None when that frame
     carries no candle-colour flags (used to stamp the candle a paper/live
