@@ -420,11 +420,12 @@ one account, and History / Sessions show the preset's name.
 
 Every protective level has always been measured in **ATR units**. The client can now run each level
 on **price**, or on **both** — chosen level by level, so one strategy can keep an ATR stop while
-booking at a price-based target. It is set in **Backtest → Strategy Configuration → Risk & Exit
+booking at a price-based target. The model is a three-state toggle — [ATR-based (default)]
+[Price-based (%)] [Both — per level] — set in **Backtest → Strategy Configuration → Risk & Exit
 Model** and saved with the strategy, and it is documented on **Kudos Strategy → Strategy Rules** and
 **Strategy Explained**, and summarised on the Paper / Live strategy panel.
 
-| Selector | Meaning |
+| Toggle | Meaning |
 | --- | --- |
 | **ATR-based (default)** | Every level in ATR units — byte-for-byte the behaviour that shipped before |
 | **Price-based (%)** | Every level as a % of the entry price |
@@ -456,6 +457,26 @@ Notes that matter in practice:
   if no price is available no venue trail is sent — it is never silently replaced by an ATR one.
 * Strategies that never set the model (old saved runs, old strategies) resolve to all-ATR, so
   nothing existing changes until a client switches a level over.
+
+### Market Chart: zoom & full screen
+
+The **Market Chart** toolbar now carries a zoom control — `−` · current factor · `+` · **Reset** —
+and a **Full screen** button. Zoom moves both axes together: the buttons scale the visible bar range
+*and* the price range, on top of the wheel / pinch zoom and drag-to-pan the chart always had.
+
+| Control | Action |
+| --- | --- |
+| `+` (or `=`) | Zoom in — fewer candles, tighter price range |
+| `−` | Zoom out |
+| **Reset** (or `0`) | Back to the automatic price fit with every candle in view (`fitContent`) |
+| Double-click the chart | Same as Reset |
+| **Full screen** | The chart fills the window — `Esc` or **Exit full** leaves it |
+
+Vertical zoom rides on the automatic price fit (an `autoscaleInfoProvider`), so the axis keeps
+following new candles while the client is zoomed in; the label next to the buttons reads `auto fit`,
+`1.54× in`, `2.00× out` and so on. Scrolling, the wheel and the keyboard shortcuts are ignored while
+typing in a field, and inside an iframe that blocks the browser Fullscreen API the button falls back
+to an in-page full-window overlay, so it still works everywhere.
 
 ### FastTest V1.0 — the debug strategy with validation + profit booking
 
@@ -591,14 +612,15 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 522 checks (521 pass; the known PaperTrade live-tick smoke check fails on the
+cd frontend && npm test            # 563 checks (562 pass; the known PaperTrade live-tick smoke check fails on the
                                    # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
                                    # FastTest V1.0 dropdowns / audit columns / validation chips,
                                    # paper+live condition analysis (trade_conditions_ui.jsx),
-                                   # Risk & Exit model editor + docs (risk_exit_model_ui.jsx)
+                                   # Risk & Exit model editor + docs (risk_exit_model_ui.jsx),
+                                   # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx)
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

@@ -338,6 +338,13 @@ choosing the model level by level (e.g. an ATR stop with a price-based target).
   per-side stops, trail / breakeven on both sides, live venue trail, legacy config fallback, V1 and
   validation), `frontend/tests/risk_exit_model_ui.jsx` (40 checks: helpers, editor rendering in all
   three models, page wiring, docs tabs).
+- **v3.6 addon — Market Chart zoom & full screen**: the Market Chart toolbar gained `− / + / Reset`
+  zoom (both axes — the visible bar range *and* the price range), the current factor label, `+`/`-`/`0`
+  keyboard shortcuts, double-click-to-reset, and a **Full screen** button that falls back to an
+  in-page full-window overlay when the browser blocks the Fullscreen API. Vertical zoom is applied
+  through an `autoscaleInfoProvider`, so the axis keeps following new candles while zoomed.
+  `frontend/src/utils/chartZoom.js` holds the pure maths and `frontend/tests/chart_zoom_ui.jsx`
+  (41 checks) covers the helpers, the rendered toolbar and the runtime wiring.
 
 ## Reproduce
 ```bash
