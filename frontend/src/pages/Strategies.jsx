@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus, FilePlus, Search, Settings, Info, Radio, LineChart, ScanSearch } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../api';
+import { DEFAULT_RISK_EXIT } from '../utils/riskExit';
 
 // --- Constants ---
 const FIELDS = [
@@ -358,6 +359,7 @@ const Strategies = () => {
       trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22,
       macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 1.2,
       trail_activation_atr: 1.5, trail_distance_atr: 0.5,
+      risk_exit: { ...DEFAULT_RISK_EXIT },
     }
   });
 
@@ -515,7 +517,7 @@ const Strategies = () => {
         <h1 className="text-2xl sm:text-3xl font-bold text-blue-400">Strategies Manager</h1>
         <button onClick={() => { 
           setEditingStrat(null); 
-          setForm({name: '', params: { trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22, macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 1.2, trail_activation_atr: 1.5, trail_distance_atr: 0.5 }}); 
+          setForm({name: '', params: { trend_ema_period: 50, rsi_oversold: 30, rsi_overbought: 70, adx_min: 22, macd_hist_min: 25, atr_regime_ratio: 0.5, stop_loss_atr: 2.0, take_profit_atr: 1.2, trail_activation_atr: 1.5, trail_distance_atr: 0.5, risk_exit: { ...DEFAULT_RISK_EXIT } }}); 
           setRootGroup({ id: 'root', type: 'group', operator: 'AND', children: [createNewRule()], enabled: true });
           setStratType('params');
           setShowModal(true); 

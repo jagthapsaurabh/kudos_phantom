@@ -8,6 +8,8 @@ import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } 
 import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart } from 'lucide-react';
 import MarketOverlayChart from '../components/MarketOverlayChart';
 import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import RiskExitModelEditor from '../components/RiskExitModelEditor';
+import { DEFAULT_RISK_EXIT, RISK_EXIT_META, riskExitText } from '../utils/riskExit';
 import {
   SETUP_MODES, TRADE_DIRECTIONS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS, DEFAULT_MACD_LINE_RULES,
   parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, macdLineRuleText,
@@ -31,6 +33,8 @@ const PARAM_META = {
   trail_activation_atr: { label: 'Trail activation', hint: 'Start trailing the stop after this much profit (ATR).' },
   trail_distance_atr: { label: 'Trail distance', hint: 'How tightly the trail follows price, in ATRs.' },
   breakeven_atr: { label: 'Breakeven after', hint: 'Move stop to entry once profit reaches this many ATRs.' },
+  // v3.6 — price-model percentages (fractions in the payload, % in the form).
+  ...RISK_EXIT_META,
   leverage: { label: 'Leverage', hint: 'Position notional = margin × leverage.' },
   margin_pct: { label: 'Margin % of equity', hint: 'Share of equity used as margin per trade (0.15 = 15%).' },
   dd_soft_pct: { label: 'Soft drawdown %', hint: 'Past this equity drawdown, position size is reduced.' },
@@ -447,6 +451,8 @@ const Backtest = () => {
     atr_regime_ratio: 0.5, enable_momentum_entry: true, cooldown_bars: 0,
     stop_loss_atr: 1.2, take_profit_atr: 14.0, trail_activation_atr: 0.8,
     trail_distance_atr: 0.3, breakeven_atr: 0.75,
+    // v3.6 — ATR units (default: unchanged), price %, or a per-level mix.
+    risk_exit: { ...DEFAULT_RISK_EXIT },
     // Tradable defaults: at 100k BTC, 50k INR * 0.25 * 7 /85 = 1029 USD = 0.01 BTC > 0.001 min lot.
     // Previous 20k*0.15*2 gave 0.0007 BTC -> LOT_TOO_SMALL -> 0 trades.
     leverage: 7, margin_pct: 0.25,
@@ -940,6 +946,8 @@ const Backtest = () => {
       setup_mode: saved.setup_mode || base.setup_mode,
       trade_direction: saved.trade_direction || base.trade_direction,
       macd_line_rules: { ...base.macd_line_rules, ...((saved.macd_line_rules && typeof saved.macd_line_rules === 'object') ? saved.macd_line_rules : {}) },
+      // v3.6: runs saved before the Risk & Exit model stay all-ATR.
+      risk_exit: { ...base.risk_exit, ...((saved.risk_exit && typeof saved.risk_exit === 'object') ? saved.risk_exit : {}) },
       entry_conditions: {
         ...base.entry_conditions,
         ...savedConditions,
@@ -1332,7 +1340,11 @@ const Backtest = () => {
               <div key={groupName} className="space-y-3">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
                 <div className="space-y-3">
-                  {fields.map(field => {
+                  {groupName === 'Risk & Exit Model' ? (
+                    /* The five ATR / % values are edited by their own block:
+                       a model selector plus an ATR | Price % switch per level. */
+                    <RiskExitModelEditor params={params} setParams={setParams} />
+                  ) : fields.map(field => {
                     if (field === 'enable_momentum_entry') {
                       return <React.Fragment key={field}>
                         {renderCheckInput(field, !!params[field], e => setSharedField(field, e.target.checked))}
@@ -1554,6 +1566,12 @@ const Backtest = () => {
               )}
               {preview.trade_direction && preview.trade_direction !== 'both' && (
                 <span className="rounded border border-blue-800/40 bg-blue-900/40 px-2 py-0.5 text-[10px] text-blue-300">{preview.direction_label || preview.trade_direction}</span>
+              )}
+              {preview.risk_exit?.model && preview.risk_exit.model !== 'atr' && (
+                <span className="rounded border border-amber-800/40 bg-amber-900/40 px-2 py-0.5 text-[10px] text-amber-300"
+                      title={riskExitText(params)}>
+                  {preview.risk_exit.model_label || 'Price-based risk'}
+                </span>
               )}
               {preview.macd_line_rules?.enabled && (
                 <span className="rounded border border-emerald-800/40 bg-emerald-900/40 px-2 py-0.5 text-[10px] text-emerald-300"

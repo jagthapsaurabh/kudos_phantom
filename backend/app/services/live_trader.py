@@ -840,8 +840,29 @@ class LiveTradeService:
         self._last_closed_candle = key
         return True
 
-    def _trail_amount(self, atr):
-        """ATR trail distance sent on the Delta bracket stop-loss leg."""
+    def _trail_amount(self, atr, price=None):
+        """Trail distance sent on the venue bracket stop-loss leg.
+
+        The Risk & Exit model decides how it is measured: ATR units
+        (``trail_distance_atr × ATR``, the original behaviour) or a % of the
+        price the entry was priced on when the client switched the trail over.
+        A price-based trail is never silently replaced by an ATR one: without
+        a price there is simply no venue trail (the local trail still runs).
+        """
+        mode = "atr"
+        mode_fn = getattr(self.config, "risk_exit_mode_for", None)
+        if callable(mode_fn):
+            try:
+                mode = str(mode_fn("trail"))
+            except Exception:
+                mode = "atr"
+        if mode == "price":
+            dist_fn = getattr(self.config, "trail_distance_for", None)
+            try:
+                amount = float(dist_fn(float(price or 0.0), atr)) if callable(dist_fn) else 0.0
+            except Exception:
+                amount = 0.0
+            return amount if amount > 0 else None
         try:
             dist = float(getattr(self.config, "trail_distance_atr", 0) or 0)
         except (TypeError, ValueError):
@@ -1024,10 +1045,12 @@ class LiveTradeService:
         if planned is None:
             return
         lots = float(planned.lots)
-        # A plain distance (trail_distance_atr × ATR) — the broker client signs
-        # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
-        # and a positive one on a sell entry.
-        trail_distance = self._trail_amount(current_atr) if self.bracket_orders else None
+        # A plain distance — trail_distance_atr × ATR by default, or a % of the
+        # entry's pricing basis when the client chose the price model for the
+        # trail. The broker client signs it for the venue, which wants a
+        # NEGATIVE bracket trail on a buy entry and a positive one on a sell
+        # entry.
+        trail_distance = self._trail_amount(current_atr, decision_price) if self.bracket_orders else None
         # The venue target is the strategy's own TP by default; FastTest V1
         # brackets at its +0.90% booking level instead. SL and trail distance
         # are unchanged either way.

@@ -196,6 +196,10 @@ class BranchConditions(BaseModel):
     macd_signal: Optional[int] = None       # per-direction MACD signal period
     macd_hist_min: Optional[float] = None   # signed: long hist >= val, short hist <= val
     stop_loss_atr: Optional[float] = None   # SL distance expressed in ATR units
+    # v3.6 — per-side stop when the stop level uses the price model (fraction of
+    # the entry price, e.g. 0.016 = 1.6%). Mirrors ``stop_loss_atr`` exactly:
+    # consulted only when the direction-condition master switch is ON.
+    stop_loss_pct: Optional[float] = None
     atr_regime_ratio: Optional[float] = None  # ATR compared with ratio * SMA(ATR, 50)
     # Comparison used for the rule above. None = default '>=' (legacy floor).
     atr_regime_op: Optional[str] = None
@@ -251,6 +255,127 @@ class EntryConditions(BaseModel):
     use_direction_macd_line: bool = False
     long: BranchConditions = Field(default_factory=BranchConditions)
     short: BranchConditions = Field(default_factory=BranchConditions)
+
+
+# ---------------------------------------------------------------------------
+# v3.6 — Risk & Exit model.
+#
+# Every protective level (stop loss, take profit, trailing stop, breakeven) is
+# measured either in ATR units — the original Phantom behaviour, and still the
+# default — or as a percentage of price. The choice is PER LEVEL, so a client
+# can run an ATR stop with a price-based target, or any other mix.
+#
+#   'atr'   → all levels in ATR units (default: nothing changes)
+#   'price' → all levels in % of price
+#   'both'  → per-level mix (each level keeps its own selector value)
+#
+# The per-level selector values (`*_mode`) are what the engine reads; `model`
+# is the convenience selector the form offers, and when it names a single
+# model it forces every level to that model during validation so a config can
+# never be stored inconsistent.
+# ---------------------------------------------------------------------------
+RISK_EXIT_ATR = 'atr'
+RISK_EXIT_PRICE = 'price'
+RISK_EXIT_MODELS = (RISK_EXIT_ATR, RISK_EXIT_PRICE, 'both')
+RISK_EXIT_LEVELS = ('stop', 'target', 'trail', 'breakeven')
+RISK_EXIT_MODE_LABELS = {RISK_EXIT_ATR: 'ATR-based', RISK_EXIT_PRICE: 'Price-based (%)'}
+RISK_EXIT_MODEL_LABELS = {
+    RISK_EXIT_ATR: 'ATR-based (default)',
+    RISK_EXIT_PRICE: 'Price-based (%)',
+    'both': 'Both — per level',
+}
+
+
+def normalize_risk_exit_model(value) -> str:
+    """'atr' / 'price' / 'both' (aliases normalised); anything else raises."""
+    v = str(value or '').strip().lower()
+    aliases = {
+        'atr': RISK_EXIT_ATR, 'atr-based': RISK_EXIT_ATR, 'atr_based': RISK_EXIT_ATR,
+        'price': RISK_EXIT_PRICE, 'price-based': RISK_EXIT_PRICE, 'price_based': RISK_EXIT_PRICE,
+        'pct': RISK_EXIT_PRICE, 'percent': RISK_EXIT_PRICE, 'percentage': RISK_EXIT_PRICE, '%': RISK_EXIT_PRICE,
+        'both': 'both', 'mixed': 'both', 'mix': 'both', 'custom': 'both', 'per-level': 'both',
+    }
+    if v not in aliases:
+        raise ValueError(f"Unknown Risk & Exit model {value!r}; use one of {RISK_EXIT_MODELS}")
+    return aliases[v]
+
+
+def normalize_risk_exit_mode(value) -> str:
+    """'atr' or 'price' for one level; anything else raises."""
+    v = str(value or '').strip().lower()
+    aliases = {
+        'atr': RISK_EXIT_ATR, 'atr-based': RISK_EXIT_ATR, 'atr_based': RISK_EXIT_ATR, 'atrs': RISK_EXIT_ATR,
+        'price': RISK_EXIT_PRICE, 'price-based': RISK_EXIT_PRICE, 'price_based': RISK_EXIT_PRICE,
+        'pct': RISK_EXIT_PRICE, 'percent': RISK_EXIT_PRICE, 'percentage': RISK_EXIT_PRICE, '%': RISK_EXIT_PRICE,
+        'usd': RISK_EXIT_PRICE,
+    }
+    if v not in aliases:
+        raise ValueError(f"Unknown Risk & Exit mode {value!r}; use 'atr' or 'price'")
+    return aliases[v]
+
+
+class RiskExitModel(BaseModel):
+    """ATR-based (default) or price-based (%) risk & exit levels.
+
+    ``*_pct`` values are fractions of the entry (pricing-basis) price, exactly
+    like ``sl_floor_pct`` / ``margin_pct`` elsewhere in the config, so
+    ``stop_loss_pct = 0.016`` means a stop 1.6% away from entry. They are only
+    read for a level whose mode is 'price'; the ATR values
+    (``stop_loss_atr`` and friends) are only read for a level whose mode is
+    'atr'. Both sets are always kept, so switching a level back and forth in
+    the form never loses the other value.
+
+    The default is every level on ATR — byte-for-byte the original behaviour.
+    """
+    model: str = RISK_EXIT_ATR
+    stop_mode: str = RISK_EXIT_ATR
+    target_mode: str = RISK_EXIT_ATR
+    trail_mode: str = RISK_EXIT_ATR
+    breakeven_mode: str = RISK_EXIT_ATR
+    # Defaults chosen for the price model: the stop matches the 1.6% price
+    # floor the ATR model already enforces, the trail arms at +1.5% and
+    # follows 0.5% behind the peak, breakeven at +1%.
+    stop_loss_pct: float = Field(default=0.016, gt=0.0, le=0.5)
+    take_profit_pct: float = Field(default=0.03, gt=0.0, le=1.0)
+    trail_activation_pct: float = Field(default=0.015, ge=0.0, le=0.5)
+    trail_distance_pct: float = Field(default=0.005, gt=0.0, le=0.5)
+    breakeven_pct: float = Field(default=0.01, ge=0.0, le=0.5)
+
+    @field_validator('model', mode='before')
+    @classmethod
+    def _validate_model(cls, value):
+        return normalize_risk_exit_model(value)
+
+    @field_validator('stop_mode', 'target_mode', 'trail_mode', 'breakeven_mode', mode='before')
+    @classmethod
+    def _validate_mode(cls, value):
+        return normalize_risk_exit_mode(value)
+
+    @model_validator(mode='after')
+    def _single_model_selects_every_level(self):
+        """'atr' / 'price' mean "that model on every level".
+
+        'both' leaves the per-level selectors untouched — that is the mix.
+        """
+        if self.model in (RISK_EXIT_ATR, RISK_EXIT_PRICE):
+            self.stop_mode = self.target_mode = self.trail_mode = self.breakeven_mode = self.model
+        return self
+
+    def mode_for(self, level: str) -> str:
+        return str(getattr(self, f'{level}_mode', RISK_EXIT_ATR) or RISK_EXIT_ATR)
+
+    def pct_for(self, level: str) -> float:
+        return float(getattr(self, self.pct_field(level), 0.0) or 0.0)
+
+    @staticmethod
+    def pct_field(level: str) -> str:
+        return {
+            'stop': 'stop_loss_pct',
+            'target': 'take_profit_pct',
+            'trail': 'trail_activation_pct',
+            'trail_distance': 'trail_distance_pct',
+            'breakeven': 'breakeven_pct',
+        }.get(level, f'{level}_pct')
 
 
 class PhantomV2Config(BaseModel):
@@ -314,6 +439,12 @@ class PhantomV2Config(BaseModel):
     trade_direction: str = Field(default=DEFAULT_TRADE_DIRECTION)
     # v3.5 — optional MACD line / signal line entry rules (OFF by default).
     macd_line_rules: MacdLineConditions = Field(default_factory=MacdLineConditions)
+    # ------------------------------------------------------------------
+    # v3.6 — Risk & Exit model. Every protective level (stop / target /
+    # trail / breakeven) is measured in ATR units (default — unchanged)
+    # or as a % of price, chosen per level. See ``RiskExitModel``.
+    # ------------------------------------------------------------------
+    risk_exit: RiskExitModel = Field(default_factory=RiskExitModel)
     # ------------------------------------------------------------------
     # Direction-specific condition overrides (default OFF = shared engine).
     # See EntryConditions / BranchConditions above.
@@ -421,6 +552,138 @@ class PhantomV2Config(BaseModel):
 
     def stop_loss_atr_for(self, direction: int) -> float:
         return self._pick(direction, 'stop_loss_atr', 'stop_loss_atr')
+
+    # ------------------------------------------------------------------
+    # v3.6 — Risk & Exit model resolution.
+    #
+    # These are the single place the engine (OrderManager), the paper / live
+    # workers and the docs summary ask "how far is the stop / target / trail
+    # on this trade?". Each level answers from its own mode: ATR units
+    # (original behaviour) or a % of price. Defaults are all-ATR, so an
+    # untouched config produces the same numbers as before.
+    # ------------------------------------------------------------------
+    def risk_exit_config(self) -> RiskExitModel:
+        """The Risk & Exit model, or all-ATR defaults if a caller's config
+        object predates it (keeps third-party / test configs working)."""
+        cfg = getattr(self, 'risk_exit', None)
+        return cfg if isinstance(cfg, RiskExitModel) else RiskExitModel()
+
+    def risk_exit_mode_for(self, level: str) -> str:
+        return self.risk_exit_config().mode_for(level)
+
+    def _risk_pct_for(self, level: str, direction: Optional[int] = None) -> float:
+        """The % value for a level, honouring a per-side stop override.
+
+        Mirrors ``stop_loss_atr_for``: the LONG / SHORT branch value is used
+        when the direction-condition master switch is ON and the side sets one
+        (an empty branch is returned otherwise, so old configs are unaffected).
+        """
+        if direction is not None:
+            branch = self._branch(direction)
+            override = getattr(branch, RiskExitModel.pct_field(level), None)
+            if override is not None:
+                return float(override)
+        return self.risk_exit_config().pct_for(level)
+
+    def stop_loss_distance_for(self, direction: int, price_usd: float,
+                               atr_usd: float) -> float:
+        """Distance from entry to the hard stop (always positive)."""
+        if self.risk_exit_mode_for('stop') == RISK_EXIT_PRICE:
+            return float(price_usd) * self._risk_pct_for('stop', direction)
+        # ATR model: max(stop_loss_atr × ATR, sl_floor_pct × price), unchanged.
+        dist = self.stop_loss_atr_for(direction) * float(atr_usd)
+        floor = float(getattr(self, 'sl_floor_pct', 0.0) or 0.0) * float(price_usd)
+        return max(dist, floor)
+
+    def take_profit_distance_for(self, direction: int, price_usd: float,
+                                 atr_usd: float) -> float:
+        """Distance from entry to the profit target (always positive)."""
+        if self.risk_exit_mode_for('target') == RISK_EXIT_PRICE:
+            return float(price_usd) * self._risk_pct_for('target')
+        return self.take_profit_atr * float(atr_usd)
+
+    def trail_activation_distance_for(self, direction: int, price_usd: float,
+                                      atr_usd: float) -> float:
+        """Favourable distance after which the trail starts following price."""
+        if self.risk_exit_mode_for('trail') == RISK_EXIT_PRICE:
+            return float(price_usd) * self._risk_pct_for('trail')
+        return self.trail_activation_atr * float(atr_usd)
+
+    def trail_distance_for(self, reference_price_usd: float,
+                           current_atr_usd: float) -> float:
+        """How far the trail sits behind the running peak / low.
+
+        Price model: the chosen % of the reference price (the peak being
+        trailed), so the stop follows it by that percentage. ATR model:
+        ``trail_distance_atr × current ATR`` — unchanged.
+        """
+        if self.risk_exit_mode_for('trail') == RISK_EXIT_PRICE:
+            pct = self._risk_pct_for('trail_distance', None)
+            return float(reference_price_usd) * pct
+        return self.trail_distance_atr * float(current_atr_usd)
+
+    def breakeven_trigger_for(self, direction: int, entry_price: float,
+                              atr_at_entry: float) -> Optional[float]:
+        """Price at which the stop ratchets to entry, or ``None`` when off."""
+        if self.risk_exit_mode_for('breakeven') == RISK_EXIT_PRICE:
+            pct = self._risk_pct_for('breakeven')
+            if pct <= 0:
+                return None
+            sign = 1.0 if direction == 1 else -1.0
+            return float(entry_price) * (1.0 + sign * pct)
+        be = float(getattr(self, 'breakeven_atr', 0.0) or 0.0)
+        if be <= 0:
+            return None
+        sign = 1.0 if direction == 1 else -1.0
+        return float(entry_price) + sign * be * float(atr_at_entry)
+
+    def risk_exit_level_text(self, level: str) -> str:
+        """One level as the client reads it, e.g. ``1.2×ATR`` or ``1.6% price``."""
+        rx = self.risk_exit_config()
+        if rx.mode_for(level) == RISK_EXIT_PRICE:
+            return f"{rx.pct_for(level) * 100:g}% price"
+        atr_field = {'stop': 'stop_loss_atr', 'target': 'take_profit_atr',
+                     'trail': 'trail_activation_atr', 'breakeven': 'breakeven_atr'}[level]
+        return f"{float(getattr(self, atr_field, 0.0) or 0.0):g}×ATR"
+
+    def risk_exit_text(self) -> str:
+        """The whole model on one line, for the docs pages and summaries."""
+        rx = self.risk_exit_config()
+        parts = [f"Stop {self.risk_exit_level_text('stop')}",
+                 f"TP {self.risk_exit_level_text('target')}"]
+        if rx.mode_for('trail') == RISK_EXIT_PRICE:
+            parts.append(f"Trail {rx.pct_for('trail') * 100:g}% → "
+                         f"{rx.pct_for('trail_distance') * 100:g}%")
+        else:
+            parts.append(f"Trail {float(self.trail_activation_atr):g}×ATR → "
+                         f"{float(self.trail_distance_atr):g}×ATR")
+        be = self.risk_exit_level_text('breakeven')
+        parts.append(f"BE {be}" if be != '0×ATR' else "BE off")
+        return " · ".join(parts)
+
+    def risk_exit_summary(self) -> dict:
+        """Structured view of the active Risk & Exit model (API / docs)."""
+        rx = self.risk_exit_config()
+        levels = {}
+        for level in RISK_EXIT_LEVELS:
+            levels[level] = {
+                'mode': rx.mode_for(level),
+                'mode_label': RISK_EXIT_MODE_LABELS.get(rx.mode_for(level), rx.mode_for(level)),
+                'atr': float(getattr(self, {
+                    'stop': 'stop_loss_atr', 'target': 'take_profit_atr',
+                    'trail': 'trail_activation_atr', 'breakeven': 'breakeven_atr',
+                }[level], 0.0) or 0.0),
+                'pct': rx.pct_for(level),
+                'text': self.risk_exit_level_text(level),
+            }
+        levels['trail']['distance_atr'] = float(self.trail_distance_atr)
+        levels['trail']['distance_pct'] = rx.pct_for('trail_distance')
+        return {
+            'model': rx.model,
+            'model_label': RISK_EXIT_MODEL_LABELS.get(rx.model, rx.model),
+            'levels': levels,
+            'text': self.risk_exit_text(),
+        }
 
     def atr_regime_ratio_for(self, direction: int) -> float:
         if self.uses_direction_atr_floor():

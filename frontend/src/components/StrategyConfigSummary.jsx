@@ -4,6 +4,7 @@ import { API_URL } from '../api';
 import {
   isPhantomBuiltin, macdLineRuleText, setupModeLabel, tradeDirectionLabel,
 } from '../utils/phantomPresets';
+import { riskExitModelFor, riskExitModelLabel, riskExitText } from '../utils/riskExit';
 
 // "What will this strategy actually trade on?" — the MACD periods, the MACD
 // line / signal rules and the setup / direction of the selected strategy,
@@ -86,6 +87,14 @@ const StrategyConfigSummary = ({ strategyId, strategies = [], className = '' }) 
         <div>
           <div className="text-[9px] font-bold uppercase text-gray-500">MACD hist threshold</div>
           <div className="font-mono text-white">Long ≥ {histLong} · Short ≤ {histShort}</div>
+        </div>
+        <div className="sm:col-span-2 xl:col-span-4">
+          <div className="text-[9px] font-bold uppercase text-gray-500">Risk &amp; exit model</div>
+          <div className="text-white">
+            <span className="font-bold">{riskExitModelLabel(riskExitModelFor(params))}</span>
+            <span className="mx-2 text-gray-600">|</span>
+            <span className="font-mono">{riskExitText(params)}</span>
+          </div>
         </div>
         <div className="sm:col-span-2 xl:col-span-4">
           <div className="text-[9px] font-bold uppercase text-gray-500">MACD line / signal line rules</div>

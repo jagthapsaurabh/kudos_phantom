@@ -416,6 +416,47 @@ A preset is the tuned champion config with only the setup / direction narrowed (
 lists them). Presets are separate strategy ids, so a preset and the default can run side by side on
 one account, and History / Sessions show the preset's name.
 
+### v3.6 addon: Risk & Exit model — ATR units, price %, or both per level
+
+Every protective level has always been measured in **ATR units**. The client can now run each level
+on **price**, or on **both** — chosen level by level, so one strategy can keep an ATR stop while
+booking at a price-based target. It is set in **Backtest → Strategy Configuration → Risk & Exit
+Model** and saved with the strategy, and it is documented on **Kudos Strategy → Strategy Rules** and
+**Strategy Explained**, and summarised on the Paper / Live strategy panel.
+
+| Selector | Meaning |
+| --- | --- |
+| **ATR-based (default)** | Every level in ATR units — byte-for-byte the behaviour that shipped before |
+| **Price-based (%)** | Every level as a % of the entry price |
+| **Both — per level** | Each level has its own **ATR / Price %** switch (the mix) |
+
+Each level keeps its ATR value and its % value, so switching back and forth never loses a number.
+The default is all-ATR, and the price values ship ready to use: **stop 1.6 % · take profit 3 % ·
+trail activation 1.5 % with a 0.5 % trail · breakeven 1 %** — all editable per strategy.
+
+```text
+ATR model (default)                       Price model
+SL  = Entry ∓ max(stop_loss_atr × ATR,    SL  = Entry ∓ stop_loss_pct × Entry
+                     sl_floor_pct × Price)
+TP  = Entry ± take_profit_atr × ATR       TP  = Entry ± take_profit_pct × Entry
+Trail arms at trail_activation_atr × ATR  Trail arms at trail_activation_pct × Entry
+Trail follows the peak by                 and follows the peak by trail_distance_pct
+      trail_distance_atr × ATR
+BE  at entry ± breakeven_atr × ATR        BE  at Entry × (1 ± breakeven_pct)
+```
+
+Notes that matter in practice:
+
+* The **per-side stop override** (`entry_conditions.long/short`, the direction-condition switch)
+  works for whichever model the stop uses — `stop_loss_atr` in ATR mode, `stop_loss_pct` in price
+  mode — exactly like the ATR settings it mirrors.
+* The ATR stop's `sl_floor_pct` floor (1.6 % of price) applies to the **ATR** model only: in price
+  mode the % you type *is* the stop, and it is not silently widened.
+* A **price-based trail** is sent to the venue as a price distance too (Delta's bracket trail), and
+  if no price is available no venue trail is sent — it is never silently replaced by an ATR one.
+* Strategies that never set the model (old saved runs, old strategies) resolve to all-ATR, so
+  nothing existing changes until a client switches a level over.
+
 ### FastTest V1.0 — the debug strategy with validation + profit booking
 
 `FastTest` is the debug strategy: it fires on almost every bar (RSI(14) below 50 → long, at/above 50
@@ -532,6 +573,8 @@ python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_macd_line_and_modes.py # 76 checks: MACD line/signal rules, setup + direction splits, presets
 python test_fast_test_v1.py       # 114 checks: FastTest V1.0 — entry parity, 2H validation, +0.90% booking,
                                   # audit fields, paper/live wiring, DB migration, results API
+python test_risk_exit_model.py   # 48 checks: ATR / price / per-level mix on every protective level,
+                                  # per-side stops, trail + breakeven, live venue trail, V1 untouched
 python test_trade_conditions_shared.py  # 28 checks: the shared entry/exit-condition detail the
                                   # backtest / paper / live logs all use, end-to-end paper entry
 python test_paper_history.py      # 63 checks: paper history persistence
@@ -548,12 +591,14 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 482 checks: trade-log table + CSV export, paper/live condition
+cd frontend && npm test            # 517 checks (516 pass; the known PaperTrade live-tick smoke check fails on the
+                                   # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
                                    # FastTest V1.0 dropdowns / audit columns / validation chips,
-                                   # paper+live condition analysis (trade_conditions_ui.jsx)
+                                   # paper+live condition analysis (trade_conditions_ui.jsx),
+                                   # Risk & Exit model editor + docs (risk_exit_model_ui.jsx)
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

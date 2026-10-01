@@ -22,6 +22,7 @@ from .core.strategy import (
     PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
     phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
     TRADE_DIRECTION_LABELS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS,
+    RISK_EXIT_MODELS, RISK_EXIT_MODEL_LABELS, RISK_EXIT_LEVELS,
 )
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
@@ -345,6 +346,8 @@ _PHANTOM_PARAM_KEYS = (
     'adx_min', 'trend_ema_period', 'trading_windows', 'use_mark_price',
     # v3.5 separation / MACD line settings
     'setup_mode', 'trade_direction', 'macd_line_rules',
+    # v3.6 risk & exit model (ATR units / price %)
+    'risk_exit',
 )
 
 
@@ -2059,6 +2062,8 @@ def _phantom_config_summary(cfg: PhantomV2Config) -> dict:
         "momentum_enabled": cfg.momentum_enabled(),
         "trade_direction": cfg.trade_direction,
         "direction_label": cfg.direction_label(),
+        # v3.6 — which model each protective level is priced on.
+        "risk_exit": cfg.risk_exit_summary(),
     }
 
 
@@ -2088,6 +2093,9 @@ def phantom_config(strategy_id: Optional[str] = None, user=Depends(get_current_u
                 "trade_directions": [{"value": d, "label": TRADE_DIRECTION_LABELS[d]} for d in TRADE_DIRECTIONS],
                 "macd_line_rules": list(MACD_LINE_RULES),
                 "macd_line_rule_keys": list(MACD_LINE_RULE_KEYS),
+                "risk_exit_models": [{"value": m, "label": RISK_EXIT_MODEL_LABELS[m]}
+                                     for m in RISK_EXIT_MODELS],
+                "risk_exit_levels": list(RISK_EXIT_LEVELS),
             }}
 
 
@@ -2628,6 +2636,8 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
             'short': config.macd_line_rule_text_for(-1),
         },
         'macd_periods': {'fast': config.macd_fast, 'slow': config.macd_slow, 'signal': config.macd_signal},
+        # v3.6 — the Risk & Exit model this preview priced its levels on.
+        'risk_exit': config.risk_exit_summary(),
     }
 
 

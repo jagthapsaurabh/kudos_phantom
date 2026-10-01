@@ -98,6 +98,55 @@ class OrderManager:
         """
         return planned_tp
 
+    # ------------------------------------------------------------------
+    # Risk & Exit model resolution (v3.6).
+    #
+    # Every level is resolved through the config so the engine, the paper and
+    # live workers and any strategy subclass share ONE answer to "how far is
+    # the stop / target / trail?". The config's resolvers know whether the
+    # level is measured in ATR units (default) or as a % of price; the
+    # fallbacks below keep a plain config object (a test stub, an old saved
+    # dict) working with exactly the original ATR formulas.
+    # ------------------------------------------------------------------
+    def _stop_distance(self, direction, price_usd, atr_usd):
+        fn = getattr(self.config, 'stop_loss_distance_for', None)
+        if callable(fn):
+            return float(fn(direction, price_usd, atr_usd))
+        sl_atr = getattr(self.config, 'stop_loss_atr_for', None)
+        val = sl_atr(direction) if callable(sl_atr) else getattr(self.config, 'stop_loss_atr', 2.0)
+        dist = float(val) * float(atr_usd)
+        floor = float(getattr(self.config, 'sl_floor_pct', 0.0) or 0.0) * float(price_usd)
+        return max(dist, floor)   # SL floor: max(stop_loss_atr × ATR, sl_floor_pct × price)
+
+    def _target_distance(self, direction, price_usd, atr_usd):
+        fn = getattr(self.config, 'take_profit_distance_for', None)
+        if callable(fn):
+            return float(fn(direction, price_usd, atr_usd))
+        return float(getattr(self.config, 'take_profit_atr', 0.0) or 0.0) * float(atr_usd)
+
+    def _activation_distance(self, direction, price_usd, atr_usd):
+        fn = getattr(self.config, 'trail_activation_distance_for', None)
+        if callable(fn):
+            return float(fn(direction, price_usd, atr_usd))
+        return float(getattr(self.config, 'trail_activation_atr', 0.0) or 0.0) * float(atr_usd)
+
+    def _trail_distance(self, reference_price_usd, current_atr_usd):
+        fn = getattr(self.config, 'trail_distance_for', None)
+        if callable(fn):
+            return float(fn(reference_price_usd, current_atr_usd))
+        return float(getattr(self.config, 'trail_distance_atr', 0.0) or 0.0) * float(current_atr_usd)
+
+    def _breakeven_trigger(self, direction, entry_price, atr_at_entry):
+        """Price at which the stop ratchets to entry; ``None`` = feature off."""
+        fn = getattr(self.config, 'breakeven_trigger_for', None)
+        if callable(fn):
+            return fn(direction, entry_price, atr_at_entry)
+        be = float(getattr(self.config, 'breakeven_atr', 0.0) or 0.0)
+        if be <= 0:
+            return None
+        sign = 1.0 if int(direction) == 1 else -1.0
+        return float(entry_price) + sign * be * float(atr_at_entry)
+
     def create_order(self, symbol, direction, price_usd, atr_usd, timestamp, margin_inr,
                      conversion_rate=85.0, trade_price_usd=None, mark_price_usd=None,
                      mark_price_basis=None):
@@ -124,20 +173,18 @@ class OrderManager:
         notional_usd = lots * price_usd
         margin_inr = (notional_usd / self.config.leverage) * conversion_rate
         
-        # SL / TP / Trail Distances. `stop_loss_atr_for` honours the
-        # direction-specific override when the master toggle is ON, otherwise
-        # it returns the shared `stop_loss_atr`.
-        sl_atr = getattr(self.config, 'stop_loss_atr_for', None)
-        sl_atr_val = sl_atr(direction) if callable(sl_atr) else self.config.stop_loss_atr
-        sl_dist = sl_atr_val * atr_usd
-        # SL Floor: max(2.0xATR, 1.6% * entry)
-        min_sl = self.config.sl_floor_pct * price_usd
-        if sl_dist < min_sl:
-            sl_dist = min_sl
-            
+        # SL / TP / Trail Distances. Every level is asked of the config's Risk
+        # & Exit model: ATR units (original behaviour, including the SL floor
+        # max(stop_loss_atr × ATR, sl_floor_pct × price) and the direction
+        # specific stop override) or a % of the entry price when the client
+        # switched that level over.
+        sl_dist = self._stop_distance(direction, price_usd, atr_usd)
+        tp_dist = self._target_distance(direction, price_usd, atr_usd)
+        act_dist = self._activation_distance(direction, price_usd, atr_usd)
+
         sl = price_usd - sl_dist if direction == 1 else price_usd + sl_dist
-        tp = price_usd + (self.config.take_profit_atr * atr_usd) if direction == 1 else price_usd - (self.config.take_profit_atr * atr_usd)
-        trail_act = price_usd + (self.config.trail_activation_atr * atr_usd) if direction == 1 else price_usd - (self.config.trail_activation_atr * atr_usd)
+        tp = price_usd + tp_dist if direction == 1 else price_usd - tp_dist
+        trail_act = price_usd + act_dist if direction == 1 else price_usd - act_dist
         
         # Trailing stop level starts at hard SL
         trail_stop = sl
@@ -248,14 +295,16 @@ class OrderManager:
             # 1. Update peak and activate trail
             trade.peak_price = max(trade.peak_price, seen_high)
             if trade.peak_price >= trade.trail_activation:
-                # Trail advances based on peak
-                new_tsl = trade.peak_price - (self.config.trail_distance_atr * current_atr_usd)
+                # Trail advances based on peak (ATR units, or the % of the peak
+                # the client chose in the Risk & Exit model).
+                new_tsl = trade.peak_price - self._trail_distance(trade.peak_price, current_atr_usd)
                 trade.trail_stop = max(trade.trail_stop, new_tsl)
 
-            # 1b. Breakeven stop (v3): once +breakeven_atr x ATR in favour,
-            # the hard stop can never lose money.
-            be = getattr(self.config, 'breakeven_atr', 0.0)
-            if be > 0 and trade.peak_price >= trade.entry_price + be * trade.atr_at_entry:
+            # 1b. Breakeven stop (v3): once the favourable move reaches the
+            # configured trigger (breakeven_atr × ATR, or breakeven_pct % of
+            # entry), the hard stop can never lose money.
+            be = self._breakeven_trigger(trade.direction, trade.entry_price, trade.atr_at_entry)
+            if be is not None and trade.peak_price >= be:
                 trade.sl = max(trade.sl, trade.entry_price)
                 if trade.peak_price >= trade.trail_activation:
                     trade.trail_stop = max(trade.trail_stop, trade.entry_price)
@@ -308,12 +357,12 @@ class OrderManager:
 
             trade.peak_price = min(trade.peak_price, seen_low)
             if trade.peak_price <= trade.trail_activation:
-                new_tsl = trade.peak_price + (self.config.trail_distance_atr * current_atr_usd)
+                new_tsl = trade.peak_price + self._trail_distance(trade.peak_price, current_atr_usd)
                 trade.trail_stop = min(trade.trail_stop, new_tsl)
 
             # Breakeven stop (v3) for shorts
-            be = getattr(self.config, 'breakeven_atr', 0.0)
-            if be > 0 and trade.peak_price <= trade.entry_price - be * trade.atr_at_entry:
+            be = self._breakeven_trigger(trade.direction, trade.entry_price, trade.atr_at_entry)
+            if be is not None and trade.peak_price <= be:
                 trade.sl = min(trade.sl, trade.entry_price)
                 if trade.peak_price <= trade.trail_activation:
                     trade.trail_stop = min(trade.trail_stop, trade.entry_price)

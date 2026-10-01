@@ -296,6 +296,49 @@ A **new, separate strategy** (`FastTestV1`, `backend/app/core/fast_test_v1.py`).
   (22 checks); the full backend + frontend suites stay green and the 2.08 MB
   trade-list parity dump is unchanged.
 
+## Addon: Risk & Exit model — ATR, price %, or both per level (v3.6)
+
+The strategy priced every protective level in ATR units. The client can now price each level either
+in **ATR units** (the default — unchanged), as a **% of the entry price**, or run a **mix** by
+choosing the model level by level (e.g. an ATR stop with a price-based target).
+
+- **One model, resolved once.** `RiskExitModel` (in `backend/app/core/strategy.py`, next to
+  `EntryConditions`) holds the selector and the percentages:
+  `model` = `atr` | `price` | `both`, plus `stop_mode` / `target_mode` / `trail_mode` /
+  `breakeven_mode` and `stop_loss_pct` / `take_profit_pct` / `trail_activation_pct` /
+  `trail_distance_pct` / `breakeven_pct` (fractions, like `sl_floor_pct`). `model = 'atr' | 'price'`
+  is a shorthand that forces every level (validators keep a config from being stored
+  half-switched); `model = 'both'` keeps the per-level selectors.
+- **Resolvers on the config** are the single answer to "how far is this level?":
+  `stop_loss_distance_for()`, `take_profit_distance_for()`, `trail_activation_distance_for()`,
+  `trail_distance_for()`, `breakeven_trigger_for()` (returns `None` = feature off), plus
+  `risk_exit_level_text()` / `risk_exit_text()` / `risk_exit_summary()` for the docs, the API and
+  the Paper / Live strategy summary.
+- **OrderManager** calls those resolvers in `create_order` (SL / TP / trail activation) and in both
+  `update_trade` branches (trail advance, breakeven ratchet). A plain config object without the
+  model (old test stubs, an older saved config) falls back to the original ATR formulas — that
+  fallback is covered by the tests.
+- **Defaults reproduce the old maths exactly**: ATR stop = `max(stop_loss_atr × ATR,
+  sl_floor_pct × price)` — the floor applies to the ATR model only; a price stop is exactly the %
+  the client typed. The direction-specific stop override works for either model
+  (`stop_loss_atr` / `stop_loss_pct` under `entry_conditions.long|short`, master switch ON).
+- **Live venues get a price trail too.** `LiveTradeService._trail_amount()` sends
+  `trail_distance_pct × price` when the trail is on the price model (no price → no venue trail — it
+  is never silently replaced by an ATR distance); the stop and target legs already come from
+  `OrderManager`, so the venue bracket follows the same model.
+- **UI.** `frontend/src/utils/riskExit.js` is the single front-end source of truth (labels,
+  defaults, pure helpers, text). `RiskExitModelEditor.jsx` renders the model selector plus one
+  ATR | Price % switch per level and is embedded in **Backtest → Strategy Configuration → Risk &
+  Exit Model**; the numbers read as percents (1.6) while the payload stores fractions (0.016).
+  **Kudos Strategy → Strategy Rules** and **Strategy Explained** document the model in force, and
+  `StrategyConfigSummary` (Paper / Live) shows it next to the MACD settings.
+- **Nothing else moves.** Signals, entries, sizing, fees and the FastTest V1 layer are untouched;
+  the all-ATR default keeps the trade-list parity dump byte-identical.
+- **Tests**: `backend/test_risk_exit_model.py` (48 checks: defaults, price model, per-level mix,
+  per-side stops, trail / breakeven on both sides, live venue trail, legacy config fallback, V1 and
+  validation), `frontend/tests/risk_exit_model_ui.jsx` (35 checks: helpers, editor rendering in all
+  three models, page wiring, docs tabs).
+
 ## Reproduce
 ```bash
 python -m backend.app.scripts.run_baseline        # v2.5 parity numbers

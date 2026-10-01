@@ -4,6 +4,7 @@ import { BookOpen, Calculator, Plug } from 'lucide-react';
 import StrategyExplainedTab from './StrategyExplainedTab';
 import StrategyFlowTab from './StrategyFlowTab';
 import { PHANTOM_PRESETS, macdLineRuleText, setupModeLabel, tradeDirectionLabel } from '../utils/phantomPresets';
+import { riskExitModeFor, riskExitModelLabel, riskExitText } from '../utils/riskExit';
 
 const authHeaders = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')}`, 'Content-Type': 'application/json' });
 
@@ -25,6 +26,12 @@ const Rule = ({ name, children }) => (
 const StrategyRulesTab = ({ profile, champion }) => {
   const cfg = champion?.config || {};
   const fmt = (v) => (typeof v === 'boolean' ? (v ? 'ON' : 'OFF') : v);
+  // v3.6 — stored fractions (0.016) shown as percent (1.6).
+  const rx = (key, fallback) => {
+    const v = (cfg.risk_exit || {})[key];
+    const pct = v === undefined || v === null ? fallback : Number(v) * 100;
+    return Math.round(pct * 1000) / 1000;
+  };
   const interesting = [
     'adx_min', 'macd_fast', 'macd_slow', 'macd_signal', 'macd_hist_min',
     'rsi_oversold', 'rsi_overbought', 'atr_regime_ratio',
@@ -138,10 +145,31 @@ const StrategyRulesTab = ({ profile, champion }) => {
       </DocSection>
 
       <DocSection title="🛡️ Risk, Exits & Drawdown Guard" color="text-red-400">
-        <Rule name="Stop loss">{cfg.stop_loss_atr ?? 1.2}×ATR from entry, with a hard floor of {(cfg.sl_floor_pct ?? 0.016) * 100}% of price.</Rule>
-        <Rule name="Take profit">{cfg.take_profit_atr ?? 14}×ATR from entry (maker fee on TP fills).</Rule>
-        <Rule name="Trailing stop">Activates after +{cfg.trail_activation_atr ?? 0.8}×ATR; trails the peak at {cfg.trail_distance_atr ?? 0.3}×ATR.</Rule>
-        <Rule name="Breakeven stop (v3)">After +{cfg.breakeven_atr ?? 0.75}×ATR in profit, the stop is ratcheted to the entry price — winners can't become losers.</Rule>
+        <Rule name="Risk &amp; exit model">
+          <b className="text-gray-200">{riskExitModelLabel((cfg.risk_exit || {}).model || 'atr')}</b> —
+          <span className="font-mono text-gray-300"> {riskExitText(cfg)}</span>. Every level below is either ATR-based
+          (default) or a % of the entry price; pick the model per level in Backtest → Strategy Configuration.
+        </Rule>
+        <Rule name="Stop loss">
+          {riskExitModeFor(cfg, 'stop') === 'price'
+            ? <>{rx('stop_loss_pct', 1.6)}% of the entry price — a fixed distance that does not move with volatility.</>
+            : <>{cfg.stop_loss_atr ?? 1.2}×ATR from entry, with a hard floor of {(cfg.sl_floor_pct ?? 0.016) * 100}% of price.</>}
+        </Rule>
+        <Rule name="Take profit">
+          {riskExitModeFor(cfg, 'target') === 'price'
+            ? <>{rx('take_profit_pct', 3)}% of the entry price (maker fee on TP fills).</>
+            : <>{cfg.take_profit_atr ?? 14}×ATR from entry (maker fee on TP fills).</>}
+        </Rule>
+        <Rule name="Trailing stop">
+          {riskExitModeFor(cfg, 'trail') === 'price'
+            ? <>Activates after +{rx('trail_activation_pct', 1.5)}%; trails the peak at {rx('trail_distance_pct', 0.5)}%.</>
+            : <>Activates after +{cfg.trail_activation_atr ?? 0.8}×ATR; trails the peak at {cfg.trail_distance_atr ?? 0.3}×ATR.</>}
+        </Rule>
+        <Rule name="Breakeven stop (v3)">
+          {riskExitModeFor(cfg, 'breakeven') === 'price'
+            ? <>After +{rx('breakeven_pct', 1)}% in profit, the stop is ratcheted to the entry price — winners can't become losers.</>
+            : <>After +{cfg.breakeven_atr ?? 0.75}×ATR in profit, the stop is ratcheted to the entry price — winners can't become losers.</>}
+        </Rule>
         <Rule name="Time stop">Positions older than {cfg.timeout_bars ?? 72} bars are closed at market ("MH").</Rule>
         <Rule name="Cooldown">{cfg.cooldown_bars ?? 0} bar(s) after every close before a new entry is allowed.</Rule>
         <Rule name="Drawdown guard (v3)">Past {cfg.dd_soft_pct ?? 8}% equity drawdown, position size drops to {(cfg.reduced_margin_pct ?? 0.075) * 100}% margin. At {cfg.dd_halt_pct ?? 100}% DD new entries halt entirely and resume below {cfg.dd_resume_pct ?? 100}% DD (100 = guard off).</Rule>

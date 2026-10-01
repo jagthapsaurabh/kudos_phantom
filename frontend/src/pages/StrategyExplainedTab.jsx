@@ -1,4 +1,5 @@
 import React from 'react';
+import { riskExitModeFor, riskExitModelLabel, riskExitText } from '../utils/riskExit';
 
 /* ============================================================================
    Kudos Strategy — Explained
@@ -117,6 +118,9 @@ const SizeCalculator = () => {
 const StrategyExplainedTab = ({ champion }) => {
   const cfg = champion?.config || {};
   const c = (k, d) => (cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : d);
+  // v3.6 — which model each protective level is priced on.
+  const riskPrice = (level) => riskExitModeFor(cfg, level) === 'price';
+  const riskModel = riskExitModelLabel((cfg.risk_exit || {}).model || 'atr');
   const lev = Number(c('leverage', 2));
   const mp = Number(c('margin_pct', 0.15));
   const priceRef = 100000;
@@ -355,24 +359,46 @@ const StrategyExplainedTab = ({ champion }) => {
 
       {/* ------------------------------------------------------- Risk & Exit -- */}
       <Card title="🛡️ Risk & Exit Model" color="text-red-400">
-        <Item name="Stop loss (ATR)" formula="SL_distance = max( stop_loss_atr × ATR(14),  sl_floor_pct × Price )  →  SL = Entry ∓ SL_distance">
-          Distance of the hard stop from entry measured in ATRs (so it adapts to volatility). A floor of
-          <K>{c('sl_floor_pct', 0.016) * 100}%</K> of price stops it getting too tight in dead-quiet markets.
-          Higher = wider stop = survives noise but risks more. Uses <K>stop_loss_atr</K>.
+        <Item name="Risk & exit model" formula="ATR units (default)  ·  Price % of entry  ·  Both — per level">
+          Every protective level is measured either in <b>ATR units</b> (the original behaviour, default) or as a
+          <b>percentage of the entry price</b> — and each level has its own selector, so a mix is allowed
+          (e.g. an ATR stop with a price-based target). Currently <b className="text-white">{riskModel}</b>:{' '}
+          <K>{riskExitText(cfg)}</K>. Set it in Backtest → Strategy Configuration → <i>Risk &amp; Exit Model</i>.
         </Item>
-        <Item name="Take profit (ATR)" formula="TP = Entry ± take_profit_atr × ATR(14)">
-          Profit target in ATRs. TP fills are treated as <b>maker</b> (lower fee). Uses <K>take_profit_atr</K>.
+        <Item name="Stop loss"
+          formula={riskPrice('stop')
+            ? 'SL_distance = stop_loss_pct × Price  →  SL = Entry ∓ SL_distance'
+            : 'SL_distance = max( stop_loss_atr × ATR(14),  sl_floor_pct × Price )  →  SL = Entry ∓ SL_distance'}>
+          {riskPrice('stop')
+            ? <>The hard stop sits <K>stop_loss_pct</K> of the entry price away — a fixed % that does not move with volatility.</>
+            : <>Distance of the hard stop from entry measured in ATRs (so it adapts to volatility). A floor of
+              <K>{c('sl_floor_pct', 0.016) * 100}%</K> of price stops it getting too tight in dead-quiet markets.
+              Uses <K>stop_loss_atr</K>.</>}
         </Item>
-        <Item name="Trail activation" formula="Activate trailing once PnL ≥ trail_activation_atr × ATR(14)">
-          The trailing stop is switched on only after this much profit — early trades are not trailed.
-          Uses <K>trail_activation_atr</K>.
+        <Item name="Take profit"
+          formula={riskPrice('target')
+            ? 'TP = Entry ± take_profit_pct × Price'
+            : 'TP = Entry ± take_profit_atr × ATR(14)'}>
+          {riskPrice('target')
+            ? <>Profit target as a fixed % of the entry price. Uses <K>take_profit_pct</K>.</>
+            : <>Profit target in ATRs. Uses <K>take_profit_atr</K>.</>} TP fills are treated as <b>maker</b> (lower fee).
         </Item>
-        <Item name="Trail distance" formula="Long:  trail_stop = max(trail_stop, Peak − trail_distance_atr × ATR)   ·   Short: mirror">
-          How tightly the trailing stop follows price. Smaller = tighter trail (locks more profit, exits sooner).
-          Uses <K>trail_distance_atr</K>.
+        <Item name="Trailing stop"
+          formula={riskPrice('trail')
+            ? 'Long:  trail_stop = max(trail_stop, Peak × (1 − trail_distance_pct))   ·   Short: mirror'
+            : 'Long:  trail_stop = max(trail_stop, Peak − trail_distance_atr × ATR)   ·   Short: mirror'}>
+          {riskPrice('trail')
+            ? <>The trail arms once the trade is <K>trail_activation_pct</K> in profit and then follows the
+              peak by <K>trail_distance_pct</K>.</>
+            : <>Arms once the trade is <K>trail_activation_atr</K>×ATR in profit; follows the peak by
+              <K>trail_distance_atr</K>×ATR. Smaller = tighter trail.</>}
         </Item>
-        <Item name="Breakeven after" formula="Once PnL ≥ breakeven_atr × ATR(14), ratchet the hard stop to the entry price">
-          Winners can no longer become losers — the stop moves to entry. Uses <K>breakeven_atr</K> (0 = disabled).
+        <Item name="Breakeven after"
+          formula={riskPrice('breakeven')
+            ? 'Once PnL ≥ breakeven_pct × Entry, ratchet the hard stop to the entry price'
+            : 'Once PnL ≥ breakeven_atr × ATR(14), ratchet the hard stop to the entry price'}>
+          Winners can no longer become losers — the stop moves to entry. 0 = disabled.
+          Uses <K>{riskPrice('breakeven') ? 'breakeven_pct' : 'breakeven_atr'}</K>.
         </Item>
         <Item name="Time stop" formula={'If bars_held ≥ timeout_bars → close at market ("MH")'}>
           Prevents capital being stuck in a trade forever. Uses <K>timeout_bars</K>.
