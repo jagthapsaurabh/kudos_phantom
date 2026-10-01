@@ -684,6 +684,7 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <PhantomPresetOptions />
               <option value="FastTest">Fast Test Strategy (Quick Signals)</option>
+              <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
               {strategies.length > 0 && (
                 <optgroup label="Saved strategies">
                   {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}

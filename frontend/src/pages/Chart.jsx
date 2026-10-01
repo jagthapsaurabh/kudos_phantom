@@ -14,7 +14,7 @@ import {
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import PhantomPresetOptions from '../components/PhantomPresetOptions';
-import { isPhantomBuiltin } from '../utils/phantomPresets';
+import { isPhantomBuiltin, isFastTestV1 } from '../utils/phantomPresets';
 import { computeAll } from '../utils/indicators';
 import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
 
@@ -119,7 +119,8 @@ const ChartPage = () => {
         setStrategies(arr);
         // Deep-link support: /chart?strategy=<id> preselects that strategy
         const q = new URLSearchParams(window.location.search).get('strategy');
-        if (q && (isPhantomBuiltin(q) || q === 'FastTest' || arr.some(s => String(s.id) === q))) {
+        if (q && (isPhantomBuiltin(q) || q === 'FastTest' || isFastTestV1(q)
+                  || arr.some(s => String(s.id) === q))) {
           setOverlayStrategy(q);
         }
       })
@@ -766,6 +767,7 @@ const ChartPage = () => {
             <option value="PhantomV2">Kudos V2.5 (Champion)</option>
             <PhantomPresetOptions />
             <option value="FastTest">FastTest (debug)</option>
+            <option value="FastTestV1">FastTest V1.0 (debug + validation)</option>
             {strategies.map(s => <option key={s.id} value={s.id}>Custom: {s.name}</option>)}
           </select>
         </div>

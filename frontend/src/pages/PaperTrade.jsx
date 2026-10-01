@@ -140,8 +140,21 @@ const EXIT_REASONS = {
   SL: { label: 'Stop Loss', color: 'text-red-400 border-red-800 bg-red-900/20' },
   MH: { label: 'Max Hold Time', color: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
   REV: { label: 'Reversal', color: 'text-blue-400 border-blue-800 bg-blue-900/20' },
+  // FastTest V1.0's own exits.
+  TP090: { label: '+0.90% Profit Book', color: 'text-emerald-300 border-emerald-800 bg-emerald-900/20' },
+  VALFAIL: { label: '2H Validation Fail', color: 'text-red-300 border-red-800 bg-red-900/20' },
 };
 const reasonMeta = (r) => EXIT_REASONS[r] || { label: r || '—', color: 'text-gray-400 border-gray-700 bg-gray-900' };
+
+// FastTest V1.0 validation chip colours (blank for every other strategy).
+const validationChipColor = (status) => {
+  switch (String(status || '').toUpperCase()) {
+    case 'VALIDATED': return 'text-green-300 border-green-800 bg-green-900/20';
+    case 'FAILED': return 'text-red-300 border-red-800 bg-red-900/20';
+    case 'TP_090_HIT': return 'text-emerald-200 border-emerald-800 bg-emerald-900/20';
+    default: return 'text-gray-400 border-gray-700 bg-gray-900';
+  }
+};
 
 const ClosedTradesPanel = ({ closedTrades }) => {
   if (!closedTrades || closedTrades.length === 0) {
@@ -199,6 +212,13 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                   <td className="p-2 font-mono text-gray-400">{t.atr_at_entry != null ? Number(t.atr_at_entry).toFixed(2) : '—'}</td>
                   <td className="p-2 max-w-[260px]">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${meta.color}`}>{meta.label}</span>
+                    {/* FastTest V1.0: the 2H validation verdict for this trade. */}
+                    {t.validation_status && (
+                      <span className={`ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold border ${validationChipColor(t.validation_status)}`}
+                            title={`Validation ${t.validation_status}${t.validation_close != null ? ` — close ${Number(t.validation_close).toFixed(2)} vs ${Number(t.validation_threshold).toFixed(2)}` : ''}`}>
+                        {t.tp090_hit ? '+0.90% HIT' : t.validation_status}
+                      </span>
+                    )}
                     {t.exit_detail && <div className="text-[10px] text-gray-500 mt-1 leading-snug">{t.exit_detail}</div>}
                   </td>
                   <td className={`p-2 font-mono font-bold ${(t.gross_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(t.gross_pnl || 0) >= 0 ? '+' : ''}{Number(t.gross_pnl || 0).toFixed(2)}</td>
@@ -891,6 +911,7 @@ const PaperTrade = () => {
             <option value="PhantomV2">Kudos V2.5 (Default)</option>
             <PhantomPresetOptions />
             <option value="FastTest">Fast Test Strategy</option>
+            <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
             {strategies.length > 0 && (
               <optgroup label="Saved strategies">
                 {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}

@@ -12,6 +12,9 @@ from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.paper_trader import _to_ist
+# Close of the candle the clock just moved past — used by close-based strategy
+# rules (FastTest V1's 2H validation).
+from app.core.fast_test_v1 import completed_bar_close
 from app.services.broker_client import BrokerClient, is_auth_rejection
 from app.services.margin_preflight import describe_margin_error, is_insufficient_margin
 from app.services.heartbeat import DeadmanSwitch
@@ -912,14 +915,22 @@ class LiveTradeService:
         # of times. Everything measured in *candles* — the holding-time clock,
         # one entry per signal, the post-exit cooldown — keys off this flag.
         new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        # The candle the clock just moved past is complete: its final close is
+        # what a close-based rule (FastTest V1's 2H validation) is judged on.
+        # Captured BEFORE the clock advances.
+        completed_bar_time = self._last_bar_time
+        completed_bar = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
+            completed_bar = completed_bar_close(df_1h, completed_bar_time)
 
         # ---- Manage open positions ------------------------------------
         self._manage_open_positions(decision_price, current_atr, current_time,
-                                    trade_price, mark_price, new_bar)
+                                    trade_price, mark_price, new_bar,
+                                    bar_close=completed_bar,
+                                    bar_time=(completed_bar_time if completed_bar else None))
 
         # A stale candle set must never OPEN anything: the signal, the ATR the
         # stop distance comes from, even the notional sizing would be built on
@@ -1012,10 +1023,14 @@ class LiveTradeService:
         # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
         # and a positive one on a sell entry.
         trail_distance = self._trail_amount(current_atr) if self.bracket_orders else None
+        # The venue target is the strategy's own TP by default; FastTest V1
+        # brackets at its +0.90% booking level instead. SL and trail distance
+        # are unchanged either way.
+        bracket_tp = float(self.oms.bracket_take_profit(last_sig, decision_price, planned.tp))
         if self.bracket_orders:
             res = self.broker.place_bracket_order(
                 self.contract_symbol, side, lots, price=None,
-                stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
+                stop_loss_price=float(planned.sl), take_profit_price=bracket_tp,
                 trigger_method="mark_price" if use_mark else "last_traded_price",
                 size_in_btc=True, trail_amount=trail_distance)
         else:
@@ -1040,7 +1055,7 @@ class LiveTradeService:
                 # sent; the local book keeps trailing on its own rules, so both
                 # the fixed level and the trail distance are worth showing.
                 trailing = f" · trail {trail_distance:,.2f}" if trail_distance else ""
-                protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}{trailing}"
+                protection = (f" · SL {planned.sl:,.2f} / TP {bracket_tp:,.2f}{trailing}"
                               f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
             print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
             self._log("trade", f"OPENED {side} {lots} BTC at {entry_note}{protection}")
@@ -1136,7 +1151,7 @@ class LiveTradeService:
             fees = entry_fee + exit_fee
             pnl = gross_pnl - fees
             f = lambda v: None if v is None else float(v)
-            self.closed_trades.append({
+            rec = {
                 "symbol": trade.symbol,
                 "direction": int(trade.direction),
                 "entry": f(trade.entry_price),
@@ -1166,7 +1181,14 @@ class LiveTradeService:
                 "entry_time": _to_ist(trade.entry_time),
                 "exit_time": _to_ist(trade.exit_time),
                 "bars_held": int(trade.bars_held or 0),
-            })
+            }
+            # Strategy audit fields (FastTest V1: validation status / close /
+            # threshold, +0.90% booking, final reason and net P&L). Empty — and
+            # the record untouched — for every other strategy.
+            audit = getattr(self.oms, 'strategy_audit_fields', None)
+            if callable(audit):
+                rec.update(audit(trade, pnl))
+            self.closed_trades.append(rec)
             # Trades are capped in memory, but the counters are not: dropping
             # old trades used to drop their PnL from net_pnl too, so after 100
             # trades the reported net_pnl no longer matched the equity/ROI that
@@ -1192,7 +1214,8 @@ class LiveTradeService:
             print(f"[{self.strategy_id}] closed-trade record failed: {exc}")
 
     def _manage_open_positions(self, decision_price, current_atr, current_time,
-                               trade_price, mark_price, advance_bar):
+                               trade_price, mark_price, advance_bar,
+                               bar_close=None, bar_time=None):
         """Mark every open position to market and send any exit it triggers.
 
         Split out of ``tick()`` so the same exit logic runs on the 60-second
@@ -1203,11 +1226,17 @@ class LiveTradeService:
 
         ``advance_bar`` must stay False on the fast path: it moves the
         holding-time clock, which is counted in candles.
+
+        ``bar_close`` / ``bar_time`` carry the *completed* candle's close and
+        stamp on the tick that follows a rollover, for close-based strategy
+        rules (FastTest V1's 2H validation). Every other strategy ignores them.
         """
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
                                            trade_price_usd=trade_price, mark_price_usd=mark_price,
-                                           advance_bar=advance_bar)
+                                           advance_bar=advance_bar,
+                                           bar_close_usd=(float(bar_close[0]) if bar_close else None),
+                                           bar_time=bar_time)
             if not result:
                 continue
             # Settled: keep it for the execution overlay + post-run review

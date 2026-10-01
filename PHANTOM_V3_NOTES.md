@@ -226,6 +226,45 @@ signals, setup labels and trade lists of six reference configs before / after).
 - **Tests**: `backend/test_macd_line_and_modes.py` (76 checks),
   `frontend/tests/phantom_presets_ui.jsx` (50 checks).
 
+## FastTest V1.0 — debug strategy with a validation / profit-booking layer
+
+A **new, separate strategy** (`FastTestV1`, `backend/app/core/fast_test_v1.py`).
+`FastTest` itself is not modified: same code, same signals, same results.
+
+- **Entry**: a verbatim copy of the FastTest rule — RSI(14) on the 1h candles,
+  long below 50 / short at or above 50, one signal per bar, no other filter.
+- **Unchanged**: initial SL, trailing SL, breakeven, timeout, cooldown,
+  sizing, leverage, mark-price handling, fees, FIFO booking.
+- **Added rule 1 — +0.90% profit booking (TOUCH)**: `high ≥ entry × 1.0090`
+  (long) / `low ≤ entry × 0.9910` (short) books the full position at the level
+  (reason `TP090`). The engine passes candle extremes, live/paper pass the
+  tick price, so a wick that would have filled a resting limit is honoured.
+- **Added rule 2 — 2H validation (CLOSE)**: the close of the second completed
+  1h candle after entry must reach `entry × 1.0035` (long) / `× 0.9965`
+  (short). Reached → `VALIDATED`, the existing exits keep running; missed →
+  the trade exits **at that close** (reason `VALFAIL`).
+- **Priority**: entry → +0.90% touch → 2H close verdict. Inside one candle the
+  resting stop still wins (the engine's worst-case rule); otherwise the
+  booking rule runs before the trail / TP / timeout steps.
+- **Wiring**: `OrderManager` grew three no-op hooks (`strategy_touch_exit`,
+  `strategy_bar_close_exit`, `strategy_audit_fields` / `strategy_summary` /
+  `bracket_take_profit`); `FastTestV1OrderManager` overrides them. The backtest
+  engine takes optional `strategy_service` / `oms` overrides and passes the
+  current candle's close as `bar_close_usd` / `bar_time`; the paper and live
+  workers pass the **completed** candle's close on the tick after a rollover.
+  `main.py` routes the id in `/phantom/signals`, the backtest task,
+  `/paper-trade/start`, `_resume_paper_session` and `/live-trade/start`; live
+  brackets rest their TP at the +0.90% level.
+- **Audit**: seven fields per trade — `validation_status`, `validation_close`,
+  `validation_threshold`, `tp090_hit`, `validation_exit`,
+  `final_exit_reason`, `final_net_pnl`. `Trade` gains seven nullable columns
+  (additive migration); `/backtest/results`, the CSV export, the trade-log
+  table, the paper/live closed-trade panel and the Sessions detail all show
+  them. Net P&L is after entry + exit fees.
+- **Tests**: `backend/test_fast_test_v1.py` (114 checks),
+  `frontend/tests/fast_test_v1_ui.jsx` (27 checks), trade-log pins updated to
+  60 CSV columns.
+
 ## Reproduce
 ```bash
 python -m backend.app.scripts.run_baseline        # v2.5 parity numbers

@@ -123,6 +123,9 @@ const buildTradesCSV = (trades) => {
     // column positions: MACD line / signal at the signal candle and the
     // optional MACD line-rule result (N/A for runs that did not use it).
     'MACD Line', 'MACD Signal', 'Entry Cond 8 - MACD Line/Signal',
+    // FastTest V1.0 audit — appended last, blank on every other strategy.
+    'Validation Status', 'Validation Close', 'Validation Threshold',
+    'TP 0.90% Hit', 'Validation Exit', 'Final Exit Reason', 'Final Net P&L',
   ];
   // UTC, to the second, so a row in the sheet matches the on-screen log exactly.
   const fmtTime = (v) => fmtCandleTime(v, { seconds: true });
@@ -159,6 +162,12 @@ const buildTradesCSV = (trades) => {
       num(t.gross_pnl), num(t.fees), num(t.net_pnl), num(t.equity_after),
       num(t.drawdown), t.hold_bars ?? '',
       num(t.macd_line), num(t.macd_signal), condLabel(c.macd_line_ok),
+      t.validation_status || '',
+      num(t.validation_close), num(t.validation_threshold),
+      t.tp090_hit == null ? '' : (t.tp090_hit ? 'YES' : 'NO'),
+      t.validation_exit == null ? '' : (t.validation_exit ? 'YES' : 'NO'),
+      t.final_exit_reason || t.exit_reason || '',
+      num(t.final_net_pnl ?? t.net_pnl),
     ];
   });
   // CRLF so Excel keeps one row per line; the caller prepends the UTF-8 BOM so
@@ -294,7 +303,16 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
               <td className={`p-3 font-mono font-bold ${(t.gross_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.gross_pnl || 0).toFixed(2)}</td>
               <td className="p-3 font-mono text-gray-400">₹{(t.fees || 0).toFixed(2)}</td>
               <td className={`p-3 font-mono font-bold ${(t.net_pnl || 0) > 0 ? 'text-green-400' : 'text-red-400'}`}>₹{(t.net_pnl || 0).toFixed(2)}</td>
-              <td className="p-3"><span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span></td>
+              <td className="p-3">
+                <span className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[10px] text-gray-400">{t.exit_reason || 'N/A'}</span>
+                {/* FastTest V1.0: the validation verdict for this trade. */}
+                {t.validation_status && (
+                  <span className={`ml-1 rounded px-1.5 py-0.5 text-[9px] font-bold ${validationChipClass(t.validation_status)}`}
+                        title={`Validation ${t.validation_status}${t.validation_close != null ? ` — close ${Number(t.validation_close).toFixed(2)} vs ${Number(t.validation_threshold).toFixed(2)}` : ''}`}>
+                    {t.tp090_hit ? '+0.90% HIT' : t.validation_status}
+                  </span>
+                )}
+              </td>
               <td className="p-3 text-gray-500">{expandedTrade === i ? '▼' : '▶'}</td>
             </tr>
             {expandedTrade === i && (
@@ -327,6 +345,23 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
                         Exit Condition — {t.exit_reason || '—'} on the {t.exit_candle_type || '—'} candle
                       </div>
                       <div className="font-mono text-[10px] text-yellow-300">{t.exit_detail}</div>
+                    </div>
+                  )}
+                  {t.validation_status && (
+                    <div className="mb-3 rounded-lg border border-gray-700 bg-gray-900 p-3"
+                         data-testid="v1-validation-audit">
+                      <div className="mb-1.5 text-[9px] font-bold uppercase text-gray-500">
+                        FastTest V1.0 — 2H validation &amp; +0.90% booking
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono text-[10px] text-gray-300 md:grid-cols-4">
+                        <div>Validation Status: <b>{t.validation_status}</b></div>
+                        <div>Validation Close: <b>{t.validation_close != null ? Number(t.validation_close).toFixed(2) : '—'}</b></div>
+                        <div>Validation Threshold: <b>{t.validation_threshold != null ? Number(t.validation_threshold).toFixed(2) : '—'}</b></div>
+                        <div>TP 0.90% Hit: <b>{t.tp090_hit ? 'YES' : 'NO'}</b></div>
+                        <div>Validation Exit: <b>{t.validation_exit ? 'YES' : 'NO'}</b></div>
+                        <div>Final Exit Reason: <b>{t.final_exit_reason || t.exit_reason || '—'}</b></div>
+                        <div>Final Net P&amp;L: <b className={(t.final_net_pnl ?? t.net_pnl ?? 0) > 0 ? 'text-green-400' : 'text-red-400'}>₹{Number(t.final_net_pnl ?? t.net_pnl ?? 0).toFixed(2)}</b></div>
+                      </div>
                     </div>
                   )}
                   <div className="grid grid-cols-2 gap-3 text-[11px] md:grid-cols-4">
@@ -1178,6 +1213,7 @@ const Backtest = () => {
               className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <PhantomPresetOptions />
+              <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
               {strategies.length > 0 && (
                 <optgroup label="Saved strategies">
                   {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -1793,6 +1829,18 @@ const Backtest = () => {
             }
             className="overflow-hidden"
           >
+            {/* FastTest V1.0 runs: how the validation layer actually behaved. */}
+            {fastTestV1Summary(results.trades) && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-[10px]"
+                   data-testid="fasttest-v1-summary">
+                <span className="font-bold uppercase tracking-wide text-gray-400">FastTest V1.0</span>
+                <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-300">trades {fastTestV1Summary(results.trades).trades}</span>
+                <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-green-300">validated {fastTestV1Summary(results.trades).validated}</span>
+                <span className="rounded bg-emerald-900/40 px-1.5 py-0.5 text-emerald-200">+0.90% booked {fastTestV1Summary(results.trades).booked}</span>
+                <span className="rounded bg-red-900/40 px-1.5 py-0.5 text-red-300">validation exits {fastTestV1Summary(results.trades).failed}</span>
+                <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">closed before 2H {fastTestV1Summary(results.trades).notReached}</span>
+              </div>
+            )}
             <TradeLogTable trades={results.trades} params={results.params}
                 expandedTrade={expandedTrade} onToggleRow={setExpandedTrade} />
           </SectionCard>
@@ -1852,9 +1900,33 @@ const CondChip = ({ ok, label }) => (
   </span>
 );
 
+// Colour of the FastTest V1.0 validation chip on the trade log.
+const validationChipClass = (status) => {
+  switch (String(status || '').toUpperCase()) {
+    case 'VALIDATED': return 'bg-green-900/50 text-green-300 border border-green-800';
+    case 'FAILED': return 'bg-red-900/50 text-red-300 border border-red-800';
+    case 'TP_090_HIT': return 'bg-emerald-900/50 text-emerald-200 border border-emerald-800';
+    case 'NOT_REACHED': return 'bg-gray-800 text-gray-400 border border-gray-700';
+    default: return 'bg-gray-800 text-gray-400 border border-gray-700';
+  }
+};
+
+// Run-level V1 counters for the header strip (0/undefined -> not a V1 run).
+const fastTestV1Summary = (trades) => {
+  const rows = (trades || []).filter(t => t && t.validation_status);
+  if (!rows.length) return null;
+  return {
+    trades: rows.length,
+    validated: rows.filter(t => t.validation_status === 'VALIDATED').length,
+    failed: rows.filter(t => t.validation_exit).length,
+    booked: rows.filter(t => t.tp090_hit).length,
+    notReached: rows.filter(t => t.validation_status === 'NOT_REACHED').length,
+  };
+};
+
 // Exported for tests: the pure helpers and the trade-log table behind the
 // Backtest page's trade log and Excel/CSV export.
 export { buildTradesCSV, condLabel, fmtCandleTime, atrRegimeRuleFor,
-         TradeLogTable, CandleChip, CondChip };
+         TradeLogTable, CandleChip, CondChip, validationChipClass, fastTestV1Summary };
 
 export default Backtest;

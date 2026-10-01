@@ -9,6 +9,11 @@ export const PHANTOM_DEFAULT_ID = 'PhantomV2';
 export const PHANTOM_DEFAULT_NAME = 'Kudos V2.5 (Default)';
 export const FAST_TEST_ID = 'FastTest';
 export const FAST_TEST_NAME = 'Fast Test Strategy';
+// FastTest V1.0 — the same debug signals, plus the 2H +0.35% validation and
+// the touch-based +0.90% profit booking. A separate id: FastTest itself is
+// untouched.
+export const FAST_TEST_V1_ID = 'FastTestV1';
+export const FAST_TEST_V1_NAME = 'Fast Test Strategy V1.0';
 
 export const SETUP_MODES = [
   { value: 'both', label: 'Reversal + Momentum', short: 'Both setups',
@@ -126,10 +131,16 @@ export const isPhantomPreset = (strategyId) => {
   return !!v && (v.setup_mode !== 'both' || v.trade_direction !== 'both');
 };
 
+// True for the FastTestV1 debug strategy (and nothing else). Mirrors the
+// backend's `is_fast_test_v1`.
+export const isFastTestV1 = (strategyId) =>
+  String(strategyId ?? '').trim().toLowerCase() === FAST_TEST_V1_ID.toLowerCase();
+
 // Display name for a built-in id; null for saved / custom strategies so the
 // caller can fall back to its own lookup.
 export const builtinStrategyName = (strategyId) => {
   if (String(strategyId) === FAST_TEST_ID) return FAST_TEST_NAME;
+  if (isFastTestV1(strategyId)) return FAST_TEST_V1_NAME;
   const v = parsePhantomVariant(strategyId);
   return v ? phantomPresetName(v.setup_mode, v.trade_direction) : null;
 };

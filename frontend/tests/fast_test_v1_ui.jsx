@@ -1,0 +1,169 @@
+import React from 'react';
+import { renderToString } from 'react-dom/server';
+import { readFileSync } from 'node:fs';
+
+// Browser stubs (effects never run under the server renderer, but a few
+// module-level helpers read these).
+const store = new Map();
+globalThis.localStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => store.set(k, String(v)),
+  removeItem: (k) => store.delete(k),
+};
+globalThis.window = { location: { protocol: 'http:', hostname: 'localhost', search: '' }, addEventListener() {}, removeEventListener() {} };
+globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ([]) });
+
+import {
+  FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_ID, FAST_TEST_V1_NAME,
+  isFastTestV1, builtinStrategyName, strategyDisplayName, parsePhantomVariant,
+  isPhantomBuiltin, isPhantomPreset,
+} from '../src/utils/phantomPresets.js';
+import Backtest, { buildTradesCSV, TradeLogTable, validationChipClass, fastTestV1Summary }
+  from '../src/pages/Backtest.jsx';
+import PaperTrade from '../src/pages/PaperTrade.jsx';
+import LiveTrade from '../src/pages/LiveTrade.jsx';
+import ChartPage from '../src/pages/Chart.jsx';
+
+// esbuild bundles this file to CJS (no import.meta.url), so the source path is
+// resolved from the runner's working directory — frontend/ under npm test.
+const readSource = (rel) => {
+  for (const base of ['', 'frontend/']) {
+    try { return readFileSync(`${base}${rel}`, 'utf8'); } catch { /* next */ }
+  }
+  return '';
+};
+
+let pass = 0, fail = 0;
+const check = (name, cond, extra = '') => {
+  if (cond) { pass++; } else { fail++; console.log(`  FAIL: ${name} ${extra}`); }
+};
+// SSR inserts <!-- --> between text and expressions; strip it before matching.
+const flat = (html) => String(html).replace(/<!-- -->/g, '');
+
+// ------------------------------------------------------------- id helpers --
+check('FastTestV1 is its own id, separate from FastTest',
+  FAST_TEST_V1_ID === 'FastTestV1' && FAST_TEST_V1_ID !== FAST_TEST_ID);
+check('isFastTestV1 matches the V1 id only',
+  isFastTestV1('FastTestV1') && !isFastTestV1('FastTest') && !isFastTestV1('PhantomV2'));
+check('the V1 id is NOT a Kudos preset (it does not touch the Phantom parser)',
+  parsePhantomVariant(FAST_TEST_V1_ID) === null
+  && !isPhantomBuiltin(FAST_TEST_V1_ID) && !isPhantomPreset(FAST_TEST_V1_ID));
+check('display name for the V1 strategy',
+  builtinStrategyName(FAST_TEST_V1_ID) === FAST_TEST_V1_NAME
+  && FAST_TEST_V1_NAME === 'Fast Test Strategy V1.0');
+check('display name resolution falls back through builtins',
+  strategyDisplayName(FAST_TEST_V1_ID) === FAST_TEST_V1_NAME
+  && strategyDisplayName(FAST_TEST_ID) === FAST_TEST_NAME
+  && strategyDisplayName('PhantomV2') === 'Kudos V2.5 (Default)');
+check('a saved strategy with the same numeric id still wins',
+  strategyDisplayName(7, [{ id: 7, name: 'My Saved' }]) === 'My Saved');
+
+// -------------------------------------------------------------- dropdowns --
+const paperHtml = flat(renderToString(React.createElement(PaperTrade)));
+const liveHtml = flat(renderToString(React.createElement(LiveTrade)));
+const chartHtml = flat(renderToString(React.createElement(ChartPage)));
+const backtestHtml = flat(renderToString(React.createElement(Backtest)));
+
+check('Paper Trade offers FastTest V1.0',
+  paperHtml.includes('value="FastTestV1"') && paperHtml.includes('Fast Test Strategy V1.0'));
+check('Live Trade offers FastTest V1.0',
+  liveHtml.includes('value="FastTestV1"') && liveHtml.includes('Fast Test Strategy V1.0'));
+check('Chart overlay offers FastTest V1.0',
+  chartHtml.includes('value="FastTestV1"') && chartHtml.includes('FastTest V1.0 (debug + validation)'));
+check('Backtest offers FastTest V1.0',
+  backtestHtml.includes('value="FastTestV1"') && backtestHtml.includes('Fast Test Strategy V1.0'));
+check('the original FastTest option is untouched everywhere',
+  paperHtml.includes('value="FastTest"') && liveHtml.includes('value="FastTest"')
+  && chartHtml.includes('value="FastTest"'));
+check('the Admin panel can start a V1 debug session',
+  readSource('src/pages/AdminPanel.jsx').includes("start('FastTestV1')"));
+
+// ------------------------------------------------------------------- CSV ----
+const v1Trade = {
+  direction: 1, setup: 'FASTTEST V1',
+  signal_candle_time: '2026-01-01T00:00:00Z', entry_candle_time: '2026-01-01T01:00:00Z',
+  entry_time: '2026-01-01T01:00:00Z', exit_time: '2026-01-01T03:00:00Z',
+  entry_price: 100, exit_price: 100.2, lots: 1, margin: 1000, notional: 7000,
+  gross_pnl: 200, fees: 4, net_pnl: 196, equity_after: 20196,
+  exit_reason: 'VALFAIL', exit_detail: '2H validation failed',
+  validation_status: 'FAILED', validation_close: 100.2, validation_threshold: 100.35,
+  tp090_hit: 0, validation_exit: 1, final_exit_reason: 'VALFAIL', final_net_pnl: 196,
+};
+const legacyTrade = {
+  direction: -1, entry_price: 100, exit_price: 99, lots: 1, margin: 1000, notional: 7000,
+  gross_pnl: 100, fees: 4, net_pnl: 96, exit_reason: 'SL',
+};
+const csv = buildTradesCSV([v1Trade, legacyTrade]);
+const header = csv.split('\r\n')[0].replace(/"/g, '').split(',');
+const rowFor = (name) => {
+  const rows = csv.split('\r\n').map(r => r.replace(/"/g, '').split(','));
+  return header.reduce((acc, h, i) => { acc[h] = rows[1][i]; return acc; }, {});
+};
+const auditOf = (trade, idx) => {
+  const rows = buildTradesCSV([trade]).split('\r\n').map(r => r.replace(/"/g, '').split(','));
+  return header.reduce((acc, h, i) => { acc[h] = rows[idx][i]; return acc; }, {});
+};
+check('the seven V1 audit columns are the last columns of the sheet',
+  header.slice(-7).join('|') === 'Validation Status|Validation Close|Validation Threshold|'
+    + 'TP 0.90% Hit|Validation Exit|Final Exit Reason|Final Net P&L', header.slice(-7).join('|'));
+check('the original layout keeps its positions (Bars Held still index 49)',
+  header.indexOf('Bars Held') === 49 && header.indexOf('MACD Line') === 50);
+const v1Csv = auditOf(v1Trade, 1);
+check('CSV: validation status / close / threshold',
+  v1Csv['Validation Status'] === 'FAILED' && v1Csv['Validation Close'] === '100.20'
+  && v1Csv['Validation Threshold'] === '100.35');
+check('CSV: TP 0.90% hit and validation exit flags read YES/NO',
+  v1Csv['TP 0.90% Hit'] === 'NO' && v1Csv['Validation Exit'] === 'YES');
+check('CSV: final exit reason and final net P&L',
+  v1Csv['Final Exit Reason'] === 'VALFAIL' && v1Csv['Final Net P&L'] === '196.00');
+const legacyCsv = auditOf(legacyTrade, 1);
+check('CSV: a non-V1 trade leaves the validation columns blank, never "undefined"',
+  legacyCsv['Validation Status'] === '' && legacyCsv['Validation Close'] === ''
+  && legacyCsv['Validation Threshold'] === ''
+  && legacyCsv['TP 0.90% Hit'] === '' && legacyCsv['Validation Exit'] === ''
+  && !csv.includes('undefined'));
+check('CSV: final reason / net P&L fall back to the ordinary exit fields',
+  legacyCsv['Final Exit Reason'] === 'SL' && legacyCsv['Final Net P&L'] === '96.00');
+
+// ------------------------------------------------------------ trade table ---
+const html = flat(renderToString(React.createElement(TradeLogTable, {
+  trades: [v1Trade], params: {}, expandedTrade: 0, onToggleRow: () => {},
+})));
+check('the trade row shows a V1 validation chip',
+  html.includes('FAILED') && html.includes('val'));  // chip text present in the row
+check('the expanded row shows the V1 audit block',
+  html.includes('data-testid="v1-validation-audit"')
+  && html.includes('Validation Status') && html.includes('Validation Threshold')
+  && html.includes('Final Net P&amp;L') && html.includes('Final Exit Reason'));
+check('the audit block shows the recorded numbers',
+  html.includes('100.20') && html.includes('100.35') && html.includes('196.00'));
+const bookedHtml = flat(renderToString(React.createElement(TradeLogTable, {
+  trades: [{ ...v1Trade, exit_reason: 'TP090', final_exit_reason: 'TP090',
+             validation_status: 'TP_090_HIT', tp090_hit: 1, validation_exit: 0 }],
+  params: {}, expandedTrade: 0, onToggleRow: () => {},
+})));
+check('a booked trade is flagged as +0.90% HIT',
+  bookedHtml.includes('+0.90% HIT') && bookedHtml.includes('TP 0.90% Hit'));
+check('a legacy trade renders no V1 audit block',
+  !flat(renderToString(React.createElement(TradeLogTable, {
+    trades: [legacyTrade], params: {}, expandedTrade: 0, onToggleRow: () => {} })))
+    .includes('v1-validation-audit'));
+
+// ----------------------------------------------------------- run summary ----
+check('chip colours are mapped per status',
+  validationChipClass('VALIDATED').includes('green')
+  && validationChipClass('FAILED').includes('red')
+  && validationChipClass('TP_090_HIT').includes('emerald')
+  && validationChipClass('NOT_REACHED').includes('gray'));
+check('run summary counts every V1 outcome',
+  JSON.stringify(fastTestV1Summary([
+    { validation_status: 'VALIDATED', validation_exit: 0, tp090_hit: 0 },
+    { validation_status: 'FAILED', validation_exit: 1, tp090_hit: 0 },
+    { validation_status: 'TP_090_HIT', validation_exit: 0, tp090_hit: 1 },
+    { validation_status: 'NOT_REACHED', validation_exit: 0, tp090_hit: 0 },
+  ])) === JSON.stringify({ trades: 4, validated: 1, failed: 1, booked: 1, notReached: 1 }));
+check('no V1 trades -> no summary strip', fastTestV1Summary([legacyTrade]) === null
+  && fastTestV1Summary([]) === null && fastTestV1Summary(null) === null);
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

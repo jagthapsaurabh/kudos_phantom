@@ -12,6 +12,10 @@ from app.services.order_manager import OrderManager
 from app.services.broker_client import BrokerClient
 import requests
 from app.core.indicators import compute_indicators
+# Helper for close-based strategy rules (FastTest V1's 2H validation): the
+# close of the candle the clock just moved past. Imported here so the import
+# graph stays one-way (fast_test_v1 -> order_manager only).
+from app.core.fast_test_v1 import completed_bar_close
 
 # India Standard Time is UTC+5:30. All timestamps shown in the paper-trade UI
 # (last checked, trade entry/exit, log lines) are emitted in IST so the user
@@ -224,7 +228,7 @@ class PaperTradeService:
         # (np.float64 serializes as float, but comparisons yield np.bool_ which
         # FastAPI cannot encode — keep every numeric field a real float).
         f = lambda v: None if v is None else float(v)
-        self.closed_trades.append({
+        rec = {
             "symbol": trade.symbol,
             "direction": int(trade.direction),
             "entry": f(trade.entry_price),
@@ -255,7 +259,14 @@ class PaperTradeService:
             "entry_time": _to_ist(trade.entry_time),
             "exit_time": _to_ist(trade.exit_time),
             "bars_held": int(trade.bars_held),
-        })
+        }
+        # Strategy audit fields (FastTest V1: validation status / close /
+        # threshold, +0.90% booking, final reason and net P&L). Empty — and the
+        # record untouched — for every other strategy.
+        audit = getattr(self.oms, 'strategy_audit_fields', None)
+        if callable(audit):
+            rec.update(audit(trade, pnl_inr))
+        self.closed_trades.append(rec)
         # Same accounting rule as the live worker: trades age out of memory,
         # but their PnL must not vanish from the session totals.
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
@@ -525,14 +536,22 @@ class PaperTradeService:
         # Everything measured in candles (holding time, one entry per signal,
         # post-exit cooldown) keys off this flag instead of the tick count.
         new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        # The candle the clock just moved past is complete, so its final close
+        # is available for close-based rules (FastTest V1's 2H validation). The
+        # timestamp is captured BEFORE the clock advances.
+        completed_bar_time = self._last_bar_time
+        completed_bar = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
+            completed_bar = completed_bar_close(df_1h, completed_bar_time)
 
         # ---- Manage open positions ----------------------------------
         if self._manage_open_positions(decision_price, current_atr, current_time,
-                                       trade_price, mark_price, new_bar):
+                                       trade_price, mark_price, new_bar,
+                                       bar_close=completed_bar,
+                                       bar_time=(completed_bar_time if completed_bar else None)):
             trade_event = True
 
         # A stale candle set must never OPEN anything — the signal and the
@@ -631,20 +650,28 @@ class PaperTradeService:
     # Trade management helpers
     # ------------------------------------------------------------------
     def _manage_open_positions(self, decision_price, current_atr, current_time,
-                               trade_price, mark_price, advance_bar):
+                               trade_price, mark_price, advance_bar,
+                               bar_close=None, bar_time=None):
         """Mark every open paper position and book any exit it triggers.
 
         Shared by the 60-second candle tick and the live-tick path so a stop
         is acted on as soon as the price arrives, not up to a minute late.
         ``advance_bar`` stays False on the fast path (holding time is candles).
         Returns True when at least one trade closed.
+
+        ``bar_close`` / ``bar_time`` are the *completed* candle's close price
+        and stamp (present only on the tick that follows a candle rollover).
+        Close-based strategy rules — FastTest V1's 2H validation — are judged on
+        them; every other strategy ignores them.
         """
         closed = False
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
                                            trade_price_usd=trade_price,
                                            mark_price_usd=mark_price,
-                                           advance_bar=advance_bar)
+                                           advance_bar=advance_bar,
+                                           bar_close_usd=(float(bar_close[0]) if bar_close else None),
+                                           bar_time=bar_time)
             if result:
                 closed = True
                 self._bars_since_exit = 0

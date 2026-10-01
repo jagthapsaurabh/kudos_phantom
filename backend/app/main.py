@@ -11,6 +11,13 @@ import os
 from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
+# FastTest V1.0 — a *separate* copy of the FastTest debug strategy with the
+# 2H/0.35% validation and +0.90% profit-booking layer. The original FastTest
+# is untouched; only ids it owns are routed here.
+from .core.fast_test_v1 import (
+    FAST_TEST_V1_ID, FAST_TEST_V1_NAME, FastTestV1Config, FastTestV1OrderManager,
+    FastTestV1StrategyService, fast_test_v1_config, is_fast_test_v1,
+)
 from .core.strategy import (
     PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
     phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
@@ -102,7 +109,16 @@ def _utc_ts(dt):
     return dt.timestamp()
 
 class StrategyParams(PhantomV2Config):
-    pass
+    """Phantom parameters, plus the FastTest V1.0 rule overrides.
+
+    The three V1 fields are ignored by every other strategy (they are only read
+    when the run's strategy_id is ``FastTestV1``); their defaults are exactly
+    the specified 2H / +0.35% / +0.90% rule, so a client that never sends them
+    gets the spec behaviour.
+    """
+    validation_bars: int = 2
+    validation_close_pct: float = 0.0035
+    profit_book_pct: float = 0.009
 
 class StrategyCreate(BaseModel):
     name: str
@@ -362,6 +378,8 @@ def _builtin_strategy_name(strategy_id) -> Optional[str]:
     """Display name for a built-in id; None for saved / custom strategies."""
     if str(strategy_id) == 'FastTest':
         return 'Fast Test Strategy'
+    if is_fast_test_v1(strategy_id):
+        return FAST_TEST_V1_NAME
     return phantom_preset_name(strategy_id)
 
 
@@ -468,6 +486,12 @@ def _resume_paper_session(spec):
             config = _fee_config(PhantomV2Config(), fees)
             service = PaperTradeService(strategy_id, config, **common)
             service.strategy = FastTestStrategyService(service.config)
+        elif is_fast_test_v1(strategy_id):
+            # FastTest V1.0 — same signals, plus the validation / booking layer.
+            config = fast_test_v1_config(fees=fees)
+            service = PaperTradeService(strategy_id, config, **common)
+            service.strategy = FastTestV1StrategyService(service.config)
+            service.oms = FastTestV1OrderManager(service.config)
         elif strategy_id == "PhantomV2":
             service = PaperTradeService(strategy_id, _fee_config(_load_champion_config(), fees), **common)
         elif _is_builtin_phantom(strategy_id):
@@ -2103,6 +2127,15 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         strategy_service = FastTestStrategyService(cfg)
         wants_metadata = False
         label = "FastTest"
+    elif is_fast_test_v1(strategy_id):
+        # FastTest V1.0 overlay: the signals are FastTest's, so the chart shows
+        # exactly where entries come from; the validation layer only changes
+        # how long a trade is held once it is on.
+        cfg = fast_test_v1_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = FastTestV1StrategyService(cfg)
+        wants_metadata = False
+        label = FAST_TEST_V1_NAME
     else:
         try:
             strat = db.query(CustomStrategy).filter(
@@ -2216,7 +2249,14 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
         config = _fee_config(req.params, fees)
-        if req.strategy_id == "PhantomV2":
+        if is_fast_test_v1(req.strategy_id):
+            # FastTest V1.0 — the FastTest signals with the validation /
+            # profit-booking order manager. Nothing else in the run changes.
+            v1_config = fast_test_v1_config(req.params, fees=fees)
+            engine = BacktestEngine(config=v1_config, fee_schedule=fees, data_source=source,
+                                    strategy_service=FastTestV1StrategyService(v1_config),
+                                    oms=FastTestV1OrderManager(v1_config))
+        elif req.strategy_id == "PhantomV2":
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         elif _is_builtin_phantom(req.strategy_id):
             # v3.5 preset: the form's parameters, narrowed to the preset's
@@ -2373,6 +2413,17 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                     # v3.5 — MACD line / signal line at the signal candle.
                     "macd_line": getattr(t, 'macd_line', None),
                     "macd_signal": getattr(t, 'macd_signal', None),
+                    # FastTest V1.0 audit (NULL for every other strategy): the
+                    # validation verdict, the close it was judged on, the price
+                    # threshold, whether +0.90% was booked / the 2H rule exited
+                    # and the final reason + net-of-fees P&L.
+                    "validation_status": getattr(t, 'validation_status', None),
+                    "validation_close": getattr(t, 'validation_close', None),
+                    "validation_threshold": getattr(t, 'validation_threshold', None),
+                    "tp090_hit": getattr(t, 'tp090_hit', None),
+                    "validation_exit": getattr(t, 'validation_exit', None),
+                    "final_exit_reason": getattr(t, 'final_exit_reason', None),
+                    "final_net_pnl": getattr(t, 'final_net_pnl', None),
                     "conditions": {
                         "trend_ok": t.cond_trend_ok,
                         "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
@@ -2914,6 +2965,17 @@ def start_paper_trade(
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
         service.strategy = FastTestStrategyService(service.config)
+    elif is_fast_test_v1(strategy_id):
+        service = PaperTradeService(strategy_id, fast_test_v1_config(fees=fees),
+                                    initial_capital=capital, margin_pct=margin_pct,
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name,
+                                    trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
+        service.strategy = FastTestV1StrategyService(service.config)
+        service.oms = FastTestV1OrderManager(service.config)
     elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
@@ -3371,6 +3433,17 @@ def start_live_trade(
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
         service.strategy = FastTestStrategyService(service.config)
+    elif is_fast_test_v1(strategy_id):
+        service = LiveTradeService(strategy_id, fast_test_v1_config(fees=fees), api_key, api_secret,
+                                   initial_capital=capital, margin_pct=margin_pct, broker_name=source,
+                                   passphrase=passphrase, testnet=testnet, fee_schedule=fees,
+                                   definition=definition, trading_windows=window_config,
+                                   use_mark_price=use_mark, user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
+        service.strategy = FastTestV1StrategyService(service.config)
+        service.oms = FastTestV1OrderManager(service.config)
     elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:

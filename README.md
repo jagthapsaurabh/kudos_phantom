@@ -416,6 +416,50 @@ A preset is the tuned champion config with only the setup / direction narrowed (
 lists them). Presets are separate strategy ids, so a preset and the default can run side by side on
 one account, and History / Sessions show the preset's name.
 
+### FastTest V1.0 — the debug strategy with validation + profit booking
+
+`FastTest` is the debug strategy: it fires on almost every bar (RSI(14) below 50 → long, at/above 50
+→ short) so order placement, history and P&L plumbing can be exercised. **`FastTestV1` is a separate
+strategy** (`backend/app/core/fast_test_v1.py`) — the original `FastTest` is untouched and keeps
+behaving exactly as before. V1 copies the entry rule verbatim and adds only two trade-management
+layers on top of the existing stop plan:
+
+| rule | type | detail |
+|---|---|---|
+| **+0.90% profit booking** | **TOUCH** | long `high ≥ entry × 1.0090` · short `low ≤ entry × 0.9910` → book the full position at that level |
+| **2H validation** | **CLOSE** | the close of the 2nd completed 1h candle after entry must satisfy long `close ≥ entry × 1.0035` / short `close ≤ entry × 0.9965` |
+| validation PASS | — | marked `VALIDATED`; the trade continues on the existing SL / trailing SL / exits |
+| validation FAIL | — | exits **at that 2h close** (reason `VALFAIL`) |
+
+Priority inside one candle matches the spec and the engine's conservatism: the resting **stop still
+wins** if a bar pierces both the stop and the target; otherwise the +0.90% touch books before the
+trailing stop, the plan's TP and the timeout. Nothing else changed — entry conditions, position
+sizing, initial SL, trailing SL, cooldown, timeout and fees are the same values the other strategies
+use, and **no new indicator or filter** was added.
+
+Where to pick it: **Paper**, **Live**, **Chart** and **Backtest** dropdowns, plus the admin panel's
+debug button. The three rule constants are fixed defaults (`validation_bars=2`,
+`validation_close_pct=0.0035`, `profit_book_pct=0.009`) and can be overridden per run from the
+params block.
+
+**Audit fields.** Every V1 trade carries seven extra fields in the trade log, the CSV/Excel export
+(appended as the last seven columns, so existing sheets keep their positions) and the paper/live
+History detail:
+
+| field | meaning |
+|---|---|
+| `validation_status` | `VALIDATED` · `FAILED` · `TP_090_HIT` · `NOT_REACHED` |
+| `validation_close` | the close the rule judged (validating close, failing deadline close, or the last close seen) |
+| `validation_threshold` | the price level the close had to reach (`entry × 1.0035` long / `× 0.9965` short) |
+| `tp090_hit` | 1 when the +0.90% booking fired |
+| `validation_exit` | 1 when the trade was closed by the 2H rule |
+| `final_exit_reason` | the closing reason code (`TP090`, `VALFAIL`, or the existing `SL` / `TSL` / `TP` / `MH` / `REV`) |
+| `final_net_pnl` | the booked P&L in ₹ **after** entry + exit fees |
+
+Exit reasons `TP090` (profit booked) and `VALFAIL` (validation failed) only ever come from this
+strategy. In live trading the venue bracket's take-profit leg is placed at the +0.90% level so the
+exchange target matches the strategy; the stop-loss leg and trail distance are unchanged.
+
 ### Trade log: which candle, which colour, and the full export
 The trade log answers three questions for every trade — **which candle raised the signal**, **which
 candle the entry actually filled on**, and **what colour each was**. The strategy fires on candle *i*
@@ -452,6 +496,8 @@ cd backend
 python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_macd_line_and_modes.py # 76 checks: MACD line/signal rules, setup + direction splits, presets
+python test_fast_test_v1.py       # 114 checks: FastTest V1.0 — entry parity, 2H validation, +0.90% booking,
+                                  # audit fields, paper/live wiring, DB migration, results API
 python test_paper_history.py      # 63 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
@@ -466,9 +512,10 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 430 checks: trade-log table + CSV export, trading windows, page
+cd frontend && npm test            # 460 checks: trade-log table + CSV export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
-                                   # key replacement + credential badges, Kudos presets + MACD line form
+                                   # key replacement + credential badges, Kudos presets + MACD line form,
+                                   # FastTest V1.0 dropdowns / audit columns / validation chips
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

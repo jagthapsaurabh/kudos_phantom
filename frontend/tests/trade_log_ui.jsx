@@ -188,11 +188,16 @@ check('CSV has one row per trade plus the header', rows.length === 3);
 // Pinned so the documented column count cannot drift from the code.
 // 45 original columns + 5 BTC-perpetual pricing columns (basis / mark /
 // traded for entry and exit, plus the "priced on mark" flag) + 3 v3.5 columns
-// appended at the end (MACD line, MACD signal, MACD line-rule PASS/FAIL/N/A).
-check('CSV has exactly 53 columns', header.length === 53, `got ${header.length}`);
+// + 7 FastTest V1.0 audit columns, all appended at the end so existing sheets
+// keep their column positions.
+check('CSV has exactly 60 columns', header.length === 60, `got ${header.length}`);
 check('v3.5 columns are appended after the original layout',
-  header.slice(-3).join('|') === 'MACD Line|MACD Signal|Entry Cond 8 - MACD Line/Signal'
+  header.slice(50, 53).join('|') === 'MACD Line|MACD Signal|Entry Cond 8 - MACD Line/Signal'
   && header.indexOf('Bars Held') === 49);
+check('FastTest V1.0 audit columns are appended last',
+  header.slice(-7).join('|') === 'Validation Status|Validation Close|Validation Threshold|'
+    + 'TP 0.90% Hit|Validation Exit|Final Exit Reason|Final Net P&L',
+  header.slice(-7).join('|'));
 check('MACD line-rule column reads N/A when the run did not use the rules', col('Entry Cond 8 - MACD Line/Signal') === 'N/A');
 check('CSV has the mark-price / traded-price columns',
   ['Entry Price (Basis)', 'Entry Price (Mark)', 'Entry Price (Traded)',

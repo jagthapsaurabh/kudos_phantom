@@ -48,6 +48,46 @@ class OrderManager:
         self.config = config
         self.active_trades = {}
 
+    # ------------------------------------------------------------------
+    # Strategy hooks (no-ops for every strategy except those that override
+    # them — see ``app/core/fast_test_v1.py``). Kept on the base class so the
+    # engine and the paper / live workers can call them unconditionally.
+    # ------------------------------------------------------------------
+    def strategy_touch_exit(self, trade, seen_high, seen_low):
+        """Touch-based exit rule; ``None`` = nothing fired.
+
+        Evaluated after the candle's worst-case stop check and before the
+        trailing / target steps, so a resting stop keeps priority over a
+        strategy's own booking rule while the booking rule keeps priority over
+        the trailing stop, the take profit and the holding-time timeout.
+        """
+        return None
+
+    def strategy_bar_close_exit(self, trade, bar_close_usd, bar_time):
+        """Close-based exit rule judged on a completed candle's close.
+
+        ``None`` = nothing fired. ``(price, reason, detail)`` closes the trade
+        at that close.
+        """
+        return None
+
+    def strategy_audit_fields(self, trade, net_pnl_inr=None):
+        """Extra audit fields recorded when the trade closes (``{}`` = none)."""
+        return {}
+
+    def strategy_summary(self, trades=None):
+        """Strategy-specific run summary for the results payload (``{}`` = none)."""
+        return {}
+
+    def bracket_take_profit(self, direction, price_usd, planned_tp):
+        """Take-profit level for the venue-side bracket order.
+
+        Default: the plan's own TP, so live brackets are unchanged for every
+        existing strategy. FastTest V1 overrides it with its +0.90% booking
+        level so the exchange rests the target the strategy actually uses.
+        """
+        return planned_tp
+
     def create_order(self, symbol, direction, price_usd, atr_usd, timestamp, margin_inr,
                      conversion_rate=85.0, trade_price_usd=None, mark_price_usd=None,
                      mark_price_basis=None):
@@ -118,7 +158,8 @@ class OrderManager:
 
     def update_trade(self, symbol, current_price_usd, current_atr_usd, timestamp,
                      trade_price_usd=None, mark_price_usd=None, advance_bar=True,
-                     bar_high_usd=None, bar_low_usd=None):
+                     bar_high_usd=None, bar_low_usd=None,
+                     bar_close_usd=None, bar_time=None):
         """Mark-to-market an open position and apply its stop/target rules.
 
         ``advance_bar`` controls the holding-time clock only. The backtest
@@ -137,6 +178,11 @@ class OrderManager:
         candle the STOP fills (the sequence inside the bar is unknowable, so
         the worst case is booked, never the best). Live and paper tick with
         real-time prices and omit them; behaviour there is unchanged.
+
+        ``bar_close_usd`` / ``bar_time`` describe the candle whose close is
+        being judged (the completed candle in paper / live, the current candle
+        in a backtest). They are only used by close-based strategy rules such
+        as FastTest V1's 2h validation; every other strategy ignores them.
         """
         if symbol not in self.active_trades: return None
         trade = self.active_trades[symbol]
@@ -178,6 +224,16 @@ class OrderManager:
                         be_note = " (at breakeven)" if trade.sl >= trade.entry_price else ""
                         detail = f"Stop loss hit — price fell to {seen_low:,.2f} \u2264 SL {pre_stop:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
                     return self.close_trade(symbol, pre_stop, timestamp, "TSL" if pre_trail else "SL", detail)
+
+            # 0b. Strategy hook (FastTest V1 +0.90% booking). After the stop, so
+            #     the resting stop keeps priority, and before the trail / target
+            #     steps so a profit touch beats the trailing stop and the timeout.
+            rule = self.strategy_touch_exit(trade, seen_high, seen_low)
+            if rule is not None:
+                price, reason, detail = rule
+                return self.close_trade(symbol, price, timestamp, reason, detail,
+                                        trade_price_usd=trade_price_usd,
+                                        mark_price_usd=mark_price_usd)
 
             # 1. Update peak and activate trail
             trade.peak_price = max(trade.peak_price, seen_high)
@@ -232,6 +288,14 @@ class OrderManager:
                         detail = f"Stop loss hit — price rose to {seen_high:,.2f} ≥ SL {pre_stop:,.2f}{be_note} (initial SL {trade.sl_entry:,.2f})"
                     return self.close_trade(symbol, pre_stop, timestamp, "TSL" if pre_trail else "SL", detail)
 
+            # 0b. Strategy hook (FastTest V1 +0.90% booking) — see the long side.
+            rule = self.strategy_touch_exit(trade, seen_high, seen_low)
+            if rule is not None:
+                price, reason, detail = rule
+                return self.close_trade(symbol, price, timestamp, reason, detail,
+                                        trade_price_usd=trade_price_usd,
+                                        mark_price_usd=mark_price_usd)
+
             trade.peak_price = min(trade.peak_price, seen_low)
             if trade.peak_price <= trade.trail_activation:
                 new_tsl = trade.peak_price + (self.config.trail_distance_atr * current_atr_usd)
@@ -259,6 +323,16 @@ class OrderManager:
             if seen_low <= trade.tp:
                 detail = f"Take profit hit — price fell to {seen_low:,.2f} ≤ TP {trade.tp:,.2f}"
                 return self.close_trade(symbol, trade.tp, timestamp, "TP", detail)
+
+        # Strategy hook (FastTest V1 2h validation): judged on a completed
+        # candle's close, after every stop / target of that candle and before
+        # the holding-time timeout.
+        rule = self.strategy_bar_close_exit(trade, bar_close_usd, bar_time)
+        if rule is not None:
+            price, reason, detail = rule
+            return self.close_trade(symbol, price, timestamp, reason, detail,
+                                    trade_price_usd=trade_price_usd,
+                                    mark_price_usd=mark_price_usd)
 
         if trade.bars_held >= self.config.timeout_bars:
             detail = (f"Max holding time reached — closed at market {current_price_usd:,.2f} "

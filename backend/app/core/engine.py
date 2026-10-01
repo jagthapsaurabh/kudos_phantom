@@ -7,13 +7,18 @@ from ..database.models import SessionLocal, Klines
 from datetime import datetime
 
 class BacktestEngine:
-    def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Delta"):
+    def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Delta",
+                 strategy_service=None, oms=None):
         self.config = config
         self.fee_schedule = fee_schedule
         self.data_source = data_source
-        self.strategy_service = StrategyService(config)
+        # Custom strategy / order-manager instances (e.g. FastTest V1, whose
+        # order manager carries the validation + profit-booking layer). Both
+        # default to the standard Phantom service, so every existing caller is
+        # unaffected.
+        self.strategy_service = strategy_service or StrategyService(config)
         self.validator_service = ValidatorService()
-        self.oms = OrderManager(config)
+        self.oms = oms or OrderManager(config)
 
     def _get_data_from_db(self, symbol, interval, start_date=None, end_date=None, source=None):
         db = SessionLocal()
@@ -503,18 +508,30 @@ class BacktestEngine:
         window_guard = TradingWindowGuard.from_any(getattr(cfg, "trading_windows", None))
         self.window_guard = window_guard
 
+        def book_closed(trade):
+            """Fee/PnL booking + trade-log record for a just-closed trade.
+
+            Shared by reversals, the stop/target pass and the strategy bar-close
+            rules so every exit lands in the log with the same fields — including
+            the strategy's own audit fields when it has any (FastTest V1).
+            """
+            net, eq, td = self._book_closed_trade(trade, equity_box[0], conversion_rate)
+            td.update(open_ctx_box.pop(trade.symbol, {}))
+            td["exit_candle_type"] = self._candle_color(meta, i)
+            audit = getattr(self.oms, 'strategy_audit_fields', None)
+            if callable(audit):
+                td.update(audit(trade, net))
+            trades.append(td)
+            equity_box[0] = eq
+            return eq
+
         def close_active(sym, price, ts, reason):
             """Force-close helper used for reversals."""
             trade = self.oms.close_trade(sym, price, ts, reason,
                                          mark_price_usd=self._mark_at(mark_closes, i))
             if trade.bars_held == 0:
                 trade.bars_held = 1
-            net, eq, td = self._book_closed_trade(trade, equity_box[0], conversion_rate)
-            td.update(open_ctx_box.pop(sym, {}))
-            td["exit_candle_type"] = self._candle_color(meta, i)
-            trades.append(td)
-            equity_box[0] = eq
-            return eq
+            return book_closed(trade)
 
         equity_box = [equity_inr]
         open_ctx_box = {}
@@ -546,13 +563,15 @@ class BacktestEngine:
                                                trade_price_usd=trade_price_usd,
                                                mark_price_usd=current_mark_usd,
                                                bar_high_usd=(float(dec_highs[i]) if dec_highs is not None else None),
-                                               bar_low_usd=(float(dec_lows[i]) if dec_lows is not None else None))
+                                               bar_low_usd=(float(dec_lows[i]) if dec_lows is not None else None),
+                                               # This candle's close / stamp: close-based
+                                               # strategy rules (FastTest V1's 2H validation)
+                                               # are judged on it. Ignored by every other
+                                               # strategy.
+                                               bar_close_usd=current_price_usd,
+                                               bar_time=current_time)
                 if result:
-                    net, equity_box[0], td = self._book_closed_trade(result, equity_box[0], conversion_rate)
-                    td.update(open_ctx_box.pop(sym, {}))
-                    # Colour of the candle the exit was evaluated on.
-                    td["exit_candle_type"] = self._candle_color(meta, i)
-                    trades.append(td)
+                    book_closed(result)
                     last_exit_i = i
 
             equity_inr = equity_box[0]
@@ -723,6 +742,14 @@ class BacktestEngine:
                 "blocked_entries": blocked_entries,
             }
         }
+
+        # Strategy-specific run summary (FastTest V1: validation counters).
+        # Empty for every other strategy, so nothing changes for them.
+        summary_hook = getattr(self.oms, 'strategy_summary', None)
+        if callable(summary_hook):
+            summary = summary_hook(trades)
+            if summary:
+                results["strategy_summary"] = summary
 
         if trade_log_path:
             self.export_trade_log(trades, trade_log_path)
