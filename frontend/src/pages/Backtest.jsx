@@ -5,7 +5,7 @@ import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } from '../utils/tradingWindows';
-import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart, AlertTriangle, BadgeCheck, BarChart3, Filter, ListChecks, LogOut, Shield } from 'lucide-react';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart, AlertTriangle, BadgeCheck, BarChart3, Filter, ListChecks, LogOut, Shield, ArrowLeftRight } from 'lucide-react';
 import MarketOverlayChart from '../components/MarketOverlayChart';
 import PhantomPresetOptions from '../components/PhantomPresetOptions';
 import RiskExitModelEditor from '../components/RiskExitModelEditor';
@@ -121,47 +121,46 @@ const paramIssue = (field, value) => {
   return '';
 };
 
-// One card per configuration group: icon, name, what it controls, how many of
-// its values differ from the shipped default, and a per-group reset. The body
-// is a responsive grid so a phone gets one field per row and a wide monitor
-// gets three without any horizontal scrolling.
+// One block per configuration group, in the order the old panel used them:
+// a plain icon and title, one sentence on what the block controls, an "edited"
+// count, a per-group reset, and the fields in a roomy responsive grid. Blocks
+// are stacked full width and separated by a hairline — no nested cards, so the
+// form keeps one column of attention on a phone and three fields per row on a
+// wide monitor.
 const ParamGroupCard = ({ id, title, icon: Icon, hint, changed = 0, onReset, children, ...rest }) => (
-  <section id={id} {...rest}
-    className="scroll-mt-28 rounded-xl border border-gray-700/70 bg-gray-900/40 shadow-sm">
-    <header className="flex items-start justify-between gap-2 border-b border-gray-700/60 px-3.5 py-2.5">
+  <section id={id} {...rest} className="scroll-mt-28 py-5 first:pt-0 last:pb-0">
+    <header className="mb-4 flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
       <div className="flex min-w-0 items-start gap-2.5">
-        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-gray-800 text-blue-400 ring-1 ring-inset ring-gray-700">
-          {Icon ? <Icon size={14} /> : null}
-        </span>
+        {Icon ? <Icon size={16} className="mt-0.5 shrink-0 text-blue-400" /> : null}
         <div className="min-w-0">
-          <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-200">{title}</h3>
-          {hint ? <p className="mt-0.5 text-[10px] leading-snug text-gray-500">{hint}</p> : null}
+          <h3 className="text-sm font-semibold text-white">{title}</h3>
+          {hint ? <p className="mt-0.5 text-xs leading-relaxed text-gray-400">{hint}</p> : null}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         {changed > 0 && (
           <span data-testid={`changed-${id}`}
             title={`${changed} value${changed === 1 ? '' : 's'} differ from the shipped default`}
-            className="rounded-full border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[9px] font-bold text-amber-300">
-            {changed} changed
+            className="rounded-full border border-amber-700/60 bg-amber-900/20 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+            {changed} edited
           </span>
         )}
         {onReset && changed > 0 && (
           <button onClick={onReset} title="Reset this group to the shipped defaults"
-            className="rounded-lg p-1 text-gray-500 transition hover:bg-gray-800 hover:text-white">
-            <RotateCcw size={12} />
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-medium text-gray-500 transition hover:bg-gray-700/40 hover:text-white">
+            <RotateCcw size={12} /> Reset
           </button>
         )}
       </div>
     </header>
-    <div className="grid grid-cols-1 gap-3 p-3.5 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
+    <div className="grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
   </section>
 );
 
 // One label / input language for every form on the page: Run Setup, the
 // Strategy Configuration groups and the trading-window block.
-const FIELD_LABEL = 'mb-1 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400';
-const FIELD_INPUT = 'w-full rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25';
+const FIELD_LABEL = 'mb-1.5 flex items-center gap-1.5 text-xs font-medium text-gray-300';
+const FIELD_INPUT = 'h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25';
 
 // One icon + one sentence per Phantom group, used by the group cards and the
 // jump links. Keys must match `sharedParamGroups`.
@@ -380,16 +379,14 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
 
 const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle, actions, className = '', children }) => (
   <div className={`bg-gray-800 rounded-2xl border border-gray-700 shadow-xl ${className}`}>
-    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-6">
       <div className="flex min-w-0 items-start gap-3">
-        {Icon ? (
-          <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-gray-900 text-blue-400 ring-1 ring-inset ring-gray-700">
-            <Icon size={16} />
-          </span>
-        ) : null}
         <div className="min-w-0">
-          <h2 className="text-sm font-bold uppercase tracking-wider text-gray-200">{title}</h2>
-          {subtitle ? <p className="mt-0.5 text-xs leading-snug text-gray-500">{subtitle}</p> : null}
+          <div className="flex items-center gap-2">
+            {Icon ? <Icon size={16} className="shrink-0 text-blue-400" /> : null}
+            <h2 className="text-sm font-bold uppercase tracking-wider text-gray-200">{title}</h2>
+          </div>
+          {subtitle ? <p className="mt-1 text-xs leading-snug text-gray-500">{subtitle}</p> : null}
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
@@ -836,13 +833,17 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     const issue = paramIssue(field, value);
     return (
       <div className="flex flex-col" data-field={field}>
-        <div className="mb-1 flex items-baseline justify-between gap-2">
+        <div className="mb-1.5 flex items-baseline justify-between gap-2">
           <label htmlFor={`param-input-${field}`}
-            className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+            className="flex items-center gap-1.5 text-xs font-medium text-gray-300">
+            {valueChanged(field) && (
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400"
+                title="Differs from the shipped default" />
+            )}
             {meta.label}
-            {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>}
+            {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={12} /></span>}
           </label>
-          {issue ? <span className="text-[9px] font-bold text-red-400">{issue}</span> : null}
+          {issue ? <span className="text-[10px] font-semibold text-red-400">{issue}</span> : null}
         </div>
         <div className="relative">
           <input id={`param-input-${field}`} type="number" inputMode="decimal"
@@ -852,12 +853,12 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
               ? onChange({ target: { value: toFraction(e.target.value) } })
               : onChange(e))}
             data-testid={`param-${field}`}
-            className={`w-full rounded-lg border bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 ${issue ? 'border-red-700' : 'border-gray-700'} ${meta.suffix ? 'pr-12' : ''}`} />
+            className={`h-10 w-full rounded-lg border bg-gray-900 px-3 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 ${issue ? 'border-red-700' : 'border-gray-700'} ${meta.suffix ? 'pr-12' : ''}`} />
           {meta.suffix ? (
-            <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-gray-500">{meta.suffix}</span>
+            <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-gray-500">{meta.suffix}</span>
           ) : null}
         </div>
-        {meta.hint && <span className="mt-1 text-[10px] leading-snug text-gray-500">{meta.hint}</span>}
+        {meta.hint && <span className="mt-1.5 text-[11px] leading-relaxed text-gray-500">{meta.hint}</span>}
       </div>
     );
   };
@@ -918,14 +919,15 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
     return (
       <div className="flex flex-col">
-        <div className="mb-1 flex items-center gap-1">
-          <label className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">{meta.label}</label>
-          {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>}
+        <div className="mb-1.5 flex items-center gap-1.5">
+          <label className="text-xs font-medium text-gray-300">{meta.label}</label>
+          {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={12} /></span>}
         </div>
-        <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-[11px] leading-snug text-gray-300 transition hover:border-gray-600">
-          <input type="checkbox" checked={checked} onChange={onChange} className="h-3.5 w-3.5 shrink-0 accent-blue-500" />
+        <label className="flex h-10 cursor-pointer items-center gap-2.5 rounded-lg border border-gray-700 bg-gray-900 px-3 text-xs leading-snug text-gray-300 transition hover:border-gray-600">
+          <input type="checkbox" checked={checked} onChange={onChange} className="h-4 w-4 shrink-0 accent-blue-500" />
           Allow momentum continuation trades
         </label>
+        {meta.hint && <span className="mt-1.5 text-[11px] leading-relaxed text-gray-500">{meta.hint}</span>}
       </div>
     );
   };
@@ -1531,7 +1533,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
               <span className="font-mono text-xs text-white">{perpetualFor(dataSource)}</span>
               <span className="ml-2 text-[10px] text-gray-500">perpetual</span>
             </div>
-            <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+            <label className="mt-2 flex cursor-pointer items-start gap-2.5 rounded-lg border border-gray-700 bg-gray-900/60 p-2.5 text-[11px] leading-relaxed text-gray-300">
               <input type="checkbox" checked={!!params.use_mark_price}
                      onChange={e => setUseMarkPrice(e.target.checked)}
                      className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
@@ -1570,60 +1572,64 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
               differ from the shipped defaults, what still needs attention, and
               the two actions that matter on a long form. */}
           <div data-testid="strategy-config-summary"
-            className="sticky top-12 z-20 -mx-4 mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-y border-gray-700/70 bg-gray-800/95 px-4 py-2.5 backdrop-blur md:top-0 sm:-mx-5 sm:px-5">
+            className="sticky top-12 z-20 -mx-4 mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-y border-gray-700/70 bg-gray-800/95 px-4 py-3 backdrop-blur md:top-0 sm:-mx-5 sm:px-6">
             <span className="inline-flex min-w-0 items-center gap-2">
               <span className={`h-2 w-2 shrink-0 rounded-full ${fastTestFamily ? 'bg-amber-400' : 'bg-blue-400'}`} />
-              <span className="truncate text-xs font-bold text-white">{editingStrategyName}</span>
+              <span className="truncate text-sm font-semibold text-white">{editingStrategyName}</span>
             </span>
             {changedTotal > 0 ? (
               <span data-testid="strategy-config-changed"
-                className="rounded-full border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[10px] font-bold text-amber-300">
+                className="rounded-full border border-amber-700/60 bg-amber-900/20 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
                 {changedTotal} changed from defaults
               </span>
             ) : (
               <span data-testid="strategy-config-default"
-                className="rounded-full border border-gray-700 bg-gray-900 px-2 py-0.5 text-[10px] text-gray-500">
+                className="rounded-full border border-gray-700 bg-gray-900 px-2.5 py-0.5 text-[11px] text-gray-500">
                 shipped defaults
               </span>
             )}
             {configIssues.length > 0 && (
               <span data-testid="strategy-config-issues"
                 title={`Fix: ${configIssues.join(', ')}`}
-                className="inline-flex items-center gap-1 rounded-full border border-red-800/60 bg-red-900/20 px-2 py-0.5 text-[10px] font-bold text-red-300">
-                <AlertTriangle size={10} /> {configIssues.length} to fix
+                className="inline-flex items-center gap-1 rounded-full border border-red-700/60 bg-red-900/20 px-2.5 py-0.5 text-[11px] font-medium text-red-300">
+                <AlertTriangle size={11} /> {configIssues.length} to fix
               </span>
             )}
             <span className="ml-auto flex flex-wrap items-center gap-2">
               <button onClick={resetParams} disabled={changedTotal === 0}
-                className="rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-[11px] font-semibold text-gray-300 transition hover:border-gray-500 hover:text-white disabled:opacity-40">
+                className="h-9 rounded-lg border border-gray-700 bg-gray-900 px-3 text-xs font-medium text-gray-300 transition hover:border-gray-500 hover:text-white disabled:opacity-40">
                 Reset all
               </button>
               <button onClick={saveAsNewStrategy} disabled={saving || configIssues.length > 0}
                 title={configIssues.length ? 'Fix the flagged values first' : 'Save these values as a named strategy'}
-                className="rounded-lg border border-green-800/60 bg-green-900/30 px-2.5 py-1.5 text-[11px] font-bold text-green-300 transition hover:bg-green-900/60 disabled:opacity-40">
+                className="h-9 rounded-lg border border-green-800/60 bg-green-900/30 px-3 text-xs font-semibold text-green-300 transition hover:bg-green-900/60 disabled:opacity-40">
                 {saving ? 'Saving…' : 'Save as strategy'}
               </button>
               <button onClick={runBacktest} disabled={loading || configIssues.length > 0}
                 title={configIssues.length ? 'Fix the flagged values first' : 'Run the full backtest with these values'}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-bold text-white shadow transition hover:bg-blue-500 disabled:opacity-40">
-                <Play size={12} /> Run Backtest
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 text-xs font-bold text-white shadow transition hover:bg-blue-500 disabled:opacity-40">
+                <Play size={13} /> Run Backtest
               </button>
             </span>
           </div>
 
           {/* Jump links — on a phone this is the quickest way through the form. */}
           <div data-testid="strategy-config-nav"
-            className="mb-4 flex items-center gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none]">
-            {configNav.map(item => (
-              <button key={item.id} onClick={() => scrollToGroup(item.id)}
-                className="whitespace-nowrap rounded-full border border-gray-700 bg-gray-900 px-3 py-1 text-[10px] font-semibold text-gray-400 transition hover:border-blue-500 hover:text-white">
-                {item.label}
-              </button>
+            className="mb-5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px]">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-600">Jump to</span>
+            {configNav.map((item, i) => (
+              <React.Fragment key={item.id}>
+                {i > 0 ? <span className="text-gray-700">·</span> : null}
+                <button onClick={() => scrollToGroup(item.id)}
+                  className="whitespace-nowrap text-gray-400 underline-offset-4 transition hover:text-blue-300 hover:underline">
+                  {item.label}
+                </button>
+              </React.Fragment>
             ))}
           </div>
 
           {fastTestFamily ? (
-            <div className="mb-4 rounded-xl border border-amber-900/40 bg-amber-900/10 p-3 text-xs leading-relaxed text-gray-400" data-testid="fast-test-config-note">
+            <div className="mb-2 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3.5 text-xs leading-relaxed text-gray-400" data-testid="fast-test-config-note">
               <b className="text-white">Entry rule</b> and <b className="text-white">Exit rule</b> below are yours to change —
               the shipped values are the original rule ({strategyFamily === FAST_TEST_V1_ID ? `${FAST_TEST_V1_NAME}: RSI 14 — long below 50, short at/above 50, plus the 2H validation and +0.90% booking` : `${FAST_TEST_NAME}: RSI 14 — long below 50, short at/above 50`}),
               so an unedited strategy behaves exactly as before.
@@ -1631,7 +1637,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
               Press <b className="text-white">Save strategy</b> to reuse them in Backtest, Paper and Live.
             </div>
           ) : (
-          <div className="mb-5 rounded-xl border border-blue-900/40 bg-blue-900/10 p-3 text-xs text-gray-400">
+          <div className="mb-2 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3.5 text-xs leading-relaxed text-gray-400">
             Set the shared strategy values below. Use the switches under <b className="text-white">MACD hist min</b> or
             <b className="text-white"> Min ATR floor</b> only when Long and Short need different thresholds — the ATR switch
             also lets each side pick its own comparison (<b className="text-white">&gt;, &lt;, ≥, ≤</b>) against the 50-bar ATR average.
@@ -1640,52 +1646,49 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
 
           {/* v3.5 — strategy separation: which setup and which side may trade. */}
           {!fastTestFamily && (
-          <div id="config-strategy-separation" className="mb-4 scroll-mt-28 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="strategy-separation">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Strategy separation</h3>
-              {presetLocked ? (
-                <span className="rounded border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[10px] text-amber-300">
-                  Fixed by the selected preset ({builtinStrategyName(selectedStrategyId)}). Pick <b>Kudos V2.5 (Default)</b> to change.
-                </span>
-              ) : (
-                <span className="text-[10px] text-gray-500">Both = the original strategy. Save the form as a strategy to reuse a split in Paper / Live.</span>
-              )}
-            </div>
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              {[['setup_mode', SETUP_MODES], ['trade_direction', TRADE_DIRECTIONS]].map(([field, options]) => {
-                const meta = PARAM_META[field];
-                const current = options.find(o => o.value === (params[field] || 'both')) || options[0];
-                return (
-                  <div key={field} className="flex flex-col">
-                    <label className="mb-1 flex items-center gap-1 text-[10px] font-semibold text-gray-400">
-                      {meta.label}
-                      <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>
-                    </label>
-                    <select value={params[field] || 'both'} disabled={presetLocked}
-                      onChange={e => setSharedField(field, e.target.value)}
-                      className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none transition focus:border-blue-500 disabled:opacity-60">
-                      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                    </select>
-                    <span className="mt-1 text-[10px] leading-snug text-gray-500">{current.hint}</span>
-                  </div>
-                );
-              })}
-            </div>
-            {(params.setup_mode === 'momentum' && params.enable_momentum_entry === false) && (
-              <p className="mt-2 text-[10px] text-amber-300">Momentum only overrides the unticked "Momentum entries" box — Setup B fires regardless.</p>
+          <ParamGroupCard id="config-strategy-separation" data-testid="strategy-separation"
+            title="Strategy separation" icon={ArrowLeftRight}
+            hint="Which entries this run may take: reversal and momentum, long and short. Both = the original strategy."
+            changed={changedIn(['setup_mode', 'trade_direction'])}
+            onReset={() => resetGroup(['setup_mode', 'trade_direction'])}>
+            {presetLocked && (
+              <span className="inline-flex w-fit items-center rounded-lg border border-amber-700/60 bg-amber-900/20 px-2.5 py-1 text-[11px] text-amber-300 sm:col-span-2 xl:col-span-3">
+                Fixed by the selected preset ({builtinStrategyName(selectedStrategyId)}). Pick <b className="mx-1">Kudos V2.5 (Default)</b> to change.
+              </span>
             )}
-          </div>
+            {[['setup_mode', SETUP_MODES], ['trade_direction', TRADE_DIRECTIONS]].map(([field, options]) => {
+              const meta = PARAM_META[field];
+              const current = options.find(o => o.value === (params[field] || 'both')) || options[0];
+              return (
+                <div key={field} className="flex flex-col">
+                  <label className={FIELD_LABEL}>
+                    {meta.label}
+                    <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={12} /></span>
+                  </label>
+                  <select value={params[field] || 'both'} disabled={presetLocked}
+                    onChange={e => setSharedField(field, e.target.value)}
+                    className={`${FIELD_INPUT} disabled:opacity-60`}>
+                    {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                  <span className="mt-1.5 text-[11px] leading-relaxed text-gray-500">{current.hint}</span>
+                </div>
+              );
+            })}
+            {(params.setup_mode === 'momentum' && params.enable_momentum_entry === false) && (
+              <p className="text-[11px] text-amber-300 sm:col-span-2 xl:col-span-3">Momentum only overrides the unticked "Momentum entries" box — Setup B fires regardless.</p>
+            )}
+          </ParamGroupCard>
           )}
 
           {fastTestFamily ? (
-            <div className="space-y-4" data-testid="fast-test-config">
+            <div className="divide-y divide-gray-700/60" data-testid="fast-test-config">
               {/* The rule itself — period, both thresholds, allowed direction. */}
               <ParamGroupCard id="config-fast-entry-rule" data-testid="fast-test-entry-rule"
                 title="Entry rule" icon={ListChecks}
                 hint="The rule's own numbers — the same rule runs with whatever you type here."
                 changed={changedIn(['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min', 'trade_direction'])}
                 onReset={() => resetGroup(['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min', 'trade_direction'])}>
-                <p className="text-[11px] leading-snug text-gray-400 sm:col-span-2 xl:col-span-3">
+                <p className="text-xs leading-relaxed text-gray-400 sm:col-span-2 xl:col-span-3">
                   One side per 1H candle, decided on that candle's RSI. Change the period, either threshold or the allowed
                   direction and the same rule runs with your numbers.{' '}
                   <span className="font-mono text-gray-200">
@@ -1698,16 +1701,15 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                   </React.Fragment>
                 ))}
                 <div className="flex flex-col">
-                  <label htmlFor="param-input-trade_direction"
-                    className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">Direction</label>
+                  <label htmlFor="param-input-trade_direction" className={FIELD_LABEL}>Direction</label>
                   <select id="param-input-trade_direction" value={params.trade_direction || 'both'} data-testid="param-trade_direction"
                     onChange={e => setFamilyField('trade_direction', e.target.value)}
-                    className="w-full rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25">
+                    className={FIELD_INPUT}>
                     <option value="both">Both — long &amp; short</option>
                     <option value="long">Long only</option>
                     <option value="short">Short only</option>
                   </select>
-                  <span className="mt-1 text-[10px] leading-snug text-gray-500">Long only never shorts, short only never longs.</span>
+                  <span className="mt-1.5 text-[11px] leading-relaxed text-gray-500">Long only never shorts, short only never longs.</span>
                 </div>
               </ParamGroupCard>
 
@@ -1720,48 +1722,49 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                 onReset={() => resetGroup(['use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout',
                   'exit_on_opposite', 'exit_rsi_enabled', 'exit_rsi_level', 'exit_macd_flip_enabled'])}>
                 <div className="sm:col-span-2 xl:col-span-3">
-                  <p className="text-[11px] leading-snug text-gray-400">
+                  <p className="text-xs leading-relaxed text-gray-400">
                     Everything is on / off exactly as the original strategy behaved — a switch only changes a run once you save
                     this strategy. The stop still keeps priority over a condition, and a condition over the timeout.
                   </p>
-                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  <h4 className="mt-4 text-xs font-semibold text-gray-300">Protective rules</h4>
+                  <div className="mt-2.5 grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
                     {DEBUG_EXIT_SWITCHES.map(([field, label, hint]) => (
-                      <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2.5 text-[10px] text-gray-300 transition hover:border-gray-600">
+                      <label key={field} className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-gray-700 bg-gray-900/60 p-3 text-xs text-gray-300 transition hover:border-gray-600">
                         <input type="checkbox" checked={params[field] !== false} data-testid={`toggle-${field}`}
                           onChange={e => setFamilyField(field, e.target.checked)}
                           className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
                         <span>
-                          <span className="block font-bold text-white">{label}</span>
-                          <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                          <span className="block font-medium text-white">{label}</span>
+                          <span className="mt-1 block leading-relaxed text-gray-500">{hint}</span>
                         </span>
                       </label>
                     ))}
                   </div>
-                  <h4 className="mt-4 text-[10px] font-bold uppercase tracking-wider text-gray-400">Exit conditions (on a completed candle)</h4>
-                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  <h4 className="mt-5 text-xs font-semibold text-gray-300">Exit conditions (read on a completed candle)</h4>
+                  <div className="mt-2.5 grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
                     {DEBUG_EXIT_CONDITIONS.map(([field, label, hint]) => (
-                      <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2.5 text-[10px] text-gray-300 transition hover:border-gray-600">
+                      <label key={field} className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-gray-700 bg-gray-900/60 p-3 text-xs text-gray-300 transition hover:border-gray-600">
                         <input type="checkbox" checked={!!params[field]} data-testid={`toggle-${field}`}
                           onChange={e => setFamilyField(field, e.target.checked)}
                           className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
                         <span>
-                          <span className="block font-bold text-white">{label}</span>
-                          <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                          <span className="block font-medium text-white">{label}</span>
+                          <span className="mt-1 block leading-relaxed text-gray-500">{hint}</span>
                         </span>
                       </label>
                     ))}
-                    <div className="rounded-lg border border-gray-700 bg-gray-900/80 p-2.5">
-                      <label className="flex cursor-pointer items-start gap-2 text-[10px] text-gray-300">
+                    <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                      <label className="flex cursor-pointer items-start gap-2.5 text-xs text-gray-300">
                         <input type="checkbox" checked={!!params.exit_rsi_enabled} data-testid="toggle-exit_rsi_enabled"
                           onChange={e => setFamilyField('exit_rsi_enabled', e.target.checked)}
                           className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
                         <span>
-                          <span className="block font-bold text-white">Exit on RSI level</span>
-                          <span className="mt-0.5 block leading-snug text-gray-500">Close a long at/above the level, a short at/below it.</span>
+                          <span className="block font-medium text-white">Exit on RSI level</span>
+                          <span className="mt-1 block leading-relaxed text-gray-500">Close a long at/above the level, a short at/below it.</span>
                         </span>
                       </label>
                       {params.exit_rsi_enabled && (
-                        <div className="mt-2">
+                        <div className="mt-3">
                           {renderNumberInput('exit_rsi_level', params.exit_rsi_level, e => setFamilyField('exit_rsi_level', parseFloat(e.target.value)))}
                         </div>
                       )}
@@ -1777,7 +1780,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                   hint="The 2H validation window and the profit-booking touch."
                   changed={changedIn(['validation_bars', 'validation_close_pct', 'profit_book_pct'])}
                   onReset={() => resetGroup(['validation_bars', 'validation_close_pct', 'profit_book_pct'])}>
-                  <p className="text-[11px] leading-snug text-gray-400 sm:col-span-2 xl:col-span-3">
+                  <p className="text-xs leading-relaxed text-gray-400 sm:col-span-2 xl:col-span-3">
                     The window is measured in completed 1H candles. A favourable close inside the window validates the trade and
                     the normal exits continue; a close that never gets there exits at the window's last close.
                     The booking percentage is checked on a price <b className="text-white">touch</b> and books the whole position first.
@@ -1790,8 +1793,10 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                 </ParamGroupCard>
               )}
 
-              {/* The shared plan: risk & exit model, timing, sizing. */}
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+              {/* The shared plan: risk & exit model, timing, sizing. A fragment
+                  keeps all six groups in the one stack, so the dividers and the
+                  first/last padding line up. */}
+              <>
                 <ParamGroupCard id="config-fast-risk-exit" title="Risk &amp; Exit Model" icon={Shield}
                   hint="ATR units (default), price % or a per-level mix."
                   changed={changedIn(['sl_floor_pct'])} onReset={() => resetGroup(['sl_floor_pct'])}>
@@ -1822,10 +1827,10 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                       </React.Fragment>
                     ))}
                 </ParamGroupCard>
-              </div>
+              </>
             </div>
           ) : (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3">
+          <div className="divide-y divide-gray-700/60">
             {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
               <ParamGroupCard key={groupName}
                 id={groupSlug(groupName)} data-testid={groupSlug(groupName)}
@@ -1851,13 +1856,13 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                       const label = isHist ? 'Use separate Long / Short MACD hist' : 'Use separate Long / Short Min ATR floor';
                       return <div key={field} className="space-y-2">
                         {renderNumberInput(field, params[field], e => setSharedField(field, parseFloat(e.target.value)))}
-                        <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                        <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-gray-700 bg-gray-900/60 p-3 text-xs text-gray-300">
                           <input type="checkbox" checked={enabled}
                             onChange={e => setDirectionalToggle(toggleKey, e.target.checked)}
-                            className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                            className="mt-0.5 h-4 w-4 accent-blue-500" />
                           <span>
-                            <span className="block font-bold text-white">{label}</span>
-                            <span className="mt-0.5 block text-gray-500">
+                            <span className="block font-medium text-white">{label}</span>
+                            <span className="mt-1 block leading-relaxed text-gray-500">
                               {isHist
                                 ? 'Long uses hist ≥ value; Short uses hist ≤ value.'
                                 : 'Pick the comparison (>, <, ≥, ≤) and value for each side. Both start on the default ATR ≥ rule.'}
@@ -1871,7 +1876,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                                 const sideValue = params.entry_conditions?.[side]?.[field];
                                 const sideOp = params.entry_conditions?.[side]?.atr_regime_op ?? DEFAULT_ATR_OP;
                                 return <div key={side}>
-                                  <label className={`mb-1 block text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                                  <label className={`mb-1 block text-[10px] font-semibold uppercase tracking-wide ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>
                                     {side} · {isHist ? (side === 'long' ? 'hist ≥' : 'hist ≤') : atrOpShort(sideOp)}
                                   </label>
                                   {isHist ? (
@@ -1895,7 +1900,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                               })}
                             </div>
                             {!isHist && (
-                              <p className="text-[9px] leading-snug text-gray-500">
+                              <p className="text-[11px] leading-relaxed text-gray-500">
                                 Applied as <span className="font-mono text-gray-300">ATR {atrOpShort(params.entry_conditions?.long?.atr_regime_op ?? DEFAULT_ATR_OP).replace('ATR ', '')} {params.entry_conditions?.long?.atr_regime_ratio ?? params[field] ?? 0} × SMA50(ATR)</span> for
                                 longs and <span className="font-mono text-gray-300">ATR {atrOpShort(params.entry_conditions?.short?.atr_regime_op ?? DEFAULT_ATR_OP).replace('ATR ', '')} {params.entry_conditions?.short?.atr_regime_ratio ?? params[field] ?? 0} × SMA50(ATR)</span> for
                                 shorts. Use <span className="font-mono text-gray-300">&lt;</span> to trade only when volatility is calm.
@@ -1917,20 +1922,23 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
 
           {/* v3.5 — optional MACD line / signal line entry rules. */}
           {!fastTestFamily && (
-          <div id="config-macd-line-rules" className="mt-4 scroll-mt-28 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="macd-line-rules">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">MACD line / signal line rules</h3>
-                <p className="mt-1 max-w-2xl text-[10px] leading-snug text-gray-500">
+          <div id="config-macd-line-rules" className="scroll-mt-28 py-5" data-testid="macd-line-rules">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <LineChart size={16} className="mt-0.5 shrink-0 text-blue-400" />
+                <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-white">MACD line / signal line rules</h3>
+                <p className="mt-0.5 max-w-2xl text-xs leading-relaxed text-gray-400">
                   Extra entry filters on the MACD <b className="text-gray-300">line</b> and its <b className="text-gray-300">signal line</b>
                   (periods {params.macd_fast}/{params.macd_slow}/{params.macd_signal} from the MACD Indicator group). Off by default — the
                   histogram threshold and the existing MACD confirmation / zero-cross checks are unchanged. Every rule is read on the
                   bullish side for longs and the bearish side for shorts, and applies to both Reversal and Momentum entries.
                 </p>
+                </div>
               </div>
-              <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-xs text-gray-200">
+              <label className="flex h-10 cursor-pointer items-center gap-2.5 rounded-lg border border-gray-700 bg-gray-900 px-3 text-xs font-medium text-gray-200 transition hover:border-gray-600">
                 <input type="checkbox" checked={!!macdLineRules.enabled}
-                  onChange={e => setMacdLineRule('enabled', e.target.checked)} className="h-3.5 w-3.5 accent-blue-500" />
+                  onChange={e => setMacdLineRule('enabled', e.target.checked)} className="h-4 w-4 accent-blue-500" />
                 Enable MACD line rules
               </label>
             </div>
@@ -1939,10 +1947,10 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   {MACD_LINE_RULE_KEYS.map(spec => (
                     <div key={spec.key} className="flex flex-col">
-                      <label className="mb-1 text-[10px] font-semibold text-gray-400">{spec.label}</label>
+                      <label className="mb-1.5 text-xs font-medium text-gray-300">{spec.label}</label>
                       <select value={macdLineRules[spec.key] || 'off'}
                         onChange={e => setMacdLineRule(spec.key, e.target.value)}
-                        className="w-full rounded-lg border border-gray-700 bg-gray-900 p-2 text-xs text-white outline-none focus:border-blue-500">
+                        className="h-10 w-full rounded-lg border border-gray-700 bg-gray-900 px-3 text-sm text-white outline-none transition focus:border-blue-500">
                         {MACD_LINE_RULES.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
                       </select>
                     </div>
@@ -1954,12 +1962,12 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                   {renderNumberInput('macd_signal_min', macdLineRules.signal_min,
                     e => setMacdLineRule('signal_min', e.target.value === '' ? null : parseFloat(e.target.value)))}
                 </div>
-                <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-gray-700 bg-gray-900/60 p-3 text-xs text-gray-300">
                   <input type="checkbox" checked={useDirMacdLine}
-                    onChange={e => setMacdLinePerSide(e.target.checked)} className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
+                    onChange={e => setMacdLinePerSide(e.target.checked)} className="mt-0.5 h-4 w-4 accent-blue-500" />
                   <span>
-                    <span className="block font-bold text-white">Use separate Long / Short MACD line rules</span>
-                    <span className="mt-0.5 block text-gray-500">Each side starts from the shared rules above; levels entered per side are used signed as typed (short levels are normally negative).</span>
+                    <span className="block font-medium text-white">Use separate Long / Short MACD line rules</span>
+                    <span className="mt-1 block leading-relaxed text-gray-500">Each side starts from the shared rules above; levels entered per side are used signed as typed (short levels are normally negative).</span>
                   </span>
                 </label>
                 {useDirMacdLine && (
@@ -1968,10 +1976,10 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                       const branch = params.entry_conditions?.[side] || {};
                       return (
                         <div key={side} className="space-y-2 rounded-lg border border-gray-700 bg-gray-900 p-3">
-                          <div className={`text-[9px] font-bold uppercase ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>{side}</div>
+                          <div className={`text-[10px] font-semibold uppercase tracking-wide ${side === 'long' ? 'text-green-400' : 'text-red-400'}`}>{side}</div>
                           {MACD_LINE_RULE_KEYS.map(spec => (
                             <div key={spec.key} className="flex items-center justify-between gap-2">
-                              <span className="text-[10px] text-gray-400">{spec.label}</span>
+                              <span className="text-[11px] text-gray-400">{spec.label}</span>
                               <select value={branch[`macd_${spec.key}`] || macdLineRules[spec.key] || 'off'}
                                 onChange={e => setDirectionalValue(side, `macd_${spec.key}`, e.target.value)}
                                 className="w-44 rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500">
@@ -1982,7 +1990,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                           <div className="grid grid-cols-2 gap-2">
                             {[['macd_line_min', side === 'long' ? 'MACD line ≥' : 'MACD line ≤'], ['macd_signal_min', side === 'long' ? 'Signal line ≥' : 'Signal line ≤']].map(([field, label]) => (
                               <div key={field}>
-                                <label className="mb-1 block text-[9px] font-bold uppercase text-gray-500">{label}</label>
+                                <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-gray-500">{label}</label>
                                 <input type="number" step="0.01" value={branch[field] ?? ''} placeholder="off"
                                   onChange={e => setDirectionalValue(side, field, e.target.value === '' ? null : parseFloat(e.target.value))}
                                   className="w-full rounded border border-gray-700 bg-gray-800 p-1.5 text-xs text-white outline-none focus:border-blue-500" />
@@ -1994,7 +2002,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
                     })}
                   </div>
                 )}
-                <p className="text-[10px] leading-snug text-gray-500">
+                <p className="text-[11px] leading-relaxed text-gray-500">
                   Applied as <span className="font-mono text-green-300">Long: {macdLineRuleText(params, 1)}</span>
                   <span className="mx-2 text-gray-600">|</span>
                   <span className="font-mono text-red-300">Short: {macdLineRuleText(params, -1)}</span>
@@ -2005,7 +2013,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
           )}
 
           {useDirection && !fastTestFamily && (
-            <div className="mt-5 rounded-lg border border-yellow-900/50 bg-yellow-900/10 p-3 text-[10px] text-yellow-300">
+            <div className="mt-5 rounded-xl border border-yellow-500/20 bg-yellow-500/5 p-3.5 text-xs leading-relaxed text-yellow-300">
               This run contains the legacy full Long / Short override switch. Its additional RSI, ADX, MACD-period,
               stop-loss and max-ATR overrides are still honoured by the engine; the two switches above control the
               editable MACD histogram and minimum ATR floor values.
@@ -2030,7 +2038,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
             ['Capital', `₹${Number(capital || 0).toLocaleString('en-IN')} · ${params.leverage}x`],
           ].map(([label, value]) => (
             <div key={label} className="rounded-xl border border-gray-700/70 bg-gray-900/40 px-3 py-2">
-              <div className="text-[9px] font-bold uppercase tracking-wider text-gray-500">{label}</div>
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-500">{label}</div>
               <div className="mt-0.5 truncate font-mono text-xs text-gray-200" title={value}>{value}</div>
             </div>
           ))}

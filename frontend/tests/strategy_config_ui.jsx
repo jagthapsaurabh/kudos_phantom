@@ -110,13 +110,19 @@ check('a changed group offers its own reset',
 
 // ------------------------------------------------------------ responsive --
 check('group bodies are one column on a phone, two on a tablet, three on a monitor',
-  trendCard.includes('grid grid-cols-1 gap-3') && trendCard.includes('sm:grid-cols-2') && trendCard.includes('xl:grid-cols-3'));
-check('the group grid itself is responsive',
-  /grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3/.test(phantom));
+  trendCard.includes('grid grid-cols-1 gap-x-5 gap-y-4') && trendCard.includes('sm:grid-cols-2') && trendCard.includes('xl:grid-cols-3'));
+check('the groups are stacked full width, separated by hairlines (no nested cards)',
+  /divide-y divide-gray-700\/60/.test(phantom) && phantom.includes('py-5 first:pt-0 last:pb-0'));
 check('the summary bar is full-bleed on every width',
   /data-testid="strategy-config-summary"[^>]*class="[^"]*-mx-4[^"]*sm:-mx-5/.test(phantom));
 check('inputs are readable on a phone (16px text, roomy padding)',
-  phantom.includes('px-2.5 py-2 text-sm text-white outline-none transition'));
+  phantom.includes('h-10 w-full rounded-lg border bg-gray-900 px-3 text-sm'));
+check('titles and labels are readable sizes, not 10px uppercase everywhere',
+  phantom.includes('text-sm font-semibold text-white')
+  && phantom.includes('text-xs font-medium text-gray-300')
+  && !phantom.includes('text-[11px] font-bold uppercase tracking-wider text-gray-200'));
+check('the jump links are quiet text links with a lead-in',
+  phantom.includes('Jump to') && /strategy-config-nav[\s\S]{0,600}hover:underline/.test(phantom));
 check('inputs keep the native mobile keyboard hints',
   phantom.includes('inputMode="decimal"') || phantom.includes('inputmode="decimal"'));
 check('a labelled input is linked to its label',
