@@ -16,7 +16,7 @@ import DateInput from '../components/DateInput';
 import PhantomPresetOptions from '../components/PhantomPresetOptions';
 import { isPhantomBuiltin, isFastTestV1 } from '../utils/phantomPresets';
 import { computeAll } from '../utils/indicators';
-import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
+import { ascendingBars, buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
 import {
   ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR, clampPriceZoom, isTypingTarget, stepPriceZoom,
   zoomActionForKey, zoomLabel, zoomLogicalRange, zoomPriceRange,
@@ -394,16 +394,19 @@ const ChartPage = () => {
       if (signalRange.start) params.set('start_date', signalRange.start);
       if (signalRange.end) params.set('end_date', signalRange.end);
       const res = await fetch(`${API_URL}/klines?${params.toString()}`);
-      const data = await res.json();
+      const payload = await res.json();
+      // Oldest-first, one candle per timestamp, numeric OHLC — whatever the API
+      // or a venue fallback answered with. Every consumer below (candles,
+      // volume, indicators, markers) then agrees on the same order.
+      const data = ascendingBars(Array.isArray(payload) ? payload : []);
       candlesRef.current = data;
       timesRef.current = data.map(d => d.time);
       closesRef.current = data.map(d => d.close);
 
-      const candles = data.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close }));
-      candleSeriesRef.current.setData(candles);
+      candleSeriesRef.current.setData(data);
       chartRef.current?.timeScale().fitContent();
-      setDataLen(candles.length);
-      setNoData(candles.length === 0);
+      setDataLen(data.length);
+      setNoData(data.length === 0);
       setLastPrice(Number(data[data.length - 1]?.close ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 }));
 
       if (volumeSeriesRef.current) {

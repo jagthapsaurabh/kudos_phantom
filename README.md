@@ -610,9 +610,11 @@ python test_broker_connections.py # 40 checks: which saved credentials a live ca
 python test_delta_key_recovery.py # 73 checks: rejected API key — hold entries, park the deadman switch, reload credentials
 python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one broker account
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
+python test_chart_overlay_api.py   # 18 checks: /klines window + chronological candle order (venue
+                                   # fallback included), signal fields for the chart overlay
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 563 checks (562 pass; the known PaperTrade live-tick smoke check fails on the
+cd frontend && npm test            # 570 checks (569 pass; the known PaperTrade live-tick smoke check fails on the
                                    # untouched baseline): trade-log table + CSV export, paper/live condition
                                    # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
@@ -620,7 +622,8 @@ cd frontend && npm test            # 563 checks (562 pass; the known PaperTrade 
                                    # FastTest V1.0 dropdowns / audit columns / validation chips,
                                    # paper+live condition analysis (trade_conditions_ui.jsx),
                                    # Risk & Exit model editor + docs (risk_exit_model_ui.jsx),
-                                   # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx)
+                                   # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx),
+                                   # candle ordering for the overlay charts (chart_overlay.jsx)
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

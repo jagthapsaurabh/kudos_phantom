@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { createChart, CandlestickSeries, createSeriesMarkers, CrosshairMode } from 'lightweight-charts';
-import { buildOverlayMarkers } from '../utils/chartOverlay';
+import { ascendingBars, buildOverlayMarkers } from '../utils/chartOverlay';
 
 /** Candlestick pane with LONG/SHORT/IN/OUT markers. Used on the Backtest page
  * so a finished run is visible on market candles, not only as an equity curve.
@@ -34,9 +34,9 @@ const MarketOverlayChart = ({ candles = [], trades = [], signals = [], height = 
       wickDownColor: '#ef4444',
       borderVisible: false,
     });
-    const bars = (candles || []).map(d => ({
-      time: d.time, open: d.open, high: d.high, low: d.low, close: d.close,
-    }));
+    // lightweight-charts asserts the series is oldest-first — never hand it the
+    // raw API order (a venue fallback can answer newest-first).
+    const bars = ascendingBars(candles);
     if (bars.length) series.setData(bars);
     const times = new Set(bars.map(b => b.time));
     const markers = buildOverlayMarkers({ signals, trades }).filter(m => times.has(m.time));

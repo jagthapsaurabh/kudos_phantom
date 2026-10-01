@@ -3943,11 +3943,32 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
             return formatted
 
         # Fallback to the selected source's public API if its seed is empty.
+        # The venue can answer newest-first (Delta does), and lightweight-charts
+        # asserts that its data is oldest-first, so the window is applied and the
+        # rows are handed over chronologically — one candle per timestamp.
         from .services.data_sync import DataSyncService
-        rows = DataSyncService.fetch_klines(normalize_source(source), symbol, interval, limit=limit)
-        return [{"time": int(pd.Timestamp(row['event_time']).timestamp()),
-                 "open": row['open'], "high": row['high'], "low": row['low'],
-                 "close": row['close'], "volume": row.get('volume', 0)} for row in rows]
+        start_dt = end_dt = None
+        try:
+            if start_date:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            pass
+        rows = DataSyncService.fetch_klines(
+            normalize_source(source), symbol, interval,
+            start_time=start_dt, end_time=end_dt, limit=cap,
+        )
+        by_time = {}
+        for row in rows or []:
+            try:
+                ts = int(pd.Timestamp(row['event_time']).timestamp())
+                by_time[ts] = {"time": ts, "open": row['open'], "high": row['high'],
+                               "low": row['low'], "close": row['close'],
+                               "volume": row.get('volume', 0)}
+            except (TypeError, ValueError, KeyError):
+                continue
+        return [by_time[ts] for ts in sorted(by_time)]
     except Exception as e:
         # No local data and the remote API is unreachable — return an empty
         # series so the UI shows an empty chart instead of a hard error.

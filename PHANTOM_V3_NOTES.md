@@ -345,6 +345,15 @@ choosing the model level by level (e.g. an ATR stop with a price-based target).
   through an `autoscaleInfoProvider`, so the axis keeps following new candles while zoomed.
   `frontend/src/utils/chartZoom.js` holds the pure maths and `frontend/tests/chart_zoom_ui.jsx`
   (41 checks) covers the helpers, the rendered toolbar and the runtime wiring.
+- **Fix — "data must be asc ordered by time" on the Backtest candle pane**: Delta answers
+  `/v2/history/candles` newest-first, and `/klines` returns that venue fallback whenever the local
+  seed is empty for the window. lightweight-charts asserts its data is oldest-first, so the overlay
+  pane threw inside React. Candles are now normalized at three levels — `_parse_candle_rows` sorts
+  and de-duplicates before anything else sees the rows, `/klines` sorts (and windows) the fallback
+  response, and `ascendingBars()` in `frontend/src/utils/chartOverlay.js` normalizes every candle
+  series the UI plots (numeric times, one candle per timestamp, oldest first). Covered by
+  `test_chart_overlay_api.py` (18 checks, incl. a stubbed fallback round-trip) and
+  `frontend/tests/chart_overlay.jsx` (20 checks).
 
 ## Reproduce
 ```bash
