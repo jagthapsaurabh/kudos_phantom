@@ -8,6 +8,7 @@ import {
 } from 'recharts';
 import { API_URL } from '../api';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
+import { EntryConditionBlock } from '../components/TradeConditionDetail';
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -187,6 +188,11 @@ const TradeRow = ({ trade, index }) => {
                   <Stat label="Final net P&L" value={num(trade.final_net_pnl ?? trade.pnl)}
                         cls={pnlClass(trade.final_net_pnl ?? trade.pnl)} />
                 </div>
+              </div>
+            )}
+            {trade.entry_conditions_detail && (
+              <div className="mt-3">
+                <EntryConditionBlock trade={trade} testId="session-trade-entry-conditions" />
               </div>
             )}
             {trade.exit_detail && (

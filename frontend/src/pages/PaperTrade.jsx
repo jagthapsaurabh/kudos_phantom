@@ -12,6 +12,7 @@ import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
+import { TradeConditionDetail, downloadTradesCSV } from '../components/TradeConditionDetail';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
 // explicitly in India Standard Time (UTC+5:30). Guarantees the user always
@@ -156,7 +157,8 @@ const validationChipColor = (status) => {
   }
 };
 
-const ClosedTradesPanel = ({ closedTrades }) => {
+const ClosedTradesPanel = ({ closedTrades, exportName = 'paper' }) => {
+  const [openRow, setOpenRow] = useState(null);
   if (!closedTrades || closedTrades.length === 0) {
     return (
       <div className="bg-gray-800/50 p-6 rounded-2xl border border-dashed border-gray-700 text-center text-sm text-gray-600">
@@ -166,7 +168,16 @@ const ClosedTradesPanel = ({ closedTrades }) => {
   }
   return (
     <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
-      <h4 className="text-xs font-bold text-gray-400 uppercase mb-3">Trade Reply / Closed Trades ({closedTrades.length})</h4>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h4 className="text-xs font-bold text-gray-400 uppercase">Trade Reply / Closed Trades ({closedTrades.length})</h4>
+        {/* Same spreadsheet as the Backtest page: every entry condition, the
+            exit rule and the candle colours, one row per trade. */}
+        <button onClick={() => downloadTradesCSV(closedTrades, `kudos_${exportName}_trades.csv`)}
+                title="Opens directly in Excel — every entry condition, the exit condition and the candle colours (UTC), exactly like the Backtest trade log"
+                className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+          <Download size={11} /> Export CSV
+        </button>
+      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
           <thead className="bg-gray-900 text-gray-500 uppercase">
@@ -186,14 +197,18 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Entry (IST)</th>
               <th className="p-2">Exit (IST)</th>
               <th className="p-2">Held</th>
+              <th className="p-2" title="Every entry condition, the exit rule and the candle colours — the same detail as the Backtest trade log">Analysis</th>
             </tr>
           </thead>
           <tbody>
             {closedTrades.map((t, i) => {
               const meta = reasonMeta(t.reason);
               const slMoved = t.sl != null && t.sl_final != null && Math.abs(t.sl_final - t.sl) > 0.005;
+              const hasDetail = !!(t.entry_conditions_detail || t.exit_detail || t.signal_candle_type
+                                   || t.entry_candle_type || t.exit_candle_type || t.validation_status);
               return (
-                <tr key={i} className="border-b border-gray-700/60 align-top">
+                <React.Fragment key={i}>
+                <tr className="border-b border-gray-700/60 align-top">
                   <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
@@ -227,7 +242,24 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
                   <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
+                  <td className="p-2">
+                    {hasDetail ? (
+                      <button onClick={() => setOpenRow(openRow === i ? null : i)}
+                              title={openRow === i ? 'Hide the entry / exit conditions' : 'Show every entry condition and the exit rule'}
+                              className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+                        {openRow === i ? <ChevronUp size={11} /> : <Eye size={11} />} {openRow === i ? 'Hide' : 'Conditions'}
+                      </button>
+                    ) : <span className="text-gray-600 text-[10px]">—</span>}
+                  </td>
                 </tr>
+                {openRow === i && (
+                  <tr className="border-b border-gray-700 bg-gray-900/60">
+                    <td colSpan={16} className="p-3">
+                      <TradeConditionDetail trade={t} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               );
             })}
           </tbody>
@@ -472,38 +504,10 @@ const HistoryRowDetail = ({ session }) => {
 };
 
 const exportSessionCSV = (session) => {
+  // The client asked for the Backtest export on paper/live trades: one row per
+  // trade with every entry condition, the exit rule and the candle colours.
   const trades = session.closed_trades || [];
-  if (!trades.length) { alert('This session has no closed trades to export.'); return; }
-  // [data key, column header] pairs so the export can use clear names while
-  // still reading each field from the closed-trade object.
-  const cols = [
-    ['entry_time', 'Entry Time (IST)'], ['exit_time', 'Exit Time (IST)'],
-    ['direction', 'Direction'], ['symbol', 'Symbol'],
-    ['entry', 'Entry Price'], ['exit', 'Exit Price'],
-    ['entry_trade_price', 'Entry Price (Traded)'], ['exit_trade_price', 'Exit Price (Traded)'],
-    ['entry_mark_price', 'Entry Price (Mark)'], ['exit_mark_price', 'Exit Price (Mark)'],
-    ['mark_price_basis', 'Priced On Mark'],
-    ['lots', 'Lots'], ['margin_inr', 'Margin (INR)'], ['notional_usd', 'Notional (USD)'],
-    ['sl', 'Stop Loss'], ['sl_final', 'Stop Loss (Final)'], ['tp', 'Take Profit'],
-    ['trail_stop', 'Trail Stop'], ['atr_at_entry', 'ATR @ Entry'], ['peak_price', 'Peak Price'],
-    ['bars_held', 'Bars Held'], ['reason', 'Exit Reason'], ['exit_detail', 'Exit Detail'],
-    ['gross_pnl', 'PnL (Gross)'], ['fees', 'Fees'], ['pnl', 'Booked PnL (Net)'],
-  ];
-  const lines = [cols.map(([, label]) => label).join(',')];
-  trades.forEach(t => {
-    lines.push(cols.map(([key]) => {
-      const v = t[key];
-      const s = v === null || v === undefined ? '' : String(v);
-      return `"${s.replace(/"/g, '""')}"`;
-    }).join(','));
-  });
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `paper_session_${session.id}_${session.strategy_name || 'kudos'}.csv`.replace(/[^a-z0-9_.-]/gi, '_');
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadTradesCSV(trades, `kudos_paper_session_${session.id}_${session.strategy_name || 'kudos'}.csv`.replace(/[^a-z0-9_.-]/gi, '_'));
 };
 
 const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {

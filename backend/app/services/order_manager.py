@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
 
@@ -42,6 +42,16 @@ class Trade:
     exit_mark_price: float = 0.0        # mark price the exit was triggered on
     mark_price_basis: bool = False      # True when entry/exit_price are marks
     current_mark_price: float = 0.0     # latest mark price while open
+    # ---- trade-log detail (paper / live workers) ---------------------
+    # The full entry-condition record for the trade: signal candle + colour,
+    # the per-condition snapshot and the readable "value vs threshold ->
+    # PASS/FAIL" breakdown. Filled by the paper / live workers from the
+    # strategy's metadata (same builders as the backtest log); empty for
+    # OMS-level trades nobody logs (e.g. manual terminal orders).
+    entry_context: dict = field(default_factory=dict)
+    # Colour of the candle the exit landed in (GREEN / RED / DOJI), stamped
+    # by the worker when the position is closed.
+    exit_candle_type: str = ""
 
 class OrderManager:
     def __init__(self, config):

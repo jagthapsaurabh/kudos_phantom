@@ -20,6 +20,7 @@ from app.services.margin_preflight import describe_margin_error, is_insufficient
 from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
 from app.core.indicators import compute_indicators
+from app.core import trade_conditions
 
 
 # Fill price keys seen across Binance / Delta order responses.
@@ -865,6 +866,9 @@ class LiveTradeService:
             df_1h_with_ind[k] = v
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
+        # Colour of the bar this tick is in, stamped on any trade closed this
+        # tick so the log can name the exit candle (None when unreadable).
+        candle_color = trade_conditions.frame_candle_color(df_1h_with_ind)
         # Traded price from the candle feed, mark price straight from the
         # exchange: risk runs on the mark price of the perpetual.
         current_price = float(df_1h['close'].iloc[-1])
@@ -930,7 +934,8 @@ class LiveTradeService:
         self._manage_open_positions(decision_price, current_atr, current_time,
                                     trade_price, mark_price, new_bar,
                                     bar_close=completed_bar,
-                                    bar_time=(completed_bar_time if completed_bar else None))
+                                    bar_time=(completed_bar_time if completed_bar else None),
+                                    candle_color=candle_color)
 
         # A stale candle set must never OPEN anything: the signal, the ATR the
         # stop distance comes from, even the notional sizing would be built on
@@ -1018,6 +1023,12 @@ class LiveTradeService:
                                         mark_price_usd=mark_price, mark_price_basis=use_mark)
         if planned is None:
             return
+        # The entry-condition record is stored on the trade before the order
+        # goes out, so an exit hours later still exports the conditions the
+        # entry was actually taken on.
+        entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
+        if entry_ctx:
+            planned.entry_context = entry_ctx
         lots = float(planned.lots)
         # A plain distance (trail_distance_atr × ATR) — the broker client signs
         # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
@@ -1098,6 +1109,33 @@ class LiveTradeService:
                 self.logs = self.logs[-self.MAX_LOG_LINES:]
         except Exception:
             pass
+
+    def _entry_condition_context(self, signal_dir, df_1h_with_ind, df_4h, current_time):
+        """The entry-condition record for an order sent on this tick.
+
+        Mirrors ``PaperTradeService._entry_condition_context``: the strategy's
+        metadata for the newest 1h bar, run through the same builders the
+        backtest uses, so a live trade exports every entry condition (value,
+        threshold, PASS/FAIL) exactly like a backtest row. Strategies without
+        metadata return ``{}`` and their trade log is unchanged.
+        """
+        meta_fn = getattr(self.strategy, 'generate_signals_with_metadata', None)
+        if not callable(meta_fn):
+            return {}
+        try:
+            _, meta = meta_fn(df_1h_with_ind, df_4h)
+            if meta is None or len(meta) == 0:
+                return {}
+            i = len(meta) - 1
+            color = trade_conditions.candle_color(meta, i)
+            return trade_conditions.entry_context(
+                getattr(self.strategy, 'config', self.config), meta, i, signal_dir,
+                signal_candle_time=current_time, entry_candle_time=current_time,
+                entry_candle_type=color)
+        except Exception as exc:
+            # Never let bookkeeping stop a real order from going out.
+            print(f"[{self.strategy_id}] Entry-condition snapshot failed: {exc}")
+            return {}
 
     def _record_equity_point(self):
         try:
@@ -1188,6 +1226,20 @@ class LiveTradeService:
             audit = getattr(self.oms, 'strategy_audit_fields', None)
             if callable(audit):
                 rec.update(audit(trade, pnl))
+            # Trade-log detail: the same entry-condition record a backtest
+            # writes (signal candle + colour, every condition with PASS/FAIL)
+            # and the candle the exit landed in. Older saved records simply
+            # lack these keys, so nothing already stored changes shape.
+            ctx = getattr(trade, 'entry_context', None) or {}
+            if ctx:
+                ctx = dict(ctx)
+                for key in ('signal_candle_time', 'entry_candle_time'):
+                    if ctx.get(key) is not None:
+                        ctx[key] = _to_ist(ctx[key])
+                rec.update(ctx)
+            exit_color = getattr(trade, 'exit_candle_type', None)
+            if exit_color:
+                rec['exit_candle_type'] = exit_color
             self.closed_trades.append(rec)
             # Trades are capped in memory, but the counters are not: dropping
             # old trades used to drop their PnL from net_pnl too, so after 100
@@ -1215,7 +1267,7 @@ class LiveTradeService:
 
     def _manage_open_positions(self, decision_price, current_atr, current_time,
                                trade_price, mark_price, advance_bar,
-                               bar_close=None, bar_time=None):
+                               bar_close=None, bar_time=None, candle_color=None):
         """Mark every open position to market and send any exit it triggers.
 
         Split out of ``tick()`` so the same exit logic runs on the 60-second
@@ -1230,6 +1282,9 @@ class LiveTradeService:
         ``bar_close`` / ``bar_time`` carry the *completed* candle's close and
         stamp on the tick that follows a rollover, for close-based strategy
         rules (FastTest V1's 2H validation). Every other strategy ignores them.
+
+        ``candle_color`` is the colour of the bar this tick is in, stamped on
+        the trade when it closes so the trade log can name the exit candle.
         """
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
@@ -1239,6 +1294,8 @@ class LiveTradeService:
                                            bar_time=bar_time)
             if not result:
                 continue
+            if candle_color:
+                result.exit_candle_type = candle_color
             # Settled: keep it for the execution overlay + post-run review
             # before the exit order is attempted, so even a failed close
             # order does not lose the trade from the book.

@@ -485,9 +485,37 @@ That button is separate from the raw engine dump described above
 `True`/`False`/blank, snake_case headers — for scripting; the UI export is the human-readable sheet,
 rendering those same flags as `PASS` / `FAIL` / `N/A` and adding the candle colours and times.
 
-Paper sessions export the same per-trade fields (`entry_time, exit_time, direction, symbol, entry,
-exit, lots, margin_inr, notional_usd, sl, sl_final, tp, trail_stop, atr_at_entry, peak_price,
-bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
+Paper and Live trade **analysis** works exactly like the Backtest log. Every closed paper/live
+trade now records the same detail (`backend/app/core/trade_conditions.py` — the engine's builders,
+moved out unchanged so the backtest wording is byte-identical):
+
+* the **signal candle** (time + colour) and the **entry candle** (time + colour),
+* **every entry condition** spelled out — measured value vs the threshold applied to that side,
+  PASS / FAIL / N/A (`1. 4h trend: … -> PASS`, `4. ATR regime: … -> PASS`, …),
+* the **condition snapshot** behind it (`rsi14`, `macd_hist`, `adx`, `atr14`, `ema50_1h/4h`,
+  `trend_4h`, `setup`, the `cond_*` flags, the MACD line/signal values),
+* the **exit rule** that fired (`exit_detail`) and the colour of the **exit candle**.
+
+Where to see it: **Paper → Trade Reply / Closed Trades** and **Live → Closed trades (live)** both
+have a **Conditions** button on every row (the same expandable detail the Backtest log shows) and an
+**Export CSV** button. The export is literally the Backtest trade-log spreadsheet — one column
+layout, so a paper or live run can be diffed against a backtest in Excel. Saved paper sessions use
+the same export from the History panel. Records ride along in the paper session snapshot and the
+`/live-trade/status` payload, so stopping, reloading or resuming a worker never loses them, and
+records saved before this feature render an honest "no condition detail" note instead of
+disappearing.
+
+```text
+# paper / live closed trade — added keys (backtest-compatible)
+signal_candle_time, signal_candle_type, entry_candle_time, entry_candle_type, exit_candle_type,
+setup, trend_4h, rsi14, macd_hist, adx, atr14, ema50_1h, ema50_4h, macd_line, macd_signal,
+cond_trend_ok, cond_adx_ok, cond_macd_hist_ok, cond_atr_regime_ok, cond_rsi_ok,
+cond_macd_confirm_ok, cond_di_ok, cond_macd_line_ok, entry_conditions_detail
+```
+
+Strategies that publish no per-condition metadata (`FastTest`, `FastTestV1`) get no invented
+conditions — exactly like a backtest run of those strategies. Their rows still show the exit rule,
+the candle colours and (for V1) the seven audit fields.
 
 ### Running the tests
 ```bash
@@ -498,6 +526,8 @@ python test_atr_regime_op.py      # 32 checks: per-side ATR operator
 python test_macd_line_and_modes.py # 76 checks: MACD line/signal rules, setup + direction splits, presets
 python test_fast_test_v1.py       # 114 checks: FastTest V1.0 — entry parity, 2H validation, +0.90% booking,
                                   # audit fields, paper/live wiring, DB migration, results API
+python test_trade_conditions_shared.py  # 28 checks: the shared entry/exit-condition detail the
+                                  # backtest / paper / live logs all use, end-to-end paper entry
 python test_paper_history.py      # 63 checks: paper history persistence
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
@@ -512,10 +542,12 @@ python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one 
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 460 checks: trade-log table + CSV export, trading windows, page
+cd frontend && npm test            # 480 checks: trade-log table + CSV export, paper/live condition
+                                   # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
                                    # key replacement + credential badges, Kudos presets + MACD line form,
-                                   # FastTest V1.0 dropdowns / audit columns / validation chips
+                                   # FastTest V1.0 dropdowns / audit columns / validation chips,
+                                   # paper+live condition analysis (trade_conditions_ui.jsx)
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

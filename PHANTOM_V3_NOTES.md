@@ -265,6 +265,33 @@ A **new, separate strategy** (`FastTestV1`, `backend/app/core/fast_test_v1.py`).
   `frontend/tests/fast_test_v1_ui.jsx` (27 checks), trade-log pins updated to
   60 CSV columns.
 
+## Paper / Live trade analysis (entry + exit conditions, same as Backtest)
+
+- **One builder for all three paths.** The entry-condition text / snapshot /
+  MACD-line lines moved out of `BacktestEngine` into
+  `backend/app/core/trade_conditions.py` unchanged (verified byte-identical:
+  a 64-case dump across default / MACD-line-enabled / reversal-long /
+  momentum-short configs, `cmp` clean). `engine.py` now delegates.
+- **Paper & live workers record the same detail.** At entry, the worker asks
+  the strategy for its metadata (`generate_signals_with_metadata`, already on
+  `StrategyService`) and stores `entry_context` on the trade: signal candle +
+  colour, every `cond_*` flag, the readable PASS/FAIL breakdown. At exit the
+  worker stamps `exit_candle_type`, and `_record_closed` merges it all into the
+  closed-trade record. `Trade` gained `entry_context: dict` and
+  `exit_candle_type: str` (defaults keep every other caller unchanged).
+- **UI + export.** Paper → Trade Reply / Closed Trades and Live → Closed trades
+  (live) both have a per-row **Conditions** view and **Export CSV**. The export
+  reuses the Backtest `buildTradesCSV` through `tradeRowFromClosed()`, so the
+  spreadsheet is the same 60+ column layout (condition columns + V1 audit).
+  Saved paper sessions export the same file from the History panel.
+- **Not invented where it does not exist.** `FastTest` / `FastTestV1` publish no
+  condition metadata; their paper/live rows show the exit rule, candle colours
+  and the V1 audit fields, with an explicit note instead of fake PASS/FAILs.
+- **Tests**: `backend/test_trade_conditions_shared.py` (28 checks, incl. a real
+  paper tick), `frontend/tests/trade_conditions_ui.jsx` (20 checks); the full
+  backend + frontend suites stay green and the 2.08 MB trade-list parity dump is
+  unchanged.
+
 ## Reproduce
 ```bash
 python -m backend.app.scripts.run_baseline        # v2.5 parity numbers

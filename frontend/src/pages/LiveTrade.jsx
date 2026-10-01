@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse, LayoutDashboard, FileText } from 'lucide-react';
+import { TradeConditionDetail, downloadTradesCSV } from '../components/TradeConditionDetail';
+import { Play, StopCircle, Activity, ShieldCheck, AlertCircle, TrendingUp, Wallet, CalendarClock, PauseCircle, TerminalSquare, Download, HeartPulse, LayoutDashboard, FileText, ClipboardList, ChevronUp, Eye } from 'lucide-react';
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import LiveTerminal from '../components/LiveTerminal';
@@ -13,6 +14,16 @@ import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 // The tool trades the BTC *perpetual* on every venue: Binance lists it as
 // BTCUSDT, Delta as BTCUSD.
+// IST timestamp for the closed-trade table, rendered like the Paper page.
+const fmtIST = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  const ist = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+  const p = (x) => String(x).padStart(2, '0');
+  return `${p(ist.getUTCHours())}:${p(ist.getUTCMinutes())}:${p(ist.getUTCSeconds())} ${p(ist.getUTCDate())}/${p(ist.getUTCMonth() + 1)}/${ist.getUTCFullYear()} IST`;
+};
+
 const perpetualFor = (source) => (String(source || '').toLowerCase() === 'delta' ? 'BTCUSD' : 'BTCUSDT');
 
 // ---------- Live price feed badge ----------
@@ -347,6 +358,95 @@ const TradeCard = ({ trade }) => (
 
 // `initialView` lets a caller (and the page-shell test) land straight on the
 // terminal tab instead of the default automation view.
+// Closed live trades: the same entry-condition / exit-condition analysis and
+// the same CSV as the Backtest page, so a live strategy can be reviewed after
+// the fact instead of only through the per-strategy P&L tiles.
+export const LiveClosedTradesPanel = ({ trades, exportName = 'live' }) => {
+  const [openRow, setOpenRow] = useState(null);
+  if (!trades || trades.length === 0) return null;
+  return (
+    <div className="mt-8 border-t border-gray-700 pt-6">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-lg font-bold">
+          <ClipboardList size={20} className="text-purple-400" /> Closed trades (live) ({trades.length})
+        </h3>
+        <button onClick={() => downloadTradesCSV(trades, `kudos_${exportName}_trades.csv`)}
+                title="Opens directly in Excel — every entry condition, the exit condition and the candle colours (UTC), exactly like the Backtest trade log"
+                className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+          <Download size={12} /> Export CSV
+        </button>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead className="bg-gray-900 uppercase text-gray-500">
+            <tr>
+              <th className="p-2">Dir</th>
+              <th className="p-2">Strategy</th>
+              <th className="p-2">Entry</th>
+              <th className="p-2">Exit</th>
+              <th className="p-2">Exit Condition</th>
+              <th className="p-2">Booked PnL</th>
+              <th className="p-2">Entry (IST)</th>
+              <th className="p-2">Exit (IST)</th>
+              <th className="p-2">Analysis</th>
+            </tr>
+          </thead>
+          <tbody>
+            {trades.map((t, i) => {
+              const hasDetail = !!(t.entry_conditions_detail || t.exit_detail || t.signal_candle_type
+                                   || t.entry_candle_type || t.exit_candle_type || t.validation_status);
+              return (
+                <React.Fragment key={`${t.instance_key || ''}-${i}`}>
+                  <tr className="border-b border-gray-700/60 align-top">
+                    <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>
+                      {t.direction === 1 ? 'LONG' : 'SHORT'}
+                    </td>
+                    <td className="p-2 text-gray-300">{t.strategy_name || '—'}</td>
+                    <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
+                    <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
+                    <td className="p-2 max-w-[260px]">
+                      <span className="rounded border border-gray-700 bg-gray-900 px-2 py-0.5 text-[10px] text-gray-300">
+                        {t.reason || '—'}
+                      </span>
+                      {t.validation_status && (
+                        <span className="ml-1 rounded border border-gray-700 bg-gray-900 px-1.5 py-0.5 text-[9px] font-bold text-gray-300">
+                          {t.tp090_hit ? '+0.90% HIT' : t.validation_status}
+                        </span>
+                      )}
+                      {t.exit_detail && <div className="mt-1 text-[10px] leading-snug text-gray-500">{t.exit_detail}</div>}
+                    </td>
+                    <td className={`p-2 font-mono font-bold ${(t.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {(t.pnl || 0) >= 0 ? '+' : ''}{Number(t.pnl || 0).toFixed(2)}
+                    </td>
+                    <td className="p-2 text-[10px] text-gray-400">{fmtIST(t.entry_time)}</td>
+                    <td className="p-2 text-[10px] text-gray-400">{fmtIST(t.exit_time)}</td>
+                    <td className="p-2">
+                      {hasDetail ? (
+                        <button onClick={() => setOpenRow(openRow === i ? null : i)}
+                                title={openRow === i ? 'Hide the entry / exit conditions' : 'Show every entry condition and the exit rule'}
+                                className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+                          {openRow === i ? <ChevronUp size={11} /> : <Eye size={11} />} {openRow === i ? 'Hide' : 'Conditions'}
+                        </button>
+                      ) : <span className="text-[10px] text-gray-600">—</span>}
+                    </td>
+                  </tr>
+                  {openRow === i && (
+                    <tr className="border-b border-gray-700 bg-gray-900/60">
+                      <td colSpan={9} className="p-3">
+                        <TradeConditionDetail trade={t} />
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
 const LiveTrade = ({ initialView = 'automation' } = {}) => {
   // Pause polling when the tab is hidden to avoid UI lag and wasted bandwidth.
   const isVisible = useVisibilityPause();
@@ -584,6 +684,12 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
   // Every broker/strategy worker is independent; show all of them so an
   // operator can monitor Binance and Delta concurrently.
   const myInstances = status;
+  // Closed live trades with the same entry/exit-condition analysis and export
+  // the Backtest page offers. Fed by /live-trade/status, which carries the last
+  // 50 closed trades of every running instance.
+  const closedTrades = myInstances.flatMap(inst => (inst.closed_trades || []).map(t => ({
+    ...t, instance_key: inst.instance_key, strategy_name: inst.strategy_name,
+  })));
   const activeTrades = myInstances.flatMap(inst => (inst.active_trades || []).map(t => ({...t, instance_key: inst.instance_key})));
   const marginUsed = activeTrades.reduce((sum, t) => sum + t.margin, 0);
 
@@ -911,6 +1017,8 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
                 <p>No live positions open. Scanning {dataSource} for institutional entries...</p>
               </div>
             )}
+
+            <LiveClosedTradesPanel trades={closedTrades} exportName="live" />
 
             {/* Per-strategy live results: how each strategy is actually doing
                 on each account, which the running-instance list cannot say. */}
