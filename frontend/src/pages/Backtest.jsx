@@ -5,14 +5,14 @@ import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import { emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule } from '../utils/tradingWindows';
-import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart } from 'lucide-react';
+import { Activity, TrendingUp, RotateCcw, Trash2, Tag, Download, Timer, HelpCircle, Play, SlidersHorizontal, CalendarRange, Wallet, ChevronDown, ChevronUp, Target, PauseCircle, LineChart, AlertTriangle, BadgeCheck, BarChart3, Filter, ListChecks, LogOut, Shield } from 'lucide-react';
 import MarketOverlayChart from '../components/MarketOverlayChart';
 import PhantomPresetOptions from '../components/PhantomPresetOptions';
 import RiskExitModelEditor from '../components/RiskExitModelEditor';
 import { DEFAULT_RISK_EXIT, RISK_EXIT_META, riskExitText } from '../utils/riskExit';
 import {
   SETUP_MODES, TRADE_DIRECTIONS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS, DEFAULT_MACD_LINE_RULES,
-  parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, macdLineRuleText,
+  parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, strategyDisplayName, macdLineRuleText,
   FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_ID, FAST_TEST_V1_NAME, isFastTestV1,
 } from '../utils/phantomPresets';
 
@@ -64,6 +64,120 @@ const PARAM_META = {
   entry_rsi_long_max: { label: 'Long below RSI', hint: 'LONG while RSI is below this value (50 = the original rule).' },
   entry_rsi_short_min: { label: 'Short at/above RSI', hint: 'SHORT while RSI is at or above this value (50 = the original rule).' },
   exit_rsi_level: { label: 'RSI exit level', hint: 'Close a long at/above this RSI, a short at/below it.' },
+};
+
+// Optional per-field ranges, in the units the input SHOWS (percent fields are
+// typed as percentages). An out-of-range value is flagged inline and blocks
+// Save / Run until it is fixed — the same limits the backend validates, so a
+// typo is caught in the form instead of coming back as a 422.
+const PARAM_RULES = {
+  trend_ema_period: { min: 2, max: 500, step: 1 },
+  macd_fast: { min: 1, max: 200, step: 1 },
+  macd_slow: { min: 2, max: 400, step: 1 },
+  macd_signal: { min: 1, max: 200, step: 1 },
+  rsi_oversold: { min: 1, max: 99 },
+  rsi_overbought: { min: 1, max: 99 },
+  adx_min: { min: 0, max: 100 },
+  atr_regime_ratio: { min: 0, max: 100 },
+  cooldown_bars: { min: 0, max: 1000, step: 1 },
+  timeout_bars: { min: 1, max: 10000, step: 1 },
+  stop_loss_atr: { min: 0.01, max: 100 },
+  take_profit_atr: { min: 0.01, max: 200 },
+  trail_activation_atr: { min: 0.01, max: 200 },
+  trail_distance_atr: { min: 0.01, max: 200 },
+  breakeven_atr: { min: 0, max: 200 },
+  leverage: { min: 1, max: 125, step: 1 },
+  margin_pct: { min: 0.01, max: 1 },
+  reduced_margin_pct: { min: 0.1, max: 100 },
+  lot_size_btc: { min: 0.001, max: 100 },
+  dd_soft_pct: { min: 0, max: 100 },
+  dd_halt_pct: { min: 0, max: 100 },
+  dd_resume_pct: { min: 0, max: 100 },
+  sl_floor_pct: { min: 0, max: 50 },
+  // Fast Test (debug) + V1.0 rules.
+  entry_rsi_period: { min: 2, max: 200, step: 1 },
+  entry_rsi_long_max: { min: 0, max: 100 },
+  entry_rsi_short_min: { min: 0, max: 100 },
+  exit_rsi_level: { min: 0, max: 100 },
+  validation_bars: { min: 1, max: 24, step: 1 },
+  validation_close_pct: { min: 0.01, max: 50 },
+  profit_book_pct: { min: 0.01, max: 50 },
+};
+
+// The field's problem, in the units the client typed ('2 .. 200', '0 .. 100').
+// Empty / non-numeric counts too: a blank leverage would otherwise be sent as
+// NaN and rejected by the API.
+const paramIssue = (field, value) => {
+  const rule = PARAM_RULES[field];
+  if (!rule) return '';
+  const meta = PARAM_META[field] || {};
+  const shown = meta.percent ? Math.round(Number(value) * 1e6) / 1e4 : Number(value);
+  if (value === '' || value === null || value === undefined || Number.isNaN(shown)) {
+    return `Enter ${rule.min ?? 0} .. ${rule.max ?? '∞'}`;
+  }
+  const bounds = `${rule.min ?? 0} .. ${rule.max ?? '∞'}`;
+  if (rule.min !== undefined && shown < rule.min) return `Must be ${bounds}`;
+  if (rule.max !== undefined && shown > rule.max) return `Must be ${bounds}`;
+  return '';
+};
+
+// One card per configuration group: icon, name, what it controls, how many of
+// its values differ from the shipped default, and a per-group reset. The body
+// is a responsive grid so a phone gets one field per row and a wide monitor
+// gets three without any horizontal scrolling.
+const ParamGroupCard = ({ id, title, icon: Icon, hint, changed = 0, onReset, children, ...rest }) => (
+  <section id={id} {...rest}
+    className="scroll-mt-28 rounded-xl border border-gray-700/70 bg-gray-900/40 shadow-sm">
+    <header className="flex items-start justify-between gap-2 border-b border-gray-700/60 px-3.5 py-2.5">
+      <div className="flex min-w-0 items-start gap-2.5">
+        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-gray-800 text-blue-400 ring-1 ring-inset ring-gray-700">
+          {Icon ? <Icon size={14} /> : null}
+        </span>
+        <div className="min-w-0">
+          <h3 className="text-[11px] font-bold uppercase tracking-wider text-gray-200">{title}</h3>
+          {hint ? <p className="mt-0.5 text-[10px] leading-snug text-gray-500">{hint}</p> : null}
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {changed > 0 && (
+          <span data-testid={`changed-${id}`}
+            title={`${changed} value${changed === 1 ? '' : 's'} differ from the shipped default`}
+            className="rounded-full border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[9px] font-bold text-amber-300">
+            {changed} changed
+          </span>
+        )}
+        {onReset && changed > 0 && (
+          <button onClick={onReset} title="Reset this group to the shipped defaults"
+            className="rounded-lg p-1 text-gray-500 transition hover:bg-gray-800 hover:text-white">
+            <RotateCcw size={12} />
+          </button>
+        )}
+      </div>
+    </header>
+    <div className="grid grid-cols-1 gap-3 p-3.5 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
+  </section>
+);
+
+// One label / input language for every form on the page: Run Setup, the
+// Strategy Configuration groups and the trading-window block.
+const FIELD_LABEL = 'mb-1 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400';
+const FIELD_INPUT = 'w-full rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25';
+
+// One icon + one sentence per Phantom group, used by the group cards and the
+// jump links. Keys must match `sharedParamGroups`.
+const CONFIG_GROUP_ICONS = {
+  'Trend & Regime': Activity,
+  'MACD Indicator': BarChart3,
+  'Entries (v3)': Filter,
+  'Risk & Exit Model': Shield,
+  'Sizing & Drawdown Guard': Wallet,
+};
+const CONFIG_GROUP_HINTS = {
+  'Trend & Regime': '4h trend filter, volatility floor and the wait after a close.',
+  'MACD Indicator': 'Periods behind the MACD line, signal line and histogram.',
+  'Entries (v3)': 'Reversal / momentum entries, ADX strength and the histogram threshold.',
+  'Risk & Exit Model': 'Choose ATR units, price % or a mix — per level.',
+  'Sizing & Drawdown Guard': 'Margin, leverage and the equity-drawdown brake.',
 };
 
 // Fast Test (debug) + Fast Test V1.0 — the protective rules the client can
@@ -266,15 +380,19 @@ const ConfirmModal = ({ open, title, message, confirmLabel, confirmColor, onCanc
 
 const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle, actions, className = '', children }) => (
   <div className={`bg-gray-800 rounded-2xl border border-gray-700 shadow-xl ${className}`}>
-    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-6">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          {Icon ? <Icon size={16} className="shrink-0 text-blue-400" /> : null}
+    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+      <div className="flex min-w-0 items-start gap-3">
+        {Icon ? (
+          <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-gray-900 text-blue-400 ring-1 ring-inset ring-gray-700">
+            <Icon size={16} />
+          </span>
+        ) : null}
+        <div className="min-w-0">
           <h2 className="text-sm font-bold uppercase tracking-wider text-gray-200">{title}</h2>
+          {subtitle ? <p className="mt-0.5 text-xs leading-snug text-gray-500">{subtitle}</p> : null}
         </div>
-        {subtitle ? <p className="mt-1 text-xs text-gray-500">{subtitle}</p> : null}
       </div>
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
         {actions}
         {onToggle && (
           <button
@@ -287,7 +405,7 @@ const SectionCard = ({ title, subtitle, icon: Icon, collapsed = false, onToggle,
         )}
       </div>
     </div>
-    {!collapsed && <div className="px-4 pb-4 sm:px-6 sm:pb-6">{children}</div>}
+    {!collapsed && <div className="px-4 pb-4 sm:px-5 sm:pb-5">{children}</div>}
   </div>
 );
 
@@ -477,10 +595,11 @@ const TradeLogTable = ({ trades, params, expandedTrade, onToggleRow }) => (
   </div>
 );
 
-// `initialStrategyId` lets a caller (the page-shell tests) open the form on a
-// specific strategy — including the two debug families, whose panels are only
-// rendered for that selection. The routed page passes nothing.
-const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
+// `initialStrategyId` / `initialParams` let a caller (the page-shell tests and
+// the design preview) open the form on a specific strategy with specific
+// values — the two debug families only render their panels for that selection.
+// The routed page passes nothing, so it starts on PhantomV2 with the defaults.
+const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}) => {
   const DEFAULT_PARAMS = {
     trend_ema_period: 50,
     macd_fast: 12, macd_slow: 26, macd_signal: 9,
@@ -533,7 +652,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
   };
   const [selectedStrategyId, setSelectedStrategyId] = useState(initialStrategyId);
   const [strategies, setStrategies] = useState([]);
-  const [params, setParams] = useState({ ...DEFAULT_PARAMS });
+  const [params, setParams] = useState(() => ({ ...DEFAULT_PARAMS, ...(initialParams || {}) }));
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -708,36 +827,103 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
   const asPercent = (v) => (v === undefined || v === null || v === '' ? '' : Math.round(Number(v) * 1e6) / 1e4);
   const toFraction = (raw) => (raw === '' ? 0 : Number(raw) / 100);
 
+  // One number field: label + inline problem, a 16px-friendly input (no iOS
+  // zoom on tap), an optional unit suffix, the hint always visible, and the
+  // same `param-<field>` test id every suite already knows.
   const renderNumberInput = (field, value, onChange) => {
     const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
+    const rule = PARAM_RULES[field] || {};
+    const issue = paramIssue(field, value);
     return (
-      <div className="flex flex-col">
-        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
-          {meta.label}
-          {meta.hint && <span title={meta.hint} className="text-gray-600 hover:text-blue-400 cursor-help"><HelpCircle size={11} /></span>}
-        </label>
-        <input type="number" step="0.01" value={meta.percent ? asPercent(value) : (value ?? '')}
-          onChange={e => (meta.percent
-            ? onChange({ target: { value: toFraction(e.target.value) } })
-            : onChange(e))}
-          data-testid={`param-${field}`}
-          className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full" />
-        {meta.hint && <span className="text-[10px] text-gray-600 mt-0.5 leading-snug hidden xl:block">{meta.hint}</span>}
+      <div className="flex flex-col" data-field={field}>
+        <div className="mb-1 flex items-baseline justify-between gap-2">
+          <label htmlFor={`param-input-${field}`}
+            className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+            {meta.label}
+            {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>}
+          </label>
+          {issue ? <span className="text-[9px] font-bold text-red-400">{issue}</span> : null}
+        </div>
+        <div className="relative">
+          <input id={`param-input-${field}`} type="number" inputMode="decimal"
+            step={rule.step || 0.01}
+            value={meta.percent ? asPercent(value) : (value ?? '')}
+            onChange={e => (meta.percent
+              ? onChange({ target: { value: toFraction(e.target.value) } })
+              : onChange(e))}
+            data-testid={`param-${field}`}
+            className={`w-full rounded-lg border bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 ${issue ? 'border-red-700' : 'border-gray-700'} ${meta.suffix ? 'pr-12' : ''}`} />
+          {meta.suffix ? (
+            <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-gray-500">{meta.suffix}</span>
+          ) : null}
+        </div>
+        {meta.hint && <span className="mt-1 text-[10px] leading-snug text-gray-500">{meta.hint}</span>}
       </div>
     );
   };
   const setFamilyField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
 
+  // ---- Strategy Configuration UX -------------------------------------------
+  // A value is "changed" when it differs from the shipped default; the summary
+  // bar and each group header count them, and a group can be reset on its own.
+  const valueChanged = (field) => {
+    const current = params[field];
+    const base = DEFAULT_PARAMS[field];
+    if (current === undefined || base === undefined) return false;
+    if (typeof current === 'number' && typeof base === 'number') return Math.abs(current - base) > 1e-12;
+    if (typeof current === 'object' || typeof base === 'object') return false;
+    return current !== base;
+  };
+  const changedIn = (fields) => fields.reduce((n, f) => n + (valueChanged(f) ? 1 : 0), 0);
+  const resetGroup = (fields) => setParams(prev => {
+    const next = { ...prev };
+    fields.forEach(f => { next[f] = JSON.parse(JSON.stringify(DEFAULT_PARAMS[f])); });
+    return next;
+  });
+  const scrollToGroup = (id) => {
+    try {
+      const el = document.getElementById(id);
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) { /* non-browser render */ }
+  };
+  const debugRuleFields = [
+    'entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min', 'trade_direction',
+    'use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout',
+    'exit_on_opposite', 'exit_rsi_enabled', 'exit_rsi_level', 'exit_macd_flip_enabled',
+    'sl_floor_pct', 'timeout_bars', 'cooldown_bars', 'leverage', 'margin_pct', 'lot_size_btc',
+    'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct',
+    ...(strategyFamily === FAST_TEST_V1_ID ? ['validation_bars', 'validation_close_pct', 'profit_book_pct'] : []),
+  ];
+  const activeConfigFields = fastTestFamily ? debugRuleFields : Object.values(sharedParamGroups).flat();
+  const changedTotal = changedIn(activeConfigFields);
+  const configIssues = activeConfigFields.filter(f => paramIssue(f, params[f]));
+  const editingStrategyName = strategyDisplayName(selectedStrategyId, strategies);
+  const groupSlug = (name) => `config-group-${String(name).replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase()}`;
+  const configNav = fastTestFamily
+    ? [
+        { id: 'config-fast-entry-rule', label: 'Entry rule' },
+        { id: 'config-fast-exit-rule', label: 'Exit rule' },
+        ...(strategyFamily === FAST_TEST_V1_ID ? [{ id: 'config-fast-v1-rules', label: 'V1.0 rules' }] : []),
+        { id: 'config-fast-risk-exit', label: 'Risk & Exit' },
+        { id: 'config-fast-timing', label: 'Timing' },
+        { id: 'config-fast-sizing', label: 'Sizing' },
+      ]
+    : [
+        { id: 'config-strategy-separation', label: 'Strategy separation' },
+        ...Object.keys(sharedParamGroups).map(name => ({ id: groupSlug(name), label: name })),
+        { id: 'config-macd-line-rules', label: 'MACD line rules' },
+      ];
+
   const renderCheckInput = (field, checked, onChange) => {
     const meta = PARAM_META[field] || { label: field.replace(/_/g, ' '), hint: '' };
     return (
       <div className="flex flex-col">
-        <label className="text-[10px] text-gray-400 font-semibold mb-1 flex items-center gap-1">
-          {meta.label}
-          {meta.hint && <span title={meta.hint} className="text-gray-600 hover:text-blue-400 cursor-help"><HelpCircle size={11} /></span>}
-        </label>
-        <label className="flex items-center gap-2 bg-gray-900 p-2 rounded-lg border border-gray-700 text-xs text-gray-300 cursor-pointer">
-          <input type="checkbox" checked={checked} onChange={onChange} className="accent-blue-500" />
+        <div className="mb-1 flex items-center gap-1">
+          <label className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">{meta.label}</label>
+          {meta.hint && <span title={meta.hint} className="cursor-help text-gray-600 hover:text-blue-400"><HelpCircle size={11} /></span>}
+        </div>
+        <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-[11px] leading-snug text-gray-300 transition hover:border-gray-600">
+          <input type="checkbox" checked={checked} onChange={onChange} className="h-3.5 w-3.5 shrink-0 accent-blue-500" />
           Allow momentum continuation trades
         </label>
       </div>
@@ -1281,24 +1467,24 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
       >
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <div className="flex flex-col">
-            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Start date</label>
+            <label className={FIELD_LABEL}>Start date</label>
             <DateInput value={dates.start} onChange={e => setDates({ ...dates, start: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">End date</label>
+            <label className={FIELD_LABEL}>End date</label>
             <DateInput value={dates.end} onChange={e => setDates({ ...dates, end: e.target.value })} />
           </div>
           <div className="flex flex-col">
-            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Market data / exchange</label>
+            <label className={FIELD_LABEL}>Market data / exchange</label>
             <select value={dataSource} onChange={e => setDataSource(e.target.value)}
-              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
+              className={FIELD_INPUT}>
               {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">Strategy to test</label>
+            <label className={FIELD_LABEL}>Strategy to test</label>
             <select value={selectedStrategyId} onChange={e => handleStrategySelect(e.target.value)}
-              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500">
+              className={FIELD_INPUT}>
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <PhantomPresetOptions />
               <option value={FAST_TEST_ID}>{FAST_TEST_NAME} (debug — configurable)</option>
@@ -1316,17 +1502,17 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500"><Tag size={10} /> Run name (optional)</label>
+            <label className={FIELD_LABEL}><Tag size={10} /> Run name (optional)</label>
             <input type="text" placeholder="e.g. Aggressive RSI Test" value={runName} onChange={e => setRunName(e.target.value)}
-              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500" maxLength={60} />
+              className={FIELD_INPUT} maxLength={60} />
           </div>
           <div className="flex flex-col">
-            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500"><Wallet size={10} /> Starting capital (₹)</label>
+            <label className={FIELD_LABEL}><Wallet size={10} /> Starting capital (₹)</label>
             <input type="number" min="1000" step="1000" value={capital} onChange={e => setCapital(e.target.value)}
-              className="rounded-lg border border-gray-700 bg-gray-900 p-2 text-sm text-white outline-none transition focus:ring-2 focus:ring-blue-500" />
+              className={FIELD_INPUT} />
           </div>
           <div className="flex flex-col sm:col-span-2">
-            <label className="mb-1 text-[10px] font-bold uppercase text-gray-500">{dataSource} fee schedule</label>
+            <label className={FIELD_LABEL}>{dataSource} fee schedule</label>
             <div className="flex min-h-[38px] flex-wrap items-center gap-x-5 gap-y-1 rounded-lg border border-gray-700 bg-gray-900 px-3 py-2">
               <span className="text-[11px] text-gray-400">Taker <b className="ml-1 font-mono text-white">{Number(fees.taker_fee_bps || 0).toFixed(2)} bps</b></span>
               <span className="text-[11px] text-gray-400">Maker <b className="ml-1 font-mono text-white">{Number(fees.maker_fee_bps || 0).toFixed(2)} bps</b></span>
@@ -1338,7 +1524,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
         {/* BTC perpetual pricing + "skip new trades" schedule for this run. */}
         <div className="mt-4 grid grid-cols-1 gap-4 border-t border-gray-700 pt-4 xl:grid-cols-3">
           <div className="flex flex-col">
-            <label className="mb-1 flex items-center gap-1 text-[10px] font-bold uppercase text-gray-500">
+            <label className={FIELD_LABEL}>
               <Target size={10} /> Contract
             </label>
             <div className="flex min-h-[38px] items-center rounded-lg border border-gray-700 bg-gray-900 px-3 py-2">
@@ -1380,8 +1566,64 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
           onToggle={() => toggleSection('config')}
           className="mb-8"
         >
+          {/* Sticky command bar: which strategy is being edited, how many values
+              differ from the shipped defaults, what still needs attention, and
+              the two actions that matter on a long form. */}
+          <div data-testid="strategy-config-summary"
+            className="sticky top-12 z-20 -mx-4 mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-y border-gray-700/70 bg-gray-800/95 px-4 py-2.5 backdrop-blur md:top-0 sm:-mx-5 sm:px-5">
+            <span className="inline-flex min-w-0 items-center gap-2">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${fastTestFamily ? 'bg-amber-400' : 'bg-blue-400'}`} />
+              <span className="truncate text-xs font-bold text-white">{editingStrategyName}</span>
+            </span>
+            {changedTotal > 0 ? (
+              <span data-testid="strategy-config-changed"
+                className="rounded-full border border-amber-800/60 bg-amber-900/20 px-2 py-0.5 text-[10px] font-bold text-amber-300">
+                {changedTotal} changed from defaults
+              </span>
+            ) : (
+              <span data-testid="strategy-config-default"
+                className="rounded-full border border-gray-700 bg-gray-900 px-2 py-0.5 text-[10px] text-gray-500">
+                shipped defaults
+              </span>
+            )}
+            {configIssues.length > 0 && (
+              <span data-testid="strategy-config-issues"
+                title={`Fix: ${configIssues.join(', ')}`}
+                className="inline-flex items-center gap-1 rounded-full border border-red-800/60 bg-red-900/20 px-2 py-0.5 text-[10px] font-bold text-red-300">
+                <AlertTriangle size={10} /> {configIssues.length} to fix
+              </span>
+            )}
+            <span className="ml-auto flex flex-wrap items-center gap-2">
+              <button onClick={resetParams} disabled={changedTotal === 0}
+                className="rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-1.5 text-[11px] font-semibold text-gray-300 transition hover:border-gray-500 hover:text-white disabled:opacity-40">
+                Reset all
+              </button>
+              <button onClick={saveAsNewStrategy} disabled={saving || configIssues.length > 0}
+                title={configIssues.length ? 'Fix the flagged values first' : 'Save these values as a named strategy'}
+                className="rounded-lg border border-green-800/60 bg-green-900/30 px-2.5 py-1.5 text-[11px] font-bold text-green-300 transition hover:bg-green-900/60 disabled:opacity-40">
+                {saving ? 'Saving…' : 'Save as strategy'}
+              </button>
+              <button onClick={runBacktest} disabled={loading || configIssues.length > 0}
+                title={configIssues.length ? 'Fix the flagged values first' : 'Run the full backtest with these values'}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-bold text-white shadow transition hover:bg-blue-500 disabled:opacity-40">
+                <Play size={12} /> Run Backtest
+              </button>
+            </span>
+          </div>
+
+          {/* Jump links — on a phone this is the quickest way through the form. */}
+          <div data-testid="strategy-config-nav"
+            className="mb-4 flex items-center gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none]">
+            {configNav.map(item => (
+              <button key={item.id} onClick={() => scrollToGroup(item.id)}
+                className="whitespace-nowrap rounded-full border border-gray-700 bg-gray-900 px-3 py-1 text-[10px] font-semibold text-gray-400 transition hover:border-blue-500 hover:text-white">
+                {item.label}
+              </button>
+            ))}
+          </div>
+
           {fastTestFamily ? (
-            <div className="mb-5 rounded-xl border border-amber-900/40 bg-amber-900/10 p-3 text-xs text-gray-400" data-testid="fast-test-config-note">
+            <div className="mb-4 rounded-xl border border-amber-900/40 bg-amber-900/10 p-3 text-xs leading-relaxed text-gray-400" data-testid="fast-test-config-note">
               <b className="text-white">Entry rule</b> and <b className="text-white">Exit rule</b> below are yours to change —
               the shipped values are the original rule ({strategyFamily === FAST_TEST_V1_ID ? `${FAST_TEST_V1_NAME}: RSI 14 — long below 50, short at/above 50, plus the 2H validation and +0.90% booking` : `${FAST_TEST_NAME}: RSI 14 — long below 50, short at/above 50`}),
               so an unedited strategy behaves exactly as before.
@@ -1398,7 +1640,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
 
           {/* v3.5 — strategy separation: which setup and which side may trade. */}
           {!fastTestFamily && (
-          <div className="mb-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="strategy-separation">
+          <div id="config-strategy-separation" className="mb-4 scroll-mt-28 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="strategy-separation">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Strategy separation</h3>
               {presetLocked ? (
@@ -1436,142 +1678,166 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
           )}
 
           {fastTestFamily ? (
-            <div className="space-y-6" data-testid="fast-test-config">
-              <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-3">
-                <div className="space-y-3">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Risk &amp; Exit Model</h3>
-                  <RiskExitModelEditor params={params} setParams={setParams} />
-                  <div className="pt-1">
-                    {renderNumberInput('sl_floor_pct', params.sl_floor_pct,
-                      e => setFamilyField('sl_floor_pct', parseFloat(e.target.value)))}
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Exits &amp; Timing</h3>
-                  <div className="space-y-3">
-                    {['timeout_bars', 'cooldown_bars'].map(field => <React.Fragment key={field}>
-                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
-                    </React.Fragment>)}
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Sizing &amp; Drawdown Guard</h3>
-                  <div className="space-y-3">
-                    {['leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct']
-                      .map(field => <React.Fragment key={field}>
-                        {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
-                      </React.Fragment>)}
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-xl border border-blue-900/40 bg-blue-900/10 p-4" data-testid="fast-test-entry-rule">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-300">Entry rule</h3>
-                <p className="mt-1 text-[10px] leading-snug text-gray-400">
+            <div className="space-y-4" data-testid="fast-test-config">
+              {/* The rule itself — period, both thresholds, allowed direction. */}
+              <ParamGroupCard id="config-fast-entry-rule" data-testid="fast-test-entry-rule"
+                title="Entry rule" icon={ListChecks}
+                hint="The rule's own numbers — the same rule runs with whatever you type here."
+                changed={changedIn(['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min', 'trade_direction'])}
+                onReset={() => resetGroup(['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min', 'trade_direction'])}>
+                <p className="text-[11px] leading-snug text-gray-400 sm:col-span-2 xl:col-span-3">
                   One side per 1H candle, decided on that candle's RSI. Change the period, either threshold or the allowed
-                  direction and the same rule runs with your numbers.
-                  <span className="ml-1 font-mono text-gray-300">
-                    Now: RSI({params.entry_rsi_period}) → long below {params.entry_rsi_long_max}, short at/above {params.entry_rsi_short_min}
-                    {params.trade_direction === 'long' ? ' · long only' : params.trade_direction === 'short' ? ' · short only' : ''}.
+                  direction and the same rule runs with your numbers.{' '}
+                  <span className="font-mono text-gray-200">
+                    Now: RSI({params.entry_rsi_period}) → long below {params.entry_rsi_long_max}, short at/above {params.entry_rsi_short_min}{params.trade_direction === 'long' ? ' · long only' : params.trade_direction === 'short' ? ' · short only' : ''}.
                   </span>
                 </p>
-                <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                  {['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min'].map(field => (
-                    <React.Fragment key={field}>
-                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
-                    </React.Fragment>
-                  ))}
-                  <div className="flex flex-col">
-                    <label className="text-[10px] text-gray-400 font-semibold mb-1">Direction</label>
-                    <select value={params.trade_direction || 'both'} data-testid="param-trade_direction"
-                      onChange={e => setFamilyField('trade_direction', e.target.value)}
-                      className="bg-gray-900 p-2 rounded-lg border border-gray-700 text-white text-xs outline-none focus:border-blue-500 transition w-full">
-                      <option value="both">Both — long &amp; short</option>
-                      <option value="long">Long only</option>
-                      <option value="short">Short only</option>
-                    </select>
+                {['entry_rsi_period', 'entry_rsi_long_max', 'entry_rsi_short_min'].map(field => (
+                  <React.Fragment key={field}>
+                    {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                  </React.Fragment>
+                ))}
+                <div className="flex flex-col">
+                  <label htmlFor="param-input-trade_direction"
+                    className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">Direction</label>
+                  <select id="param-input-trade_direction" value={params.trade_direction || 'both'} data-testid="param-trade_direction"
+                    onChange={e => setFamilyField('trade_direction', e.target.value)}
+                    className="w-full rounded-lg border border-gray-700 bg-gray-900 px-2.5 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25">
+                    <option value="both">Both — long &amp; short</option>
+                    <option value="long">Long only</option>
+                    <option value="short">Short only</option>
+                  </select>
+                  <span className="mt-1 text-[10px] leading-snug text-gray-500">Long only never shorts, short only never longs.</span>
+                </div>
+              </ParamGroupCard>
+
+              {/* Which protective rules exist, plus the optional conditions. */}
+              <ParamGroupCard id="config-fast-exit-rule" data-testid="fast-test-exit-rule"
+                title="Exit rule" icon={LogOut}
+                hint="Protective rules and the optional exits judged on a completed candle."
+                changed={changedIn(['use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout',
+                  'exit_on_opposite', 'exit_rsi_enabled', 'exit_rsi_level', 'exit_macd_flip_enabled'])}
+                onReset={() => resetGroup(['use_stop_loss', 'use_take_profit', 'use_trailing_stop', 'use_breakeven', 'use_timeout',
+                  'exit_on_opposite', 'exit_rsi_enabled', 'exit_rsi_level', 'exit_macd_flip_enabled'])}>
+                <div className="sm:col-span-2 xl:col-span-3">
+                  <p className="text-[11px] leading-snug text-gray-400">
+                    Everything is on / off exactly as the original strategy behaved — a switch only changes a run once you save
+                    this strategy. The stop still keeps priority over a condition, and a condition over the timeout.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    {DEBUG_EXIT_SWITCHES.map(([field, label, hint]) => (
+                      <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2.5 text-[10px] text-gray-300 transition hover:border-gray-600">
+                        <input type="checkbox" checked={params[field] !== false} data-testid={`toggle-${field}`}
+                          onChange={e => setFamilyField(field, e.target.checked)}
+                          className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
+                        <span>
+                          <span className="block font-bold text-white">{label}</span>
+                          <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  <h4 className="mt-4 text-[10px] font-bold uppercase tracking-wider text-gray-400">Exit conditions (on a completed candle)</h4>
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    {DEBUG_EXIT_CONDITIONS.map(([field, label, hint]) => (
+                      <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2.5 text-[10px] text-gray-300 transition hover:border-gray-600">
+                        <input type="checkbox" checked={!!params[field]} data-testid={`toggle-${field}`}
+                          onChange={e => setFamilyField(field, e.target.checked)}
+                          className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
+                        <span>
+                          <span className="block font-bold text-white">{label}</span>
+                          <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
+                        </span>
+                      </label>
+                    ))}
+                    <div className="rounded-lg border border-gray-700 bg-gray-900/80 p-2.5">
+                      <label className="flex cursor-pointer items-start gap-2 text-[10px] text-gray-300">
+                        <input type="checkbox" checked={!!params.exit_rsi_enabled} data-testid="toggle-exit_rsi_enabled"
+                          onChange={e => setFamilyField('exit_rsi_enabled', e.target.checked)}
+                          className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500" />
+                        <span>
+                          <span className="block font-bold text-white">Exit on RSI level</span>
+                          <span className="mt-0.5 block leading-snug text-gray-500">Close a long at/above the level, a short at/below it.</span>
+                        </span>
+                      </label>
+                      {params.exit_rsi_enabled && (
+                        <div className="mt-2">
+                          {renderNumberInput('exit_rsi_level', params.exit_rsi_level, e => setFamilyField('exit_rsi_level', parseFloat(e.target.value)))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
+              </ParamGroupCard>
 
-              <div className="rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="fast-test-exit-rule">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">Exit rule</h3>
-                <p className="mt-1 text-[10px] leading-snug text-gray-400">
-                  Which protective rules this strategy runs, and the optional conditions that close a position on a
-                  completed candle. Everything is on / off exactly as the original strategy behaved — a switch only
-                  changes a run once you save this strategy. The stop still keeps priority over a condition, and a
-                  condition over the timeout.
-                </p>
-                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                  {DEBUG_EXIT_SWITCHES.map(([field, label, hint]) => (
-                    <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
-                      <input type="checkbox" checked={params[field] !== false} data-testid={`toggle-${field}`}
-                        onChange={e => setFamilyField(field, e.target.checked)}
-                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
-                      <span>
-                        <span className="block font-bold text-white">{label}</span>
-                        <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
-                      </span>
-                    </label>
-                  ))}
-                </div>
-                <h4 className="mt-4 text-[10px] font-bold uppercase tracking-wider text-gray-400">Exit conditions (on a completed candle)</h4>
-                <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                  {DEBUG_EXIT_CONDITIONS.map(([field, label, hint]) => (
-                    <label key={field} className="flex cursor-pointer items-start gap-2 rounded-lg border border-gray-700 bg-gray-900/80 p-2 text-[10px] text-gray-300">
-                      <input type="checkbox" checked={!!params[field]} data-testid={`toggle-${field}`}
-                        onChange={e => setFamilyField(field, e.target.checked)}
-                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
-                      <span>
-                        <span className="block font-bold text-white">{label}</span>
-                        <span className="mt-0.5 block leading-snug text-gray-500">{hint}</span>
-                      </span>
-                    </label>
-                  ))}
-                  <div className="rounded-lg border border-gray-700 bg-gray-900/80 p-2">
-                    <label className="flex cursor-pointer items-start gap-2 text-[10px] text-gray-300">
-                      <input type="checkbox" checked={!!params.exit_rsi_enabled} data-testid="toggle-exit_rsi_enabled"
-                        onChange={e => setFamilyField('exit_rsi_enabled', e.target.checked)}
-                        className="mt-0.5 h-3.5 w-3.5 accent-blue-500" />
-                      <span>
-                        <span className="block font-bold text-white">Exit on RSI level</span>
-                        <span className="mt-0.5 block leading-snug text-gray-500">Close a long at/above the level, a short at/below it.</span>
-                      </span>
-                    </label>
-                    {params.exit_rsi_enabled && (
-                      <div className="mt-2">
-                        {renderNumberInput('exit_rsi_level', params.exit_rsi_level, e => setFamilyField('exit_rsi_level', parseFloat(e.target.value)))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
+              {/* V1.0's own layers. */}
               {strategyFamily === FAST_TEST_V1_ID && (
-                <div className="rounded-xl border border-emerald-900/40 bg-emerald-900/10 p-4" data-testid="fast-test-v1-rules">
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-300">V1.0 — validation &amp; profit booking</h3>
-                  <p className="mt-1 text-[10px] leading-snug text-gray-400">
+                <ParamGroupCard id="config-fast-v1-rules" data-testid="fast-test-v1-rules"
+                  title="V1.0 — validation & profit booking" icon={BadgeCheck}
+                  hint="The 2H validation window and the profit-booking touch."
+                  changed={changedIn(['validation_bars', 'validation_close_pct', 'profit_book_pct'])}
+                  onReset={() => resetGroup(['validation_bars', 'validation_close_pct', 'profit_book_pct'])}>
+                  <p className="text-[11px] leading-snug text-gray-400 sm:col-span-2 xl:col-span-3">
                     The window is measured in completed 1H candles. A favourable close inside the window validates the trade and
                     the normal exits continue; a close that never gets there exits at the window's last close.
                     The booking percentage is checked on a price <b className="text-white">touch</b> and books the whole position first.
                   </p>
-                  <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                    {['validation_bars', 'validation_close_pct', 'profit_book_pct'].map(field => <React.Fragment key={field}>
+                  {['validation_bars', 'validation_close_pct', 'profit_book_pct'].map(field => (
+                    <React.Fragment key={field}>
                       {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
-                    </React.Fragment>)}
-                  </div>
-                </div>
+                    </React.Fragment>
+                  ))}
+                </ParamGroupCard>
               )}
+
+              {/* The shared plan: risk & exit model, timing, sizing. */}
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+                <ParamGroupCard id="config-fast-risk-exit" title="Risk &amp; Exit Model" icon={Shield}
+                  hint="ATR units (default), price % or a per-level mix."
+                  changed={changedIn(['sl_floor_pct'])} onReset={() => resetGroup(['sl_floor_pct'])}>
+                  <div className="sm:col-span-2 xl:col-span-3">
+                    <RiskExitModelEditor params={params} setParams={setParams} />
+                  </div>
+                  {renderNumberInput('sl_floor_pct', params.sl_floor_pct,
+                    e => setFamilyField('sl_floor_pct', parseFloat(e.target.value)))}
+                </ParamGroupCard>
+                <ParamGroupCard id="config-fast-timing" title="Exits &amp; Timing" icon={Timer}
+                  hint="Holding-time limit and the wait after a close."
+                  changed={changedIn(['timeout_bars', 'cooldown_bars'])}
+                  onReset={() => resetGroup(['timeout_bars', 'cooldown_bars'])}>
+                  {['timeout_bars', 'cooldown_bars'].map(field => (
+                    <React.Fragment key={field}>
+                      {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                    </React.Fragment>
+                  ))}
+                </ParamGroupCard>
+                <ParamGroupCard id="config-fast-sizing" title="Sizing &amp; Drawdown Guard" icon={Wallet}
+                  hint="Position size per trade and the equity-drawdown brake."
+                  changed={changedIn(['leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct'])}
+                  onReset={() => resetGroup(['leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct'])}>
+                  {['leverage', 'margin_pct', 'lot_size_btc', 'reduced_margin_pct', 'dd_soft_pct', 'dd_halt_pct', 'dd_resume_pct']
+                    .map(field => (
+                      <React.Fragment key={field}>
+                        {renderNumberInput(field, params[field], e => setFamilyField(field, parseFloat(e.target.value)))}
+                      </React.Fragment>
+                    ))}
+                </ParamGroupCard>
+              </div>
             </div>
           ) : (
-          <div className="grid grid-cols-1 gap-6 border-t border-gray-700 pt-6 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3">
             {Object.entries(sharedParamGroups).map(([groupName, fields]) => (
-              <div key={groupName} className="space-y-3">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">{groupName}</h3>
-                <div className="space-y-3">
+              <ParamGroupCard key={groupName}
+                id={groupSlug(groupName)} data-testid={groupSlug(groupName)}
+                title={groupName} icon={CONFIG_GROUP_ICONS[groupName]} hint={CONFIG_GROUP_HINTS[groupName]}
+                changed={changedIn(fields)} onReset={() => resetGroup(fields)}>
+                <div className="contents">
+                  {/* The five ATR / % values are edited by the model selector
+                      plus an ATR | Price % switch per level. */}
                   {groupName === 'Risk & Exit Model' ? (
-                    /* The five ATR / % values are edited by their own block:
-                       a model selector plus an ATR | Price % switch per level. */
-                    <RiskExitModelEditor params={params} setParams={setParams} />
+                    <div className="sm:col-span-2 xl:col-span-3">
+                      <RiskExitModelEditor params={params} setParams={setParams} />
+                    </div>
                   ) : fields.map(field => {
                     if (field === 'enable_momentum_entry') {
                       return <React.Fragment key={field}>
@@ -1644,14 +1910,14 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
                     </React.Fragment>;
                   })}
                 </div>
-              </div>
+              </ParamGroupCard>
             ))}
           </div>
           )}
 
           {/* v3.5 — optional MACD line / signal line entry rules. */}
           {!fastTestFamily && (
-          <div className="mt-6 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="macd-line-rules">
+          <div id="config-macd-line-rules" className="mt-4 scroll-mt-28 rounded-xl border border-gray-700 bg-gray-900/60 p-4" data-testid="macd-line-rules">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h3 className="text-xs font-bold uppercase tracking-wider text-blue-400">MACD line / signal line rules</h3>
@@ -1754,28 +2020,46 @@ const Backtest = ({ initialStrategyId = 'PhantomV2' } = {}) => {
         icon={Play}
         className="mb-8"
       >
+        {/* What is about to run, spelled out — so nobody has to scroll back
+            up through the form to check the dates, market, strategy or size. */}
+        <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4" data-testid="run-summary">
+          {[
+            ['Dates', `${dates.start} → ${dates.end}`],
+            ['Market', `${perpetualFor(dataSource)} perpetual · ${dataSource}`],
+            ['Strategy', editingStrategyName],
+            ['Capital', `₹${Number(capital || 0).toLocaleString('en-IN')} · ${params.leverage}x`],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-xl border border-gray-700/70 bg-gray-900/40 px-3 py-2">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-gray-500">{label}</div>
+              <div className="mt-0.5 truncate font-mono text-xs text-gray-200" title={value}>{value}</div>
+            </div>
+          ))}
+        </div>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <p className="max-w-md text-[11px] text-gray-500">
+          <p className="max-w-md text-[11px] leading-snug text-gray-500">
             <SlidersHorizontal size={12} className="mr-1 inline text-gray-600" />
             {fastTestFamily
               ? `${strategyFamily === FAST_TEST_V1_ID ? FAST_TEST_V1_NAME : FAST_TEST_NAME} runs the entry / exit rules above — Run Backtest builds the full equity curve and trade log.`
               : 'Preview Filters is a fast quality check. Run Backtest builds the full equity curve and trade log.'}
           </p>
-          <div className="flex flex-col flex-wrap gap-2 sm:flex-row sm:items-center">
-            <button onClick={resetParams} className="flex items-center justify-center gap-2 px-4 py-2 text-xs text-gray-500 transition hover:text-white">
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+            <button onClick={resetParams}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border border-gray-700 bg-gray-900 px-4 py-2.5 text-xs font-semibold text-gray-300 transition hover:border-gray-500 hover:text-white">
               <RotateCcw size={14} /> Reset defaults
             </button>
             {!fastTestFamily && (
               <button onClick={runFilterPreview} disabled={previewLoading || loading}
-                className="flex items-center justify-center gap-2 rounded-xl border border-blue-800/50 px-4 py-2 text-xs font-semibold text-blue-300 transition hover:bg-blue-900/20 disabled:opacity-50">
+                title="Quick per-bucket quality check of the conditions, without the full equity curve"
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-blue-800/50 bg-blue-900/10 px-4 py-2.5 text-xs font-semibold text-blue-300 transition hover:bg-blue-900/30 disabled:opacity-50">
                 {previewLoading ? <div className="h-3 w-3 rounded-full border-2 border-blue-400 border-t-transparent animate-spin"></div> : 'Preview Filters'}
               </button>
             )}
             <button onClick={saveAsNewStrategy} disabled={saving}
-              className="flex items-center justify-center gap-2 rounded-xl bg-green-700 px-4 py-2 text-xs font-bold text-white transition hover:bg-green-600 disabled:opacity-50">
+              className="inline-flex items-center justify-center gap-2 rounded-xl border border-green-800/60 bg-green-900/30 px-4 py-2.5 text-xs font-bold text-green-300 transition hover:bg-green-900/60 disabled:opacity-50">
               <Download size={14} /> {saving ? 'Saving...' : 'Save as strategy'}
             </button>
-            <button onClick={runBacktest} disabled={loading} className="flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-8 py-3 font-bold shadow-lg shadow-blue-900/20 transition hover:bg-blue-500 disabled:opacity-50">
+            <button onClick={runBacktest} disabled={loading}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-blue-900/20 transition hover:bg-blue-500 disabled:opacity-50">
               {loading ? <div className="h-4 w-4 rounded-full border-2 border-white border-t-transparent animate-spin"></div> : <><Play size={16} /> Run Backtest</>}
             </button>
           </div>

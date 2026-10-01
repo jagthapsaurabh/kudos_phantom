@@ -3,6 +3,7 @@ import { Plus, Trash2, Copy, X, ChevronDown, ChevronUp, Lock, Unlock, FolderPlus
 import { useNavigate } from 'react-router-dom';
 import { API_URL } from '../api';
 import { DEFAULT_RISK_EXIT } from '../utils/riskExit';
+import StrategyConfigSummary from '../components/StrategyConfigSummary';
 import { FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_NAME, isFastTestV1 } from '../utils/phantomPresets';
 
 // --- Constants ---
@@ -360,6 +361,10 @@ const Strategies = () => {
     id: 'root', type: 'group', operator: 'AND', children: [], enabled: true 
   });
   const [scanning, setScanning] = useState(false);
+  // List tools: search, family filter and the per-row settings drawer.
+  const [query, setQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [openSettings, setOpenSettings] = useState(null);
   const [scanResults, setScanResults] = useState([]);
   const [scanMeta, setScanMeta] = useState(null);
   const [form, setForm] = useState({
@@ -371,6 +376,18 @@ const Strategies = () => {
       risk_exit: { ...DEFAULT_RISK_EXIT },
     }
   });
+
+  const isRuleBased = (s) => Array.isArray(s.rules) || (s.rules && s.rules.type === 'group');
+
+  const visibleStrategies = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return strategies.filter(s => {
+      if (typeFilter === 'rules' && !isRuleBased(s)) return false;
+      if (typeFilter === 'params' && isRuleBased(s)) return false;
+      if (!q) return true;
+      return `${s.name} ${familyLabel(s.strategy_id)}`.toLowerCase().includes(q);
+    });
+  }, [strategies, query, typeFilter]);
 
   const fetchStrategies = async () => {
     try {
@@ -536,42 +553,104 @@ const Strategies = () => {
         </button>
       </div>
       
+      {/* Search + family filter: find a strategy without scanning the whole list. */}
+      <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="relative w-full lg:max-w-xs">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input value={query} onChange={e => setQuery(e.target.value)}
+            placeholder="Search by name or type…" aria-label="Search strategies"
+            data-testid="strategies-search"
+            className="w-full rounded-xl border border-gray-700 bg-gray-800 py-2 pl-9 pr-3 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25" />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500" data-testid="strategies-count">
+            {visibleStrategies.length} of {strategies.length} strategies
+          </span>
+          {[['all', 'All'], ['params', 'Parameter-based'], ['rules', 'Rule-based']].map(([id, label]) => (
+            <button key={id} onClick={() => setTypeFilter(id)}
+              className={`rounded-full border px-3 py-1 text-[11px] font-semibold transition ${
+                typeFilter === id
+                  ? 'border-blue-500/50 bg-blue-500/10 text-blue-300'
+                  : 'border-gray-700 text-gray-400 hover:border-gray-500 hover:text-white'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden overflow-x-auto">
-        <table className="w-full text-left min-w-[640px]">
-          <thead className="bg-gray-700 text-gray-300 text-sm">
+        <table className="w-full text-left min-w-[720px]">
+          <thead className="sticky top-0 z-10 bg-gray-700 text-gray-300 text-xs uppercase tracking-wider">
             <tr>
-              <th className="p-4">Strategy Name</th>
-              <th className="p-4">Type</th>
-              <th className="p-4">Created At</th>
-              <th className="p-4">Actions</th>
+              <th className="px-4 py-3">Strategy Name</th>
+              <th className="px-4 py-3">Type</th>
+              <th className="px-4 py-3">Created At</th>
+              <th className="px-4 py-3">Actions</th>
+              <th className="px-4 py-3 text-right">Settings</th>
             </tr>
           </thead>
           <tbody>
-            {strategies.map(s => (
-              <tr key={s.id} className="border-b border-gray-700 hover:bg-gray-700/50 transition">
-                <td className="p-4 font-medium">{s.name}</td>
-                <td className="p-4 text-sm text-gray-400">
-                  {Array.isArray(s.rules) || (s.rules && s.rules.type === 'group') ? 'Rule-based'
-                    : `Parameter-based${familyLabel(s.strategy_id)}`}
+            {visibleStrategies.map(s => {
+              const rules = isRuleBased(s);
+              const expanded = String(openSettings) === String(s.id);
+              return (
+              <React.Fragment key={s.id}>
+              <tr className="border-b border-gray-700 transition hover:bg-gray-700/40">
+                <td className="px-4 py-3 font-medium text-white">{s.name}</td>
+                <td className="px-4 py-3">
+                  <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                    rules ? 'border-gray-600 bg-gray-700/40 text-gray-300'
+                          : 'border-blue-500/30 bg-blue-500/10 text-blue-300'}`}>
+                    {rules ? 'Rule-based' : `Parameter-based${familyLabel(s.strategy_id)}`}
+                  </span>
                 </td>
-                <td className="p-4 text-gray-400 text-sm">{new Date(s.created_at).toLocaleDateString()}</td>
-                <td className="p-4">
-                  <div className="flex items-center gap-2">
+                <td className="px-4 py-3 font-mono text-xs text-gray-400">{new Date(s.created_at).toLocaleDateString()}</td>
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-3">
                     <button onClick={() => viewOnChart(s.id)}
-                      className="text-green-400 hover:text-green-300 flex items-center gap-1 text-xs font-semibold mr-1"
+                      className="flex items-center gap-1 text-xs font-semibold text-green-400 transition hover:text-green-300"
                       title="Show this strategy's signals on the market chart">
                       <LineChart size={14} /> Chart
                     </button>
-                    <button onClick={() => openEdit(s)} className="text-blue-400 hover:text-blue-300 mr-1">Edit</button>
-                    <button onClick={() => requestDelete(s.id, s.name)} className="text-red-400 hover:text-red-300">
+                    <button onClick={() => openEdit(s)}
+                      className="text-xs font-semibold text-blue-400 transition hover:text-blue-300"
+                      title="Open this strategy in the editor">Edit</button>
+                    <button onClick={() => requestDelete(s.id, s.name)}
+                      className="text-red-400 transition hover:text-red-300"
+                      title={`Delete ${s.name}`}>
                       <Trash2 size={14} className="inline" />
                     </button>
                   </div>
                 </td>
+                <td className="px-4 py-3 text-right">
+                  <button onClick={() => setOpenSettings(expanded ? null : s.id)}
+                    data-testid={`strategy-settings-toggle-${s.id}`}
+                    aria-expanded={expanded}
+                    title={expanded ? 'Hide these settings' : 'Show what this strategy trades on'}
+                    className="inline-flex items-center gap-1 rounded-lg border border-gray-700 px-2.5 py-1 text-[11px] font-semibold text-gray-300 transition hover:border-gray-500 hover:text-white">
+                    <Settings size={12} /> {expanded ? 'Hide' : 'View'}
+                  </button>
+                </td>
               </tr>
-            ))}
+              {expanded && (
+                <tr className="border-b border-gray-700 bg-gray-900/40">
+                  <td colSpan={5} className="px-4 py-3">
+                    <StrategyConfigSummary strategyId={s.id} strategies={strategies} className="mx-auto max-w-4xl" />
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
+              );
+            })}
           </tbody>
         </table>
+        {visibleStrategies.length === 0 && (
+          <div className="px-6 py-10 text-center text-sm text-gray-500" data-testid="strategies-empty">
+            {strategies.length === 0
+              ? 'No strategies yet — create one to see its settings here.'
+              : 'No strategy matches your search or filter.'}
+          </div>
+        )}
       </div>
 
       {showModal && (

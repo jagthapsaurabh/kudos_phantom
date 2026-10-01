@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Info } from 'lucide-react';
+import { Activity, Crosshair, Info, Shield } from 'lucide-react';
 import { API_URL } from '../api';
 import {
   isPhantomBuiltin, macdLineRuleText, setupModeLabel, tradeDirectionLabel,
@@ -14,6 +14,20 @@ import { riskExitModelFor, riskExitModelLabel, riskExitText } from '../utils/ris
 // saved strategies are read from the `strategies` list the page already has.
 // Self-contained: fetches on its own, never blocks the page, renders nothing
 // for Chartink-style rule strategies that have no Phantom parameters.
+// One label + value tile, so every screen reads the same way.
+const SummaryTile = ({ label, children, mono = false }) => (
+  <div className="rounded-xl border border-gray-700/60 bg-gray-900/40 px-3 py-2">
+    <div className="text-[9px] font-bold uppercase tracking-wider text-gray-500">{label}</div>
+    <div className={`mt-0.5 text-xs text-white ${mono ? 'font-mono' : ''}`}>{children}</div>
+  </div>
+);
+
+const SectionTitle = ({ icon: Icon, tone = 'text-blue-400', children }) => (
+  <div className="mb-2 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-gray-400">
+    <Icon size={12} className={tone} /> {children}
+  </div>
+);
+
 const StrategyConfigSummary = ({ strategyId, strategies = [], className = '' }) => {
   const [builtin, setBuiltin] = useState(null);
 
@@ -64,52 +78,62 @@ const StrategyConfigSummary = ({ strategyId, strategies = [], className = '' }) 
   const lineActive = lineLong !== 'off' || lineShort !== 'off';
 
   return (
-    <div className={`rounded-xl border border-gray-700 bg-gray-800/70 p-3 text-[11px] text-gray-300 ${className}`}
+    <div className={`overflow-hidden rounded-2xl border border-gray-700 bg-gray-800/70 text-[11px] text-gray-300 ${className}`}
          data-testid="strategy-config-summary">
-      <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-gray-400">
-        <Activity size={12} className="text-blue-400" /> Strategy settings{title ? <span className="normal-case tracking-normal text-gray-300">· {title}</span> : null}
+      {/* Header: what this panel is, which strategy it describes, and where to change it. */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-gray-700/70 bg-gray-800/80 px-4 py-2.5">
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-400">
+          <Activity size={13} />
+        </span>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Strategy settings</span>
+        {title ? <span className="truncate text-xs font-semibold text-white" title={title}>· {title}</span> : null}
+        <span className="ml-auto hidden text-[10px] text-gray-500 lg:inline">
+          Change these in the Strategies manager, or in Backtest → Strategy Configuration
+        </span>
       </div>
-      <div className="grid grid-cols-1 gap-x-6 gap-y-1.5 sm:grid-cols-2 xl:grid-cols-4">
-        <div>
-          <div className="text-[9px] font-bold uppercase text-gray-500">Setup</div>
-          <div className="text-white">{setupText}</div>
-        </div>
-        <div>
-          <div className="text-[9px] font-bold uppercase text-gray-500">Direction</div>
-          <div className="text-white">{tradeDirectionLabel(direction)}</div>
-        </div>
-        <div>
-          <div className="text-[9px] font-bold uppercase text-gray-500">MACD periods (fast/slow/signal)</div>
-          <div className="font-mono text-white">
-            {perSidePeriods ? <>L {periods('long')} · S {periods('short')}</> : periods('long')}
+
+      <div className="space-y-4 p-4">
+        <section data-testid="summary-entry">
+          <SectionTitle icon={Crosshair} tone="text-emerald-400">Entry conditions</SectionTitle>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <SummaryTile label="Setup">{setupText}</SummaryTile>
+            <SummaryTile label="Direction">{tradeDirectionLabel(direction)}</SummaryTile>
+            <SummaryTile label="MACD periods (fast/slow/signal)" mono>
+              {perSidePeriods ? <>L {periods('long')} · S {periods('short')}</> : periods('long')}
+            </SummaryTile>
+            <SummaryTile label="MACD hist threshold" mono>Long ≥ {histLong} · Short ≤ {histShort}</SummaryTile>
           </div>
-        </div>
-        <div>
-          <div className="text-[9px] font-bold uppercase text-gray-500">MACD hist threshold</div>
-          <div className="font-mono text-white">Long ≥ {histLong} · Short ≤ {histShort}</div>
-        </div>
-        <div className="sm:col-span-2 xl:col-span-4">
-          <div className="text-[9px] font-bold uppercase text-gray-500">Risk &amp; exit model</div>
-          <div className="text-white">
-            <span className="font-bold">{riskExitModelLabel(riskExitModelFor(params))}</span>
-            <span className="mx-2 text-gray-600">|</span>
-            <span className="font-mono">{riskExitText(params)}</span>
+        </section>
+
+        <section data-testid="summary-risk-exit">
+          <SectionTitle icon={Shield}>Risk &amp; exit model</SectionTitle>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border border-gray-700/60 bg-gray-900/40 px-3 py-2">
+            <span className="rounded-full border border-blue-500/30 bg-blue-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-blue-300">
+              {riskExitModelLabel(riskExitModelFor(params))}
+            </span>
+            <span className="font-mono text-xs text-white">{riskExitText(params)}</span>
           </div>
-        </div>
-        <div className="sm:col-span-2 xl:col-span-4">
-          <div className="text-[9px] font-bold uppercase text-gray-500">MACD line / signal line rules</div>
+        </section>
+
+        <section data-testid="summary-line-rules">
+          <SectionTitle icon={Info}>MACD line / signal line rules</SectionTitle>
           {lineActive ? (
-            <div className="font-mono text-white">
-              <span className="text-green-400">Long:</span> {lineLong}
-              <span className="mx-2 text-gray-600">|</span>
-              <span className="text-red-400">Short:</span> {lineShort}
+            <div className="flex flex-col gap-2 rounded-xl border border-gray-700/60 bg-gray-900/40 px-3 py-2 font-mono text-xs text-white sm:flex-row sm:items-center sm:gap-6">
+              <span className="flex items-center gap-2">
+                <span className="rounded border border-green-500/30 bg-green-500/10 px-1.5 py-0.5 text-[10px] font-bold text-green-300">Long</span>
+                {lineLong}
+              </span>
+              <span className="flex items-center gap-2">
+                <span className="rounded border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 text-[10px] font-bold text-red-300">Short</span>
+                {lineShort}
+              </span>
             </div>
           ) : (
-            <div className="flex items-center gap-1 text-gray-500">
-              <Info size={11} /> Off — only the histogram threshold and the MACD confirmation / zero-cross checks apply (original behaviour).
+            <div className="flex items-start gap-1.5 rounded-xl border border-gray-700/60 bg-gray-900/40 px-3 py-2 text-gray-500">
+              <Info size={11} className="mt-0.5 shrink-0" /> Off — only the histogram threshold and the MACD confirmation / zero-cross checks apply (original behaviour).
             </div>
           )}
-        </div>
+        </section>
       </div>
     </div>
   );

@@ -914,8 +914,14 @@ const PaperTrade = () => {
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
           </select>
-          <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+          {/* Labelled like every other control in this row, and the chosen
+              strategy's settings are spelled out right below the header. */}
+          <div className="flex flex-col">
+            <label htmlFor="paper-strategy" className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Strategy</label>
+            <select id="paper-strategy" data-testid="strategy-select"
+                  value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
+                  title="Which strategy this paper instance runs. Its setup, MACD rules and risk & exit model are shown below."
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-blue-500">
             <option value="PhantomV2">Kudos V2.5 (Default)</option>
             <PhantomPresetOptions />
             <option value="FastTest">Fast Test Strategy</option>
@@ -925,7 +931,8 @@ const PaperTrade = () => {
                 {strategies.map(s => <option key={s.id} value={s.id}>{s.name}{isFastTestV1(s.strategy_id) ? ` · ${FAST_TEST_V1_NAME}` : String(s.strategy_id) === FAST_TEST_ID ? ` · ${FAST_TEST_NAME}` : ''}</option>)}
               </optgroup>
             )}
-          </select>
+            </select>
+          </div>
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Exit checks</label>
             <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}

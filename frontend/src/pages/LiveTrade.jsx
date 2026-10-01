@@ -787,9 +787,11 @@ const LiveTrade = ({ initialView = 'automation' } = {}) => {
             </select>
           </div>
           <div className="flex flex-col">
-            <label className="text-xs text-gray-500 uppercase font-bold mb-1">Active Strategy</label>
-            <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
-                    className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+            <label htmlFor="live-strategy" className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Active Strategy</label>
+            <select id="live-strategy" data-testid="strategy-select"
+                    value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
+                    title="Which strategy this live instance runs. Its setup, MACD rules and risk & exit model are shown below."
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-green-500">
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
               <PhantomPresetOptions />
               <option value="FastTest">Fast Test Strategy (Quick Signals)</option>

@@ -19,7 +19,7 @@ rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
 const targets = process.argv.slice(2).map((f) => (f.endsWith('.jsx') ? f : `${f}.jsx`));
-const files = targets.length ? targets : ['trade_log_ui.jsx', 'fast_test_v1_ui.jsx', 'trade_conditions_ui.jsx', 'trading_windows_ui.jsx', 'pages_smoke.jsx', 'terminal_ui.jsx', 'admin_seed_ui.jsx', 'chart_overlay.jsx', 'chart_zoom_ui.jsx', 'broker_keys_ui.jsx', 'phantom_presets_ui.jsx', 'risk_exit_model_ui.jsx'];
+const files = targets.length ? targets : ['trade_log_ui.jsx', 'fast_test_v1_ui.jsx', 'trade_conditions_ui.jsx', 'trading_windows_ui.jsx', 'pages_smoke.jsx', 'terminal_ui.jsx', 'admin_seed_ui.jsx', 'chart_overlay.jsx', 'chart_zoom_ui.jsx', 'broker_keys_ui.jsx', 'phantom_presets_ui.jsx', 'risk_exit_model_ui.jsx', 'strategy_config_ui.jsx'];
 
 let failed = 0;
 
