@@ -168,5 +168,12 @@ const strategiesSrc = readSource('src/pages/Strategies.jsx');
 check('Saved strategies carry the inert all-ATR defaults',
   (strategiesSrc.match(/risk_exit: \{ \.\.\.DEFAULT_RISK_EXIT \}/g) || []).length === 2);
 
+check('Kudos Strategy config grid maps each ATR risk key to its % counterpart',
+  rulesSrc.includes("stop_loss_atr: ['stop', 'stop_loss_pct']")
+  && rulesSrc.includes("trail_distance_atr: ['trail', 'trail_distance_pct']")
+  && rulesSrc.includes("breakeven_atr: ['breakeven', 'breakeven_pct']"));
+check('Kudos Strategy config grid shows the price value when the level is on price',
+  rulesSrc.includes('% price') && rulesSrc.includes('riskExitModeFor(cfg, RISK_KEY[0])'));
+
 console.log(`\nPASSED: ${pass}  FAILED: ${fail}`);
 process.exit(fail ? 1 : 0);

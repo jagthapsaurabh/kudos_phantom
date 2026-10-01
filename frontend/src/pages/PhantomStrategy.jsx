@@ -182,7 +182,20 @@ const StrategyRulesTab = ({ profile, champion }) => {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs">
           {interesting.map(k => {
             const defaults = { macd_fast: 12, macd_slow: 26, macd_signal: 9, trend_ema_period: 50, setup_mode: 'both', trade_direction: 'both' };
-            const val = cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : defaults[k];
+            // v3.6 — when a level runs on the price model, show the value it
+            // actually uses (the % of entry) instead of the unused ATR number.
+            const RISK_KEY = {
+              stop_loss_atr: ['stop', 'stop_loss_pct'],
+              take_profit_atr: ['target', 'take_profit_pct'],
+              trail_activation_atr: ['trail', 'trail_activation_pct'],
+              trail_distance_atr: ['trail', 'trail_distance_pct'],
+              breakeven_atr: ['breakeven', 'breakeven_pct'],
+            }[k];
+            let val = cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : defaults[k];
+            if (RISK_KEY && riskExitModeFor(cfg, RISK_KEY[0]) === 'price') {
+              const pct = (cfg.risk_exit || {})[RISK_KEY[1]];
+              val = pct === undefined || pct === null ? val : `${Math.round(Number(pct) * 100000) / 1000}% price`;
+            }
             return (
               <div key={k} className="flex justify-between border-b border-gray-700/50 py-1">
                 <span className="text-gray-500">{k}</span>
