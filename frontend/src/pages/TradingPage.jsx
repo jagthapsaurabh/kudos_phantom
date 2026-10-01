@@ -4,6 +4,8 @@ import api from '../api';
 import useToast from '../hooks/useToast';
 import ToastContainer from '../components/ToastContainer';
 import ErrorBoundary from '../components/ErrorBoundary';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import { builtinStrategyName } from '../utils/phantomPresets';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
 
 const TradeCard = ({ trade, type }) => {
@@ -170,9 +172,14 @@ const TradingPageInner = ({ type }) => {
               className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="PhantomV2">Kudos V2.5 (Default)</option>
-              {strategies.map(s => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
+              <PhantomPresetOptions />
+              {strategies.length > 0 && (
+                <optgroup label="Saved strategies">
+                  {strategies.map(s => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </div>
           <button
@@ -229,7 +236,7 @@ const TradingPageInner = ({ type }) => {
               <div className="mt-3 space-y-1">
                 {instances.map(inst => (
                   <div key={inst.instance_key} className="text-[11px] text-gray-500 flex justify-between">
-                    <span className="truncate">{inst.strategy_name || inst.strategy_id}</span>
+                    <span className="truncate">{inst.strategy_name || builtinStrategyName(inst.strategy_id) || inst.strategy_id}</span>
                     <span className={inst.is_running ? 'text-green-400' : 'text-gray-600'}>{inst.is_running ? 'Running' : 'Stopped'}</span>
                   </div>
                 ))}
@@ -243,7 +250,7 @@ const TradingPageInner = ({ type }) => {
               <div className="space-y-2">
                 {history.slice(0, 5).map(s => (
                   <div key={s.id} className="text-[11px] flex justify-between text-gray-500">
-                    <span className="truncate">{s.strategy_name || s.strategy_id}</span>
+                    <span className="truncate">{s.strategy_name || builtinStrategyName(s.strategy_id) || s.strategy_id}</span>
                     <span className={s.status === 'running' ? 'text-green-400' : 'text-gray-400'}>{s.status}</span>
                   </div>
                 ))}

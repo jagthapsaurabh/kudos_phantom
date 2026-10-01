@@ -390,6 +390,22 @@ class Trade(Base):
     cond_atr_regime_ok = Column(Integer, nullable=True)
     cond_rsi_ok = Column(Integer, nullable=True)
     cond_macd_confirm_ok = Column(Integer, nullable=True)
+    # v3.5 — MACD line / signal line at the signal candle and the result of
+    # the optional line/signal rules (NULL = rules were off for that run).
+    macd_line = Column(Float, nullable=True)
+    macd_signal = Column(Float, nullable=True)
+    cond_macd_line_ok = Column(Integer, nullable=True)
+    # FastTest V1.0 audit — NULL for every other strategy, so old runs and
+    # Phantom runs are untouched. `validation_threshold` is the price level the
+    # 2H close had to reach (entry x 1.0035 long / x 0.9965 short) and
+    # `final_net_pnl` restates `net_pnl` as the audit's net-of-fees figure.
+    validation_status = Column(String, nullable=True)
+    validation_close = Column(Float, nullable=True)
+    validation_threshold = Column(Float, nullable=True)
+    tp090_hit = Column(Integer, nullable=True)
+    validation_exit = Column(Integer, nullable=True)
+    final_exit_reason = Column(String, nullable=True)
+    final_net_pnl = Column(Float, nullable=True)
     gross_pnl = Column(Float, nullable=True)
     sl = Column(Float, nullable=True)
     tp = Column(Float, nullable=True)

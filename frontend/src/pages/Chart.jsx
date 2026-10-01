@@ -9,12 +9,18 @@ import {
 } from 'lightweight-charts';
 import {
   TrendingUp, Timer, Layers, Volume2, Radio, Filter, Crosshair,
-  Maximize2, Minimize2, Activity, BarChart3, ChevronDown,
+  Maximize2, Minimize2, Activity, BarChart3, ChevronDown, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import { API_URL } from '../api';
 import DateInput from '../components/DateInput';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import { isPhantomBuiltin, isFastTestV1 } from '../utils/phantomPresets';
 import { computeAll } from '../utils/indicators';
-import { buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
+import { ascendingBars, buildOverlayMarkers, defaultSignalRange, fmtUnixUtc, signalLabel, joinSignalContext, toUnix } from '../utils/chartOverlay';
+import {
+  ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR, clampPriceZoom, isTypingTarget, stepPriceZoom,
+  zoomActionForKey, zoomLabel, zoomLogicalRange, zoomPriceRange,
+} from '../utils/chartZoom';
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
 const DEFAULT_INDICATORS = { ema20: false, ema50: true, sma50: false, rsi: false, macd: false };
@@ -55,6 +61,8 @@ const ChartPage = () => {
   const closesRef = useRef([]);        // aligned closes array
   const crosshairRef = useRef(null);   // subscription handler
   const fullscreenRef = useRef(false);
+  // Vertical (price-axis) zoom. 1 = the automatic price fit, < 1 tighter.
+  const priceZoomRef = useRef(1);
   // time → { label, side, setup, trend, candle, rsi, price, kind } for the
   // hover tooltip over a marked candle (markers render icon-only).
   const markersByTimeRef = useRef(new Map());
@@ -87,6 +95,7 @@ const ChartPage = () => {
   const [dataLen, setDataLen] = useState(0);
   const [noData, setNoData] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [zoomLabelText, setZoomLabelText] = useState('auto fit');
   const [showIndPanel, setShowIndPanel] = useState(false);
   const [showExec, setShowExec] = useState(false);
   const [execSessions, setExecSessions] = useState([]);
@@ -95,6 +104,50 @@ const ChartPage = () => {
 
   const authHeaders = useCallback(() => ({ Authorization: `Bearer ${localStorage.getItem('token')}` }), []);
   const getChartHeight = useCallback(() => (fullscreenRef.current ? window.innerHeight - 20 : 560), []);
+
+  // --- Zoom ----------------------------------------------------------
+  // Horizontal zoom scales the visible bar range around its centre — the very
+  // same range the mouse wheel changes. Vertical zoom is applied on top of the
+  // automatic price fit: the axis hands the provider the fit it just computed
+  // and the provider widens/tightens it around the middle. Because it is a
+  // provider (not a pinned range), the axis keeps following new candles while
+  // zoomed. Switching the provider to a fresh function is what asks the axis to
+  // recompute on the next frame.
+  const makePriceZoomProvider = useCallback(() => (original) => {
+    const res = original();
+    const factor = priceZoomRef.current;
+    if (!res || !res.priceRange || factor === 1) return res;
+    const priceRange = zoomPriceRange(res.priceRange, factor);
+    return priceRange ? { ...res, priceRange } : res;
+  }, []);
+
+  const applyPriceZoom = useCallback(() => {
+    // Never fight a manually dragged price axis: the buttons always win.
+    chartRef.current?.priceScale('right').setAutoScale(true);
+    candleSeriesRef.current?.applyOptions({ autoscaleInfoProvider: makePriceZoomProvider() });
+  }, [makePriceZoomProvider]);
+
+  const zoomStep = useCallback((factor) => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const next = zoomLogicalRange(chart.timeScale().getVisibleLogicalRange(), factor);
+    if (next) chart.timeScale().setVisibleLogicalRange(next);
+    else chart.timeScale().fitContent();
+    // `priceZoomRef` holds the accumulated factor; the axis re-runs the
+    // provider with it against a fresh automatic fit.
+    priceZoomRef.current = stepPriceZoom(priceZoomRef.current, factor);
+    applyPriceZoom();
+    setZoomLabelText(zoomLabel(priceZoomRef.current));
+  }, [applyPriceZoom]);
+
+  const zoomIn = useCallback(() => zoomStep(ZOOM_IN_FACTOR), [zoomStep]);
+  const zoomOut = useCallback(() => zoomStep(ZOOM_OUT_FACTOR), [zoomStep]);
+  const resetZoom = useCallback(() => {
+    priceZoomRef.current = 1;
+    applyPriceZoom();
+    chartRef.current?.timeScale().fitContent();
+    setZoomLabelText(zoomLabel(1));
+  }, [applyPriceZoom]);
 
   // --- Symbols + strategies -----------------------------------------
   useEffect(() => {
@@ -117,7 +170,8 @@ const ChartPage = () => {
         setStrategies(arr);
         // Deep-link support: /chart?strategy=<id> preselects that strategy
         const q = new URLSearchParams(window.location.search).get('strategy');
-        if (q && (q === 'PhantomV2' || q === 'FastTest' || arr.some(s => String(s.id) === q))) {
+        if (q && (isPhantomBuiltin(q) || q === 'FastTest' || isFastTestV1(q)
+                  || arr.some(s => String(s.id) === q))) {
           setOverlayStrategy(q);
         }
       })
@@ -224,6 +278,8 @@ const ChartPage = () => {
         borderVisible: false,
         priceLineVisible: true,
         lastValueVisible: true,
+        // v3.6 vertical zoom — see makePriceZoomProvider above.
+        autoscaleInfoProvider: makePriceZoomProvider(),
       });
       candleSeriesRef.current = candleSeries;
 
@@ -285,6 +341,10 @@ const ChartPage = () => {
       };
       chart.subscribeClick(onChartClick);
 
+      // Double-click resets the zoom (buttons + keyboard do the same).
+      const onDblClick = () => resetZoom();
+      chart.subscribeDblClick(onDblClick);
+
       const handleResize = () => {
         if (chartRef.current && chartContainerRef.current) {
           chartRef.current.applyOptions({
@@ -308,11 +368,12 @@ const ChartPage = () => {
         if (crosshairRef.current) chart.unsubscribeCrosshairMove(crosshairRef.current);
         crosshairRef.current = null;
         try { chart.unsubscribeClick(onChartClick); } catch (_) {}
+        try { chart.unsubscribeDblClick(onDblClick); } catch (_) {}
       };
     } catch (error) {
       console.error('Critical error initializing chart:', error);
     }
-  }, [getChartHeight]);
+  }, [getChartHeight, makePriceZoomProvider, resetZoom]);
 
   useEffect(() => {
     const cleanup = initChart();
@@ -333,16 +394,19 @@ const ChartPage = () => {
       if (signalRange.start) params.set('start_date', signalRange.start);
       if (signalRange.end) params.set('end_date', signalRange.end);
       const res = await fetch(`${API_URL}/klines?${params.toString()}`);
-      const data = await res.json();
+      const payload = await res.json();
+      // Oldest-first, one candle per timestamp, numeric OHLC — whatever the API
+      // or a venue fallback answered with. Every consumer below (candles,
+      // volume, indicators, markers) then agrees on the same order.
+      const data = ascendingBars(Array.isArray(payload) ? payload : []);
       candlesRef.current = data;
       timesRef.current = data.map(d => d.time);
       closesRef.current = data.map(d => d.close);
 
-      const candles = data.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close }));
-      candleSeriesRef.current.setData(candles);
+      candleSeriesRef.current.setData(data);
       chartRef.current?.timeScale().fitContent();
-      setDataLen(candles.length);
-      setNoData(candles.length === 0);
+      setDataLen(data.length);
+      setNoData(data.length === 0);
       setLastPrice(Number(data[data.length - 1]?.close ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 }));
 
       if (volumeSeriesRef.current) {
@@ -638,16 +702,51 @@ const ChartPage = () => {
 
   // --- Fullscreen ----------------------------------------------------
   const toggleFullscreen = () => {
-    const el = chartContainerRef.current?.parentElement;
-    if (!el) return;
-    if (!document.fullscreenElement) {
-      el.requestFullscreen?.();
-      setFullscreen(true);
-    } else {
-      document.exitFullscreen?.();
+    if (fullscreenRef.current) {
+      if (document.fullscreenElement) document.exitFullscreen?.();
       setFullscreen(false);
+      return;
+    }
+    const el = chartContainerRef.current?.parentElement;
+    // Real browser fullscreen when the browser allows it (Esc is handled by the
+    // browser); otherwise the very same layout is shown as a fixed overlay, so
+    // the button still works inside an iframe that blocks the Fullscreen API.
+    let req = null;
+    try { req = el?.requestFullscreen ? el.requestFullscreen() : null; } catch (_) { req = null; }
+    if (req && typeof req.then === 'function') {
+      req.then(() => setFullscreen(true)).catch(() => setFullscreen(true));
+    } else {
+      setFullscreen(true);
     }
   };
+
+  // Keyboard: + / - / 0 zoom (unless the user is typing somewhere), Esc leaves
+  // the overlay fullscreen (browser fullscreen handles Esc itself).
+  useEffect(() => {
+    const onKey = (e) => {
+      if (isTypingTarget(e.target)) return;
+      if (e.key === 'Escape' && fullscreenRef.current && !document.fullscreenElement) {
+        setFullscreen(false);
+        return;
+      }
+      const action = zoomActionForKey(e.key);
+      if (!action) return;
+      e.preventDefault();
+      if (action === 'in') zoomIn();
+      else if (action === 'out') zoomOut();
+      else resetZoom();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomIn, zoomOut, resetZoom]);
+
+  // Overlay fullscreen: keep the page behind it from scrolling while it is up.
+  useEffect(() => {
+    if (!fullscreen) return undefined;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, [fullscreen]);
 
   useEffect(() => {
     fullscreenRef.current = fullscreen;
@@ -703,10 +802,23 @@ const ChartPage = () => {
             className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded-lg border border-gray-700 text-xs font-semibold hover:border-blue-500 transition">
             <Activity size={14} /> Indicators {Object.values(indicators).some(Boolean) ? '·' : ''}
           </button>
-          <button onClick={toggleFullscreen}
+          <div data-testid="chart-zoom-group"
+            className="flex items-center gap-1 bg-gray-800 px-2 py-1.5 rounded-lg border border-gray-700">
+            <ZoomOut size={14} className="text-gray-500" />
+            <button onClick={zoomOut} data-testid="chart-zoom-out" title="Zoom out (-)"
+              className="rounded px-2 py-0.5 text-sm font-bold text-gray-300 hover:bg-gray-700 hover:text-white transition">−</button>
+            <span data-testid="chart-zoom-label" title="Vertical zoom — Reset returns to the automatic price fit"
+              className="min-w-[3.6rem] text-center font-mono text-[10px] text-gray-400">{zoomLabelText}</span>
+            <button onClick={zoomIn} data-testid="chart-zoom-in" title="Zoom in (+)"
+              className="rounded px-2 py-0.5 text-sm font-bold text-gray-300 hover:bg-gray-700 hover:text-white transition">+</button>
+            <ZoomIn size={14} className="text-gray-500" />
+            <button onClick={resetZoom} data-testid="chart-zoom-reset" title="Reset zoom (0) — fit all candles"
+              className="ml-1 rounded border border-gray-700 px-2 py-0.5 text-[10px] font-semibold text-gray-300 hover:border-blue-500 hover:text-white transition">Reset</button>
+          </div>
+          <button onClick={toggleFullscreen} data-testid="chart-fullscreen"
             className="flex items-center gap-2 bg-gray-800 px-3 py-2 rounded-lg border border-gray-700 text-xs font-semibold hover:border-blue-500 transition"
-            title="Fullscreen">
-            {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />} {fullscreen ? 'Exit' : 'Full'}
+            title={fullscreen ? 'Exit full screen (Esc)' : 'Full screen — the chart fills the window'}>
+            {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />} {fullscreen ? 'Exit full' : 'Full screen'}
           </button>
         </div>
       </div>
@@ -762,7 +874,9 @@ const ChartPage = () => {
           <select value={overlayStrategy} onChange={e => setOverlayStrategy(e.target.value)}
             className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none">
             <option value="PhantomV2">Kudos V2.5 (Champion)</option>
+            <PhantomPresetOptions />
             <option value="FastTest">FastTest (debug)</option>
+            <option value="FastTestV1">FastTest V1.0 (debug + validation)</option>
             {strategies.map(s => <option key={s.id} value={s.id}>Custom: {s.name}</option>)}
           </select>
         </div>
@@ -801,6 +915,8 @@ const ChartPage = () => {
           <span className="text-gray-400">{interval}</span>
           <span className="mx-1 text-gray-600">•</span>
           <span className="font-mono font-bold text-yellow-400">{lastPrice}</span>
+          <span className="mx-1 text-gray-600">•</span>
+          <span className="text-[10px] text-gray-500" title="Mouse wheel / pinch zooms, drag pans, double-click resets">wheel to zoom · drag to pan · double-click resets</span>
         </div>
         <div className="relative">
           <div ref={chartContainerRef} className="w-full" />

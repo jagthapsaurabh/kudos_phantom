@@ -188,6 +188,11 @@ class DataSyncService:
           - a bare JSON array of dicts:  [{"time": 1690000000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...}]
           - a bare JSON array of arrays: [[time, open, high, low, close, volume], ...]
         Malformed rows are skipped instead of aborting the whole page.
+
+        Delta answers newest-first. Every consumer — the last-N page, the seed
+        walk, the chart overlay — wants one candle per timestamp, oldest first,
+        so the order is normalized here (stable sort + last row wins on a
+        duplicate timestamp) instead of at each call site.
         """
         rows = []
         for k in raw or []:
@@ -210,7 +215,9 @@ class DataSyncService:
                     })
             except (TypeError, ValueError, KeyError):
                 continue
-        return rows
+        rows.sort(key=lambda row: row['event_time'])
+        unique = {row['event_time']: row for row in rows}
+        return [unique[event_time] for event_time in sorted(unique)]
 
     @staticmethod
     def _extract_delta_array(payload):

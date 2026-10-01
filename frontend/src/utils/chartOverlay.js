@@ -271,6 +271,35 @@ export const buildOverlayMarkers = ({ signals = [], trades = [], executions = []
     .map(({ kind, ...marker }) => marker);
 };
 
+// Candles must reach lightweight-charts oldest-first — the library asserts on
+// the order when a series is filled. The API is chronological, but a venue
+// fallback (Delta answers newest-first), a proxy or a stale seed can hand over
+// any order, so every chart normalizes through here: numeric times, one candle
+// per timestamp (the later row wins), ascending. Malformed rows are dropped
+// rather than crashing the pane.
+export const ascendingBars = (candles = []) => {
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const byTime = new Map();
+  for (const c of candles || []) {
+    if (!c) continue;
+    const time = toUnix(c.time);
+    const open = num(c.open);
+    const high = num(c.high);
+    const low = num(c.low);
+    const close = num(c.close);
+    if (time == null || open === null || high === null || low === null || close === null) continue;
+    const volume = num(c.volume);
+    byTime.set(time, {
+      ...c, time, open, high, low, close,
+      ...(volume === null ? {} : { volume }),
+    });
+  }
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+};
+
 export const defaultSignalRange = (now = new Date()) => {
   const end = new Date(now);
   const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);

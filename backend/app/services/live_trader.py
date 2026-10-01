@@ -12,11 +12,16 @@ from app.core.mark_price import MarkPriceService, perpetual_symbol
 from app.core.trading_windows import TradingWindowConfig, TradingWindowGuard
 from app.services.order_manager import OrderManager
 from app.services.paper_trader import _to_ist
+# Close of the candle the clock just moved past — used by close-based strategy
+# rules (FastTest V1's 2H validation).
+from app.core.fast_test_v1 import completed_bar_close
+from app.core.fast_test_rules import fast_test_bar_state
 from app.services.broker_client import BrokerClient, is_auth_rejection
 from app.services.margin_preflight import describe_margin_error, is_insufficient_margin
 from app.services.heartbeat import DeadmanSwitch
 from app.database.models import SessionLocal, Klines
 from app.core.indicators import compute_indicators
+from app.core import trade_conditions
 
 
 # Fill price keys seen across Binance / Delta order responses.
@@ -836,8 +841,29 @@ class LiveTradeService:
         self._last_closed_candle = key
         return True
 
-    def _trail_amount(self, atr):
-        """ATR trail distance sent on the Delta bracket stop-loss leg."""
+    def _trail_amount(self, atr, price=None):
+        """Trail distance sent on the venue bracket stop-loss leg.
+
+        The Risk & Exit model decides how it is measured: ATR units
+        (``trail_distance_atr × ATR``, the original behaviour) or a % of the
+        price the entry was priced on when the client switched the trail over.
+        A price-based trail is never silently replaced by an ATR one: without
+        a price there is simply no venue trail (the local trail still runs).
+        """
+        mode = "atr"
+        mode_fn = getattr(self.config, "risk_exit_mode_for", None)
+        if callable(mode_fn):
+            try:
+                mode = str(mode_fn("trail"))
+            except Exception:
+                mode = "atr"
+        if mode == "price":
+            dist_fn = getattr(self.config, "trail_distance_for", None)
+            try:
+                amount = float(dist_fn(float(price or 0.0), atr)) if callable(dist_fn) else 0.0
+            except Exception:
+                amount = 0.0
+            return amount if amount > 0 else None
         try:
             dist = float(getattr(self.config, "trail_distance_atr", 0) or 0)
         except (TypeError, ValueError):
@@ -862,6 +888,9 @@ class LiveTradeService:
             df_1h_with_ind[k] = v
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
+        # Colour of the bar this tick is in, stamped on any trade closed this
+        # tick so the log can name the exit candle (None when unreadable).
+        candle_color = trade_conditions.frame_candle_color(df_1h_with_ind)
         # Traded price from the candle feed, mark price straight from the
         # exchange: risk runs on the mark price of the perpetual.
         current_price = float(df_1h['close'].iloc[-1])
@@ -912,14 +941,28 @@ class LiveTradeService:
         # of times. Everything measured in *candles* — the holding-time clock,
         # one entry per signal, the post-exit cooldown — keys off this flag.
         new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        # The candle the clock just moved past is complete: its final close is
+        # what a close-based rule (FastTest V1's 2H validation) is judged on.
+        # Captured BEFORE the clock advances.
+        completed_bar_time = self._last_bar_time
+        completed_bar = None
+        completed_state = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
+            completed_bar = completed_bar_close(df_1h, completed_bar_time)
+            # The same candle's RSI / MACD values, for the debug strategies'
+            # configurable signal-condition exits (None unless one is on).
+            completed_state = fast_test_bar_state(df_1h_with_ind, completed_bar_time, self.config)
 
         # ---- Manage open positions ------------------------------------
         self._manage_open_positions(decision_price, current_atr, current_time,
-                                    trade_price, mark_price, new_bar)
+                                    trade_price, mark_price, new_bar,
+                                    bar_close=completed_bar,
+                                    bar_time=(completed_bar_time if completed_bar else None),
+                                    candle_color=candle_color,
+                                    bar_state=completed_state)
 
         # A stale candle set must never OPEN anything: the signal, the ATR the
         # stop distance comes from, even the notional sizing would be built on
@@ -1008,14 +1051,27 @@ class LiveTradeService:
         if planned is None:
             return
         lots = float(planned.lots)
-        # A plain distance (trail_distance_atr × ATR) — the broker client signs
-        # it for the venue, which wants a NEGATIVE bracket trail on a buy entry
-        # and a positive one on a sell entry.
-        trail_distance = self._trail_amount(current_atr) if self.bracket_orders else None
+        # A plain distance — trail_distance_atr × ATR by default, or a % of the
+        # entry's pricing basis when the client chose the price model for the
+        # trail. The broker client signs it for the venue, which wants a
+        # NEGATIVE bracket trail on a buy entry and a positive one on a sell
+        # entry.
+        trail_distance = self._trail_amount(current_atr, decision_price) if self.bracket_orders else None
+        # A strategy whose stop / trail / target is switched off must not rest
+        # that leg on the venue either, or live would protect a position the
+        # strategy itself no longer manages. Every other strategy keeps all
+        # three (the switches default to True and are never declared on it).
+        stop_price = self.oms.bracket_stop_loss(float(planned.sl))
+        trail_distance = self.oms.bracket_trail_amount(trail_distance)
+        # The venue target is the strategy's own TP by default; FastTest V1
+        # brackets at its +0.90% booking level instead. SL and trail distance
+        # are unchanged either way.
+        bracket_tp_raw = self.oms.bracket_take_profit(last_sig, decision_price, planned.tp)
+        bracket_tp = float(bracket_tp_raw) if bracket_tp_raw is not None else None
         if self.bracket_orders:
             res = self.broker.place_bracket_order(
                 self.contract_symbol, side, lots, price=None,
-                stop_loss_price=float(planned.sl), take_profit_price=float(planned.tp),
+                stop_loss_price=stop_price, take_profit_price=bracket_tp,
                 trigger_method="mark_price" if use_mark else "last_traded_price",
                 size_in_btc=True, trail_amount=trail_distance)
         else:
@@ -1040,10 +1096,16 @@ class LiveTradeService:
                 # sent; the local book keeps trailing on its own rules, so both
                 # the fixed level and the trail distance are worth showing.
                 trailing = f" · trail {trail_distance:,.2f}" if trail_distance else ""
-                protection = (f" · SL {planned.sl:,.2f} / TP {planned.tp:,.2f}{trailing}"
+                protection = (f" · SL {planned.sl:,.2f} / TP {bracket_tp:,.2f}{trailing}"
                               f" ({'native bracket' if res.get('_bracket') and 'entry' not in res else 'bracket legs'})")
             print(f"🚀 [{self.strategy_id}] LIVE {self.broker_name} opened: {side} at {entry_note} ({lots} BTC){protection}")
             self._log("trade", f"OPENED {side} {lots} BTC at {entry_note}{protection}")
+            # The condition snapshot is taken only after the order is out, so
+            # nothing in the analysis can sit in front of (or disturb) a real
+            # order. An exit hours later still exports the entry conditions.
+            entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
+            if entry_ctx:
+                planned.entry_context = entry_ctx
             self._persist_history(force=True)
         else:
             # No order left the building: roll the OMS trade back so the
@@ -1083,6 +1145,34 @@ class LiveTradeService:
                 self.logs = self.logs[-self.MAX_LOG_LINES:]
         except Exception:
             pass
+
+    def _entry_condition_context(self, signal_dir, df_1h_with_ind, df_4h, current_time):
+        """The entry-condition record for an order sent on this tick.
+
+        Mirrors ``PaperTradeService._entry_condition_context``: the strategy's
+        metadata for the newest 1h bar, run through the same builders the
+        backtest uses, so a live trade exports every entry condition (value,
+        threshold, PASS/FAIL) exactly like a backtest row. Strategies without
+        metadata return ``{}`` and their trade log is unchanged.
+        """
+        meta_fn = getattr(self.strategy, 'generate_signals_with_metadata', None)
+        if not callable(meta_fn):
+            return {}
+        try:
+            _, meta = meta_fn(df_1h_with_ind, df_4h)
+            if meta is None or len(meta) == 0:
+                return {}
+            i = len(meta) - 1
+            color = trade_conditions.candle_color(meta, i)
+            return trade_conditions.entry_context(
+                getattr(self.strategy, 'config', self.config), meta, i, signal_dir,
+                signal_candle_time=current_time, entry_candle_time=current_time,
+                entry_candle_type=color)
+        except Exception:
+            # Analysis must never disturb trading: a strategy whose metadata
+            # cannot be read simply gets no condition record. No exception and
+            # no error output — the order path is unaffected.
+            return {}
 
     def _record_equity_point(self):
         try:
@@ -1136,7 +1226,7 @@ class LiveTradeService:
             fees = entry_fee + exit_fee
             pnl = gross_pnl - fees
             f = lambda v: None if v is None else float(v)
-            self.closed_trades.append({
+            rec = {
                 "symbol": trade.symbol,
                 "direction": int(trade.direction),
                 "entry": f(trade.entry_price),
@@ -1166,7 +1256,32 @@ class LiveTradeService:
                 "entry_time": _to_ist(trade.entry_time),
                 "exit_time": _to_ist(trade.exit_time),
                 "bars_held": int(trade.bars_held or 0),
-            })
+            }
+            # Strategy audit fields (FastTest V1: validation status / close /
+            # threshold, +0.90% booking, final reason and net P&L). Empty — and
+            # the record untouched — for every other strategy.
+            audit = getattr(self.oms, 'strategy_audit_fields', None)
+            if callable(audit):
+                rec.update(audit(trade, pnl))
+            # Trade-log detail: the same entry-condition record a backtest
+            # writes (signal candle + colour, every condition with PASS/FAIL)
+            # and the candle the exit landed in. Older saved records simply
+            # lack these keys, so nothing already stored changes shape.
+            try:
+                # Convert the candle stamps first: safe_context keeps plain
+                # scalars and would otherwise drop a datetime it cannot classify.
+                ctx = dict(getattr(trade, 'entry_context', None) or {})
+                for key in ('signal_candle_time', 'entry_candle_time'):
+                    if ctx.get(key) is not None:
+                        ctx[key] = _to_ist(ctx[key])
+                rec.update(trade_conditions.safe_context(ctx))
+                exit_color = getattr(trade, 'exit_candle_type', None)
+                if exit_color:
+                    rec['exit_candle_type'] = exit_color
+            except Exception:
+                # Booking the trade must never fail on analysis detail.
+                pass
+            self.closed_trades.append(rec)
             # Trades are capped in memory, but the counters are not: dropping
             # old trades used to drop their PnL from net_pnl too, so after 100
             # trades the reported net_pnl no longer matched the equity/ROI that
@@ -1192,7 +1307,9 @@ class LiveTradeService:
             print(f"[{self.strategy_id}] closed-trade record failed: {exc}")
 
     def _manage_open_positions(self, decision_price, current_atr, current_time,
-                               trade_price, mark_price, advance_bar):
+                               trade_price, mark_price, advance_bar,
+                               bar_close=None, bar_time=None, candle_color=None,
+                               bar_state=None):
         """Mark every open position to market and send any exit it triggers.
 
         Split out of ``tick()`` so the same exit logic runs on the 60-second
@@ -1203,13 +1320,25 @@ class LiveTradeService:
 
         ``advance_bar`` must stay False on the fast path: it moves the
         holding-time clock, which is counted in candles.
+
+        ``bar_close`` / ``bar_time`` carry the *completed* candle's close and
+        stamp on the tick that follows a rollover, for close-based strategy
+        rules (FastTest V1's 2H validation). Every other strategy ignores them.
+
+        ``candle_color`` is the colour of the bar this tick is in, stamped on
+        the trade when it closes so the trade log can name the exit candle.
         """
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
                                            trade_price_usd=trade_price, mark_price_usd=mark_price,
-                                           advance_bar=advance_bar)
+                                           advance_bar=advance_bar,
+                                           bar_close_usd=(float(bar_close[0]) if bar_close else None),
+                                           bar_time=bar_time,
+                                           strategy_bar_state=bar_state)
             if not result:
                 continue
+            if candle_color:
+                result.exit_candle_type = candle_color
             # Settled: keep it for the execution overlay + post-run review
             # before the exit order is attempted, so even a failed close
             # order does not lose the trade from the book.

@@ -1,4 +1,5 @@
 import React from 'react';
+import { riskExitModeFor, riskExitModelLabel, riskExitText } from '../utils/riskExit';
 
 /* ============================================================================
    Kudos Strategy — Explained
@@ -117,6 +118,9 @@ const SizeCalculator = () => {
 const StrategyExplainedTab = ({ champion }) => {
   const cfg = champion?.config || {};
   const c = (k, d) => (cfg[k] !== undefined && cfg[k] !== null ? cfg[k] : d);
+  // v3.6 — which model each protective level is priced on.
+  const riskPrice = (level) => riskExitModeFor(cfg, level) === 'price';
+  const riskModel = riskExitModelLabel((cfg.risk_exit || {}).model || 'atr');
   const lev = Number(c('leverage', 2));
   const mp = Number(c('margin_pct', 0.15));
   const priceRef = 100000;
@@ -180,9 +184,10 @@ const StrategyExplainedTab = ({ champion }) => {
             <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
               <K>MACD indicator (the "MACD value")</K>
               <div className="text-gray-400 text-xs mt-1 leading-relaxed">
-                Config keys <K>macd_fast=12</K>, <K>macd_slow=26</K>, <K>macd_signal=9</K>. These are the
-                EMA periods that build the MACD oscillator. They are <b>not shown as inputs</b> on the
-                backtest form — they stay at their defaults (12, 26, 9).
+                Config keys <K>macd_fast={c('macd_fast', 12)}</K>, <K>macd_slow={c('macd_slow', 26)}</K>, <K>macd_signal={c('macd_signal', 9)}</K>.
+                These are the EMA periods that build the MACD oscillator. They are editable in the Backtest form
+                (<b>MACD Indicator</b> group), saved with a named strategy, and shown on the Paper / Live pages
+                under the strategy dropdown so the running values are never a guess.
               </div>
               <Formula>MACD_line = EMA(fast) − EMA(slow) = EMA(12) − EMA(26)</Formula>
               <Formula>Signal = EMA(MACD_line, signal) = EMA(MACD_line, 9)</Formula>
@@ -198,7 +203,7 @@ const StrategyExplainedTab = ({ champion }) => {
               <div className="text-gray-400 text-xs mt-1 leading-relaxed">
                 Config key <K>macd_hist_min</K> (default <K>{c('macd_hist_min', 5)}</K>). This is the
                 <b>input you tune</b> on the backtest form — the minimum size of the histogram required to
-                allow an entry. It is the only MACD knob exposed in the UI.
+                allow an entry. Since v3.5 the MACD <b>line</b> and <b>signal line</b> can be filtered too (below).
               </div>
               <Formula>Long:   MACD_histogram ≥ macd_hist_min</Formula>
               <Formula>Short:  MACD_histogram ≤ −macd_hist_min   (or ≤ the negative value when directional)</Formula>
@@ -230,6 +235,83 @@ const StrategyExplainedTab = ({ champion }) => {
                 </div>
               </div>
             </div>
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50" data-testid="macd-line-rules-doc">
+              <K>④ MACD line / signal line rules (v3.5 — optional, OFF by default)</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                A separate block, <K>macd_line_rules</K>, that reads the <b>MACD line</b> and the <b>signal line</b>
+                themselves rather than the histogram. Nothing changes until <K>macd_line_rules.enabled</K> is switched
+                on in Backtest → Strategy Configuration → <i>MACD line / signal line rules</i>; existing strategies,
+                saved runs and paper / live sessions keep their original behaviour. When on, every active rule must
+                pass on the signal candle for <b>both</b> Setup A and Setup B entries.
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-2 text-xs text-gray-400">
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">MACD line vs signal line</div>
+                  <K>line_vs_signal</K> · <b>above / below</b>: long needs MACD line &gt; signal, short needs &lt;.
+                  <b> cross</b>: the previous bar was on the other side (a crossover on the signal candle).
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">MACD line vs zero</div>
+                  <K>line_vs_zero</K> · long needs MACD line &gt; 0 (or a cross above 0), short needs &lt; 0 (cross below).
+                  Keeps entries on the bullish / bearish side of the oscillator.
+                </div>
+                <div className="bg-gray-800/60 p-3 rounded-lg border border-gray-700/50">
+                  <div className="text-gray-200 font-bold mb-1">Signal line vs zero</div>
+                  <K>signal_vs_zero</K> · same choices applied to the slower signal line — a stricter "trend of momentum" check.
+                </div>
+              </div>
+              <Formula>Levels (optional): Long  MACD_line ≥ line_min,  Signal ≥ signal_min</Formula>
+              <Formula>                   Short MACD_line ≤ −line_min, Signal ≤ −signal_min   (per-side values are used signed as typed)</Formula>
+              <div className="text-gray-400 text-xs mt-1">
+                Tick <i>Use separate Long / Short MACD line rules</i> (<K>entry_conditions.use_direction_macd_line</K>) to give each
+                side its own rules, stored under <K>entry_conditions.long.macd_*</K> / <K>entry_conditions.short.macd_*</K>.
+                The trade log gains a <b>MACD line/signal</b> PASS / FAIL flag, the MACD line and signal values at the signal
+                candle, and an "8. MACD line/signal" line in the entry-condition detail — only for runs that used the rules.
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* ------------------------------------------------- Separation (v3.5) -- */}
+      <div className="lg:col-span-2">
+        <Card title="🔀 Strategy separation (v3.5) — one setup, one side" color="text-amber-400">
+          <Note>
+            The two-sided, two-setup strategy can be split without re-tuning anything. Two config keys,
+            <K>setup_mode</K> and <K>trade_direction</K>, both default to <K>both</K> (the original behaviour);
+            the Backtest form exposes them as <b>Setup</b> and <b>Direction</b>, and the same splits exist as
+            built-in presets (<i>Kudos — Reversal only</i>, <i>Kudos — Momentum only</i>, <i>Kudos — Long only</i>,
+            <i>Kudos — Short only</i>, and the four combinations) in every strategy dropdown — Backtest, Paper, Live and Chart.
+          </Note>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>setup_mode — reversal / momentum</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                <b>Reversal only</b> keeps Setup A and never lets Setup B fire (identical to the legacy
+                "momentum entries" box unticked). <b>Momentum only</b> keeps Setup B and switches Setup A off —
+                it fires even when the momentum box is unticked, so a momentum-only strategy can never be empty.
+                On a candle where both setups qualify, the two-sided strategy labels the trade REVERSAL; the
+                momentum-only split takes the same candle as MOMENTUM.
+              </div>
+              <Formula>reversal:  signals = Setup A only</Formula>
+              <Formula>momentum:  signals = Setup B only</Formula>
+            </div>
+            <div className="bg-gray-900/60 p-3 rounded-lg border border-gray-700/50">
+              <K>trade_direction — long / short</K>
+              <div className="text-gray-400 text-xs mt-1 leading-relaxed">
+                <b>Long only</b> drops every short signal and keeps the longs exactly as the two-sided strategy
+                produced them; <b>Short only</b> is the mirror. Because the kept side is unchanged, the split's
+                trades are the same trades you would see on that side of a full run (apart from capital-path
+                effects such as drawdown sizing and overlapping positions).
+              </div>
+              <Formula>long:  signals[signals == −1] = 0</Formula>
+              <Formula>short: signals[signals == +1] = 0</Formula>
+            </div>
+          </div>
+          <div className="text-gray-400 text-xs mt-3">
+            Preset ids are <K>PhantomV2:&lt;setup&gt;</K>, <K>PhantomV2:&lt;direction&gt;</K> or <K>PhantomV2:&lt;setup&gt;:&lt;direction&gt;</K>
+            (e.g. <K>PhantomV2:reversal:long</K>). Each preset is a separate strategy id, so a preset and the default can run
+            side by side on one account, and History / Sessions show the preset's name.
           </div>
         </Card>
       </div>
@@ -277,24 +359,46 @@ const StrategyExplainedTab = ({ champion }) => {
 
       {/* ------------------------------------------------------- Risk & Exit -- */}
       <Card title="🛡️ Risk & Exit Model" color="text-red-400">
-        <Item name="Stop loss (ATR)" formula="SL_distance = max( stop_loss_atr × ATR(14),  sl_floor_pct × Price )  →  SL = Entry ∓ SL_distance">
-          Distance of the hard stop from entry measured in ATRs (so it adapts to volatility). A floor of
-          <K>{c('sl_floor_pct', 0.016) * 100}%</K> of price stops it getting too tight in dead-quiet markets.
-          Higher = wider stop = survives noise but risks more. Uses <K>stop_loss_atr</K>.
+        <Item name="Risk & exit model" formula="ATR units (default)  ·  Price % of entry  ·  Both — per level">
+          Every protective level is measured either in <b>ATR units</b> (the original behaviour, default) or as a
+          <b>percentage of the entry price</b> — and each level has its own selector, so a mix is allowed
+          (e.g. an ATR stop with a price-based target). Currently <b className="text-white">{riskModel}</b>:{' '}
+          <K>{riskExitText(cfg)}</K>. Set it in Backtest → Strategy Configuration → <i>Risk &amp; Exit Model</i>.
         </Item>
-        <Item name="Take profit (ATR)" formula="TP = Entry ± take_profit_atr × ATR(14)">
-          Profit target in ATRs. TP fills are treated as <b>maker</b> (lower fee). Uses <K>take_profit_atr</K>.
+        <Item name="Stop loss"
+          formula={riskPrice('stop')
+            ? 'SL_distance = stop_loss_pct × Price  →  SL = Entry ∓ SL_distance'
+            : 'SL_distance = max( stop_loss_atr × ATR(14),  sl_floor_pct × Price )  →  SL = Entry ∓ SL_distance'}>
+          {riskPrice('stop')
+            ? <>The hard stop sits <K>stop_loss_pct</K> of the entry price away — a fixed % that does not move with volatility.</>
+            : <>Distance of the hard stop from entry measured in ATRs (so it adapts to volatility). A floor of
+              <K>{c('sl_floor_pct', 0.016) * 100}%</K> of price stops it getting too tight in dead-quiet markets.
+              Uses <K>stop_loss_atr</K>.</>}
         </Item>
-        <Item name="Trail activation" formula="Activate trailing once PnL ≥ trail_activation_atr × ATR(14)">
-          The trailing stop is switched on only after this much profit — early trades are not trailed.
-          Uses <K>trail_activation_atr</K>.
+        <Item name="Take profit"
+          formula={riskPrice('target')
+            ? 'TP = Entry ± take_profit_pct × Price'
+            : 'TP = Entry ± take_profit_atr × ATR(14)'}>
+          {riskPrice('target')
+            ? <>Profit target as a fixed % of the entry price. Uses <K>take_profit_pct</K>.</>
+            : <>Profit target in ATRs. Uses <K>take_profit_atr</K>.</>} TP fills are treated as <b>maker</b> (lower fee).
         </Item>
-        <Item name="Trail distance" formula="Long:  trail_stop = max(trail_stop, Peak − trail_distance_atr × ATR)   ·   Short: mirror">
-          How tightly the trailing stop follows price. Smaller = tighter trail (locks more profit, exits sooner).
-          Uses <K>trail_distance_atr</K>.
+        <Item name="Trailing stop"
+          formula={riskPrice('trail')
+            ? 'Long:  trail_stop = max(trail_stop, Peak × (1 − trail_distance_pct))   ·   Short: mirror'
+            : 'Long:  trail_stop = max(trail_stop, Peak − trail_distance_atr × ATR)   ·   Short: mirror'}>
+          {riskPrice('trail')
+            ? <>The trail arms once the trade is <K>trail_activation_pct</K> in profit and then follows the
+              peak by <K>trail_distance_pct</K>.</>
+            : <>Arms once the trade is <K>trail_activation_atr</K>×ATR in profit; follows the peak by
+              <K>trail_distance_atr</K>×ATR. Smaller = tighter trail.</>}
         </Item>
-        <Item name="Breakeven after" formula="Once PnL ≥ breakeven_atr × ATR(14), ratchet the hard stop to the entry price">
-          Winners can no longer become losers — the stop moves to entry. Uses <K>breakeven_atr</K> (0 = disabled).
+        <Item name="Breakeven after"
+          formula={riskPrice('breakeven')
+            ? 'Once PnL ≥ breakeven_pct × Entry, ratchet the hard stop to the entry price'
+            : 'Once PnL ≥ breakeven_atr × ATR(14), ratchet the hard stop to the entry price'}>
+          Winners can no longer become losers — the stop moves to entry. 0 = disabled.
+          Uses <K>{riskPrice('breakeven') ? 'breakeven_pct' : 'breakeven_atr'}</K>.
         </Item>
         <Item name="Time stop" formula={'If bars_held ≥ timeout_bars → close at market ("MH")'}>
           Prevents capital being stuck in a trade forever. Uses <K>timeout_bars</K>.

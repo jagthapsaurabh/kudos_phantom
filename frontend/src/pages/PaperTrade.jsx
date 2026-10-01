@@ -4,11 +4,15 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 import { API_URL } from '../api';
 import TradingWindowsEditor from '../components/TradingWindowsEditor';
 import EntryGuardBadges from '../components/EntryGuardBadges';
+import PhantomPresetOptions from '../components/PhantomPresetOptions';
+import StrategyConfigSummary from '../components/StrategyConfigSummary';
+import { builtinStrategyName, isFastTestV1, FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_NAME } from '../utils/phantomPresets';
 import { FeedBadge, PreflightModal } from './LiveTrade';
 import {
   emptySchedule, normalizeSchedule, isScheduleActive, describeSchedule,
 } from '../utils/tradingWindows';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
+import { TradeConditionDetail, downloadTradesCSV } from '../components/TradeConditionDetail';
 
 // Format an ISO timestamp (already IST-encoded by the backend, or naive UTC)
 // explicitly in India Standard Time (UTC+5:30). Guarantees the user always
@@ -137,10 +141,28 @@ const EXIT_REASONS = {
   SL: { label: 'Stop Loss', color: 'text-red-400 border-red-800 bg-red-900/20' },
   MH: { label: 'Max Hold Time', color: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
   REV: { label: 'Reversal', color: 'text-blue-400 border-blue-800 bg-blue-900/20' },
+  // FastTest V1.0's own exits.
+  TP090: { label: '+0.90% Profit Book', color: 'text-emerald-300 border-emerald-800 bg-emerald-900/20' },
+  VALFAIL: { label: '2H Validation Fail', color: 'text-red-300 border-red-800 bg-red-900/20' },
+  // Fast Test (debug) + V1.0 configurable exit conditions.
+  OPP: { label: 'Opposite Signal', color: 'text-sky-300 border-sky-800 bg-sky-900/20' },
+  RSIX: { label: 'RSI Exit', color: 'text-indigo-300 border-indigo-800 bg-indigo-900/20' },
+  MFLIP: { label: 'MACD Flip', color: 'text-teal-300 border-teal-800 bg-teal-900/20' },
 };
 const reasonMeta = (r) => EXIT_REASONS[r] || { label: r || '—', color: 'text-gray-400 border-gray-700 bg-gray-900' };
 
-const ClosedTradesPanel = ({ closedTrades }) => {
+// FastTest V1.0 validation chip colours (blank for every other strategy).
+const validationChipColor = (status) => {
+  switch (String(status || '').toUpperCase()) {
+    case 'VALIDATED': return 'text-green-300 border-green-800 bg-green-900/20';
+    case 'FAILED': return 'text-red-300 border-red-800 bg-red-900/20';
+    case 'TP_090_HIT': return 'text-emerald-200 border-emerald-800 bg-emerald-900/20';
+    default: return 'text-gray-400 border-gray-700 bg-gray-900';
+  }
+};
+
+const ClosedTradesPanel = ({ closedTrades, exportName = 'paper' }) => {
+  const [openRow, setOpenRow] = useState(null);
   if (!closedTrades || closedTrades.length === 0) {
     return (
       <div className="bg-gray-800/50 p-6 rounded-2xl border border-dashed border-gray-700 text-center text-sm text-gray-600">
@@ -150,7 +172,16 @@ const ClosedTradesPanel = ({ closedTrades }) => {
   }
   return (
     <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
-      <h4 className="text-xs font-bold text-gray-400 uppercase mb-3">Trade Reply / Closed Trades ({closedTrades.length})</h4>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h4 className="text-xs font-bold text-gray-400 uppercase">Trade Reply / Closed Trades ({closedTrades.length})</h4>
+        {/* Same spreadsheet as the Backtest page: every entry condition, the
+            exit rule and the candle colours, one row per trade. */}
+        <button onClick={() => downloadTradesCSV(closedTrades, `kudos_${exportName}_trades.csv`)}
+                title="Opens directly in Excel — every entry condition, the exit condition and the candle colours (UTC), exactly like the Backtest trade log"
+                className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+          <Download size={11} /> Export CSV
+        </button>
+      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
           <thead className="bg-gray-900 text-gray-500 uppercase">
@@ -170,14 +201,18 @@ const ClosedTradesPanel = ({ closedTrades }) => {
               <th className="p-2">Entry (IST)</th>
               <th className="p-2">Exit (IST)</th>
               <th className="p-2">Held</th>
+              <th className="p-2" title="Every entry condition, the exit rule and the candle colours — the same detail as the Backtest trade log">Analysis</th>
             </tr>
           </thead>
           <tbody>
             {closedTrades.map((t, i) => {
               const meta = reasonMeta(t.reason);
               const slMoved = t.sl != null && t.sl_final != null && Math.abs(t.sl_final - t.sl) > 0.005;
+              const hasDetail = !!(t.entry_conditions_detail || t.exit_detail || t.signal_candle_type
+                                   || t.entry_candle_type || t.exit_candle_type || t.validation_status);
               return (
-                <tr key={i} className="border-b border-gray-700/60 align-top">
+                <React.Fragment key={i}>
+                <tr className="border-b border-gray-700/60 align-top">
                   <td className={`p-2 font-bold ${t.direction === 1 ? 'text-green-400' : 'text-red-400'}`}>{t.direction === 1 ? 'LONG' : 'SHORT'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.entry != null ? Number(t.entry).toFixed(2) : '—'}</td>
                   <td className="p-2 font-mono text-gray-300">{t.exit != null ? Number(t.exit).toFixed(2) : '—'}</td>
@@ -196,6 +231,13 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                   <td className="p-2 font-mono text-gray-400">{t.atr_at_entry != null ? Number(t.atr_at_entry).toFixed(2) : '—'}</td>
                   <td className="p-2 max-w-[260px]">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${meta.color}`}>{meta.label}</span>
+                    {/* FastTest V1.0: the 2H validation verdict for this trade. */}
+                    {t.validation_status && (
+                      <span className={`ml-1 px-1.5 py-0.5 rounded text-[9px] font-bold border ${validationChipColor(t.validation_status)}`}
+                            title={`Validation ${t.validation_status}${t.validation_close != null ? ` — close ${Number(t.validation_close).toFixed(2)} vs ${Number(t.validation_threshold).toFixed(2)}` : ''}`}>
+                        {t.tp090_hit ? '+0.90% HIT' : t.validation_status}
+                      </span>
+                    )}
                     {t.exit_detail && <div className="text-[10px] text-gray-500 mt-1 leading-snug">{t.exit_detail}</div>}
                   </td>
                   <td className={`p-2 font-mono font-bold ${(t.gross_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(t.gross_pnl || 0) >= 0 ? '+' : ''}{Number(t.gross_pnl || 0).toFixed(2)}</td>
@@ -204,7 +246,24 @@ const ClosedTradesPanel = ({ closedTrades }) => {
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.entry_time)}</td>
                   <td className="p-2 text-gray-400 text-[10px]">{fmtIST(t.exit_time)}</td>
                   <td className="p-2 text-gray-400">{t.bars_held || 0} bars</td>
+                  <td className="p-2">
+                    {hasDetail ? (
+                      <button onClick={() => setOpenRow(openRow === i ? null : i)}
+                              title={openRow === i ? 'Hide the entry / exit conditions' : 'Show every entry condition and the exit rule'}
+                              className="inline-flex items-center gap-1 rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition hover:border-blue-500 hover:text-white">
+                        {openRow === i ? <ChevronUp size={11} /> : <Eye size={11} />} {openRow === i ? 'Hide' : 'Conditions'}
+                      </button>
+                    ) : <span className="text-gray-600 text-[10px]">—</span>}
+                  </td>
                 </tr>
+                {openRow === i && (
+                  <tr className="border-b border-gray-700 bg-gray-900/60">
+                    <td colSpan={16} className="p-3">
+                      <TradeConditionDetail trade={t} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               );
             })}
           </tbody>
@@ -283,7 +342,7 @@ const LogPanel = ({ instanceKey }) => {
 const InstanceCard = ({ inst, position, onStop, onDelete, onSelect, selected }) => {
   const activeTrades = inst.active_trades || [];
   const lastChecked = fmtIST(inst.last_checked);
-  const strategyName = inst.strategy_name || (inst.strategy_id === 'PhantomV2' ? 'Kudos V2.5 (Default)' : inst.strategy_id);
+  const strategyName = inst.strategy_name || builtinStrategyName(inst.strategy_id) || inst.strategy_id;
   return (
     <div onClick={() => onSelect(inst.instance_key)}
          className={`min-w-0 rounded-xl border p-4 cursor-pointer transition ${selected ? 'border-blue-500 bg-blue-900/20 shadow-lg shadow-blue-950/20' : 'border-gray-700 bg-gray-800 hover:border-gray-600'}`}>
@@ -449,38 +508,10 @@ const HistoryRowDetail = ({ session }) => {
 };
 
 const exportSessionCSV = (session) => {
+  // The client asked for the Backtest export on paper/live trades: one row per
+  // trade with every entry condition, the exit rule and the candle colours.
   const trades = session.closed_trades || [];
-  if (!trades.length) { alert('This session has no closed trades to export.'); return; }
-  // [data key, column header] pairs so the export can use clear names while
-  // still reading each field from the closed-trade object.
-  const cols = [
-    ['entry_time', 'Entry Time (IST)'], ['exit_time', 'Exit Time (IST)'],
-    ['direction', 'Direction'], ['symbol', 'Symbol'],
-    ['entry', 'Entry Price'], ['exit', 'Exit Price'],
-    ['entry_trade_price', 'Entry Price (Traded)'], ['exit_trade_price', 'Exit Price (Traded)'],
-    ['entry_mark_price', 'Entry Price (Mark)'], ['exit_mark_price', 'Exit Price (Mark)'],
-    ['mark_price_basis', 'Priced On Mark'],
-    ['lots', 'Lots'], ['margin_inr', 'Margin (INR)'], ['notional_usd', 'Notional (USD)'],
-    ['sl', 'Stop Loss'], ['sl_final', 'Stop Loss (Final)'], ['tp', 'Take Profit'],
-    ['trail_stop', 'Trail Stop'], ['atr_at_entry', 'ATR @ Entry'], ['peak_price', 'Peak Price'],
-    ['bars_held', 'Bars Held'], ['reason', 'Exit Reason'], ['exit_detail', 'Exit Detail'],
-    ['gross_pnl', 'PnL (Gross)'], ['fees', 'Fees'], ['pnl', 'Booked PnL (Net)'],
-  ];
-  const lines = [cols.map(([, label]) => label).join(',')];
-  trades.forEach(t => {
-    lines.push(cols.map(([key]) => {
-      const v = t[key];
-      const s = v === null || v === undefined ? '' : String(v);
-      return `"${s.replace(/"/g, '""')}"`;
-    }).join(','));
-  });
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `paper_session_${session.id}_${session.strategy_name || 'kudos'}.csv`.replace(/[^a-z0-9_.-]/gi, '_');
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadTradesCSV(trades, `kudos_paper_session_${session.id}_${session.strategy_name || 'kudos'}.csv`.replace(/[^a-z0-9_.-]/gi, '_'));
 };
 
 const HistoryPanel = ({ history, loading, onRefresh, onDelete }) => {
@@ -883,12 +914,25 @@ const PaperTrade = () => {
                   className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
             {sources.map(s => <option key={s.code} value={s.code}>{s.name}</option>)}
           </select>
-          <select value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+          {/* Labelled like every other control in this row, and the chosen
+              strategy's settings are spelled out right below the header. */}
+          <div className="flex flex-col">
+            <label htmlFor="paper-strategy" className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Strategy</label>
+            <select id="paper-strategy" data-testid="strategy-select"
+                  value={selectedStrategy} onChange={e => setSelectedStrategy(e.target.value)}
+                  title="Which strategy this paper instance runs. Its setup, MACD rules and risk & exit model are shown below."
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-blue-500">
             <option value="PhantomV2">Kudos V2.5 (Default)</option>
+            <PhantomPresetOptions />
             <option value="FastTest">Fast Test Strategy</option>
-            {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
+            <option value="FastTestV1">Fast Test Strategy V1.0 (Validation + 0.90% TP)</option>
+            {strategies.length > 0 && (
+              <optgroup label="Saved strategies">
+                {strategies.map(s => <option key={s.id} value={s.id}>{s.name}{isFastTestV1(s.strategy_id) ? ` · ${FAST_TEST_V1_NAME}` : String(s.strategy_id) === FAST_TEST_ID ? ` · ${FAST_TEST_NAME}` : ''}</option>)}
+              </optgroup>
+            )}
+            </select>
+          </div>
           <div className="flex flex-col">
             <label className="text-[10px] text-gray-500 uppercase font-bold mb-0.5">Exit checks</label>
             <select value={priceFeed} onChange={e => setPriceFeed(e.target.value)}
@@ -950,6 +994,9 @@ const PaperTrade = () => {
           </div>
         </div>
       </div>
+
+      {/* What the selected strategy trades on: MACD periods, MACD line rules, setup & side. */}
+      <StrategyConfigSummary strategyId={selectedStrategy} strategies={strategies} className="mb-6" />
 
       {/* Pricing basis + "skip new trades" schedule for new instances */}
       {showWindows && (

@@ -11,6 +11,23 @@ import os
 from dotenv import load_dotenv
 from .core.engine import BacktestEngine
 from .core.strategy import PhantomV2Config, StrategyService
+# FastTest V1.0 — a *separate* copy of the FastTest debug strategy with the
+# 2H/0.35% validation and +0.90% profit-booking layer. The original FastTest
+# is untouched; only ids it owns are routed here.
+from .core.fast_test_v1 import (
+    FAST_TEST_V1_ID, FAST_TEST_V1_NAME, FastTestV1Config, FastTestV1OrderManager,
+    FastTestV1StrategyService, fast_test_v1_config, is_fast_test_v1,
+    # One place decides which entry rule / order manager a config runs with,
+    # so a saved Fast Test / V1.0 strategy behaves like the built-in id.
+    order_manager_for, strategy_service_for,
+)
+from .core.strategy import (
+    PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
+    phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
+    TRADE_DIRECTION_LABELS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS,
+    RISK_EXIT_MODELS, RISK_EXIT_MODEL_LABELS, RISK_EXIT_LEVELS,
+    FastTestConfig, FastTestStrategyService, fast_test_config,
+)
 from .core.mark_price import MarkPriceService, perpetual_symbol, contract_label
 from .core.trading_windows import (
     TradingWindowConfig, TradingWindowGuard, default_config as default_window_config,
@@ -97,7 +114,37 @@ def _utc_ts(dt):
     return dt.timestamp()
 
 class StrategyParams(PhantomV2Config):
-    pass
+    """Phantom parameters, plus the FastTest families' own fields.
+
+    Every field below is ignored by the Kudos / Phantom strategy — it does not
+    declare them, and the run path copies only the keys a config knows. Their
+    defaults are the shipped behaviour, so a client that never sends them runs
+    exactly what it ran before.
+
+    * the three V1.0 rule values (2H window / +0.35% validation / +0.90%
+      booking),
+    * the debug **entry rule** (RSI period, long / short thresholds — the
+      allowed sides reuse the Phantom ``trade_direction`` field),
+    * the debug **exit rule** (which protective rules are live, plus the
+      optional signal conditions: opposite signal / RSI level / MACD flip).
+    """
+    validation_bars: int = 2
+    validation_close_pct: float = 0.0035
+    profit_book_pct: float = 0.009
+    # ---- Fast Test (debug) + V1.0 entry rule ---------------------------
+    entry_rsi_period: int = 14
+    entry_rsi_long_max: float = 50.0
+    entry_rsi_short_min: float = 50.0
+    # ---- Fast Test (debug) + V1.0 exit rule ----------------------------
+    use_stop_loss: bool = True
+    use_take_profit: bool = True
+    use_trailing_stop: bool = True
+    use_breakeven: bool = True
+    use_timeout: bool = True
+    exit_on_opposite: bool = False
+    exit_rsi_enabled: bool = False
+    exit_rsi_level: float = 50.0
+    exit_macd_flip_enabled: bool = False
 
 class StrategyCreate(BaseModel):
     name: str
@@ -107,6 +154,10 @@ class CustomStrategyCreate(BaseModel):
     name: str
     rules: Optional[List[Dict]] = None
     params: Optional[Dict] = None
+    # Which built-in strategy family these values belong to. Omitted → the
+    # Phantom (Kudos) family, exactly as before. ``FastTest`` / ``FastTestV1``
+    # make the saved strategy run the debug entry rule with these values.
+    strategy_id: Optional[str] = None
 
 
 class BacktestRequest(BaseModel):
@@ -318,11 +369,90 @@ def _fee_config(config, fees):
                                    'maker_fee_bps': float(fees.maker_fee_bps)})
 
 
+def _strategy_family(strategy_id) -> str:
+    """Normalize a strategy family id to '' (Phantom), 'FastTest' or 'FastTestV1'.
+
+    Only the two debug families are named; everything else — PhantomV2, its
+    presets, a numeric saved-strategy id, an empty value — is the Phantom
+    family, which is what every existing strategy already is.
+    """
+    value = str(strategy_id or '').strip()
+    if is_fast_test_v1(value):
+        return FAST_TEST_V1_ID
+    if value.lower() == 'fasttest':
+        return 'FastTest'
+    return ''
+
+
+def _family_config(data, fees=None):
+    """Rebuild the config a saved strategy was created for.
+
+    A saved Fast Test / V1.0 strategy stores ``strategy_id`` next to its
+    parameters, so opening it (backtest, paper, live, chart) runs that family
+    with the saved values instead of the Phantom rules. Returns ``None`` for
+    the Phantom family, where the caller keeps the existing lookup.
+    """
+    if not isinstance(data, dict):
+        return None
+    family = _strategy_family(data.get('strategy_id'))
+    if family == FAST_TEST_V1_ID:
+        # FastTestV1Config extends FastTestConfig and carries the three V1.0
+        # rule fields, so the saved values load back exactly as edited.
+        return fast_test_v1_config(data, fees=fees)
+    if family == 'FastTest':
+        cfg = fast_test_config(data)
+        return _fee_config(cfg, fees) if fees is not None else cfg
+    return None
+
+
 _PHANTOM_PARAM_KEYS = (
     'entry_conditions', 'use_direction_conditions', 'rsi_oversold',
     'rsi_overbought', 'stop_loss_atr', 'macd_hist_min', 'atr_regime_ratio',
     'adx_min', 'trend_ema_period', 'trading_windows', 'use_mark_price',
+    # v3.5 separation / MACD line settings
+    'setup_mode', 'trade_direction', 'macd_line_rules',
+    # v3.6 risk & exit model (ATR units / price %)
+    'risk_exit',
 )
+
+
+# ---------------------------------------------------------------------------
+# v3.5 — built-in Phantom presets
+# ---------------------------------------------------------------------------
+# ``PhantomV2`` stays the tuned champion. ``PhantomV2:reversal``,
+# ``PhantomV2:long``, ``PhantomV2:momentum:short`` … are the same champion with
+# only the setup / direction narrowed, so the separated strategies are
+# available in every dropdown (backtest, paper, live, chart) without a saved
+# copy. A saved custom strategy id never matches, so those paths are untouched.
+def _is_builtin_phantom(strategy_id) -> bool:
+    return parse_phantom_variant(strategy_id) is not None
+
+
+def _is_phantom_preset(strategy_id) -> bool:
+    """A built-in id OTHER than the plain champion (``PhantomV2``)."""
+    variant = parse_phantom_variant(strategy_id)
+    return bool(variant) and (variant['setup_mode'] != 'both' or variant['trade_direction'] != 'both')
+
+
+def _load_builtin_config(strategy_id) -> PhantomV2Config:
+    """Champion config with the preset's setup / direction applied.
+
+    For the plain ``PhantomV2`` id this is exactly ``_load_champion_config()``.
+    """
+    return apply_phantom_variant(_load_champion_config(), strategy_id)
+
+
+def _builtin_strategy_name(strategy_id) -> Optional[str]:
+    """Display name for a built-in id; None for saved / custom strategies."""
+    if str(strategy_id) == 'FastTest':
+        return 'Fast Test Strategy'
+    if is_fast_test_v1(strategy_id):
+        return FAST_TEST_V1_NAME
+    return phantom_preset_name(strategy_id)
+
+
+def _phantom_presets_payload() -> list:
+    return [dict(p) for p in PHANTOM_PRESETS]
 
 
 def _parse_run_params(config_json):
@@ -361,6 +491,11 @@ def _resolve_strategy_payload(db, strategy_id, user_id, fees):
     if not strat:
         return None
     data = strat.rules
+    # A saved debug-strategy config (Fast Test / V1.0) knows its family; the
+    # typed config is what makes every run path pick the right entry rule.
+    family_cfg = _family_config(data, fees)
+    if family_cfg is not None:
+        return ('phantom', family_cfg, strat)
     if isinstance(data, dict) and any(k in data for k in _PHANTOM_PARAM_KEYS):
         cfg = PhantomV2Config(**{k: v for k, v in data.items() if k in PhantomV2Config.model_fields})
         if fees is not None:
@@ -420,12 +555,19 @@ def _resume_paper_session(spec):
                       connection_id=spec.get("connection_id"),
                       account_label=spec.get("account_label"))
         if strategy_id == "FastTest":
-            from .core.strategy import FastTestStrategyService
-            config = _fee_config(PhantomV2Config(), fees)
+            config = _fee_config(fast_test_config(), fees)
             service = PaperTradeService(strategy_id, config, **common)
-            service.strategy = FastTestStrategyService(service.config)
+        elif is_fast_test_v1(strategy_id):
+            # FastTest V1.0 — same signals, plus the validation / booking layer.
+            config = fast_test_v1_config(fees=fees)
+            service = PaperTradeService(strategy_id, config, **common)
         elif strategy_id == "PhantomV2":
             service = PaperTradeService(strategy_id, _fee_config(_load_champion_config(), fees), **common)
+        elif _is_builtin_phantom(strategy_id):
+            # v3.5 preset (e.g. PhantomV2:reversal:long) — champion narrowed
+            # to that setup / direction.
+            common["strategy_name"] = common.get("strategy_name") or _builtin_strategy_name(strategy_id)
+            service = PaperTradeService(strategy_id, _fee_config(_load_builtin_config(strategy_id), fees), **common)
         else:
             resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
             if not resolved:
@@ -434,6 +576,12 @@ def _resume_paper_session(spec):
             common["strategy_name"] = strat.name
             service = PaperTradeService(strategy_id, strategy_payload,
                                         is_custom=(kind != 'phantom'), **common)
+        # The entry rule and the order manager follow the config, so a resumed
+        # session keeps running the strategy it was started with — including a
+        # saved Fast Test / V1.0 config with the client's own values.
+        if not service.is_custom:
+            service.strategy = strategy_service_for(service.config, strategy_id)
+            service.oms = order_manager_for(service.config, strategy_id)
         # Carry the banked result forward so the resumed session is continuous.
         service.instance_key = spec["instance_key"]
         service.user_id = spec["user_id"]
@@ -569,7 +717,12 @@ def health_check():
 def list_strategies(user=Depends(get_current_user), db=Depends(get_db)):
     try:
         strategies = db.query(CustomStrategy).filter(CustomStrategy.user_id == user.id).all()
-        return [{"id": s.id, "name": s.name, "rules": s.rules, "is_active": s.is_active, "created_at": s.created_at} for s in strategies]
+        return [{"id": s.id, "name": s.name, "rules": s.rules, "is_active": s.is_active,
+                 "created_at": s.created_at,
+                 # '' for a Kudos-style strategy, 'FastTest' / 'FastTestV1' for a
+                 # saved debug-strategy config (the UI labels + edits by family).
+                 "strategy_id": _strategy_family(
+                     (s.rules or {}).get('strategy_id') if isinstance(s.rules, dict) else None)} for s in strategies]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch strategies: {str(e)}")
 
@@ -579,6 +732,11 @@ def create_strategy(strategy: CustomStrategyCreate, user=Depends(get_current_use
         config_data = strategy.rules if strategy.rules is not None else strategy.params
         if config_data is None:
             raise HTTPException(status_code=400, detail="Either 'rules' or 'params' must be provided")
+        # Remember which strategy family the values were edited for. Phantom
+        # (the default) stores no marker, so existing strategies are untouched.
+        family = _strategy_family(strategy.strategy_id)
+        if family and isinstance(config_data, dict):
+            config_data = {**config_data, 'strategy_id': family}
         new_strat = CustomStrategy(user_id=user.id, name=strategy.name, rules=config_data)
         db.add(new_strat)
         db.commit()
@@ -594,7 +752,15 @@ def update_strategy(strat_id: int, strategy_data: dict, user=Depends(get_current
         if not strat: raise HTTPException(status_code=404, detail="Strategy not found")
         if "name" in strategy_data: strat.name = strategy_data["name"]
         config_update = strategy_data.get("rules") or strategy_data.get("params")
-        if config_update is not None: strat.rules = config_update
+        if config_update is not None:
+            # Editing a saved Fast Test / V1.0 config from the Strategies
+            # manager must not silently turn it into a Kudos strategy: keep the
+            # family marker when the update does not carry one itself.
+            if (isinstance(config_update, dict) and 'strategy_id' not in config_update
+                    and isinstance(strat.rules, dict)
+                    and _strategy_family(strat.rules.get('strategy_id'))):
+                config_update = {**config_update, 'strategy_id': _strategy_family(strat.rules['strategy_id'])}
+            strat.rules = config_update
         db.commit()
         return {"status": "Strategy updated successfully"}
     except Exception as e:
@@ -1963,12 +2129,71 @@ def _load_champion_config() -> PhantomV2Config:
             pass
     return PhantomV2Config()
 
+def _phantom_config_summary(cfg: PhantomV2Config) -> dict:
+    """Plain-language view of the settings a client asks about most:
+    the MACD indicator periods, the histogram threshold, the MACD line /
+    signal line rules, and which setups / sides the strategy trades."""
+    return {
+        "macd": {
+            "fast": cfg.macd_fast, "slow": cfg.macd_slow, "signal": cfg.macd_signal,
+            "hist_min": cfg.macd_hist_min,
+            "hist_min_long": cfg.macd_hist_min_for(1),
+            "hist_min_short": cfg.macd_hist_min_for(-1),
+            "periods_long": list(cfg.macd_periods_for(1)),
+            "periods_short": list(cfg.macd_periods_for(-1)),
+            "line_rules_enabled": cfg.uses_macd_line_rules(),
+            "line_rules": cfg.macd_line_rules.model_dump(),
+            "line_rule_long": cfg.macd_line_rule_text_for(1),
+            "line_rule_short": cfg.macd_line_rule_text_for(-1),
+        },
+        "setup_mode": cfg.setup_mode,
+        "setup_label": cfg.setup_label(),
+        "reversal_enabled": cfg.reversal_enabled(),
+        "momentum_enabled": cfg.momentum_enabled(),
+        "trade_direction": cfg.trade_direction,
+        "direction_label": cfg.direction_label(),
+        # v3.6 — which model each protective level is priced on.
+        "risk_exit": cfg.risk_exit_summary(),
+    }
+
+
 @app.get("/phantom/config")
-def phantom_config(user=Depends(get_current_user)):
+def phantom_config(strategy_id: Optional[str] = None, user=Depends(get_current_user)):
+    """The tuned champion config (default) or one of its built-in presets.
+
+    ``strategy_id`` may name a preset such as ``PhantomV2:reversal:long``; the
+    returned ``config`` then carries that preset's setup / direction. The
+    response also lists every preset and a ``summary`` (MACD periods, MACD
+    line / signal rules, setup, direction) so the docs and the paper / live
+    pages can show what the selected strategy actually trades on.
+    """
     cfg = _load_champion_config()
     path = _champion_config_path()
+    if strategy_id and _is_builtin_phantom(strategy_id):
+        cfg = apply_phantom_variant(cfg, strategy_id)
     return {"profile": os.path.basename(path) if path else 'v2.5-defaults',
-            "config": cfg.model_dump()}
+            "config": cfg.model_dump(),
+            "strategy_id": strategy_id if (strategy_id and _is_builtin_phantom(strategy_id)) else BUILTIN_PHANTOM_ID,
+            "strategy_name": (_builtin_strategy_name(strategy_id) if (strategy_id and _is_builtin_phantom(strategy_id))
+                              else 'Kudos V2.5 (Default)'),
+            "summary": _phantom_config_summary(cfg),
+            "presets": _phantom_presets_payload(),
+            "options": {
+                "setup_modes": [{"value": m, "label": SETUP_MODE_LABELS[m]} for m in SETUP_MODES],
+                "trade_directions": [{"value": d, "label": TRADE_DIRECTION_LABELS[d]} for d in TRADE_DIRECTIONS],
+                "macd_line_rules": list(MACD_LINE_RULES),
+                "macd_line_rule_keys": list(MACD_LINE_RULE_KEYS),
+                "risk_exit_models": [{"value": m, "label": RISK_EXIT_MODEL_LABELS[m]}
+                                     for m in RISK_EXIT_MODELS],
+                "risk_exit_levels": list(RISK_EXIT_LEVELS),
+            }}
+
+
+@app.get("/phantom/presets")
+def phantom_presets(user=Depends(get_current_user)):
+    """Built-in separated variants of the tuned strategy for the dropdowns."""
+    return {"default": {"id": BUILTIN_PHANTOM_ID, "name": 'Kudos V2.5 (Default)'},
+            "presets": _phantom_presets_payload()}
 
 @app.get("/phantom/signals")
 def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = None,
@@ -1986,13 +2211,28 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         strategy_service = engine.strategy_service
         wants_metadata = True
         label = None
-    elif strategy_id == "FastTest":
-        cfg = PhantomV2Config()
+    elif _is_builtin_phantom(strategy_id):
+        # v3.5 preset: the champion narrowed to one setup / direction.
+        cfg = _load_builtin_config(strategy_id)
         engine = BacktestEngine(cfg)
-        from .core.strategy import FastTestStrategyService
-        strategy_service = FastTestStrategyService(cfg)
+        strategy_service = engine.strategy_service
+        wants_metadata = True
+        label = None
+    elif strategy_id == "FastTest":
+        cfg = fast_test_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = strategy_service_for(cfg)
         wants_metadata = False
         label = "FastTest"
+    elif is_fast_test_v1(strategy_id):
+        # FastTest V1.0 overlay: the signals are FastTest's, so the chart shows
+        # exactly where entries come from; the validation layer only changes
+        # how long a trade is held once it is on.
+        cfg = fast_test_v1_config()
+        engine = BacktestEngine(cfg)
+        strategy_service = strategy_service_for(cfg)
+        wants_metadata = False
+        label = FAST_TEST_V1_NAME
     else:
         try:
             strat = db.query(CustomStrategy).filter(
@@ -2007,8 +2247,11 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
         if resolved and resolved[0] == 'phantom':
             cfg = resolved[1]
             engine = BacktestEngine(cfg)
-            strategy_service = engine.strategy_service
-            wants_metadata = True
+            # A saved Fast Test / V1.0 strategy overlays its own entry rule and
+            # reports no Phantom condition metadata, exactly like the builtin.
+            strategy_service = strategy_service_for(cfg, strategy_id)
+            wants_metadata = not isinstance(strategy_service, (FastTestStrategyService,
+                                                               FastTestV1StrategyService))
             label = strat.name
         else:
             from .core.dynamic_strategy import DynamicStrategyService
@@ -2064,6 +2307,11 @@ def phantom_signals(start_date: Optional[str] = None, end_date: Optional[str] = 
             except Exception:
                 pass
             try:
+                item["macd_line"] = round(float(meta['macd_line'][i]), 4)
+                item["macd_signal"] = round(float(meta['macd_signal'][i]), 4)
+            except Exception:
+                pass
+            try:
                 trend = int(meta['trend'][i])
                 item["trend"] = trend
                 item["trend_label"] = "UP" if trend == 1 else ("DOWN" if trend == -1 else "FLAT")
@@ -2101,15 +2349,37 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
         config = _fee_config(req.params, fees)
-        if req.strategy_id == "PhantomV2":
+        if is_fast_test_v1(req.strategy_id):
+            # FastTest V1.0 — the FastTest signals with the validation /
+            # profit-booking order manager, on the client's own values.
+            v1_config = fast_test_v1_config(req.params, fees=fees)
+            engine = BacktestEngine(config=v1_config, fee_schedule=fees, data_source=source,
+                                    strategy_service=strategy_service_for(v1_config),
+                                    oms=order_manager_for(v1_config))
+        elif req.strategy_id == "FastTest":
+            # The debug strategy: same loose entry rule, client-editable stop /
+            # target / sizing / timing from the Strategy Configuration panel.
+            ft_config = _fee_config(fast_test_config(req.params), fees)
+            engine = BacktestEngine(config=ft_config, fee_schedule=fees, data_source=source,
+                                    strategy_service=strategy_service_for(ft_config),
+                                    oms=order_manager_for(ft_config))
+        elif req.strategy_id == "PhantomV2":
+            engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        elif _is_builtin_phantom(req.strategy_id):
+            # v3.5 preset: the form's parameters, narrowed to the preset's
+            # setup / direction so "Reversal · Long only" always means that.
+            config = apply_phantom_variant(config, req.strategy_id)
             engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
         else:
             resolved = _resolve_strategy_payload(db, req.strategy_id, user_id, fees)
             if not resolved: return
             kind, payload, strat = resolved
             if kind == 'phantom':
-                # A saved Phantom params config (may include entry_conditions).
-                engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source)
+                # A saved params config (Phantom, or a saved Fast Test / V1.0
+                # strategy — the config type decides the entry rule).
+                engine = BacktestEngine(config=payload, fee_schedule=fees, data_source=source,
+                                        strategy_service=strategy_service_for(payload, req.strategy_id),
+                                        oms=order_manager_for(payload, req.strategy_id))
             else:
                 from .core.dynamic_strategy import DynamicStrategyService
                 class DynamicBacktestEngine:
@@ -2250,12 +2520,27 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
                     "exit_detail": t.exit_detail,
                     "rsi14": t.rsi14, "macd_hist": t.macd_hist, "adx": t.adx,
                     "atr14": t.atr14, "ema50_1h": t.ema50_1h, "ema50_4h": t.ema50_4h,
+                    # v3.5 — MACD line / signal line at the signal candle.
+                    "macd_line": getattr(t, 'macd_line', None),
+                    "macd_signal": getattr(t, 'macd_signal', None),
+                    # FastTest V1.0 audit (NULL for every other strategy): the
+                    # validation verdict, the close it was judged on, the price
+                    # threshold, whether +0.90% was booked / the 2H rule exited
+                    # and the final reason + net-of-fees P&L.
+                    "validation_status": getattr(t, 'validation_status', None),
+                    "validation_close": getattr(t, 'validation_close', None),
+                    "validation_threshold": getattr(t, 'validation_threshold', None),
+                    "tp090_hit": getattr(t, 'tp090_hit', None),
+                    "validation_exit": getattr(t, 'validation_exit', None),
+                    "final_exit_reason": getattr(t, 'final_exit_reason', None),
+                    "final_net_pnl": getattr(t, 'final_net_pnl', None),
                     "conditions": {
                         "trend_ok": t.cond_trend_ok,
                         "adx_ok": t.cond_adx_ok, "macd_hist_ok": t.cond_macd_hist_ok,
                         "atr_regime_ok": t.cond_atr_regime_ok, "rsi_ok": t.cond_rsi_ok,
                         "macd_confirm_ok": t.cond_macd_confirm_ok,
                         "di_ok": t.cond_di_ok,
+                        "macd_line_ok": getattr(t, 'cond_macd_line_ok', None),
                     },
                     # BTC perpetual: the traded price and the exchange mark
                     # price are both persisted; entry/exit_price are the basis
@@ -2341,6 +2626,9 @@ def delete_backtest_run(run_id: int, user=Depends(get_current_user), db=Depends(
 # --- FILTER PREVIEW (per bucket, before the full run) --------------------
 class FilterPreviewRequest(BaseModel):
     params: StrategyParams
+    # Which strategy the form is set to (the chart overlay uses it to plot the
+    # right entry rule; omitted = Phantom).
+    strategy_id: Optional[str] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     symbol: str = "BTCUSD"
@@ -2441,6 +2729,20 @@ def filter_preview(req: FilterPreviewRequest, user=Depends(get_current_user), db
         'buckets': out,
         'by_side': {k: v for k, v in sides.items()},
         'setup_dist': results.get('setup_dist', {}),
+        # v3.5 — separation + MACD line / signal rules this preview ran with.
+        'setup_mode': config.setup_mode,
+        'setup_label': config.setup_label(),
+        'trade_direction': config.trade_direction,
+        'direction_label': config.direction_label(),
+        'macd_line_rules': {
+            'enabled': config.uses_macd_line_rules(),
+            'per_side': config.uses_direction_macd_line(),
+            'long': config.macd_line_rule_text_for(1),
+            'short': config.macd_line_rule_text_for(-1),
+        },
+        'macd_periods': {'fast': config.macd_fast, 'slow': config.macd_slow, 'signal': config.macd_signal},
+        # v3.6 — the Risk & Exit model this preview priced its levels on.
+        'risk_exit': config.risk_exit_summary(),
     }
 
 
@@ -2451,8 +2753,17 @@ def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_u
         req = _apply_run_overrides(req)
         source = normalize_source(req.data_source)
         fees = resolve_fees(db, source, req.fee_mode, req.params)
-        config = _fee_config(req.params, fees)
-        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source)
+        # The overlay follows the strategy the form is set to: a Fast Test /
+        # V1.0 selection plots that entry rule, not the Phantom one.
+        family = _strategy_family(getattr(req, 'strategy_id', None))
+        if family == FAST_TEST_V1_ID:
+            config = fast_test_v1_config(req.params, fees=fees)
+        elif family == 'FastTest':
+            config = _fee_config(fast_test_config(req.params), fees)
+        else:
+            config = _fee_config(req.params, fees)
+        engine = BacktestEngine(config=config, fee_schedule=fees, data_source=source,
+                                strategy_service=strategy_service_for(config, family or None))
         strategy_service = engine.strategy_service
         df_1h = engine._get_data_from_db(req.symbol, "1h", req.start_date, req.end_date, source)
         df_4h = engine._get_data_from_db(req.symbol, "4h", req.start_date, req.end_date, source)
@@ -2486,6 +2797,10 @@ def phantom_signals_custom(req: FilterPreviewRequest, user=Depends(get_current_u
                 try: item["adx"] = round(float(meta['adx'][i]), 3)
                 except Exception: pass
                 try: item["macd_hist"] = round(float(meta['macd_hist'][i]), 4)
+                except Exception: pass
+                try:
+                    item["macd_line"] = round(float(meta['macd_line'][i]), 4)
+                    item["macd_signal"] = round(float(meta['macd_signal'][i]), 4)
                 except Exception: pass
                 try:
                     trend = int(meta['trend'][i])
@@ -2688,7 +3003,7 @@ def trade_preflight(payload: PreflightRequest, user=Depends(get_current_user), d
         try:
             capital, margin_pct = _resolve_sizing(payload, user)
             leverage = int(payload.leverage) if payload.leverage else \
-                int(getattr(_load_champion_config() if payload.strategy_id == 'PhantomV2'
+                int(getattr(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
                             else PhantomV2Config(), 'leverage', 7) or 7)
             client, _d, _c = _live_client(db, user, source, payload.connection_id)
             funding = check_affordable(client, broker=source, capital_inr=capital,
@@ -2736,7 +3051,10 @@ def start_paper_trade(
         raise HTTPException(status_code=409,
                             detail=_conflict_detail('paper', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'paper')
-    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
+    # Built-in ids (PhantomV2 and its v3.5 presets) run the tuned champion,
+    # narrowed to the preset's setup / direction when one was picked.
+    config = _fee_config(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
+                         else PhantomV2Config(), fees)
     capital, margin_pct = _resolve_sizing(payload, user)
     # Paper is the rehearsal for live: a leverage or margin mode the venue
     # would refuse must be refused here too, not silently simulated so the
@@ -2749,7 +3067,7 @@ def start_paper_trade(
     except PhantomValidationError as ve:
         raise HTTPException(status_code=ve.status_code, detail=ve.message)
     strategy_id = str(payload.strategy_id)
-    strategy_name = 'Kudos V2.5 (Default)' if strategy_id == 'PhantomV2' else 'Fast Test Strategy' if strategy_id == 'FastTest' else None
+    strategy_name = _builtin_strategy_name(strategy_id)
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
     window_config = resolve_window_config(payload, user)
     use_mark = resolve_use_mark_price(payload, user)
@@ -2762,16 +3080,24 @@ def start_paper_trade(
     instance_key = f"paper_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        from .core.strategy import FastTestStrategyService
-        service = PaperTradeService(strategy_id, config, initial_capital=capital, margin_pct=margin_pct,
+        service = PaperTradeService(strategy_id, _fee_config(fast_test_config(), fees),
+                                    initial_capital=capital, margin_pct=margin_pct,
                                     market_source=source, broker_name=source, fee_schedule=fees,
                                     broker_definition=definition, strategy_name=strategy_name,
                                     trading_windows=window_config, use_mark_price=use_mark,
                                     price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
-        service.strategy = FastTestStrategyService(service.config)
-    elif strategy_id != "PhantomV2":
+    elif is_fast_test_v1(strategy_id):
+        service = PaperTradeService(strategy_id, fast_test_v1_config(fees=fees),
+                                    initial_capital=capital, margin_pct=margin_pct,
+                                    market_source=source, broker_name=source, fee_schedule=fees,
+                                    broker_definition=definition, strategy_name=strategy_name,
+                                    trading_windows=window_config, use_mark_price=use_mark,
+                                    price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
+                                    connection_id=(connection.id if connection else None),
+                                    account_label=account_label, leverage=payload.leverage)
+    elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
@@ -2801,6 +3127,12 @@ def start_paper_trade(
                                     price_feed=feed_mode, tick_interval=feed_interval, testnet=testnet,
                                     connection_id=(connection.id if connection else None),
                                     account_label=account_label, leverage=payload.leverage)
+    # The entry rule and the order manager follow the config: a saved Fast Test
+    # / V1.0 strategy trades its own entry rule with the saved values (V1.0
+    # additionally gets the validation + profit-booking order manager).
+    if not service.is_custom:
+        service.strategy = strategy_service_for(service.config, strategy_id)
+        service.oms = order_manager_for(service.config, strategy_id)
     # Every instance is mirrored into paper_sessions so stopping it (or a
     # server restart) no longer throws the result away.
     service.instance_key = instance_key
@@ -3116,7 +3448,10 @@ def start_live_trade(
         raise HTTPException(status_code=409,
                             detail=_conflict_detail('live', conflict[0], conflict[1], connection))
     fees = resolve_fees(db, source, 'live')
-    config = _fee_config(_load_champion_config() if payload.strategy_id == 'PhantomV2' else PhantomV2Config(), fees)
+    # Built-in ids (PhantomV2 and its v3.5 presets) run the tuned champion,
+    # narrowed to the preset's setup / direction when one was picked.
+    config = _fee_config(_load_builtin_config(payload.strategy_id) if _is_builtin_phantom(payload.strategy_id)
+                         else PhantomV2Config(), fees)
     strategy_id = payload.strategy_id
     capital, margin_pct = _resolve_sizing(payload, user)
     # BTC perpetual pricing + "skip new trades" schedule for this instance.
@@ -3215,8 +3550,8 @@ def start_live_trade(
     instance_key = f"live_{user.username}_{source}_{strategy_id}_{instance_id}"
 
     if strategy_id == "FastTest":
-        from .core.strategy import FastTestStrategyService
-        service = LiveTradeService(strategy_id, config, api_key, api_secret, initial_capital=capital,
+        service = LiveTradeService(strategy_id, _fee_config(fast_test_config(), fees),
+                                   api_key, api_secret, initial_capital=capital,
                                    margin_pct=margin_pct, broker_name=source, passphrase=passphrase,
                                    testnet=testnet, fee_schedule=fees, definition=definition,
                                    trading_windows=window_config, use_mark_price=use_mark,
@@ -3224,8 +3559,16 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
-        service.strategy = FastTestStrategyService(service.config)
-    elif strategy_id != "PhantomV2":
+    elif is_fast_test_v1(strategy_id):
+        service = LiveTradeService(strategy_id, fast_test_v1_config(fees=fees), api_key, api_secret,
+                                   initial_capital=capital, margin_pct=margin_pct, broker_name=source,
+                                   passphrase=passphrase, testnet=testnet, fee_schedule=fees,
+                                   definition=definition, trading_windows=window_config,
+                                   use_mark_price=use_mark, user_id=user.id, instance_key=instance_key,
+                                   price_feed=feed_mode, tick_interval=feed_interval,
+                                   account_label=account_label, heartbeat=heartbeat_on,
+                                   connection_id=(connection.id if connection else None))
+    elif not _is_builtin_phantom(strategy_id):
         resolved = _resolve_strategy_payload(db, strategy_id, user.id, fees)
         if not resolved:
             raise HTTPException(status_code=404, detail="Custom strategy not found")
@@ -3257,10 +3600,19 @@ def start_live_trade(
                                    price_feed=feed_mode, tick_interval=feed_interval,
                                    account_label=account_label, heartbeat=heartbeat_on,
                                    connection_id=(connection.id if connection else None))
+    # The entry rule and the order manager follow the config (see the paper
+    # start): a saved Fast Test / V1.0 strategy lives trade its own values.
+    if not service.is_custom:
+        service.strategy = strategy_service_for(service.config, strategy_id)
+        service.oms = order_manager_for(service.config, strategy_id)
     # Mirror the live session into the sessions table from the start, exactly
     # like a paper run, so stopping it later leaves a full reviewable record.
     service.user_id = user.id
     service.account_label_for_history = account_label
+    if _is_phantom_preset(strategy_id):
+        # v3.5 presets carry their display name into the session record so
+        # History / Sessions show "Kudos — Reversal only", not the raw id.
+        service.strategy_name = _builtin_strategy_name(strategy_id)
     session_id = paper_history.start_session(user.id, instance_key, service)
     # Blocks a double-clicked Start until the background task flips is_running.
     service.pending_start = True
@@ -3710,11 +4062,32 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
             return formatted
 
         # Fallback to the selected source's public API if its seed is empty.
+        # The venue can answer newest-first (Delta does), and lightweight-charts
+        # asserts that its data is oldest-first, so the window is applied and the
+        # rows are handed over chronologically — one candle per timestamp.
         from .services.data_sync import DataSyncService
-        rows = DataSyncService.fetch_klines(normalize_source(source), symbol, interval, limit=limit)
-        return [{"time": int(pd.Timestamp(row['event_time']).timestamp()),
-                 "open": row['open'], "high": row['high'], "low": row['low'],
-                 "close": row['close'], "volume": row.get('volume', 0)} for row in rows]
+        start_dt = end_dt = None
+        try:
+            if start_date:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        except ValueError:
+            pass
+        rows = DataSyncService.fetch_klines(
+            normalize_source(source), symbol, interval,
+            start_time=start_dt, end_time=end_dt, limit=cap,
+        )
+        by_time = {}
+        for row in rows or []:
+            try:
+                ts = int(pd.Timestamp(row['event_time']).timestamp())
+                by_time[ts] = {"time": ts, "open": row['open'], "high": row['high'],
+                               "low": row['low'], "close": row['close'],
+                               "volume": row.get('volume', 0)}
+            except (TypeError, ValueError, KeyError):
+                continue
+        return [by_time[ts] for ts in sorted(by_time)]
     except Exception as e:
         # No local data and the remote API is unreachable — return an empty
         # series so the UI shows an empty chart instead of a hard error.

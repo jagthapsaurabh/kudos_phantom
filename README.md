@@ -370,6 +370,205 @@ configuration under a name for re-running or Paper / Live trading.
 Opening any saved Backtest history card now restores its saved dates, exchange, strategy, capital,
 and complete parameter snapshot before showing the result.
 
+### v3.5 addon: MACD line / signal rules, and Reversal · Momentum · Long · Short separation
+Everything in this addon is **additive**: every new key defaults to the original behaviour, so
+existing saved strategies, backtest runs and paper / live sessions produce identical signals.
+
+**MACD settings, all in one place.** The MACD periods (`macd_fast` / `macd_slow` / `macd_signal`) were
+always editable in the Backtest form's *MACD Indicator* group; they are now also documented on the
+Kudos Strategy page (*Strategy Rules → MACD Settings*) and shown, together with the histogram
+threshold and the line rules, under the strategy dropdown on the Paper and Live pages
+(`StrategyConfigSummary`, fed by `GET /phantom/config?strategy_id=…`).
+
+**MACD line / signal line entry rules (new, OFF by default).** `macd_line_rules` adds optional
+conditions on the MACD *line* and its *signal line* — separate from the histogram threshold:
+
+| key | choices | Long reads | Short reads |
+|---|---|---|---|
+| `line_vs_signal` | `off` · `above_below` · `cross` | MACD line > signal (or crosses above) | MACD line < signal (or crosses below) |
+| `line_vs_zero` | `off` · `above_below` · `cross` | MACD line > 0 | MACD line < 0 |
+| `signal_vs_zero` | `off` · `above_below` · `cross` | signal line > 0 | signal line < 0 |
+| `line_min` / `signal_min` | number or blank | line / signal ≥ value | line / signal ≤ −value |
+
+Switch the block on in *Backtest → Strategy Configuration → MACD line / signal line rules*; tick
+**Use separate Long / Short MACD line rules** (`entry_conditions.use_direction_macd_line`) to give
+each side its own rules under `entry_conditions.long.macd_*` / `.short.macd_*` (per-side levels are
+used signed as typed). Active rules apply to **both** setups. Runs that used them gain a
+`cond_macd_line_ok` flag, the `macd_line` / `macd_signal` values at the signal candle and an
+`8. MACD line/signal` line in the entry-condition detail (also in the CSV / Excel export); runs that
+did not show `N/A`.
+
+**Strategy separation.** Two new config keys, `setup_mode` (`both` · `reversal` · `momentum`) and
+`trade_direction` (`both` · `long` · `short`), appear as **Setup** and **Direction** selectors in the
+Backtest form and are saved with a named strategy, so a split can be re-run or traded in Paper / Live
+like any other saved strategy. `reversal` is exactly the legacy *momentum entries off*; `momentum`
+forces Setup B on even when that box is unticked; `long` / `short` keep that side's signals exactly
+as the two-sided strategy produced them. The same splits are available as **built-in presets** in
+every strategy dropdown (Backtest, Paper, Live, Chart), right after *Kudos V2.5 (Default)*:
+
+| id | name |
+|---|---|
+| `PhantomV2:reversal` / `PhantomV2:momentum` | Kudos — Reversal only / Kudos — Momentum only |
+| `PhantomV2:long` / `PhantomV2:short` | Kudos — Long only / Kudos — Short only |
+| `PhantomV2:reversal:long` … `PhantomV2:momentum:short` | Kudos — Reversal · Long only, … |
+
+A preset is the tuned champion config with only the setup / direction narrowed (`GET /phantom/presets`
+lists them). Presets are separate strategy ids, so a preset and the default can run side by side on
+one account, and History / Sessions show the preset's name.
+
+### v3.6 addon: Risk & Exit model — ATR units, price %, or both per level
+
+Every protective level has always been measured in **ATR units**. The client can now run each level
+on **price**, or on **both** — chosen level by level, so one strategy can keep an ATR stop while
+booking at a price-based target. The model is a three-state toggle — [ATR-based (default)]
+[Price-based (%)] [Both — per level] — set in **Backtest → Strategy Configuration → Risk & Exit
+Model** and saved with the strategy, and it is documented on **Kudos Strategy → Strategy Rules** and
+**Strategy Explained**, and summarised on the Paper / Live strategy panel.
+
+| Toggle | Meaning |
+| --- | --- |
+| **ATR-based (default)** | Every level in ATR units — byte-for-byte the behaviour that shipped before |
+| **Price-based (%)** | Every level as a % of the entry price |
+| **Both — per level** | Each level has its own **ATR / Price %** switch (the mix) |
+
+Each level keeps its ATR value and its % value, so switching back and forth never loses a number.
+The default is all-ATR, and the price values ship ready to use: **stop 1.6 % · take profit 3 % ·
+trail activation 1.5 % with a 0.5 % trail · breakeven 1 %** — all editable per strategy.
+
+```text
+ATR model (default)                       Price model
+SL  = Entry ∓ max(stop_loss_atr × ATR,    SL  = Entry ∓ stop_loss_pct × Entry
+                     sl_floor_pct × Price)
+TP  = Entry ± take_profit_atr × ATR       TP  = Entry ± take_profit_pct × Entry
+Trail arms at trail_activation_atr × ATR  Trail arms at trail_activation_pct × Entry
+Trail follows the peak by                 and follows the peak by trail_distance_pct
+      trail_distance_atr × ATR
+BE  at entry ± breakeven_atr × ATR        BE  at Entry × (1 ± breakeven_pct)
+```
+
+Notes that matter in practice:
+
+* The **per-side stop override** (`entry_conditions.long/short`, the direction-condition switch)
+  works for whichever model the stop uses — `stop_loss_atr` in ATR mode, `stop_loss_pct` in price
+  mode — exactly like the ATR settings it mirrors.
+* The ATR stop's `sl_floor_pct` floor (1.6 % of price) applies to the **ATR** model only: in price
+  mode the % you type *is* the stop, and it is not silently widened.
+* A **price-based trail** is sent to the venue as a price distance too (Delta's bracket trail), and
+  if no price is available no venue trail is sent — it is never silently replaced by an ATR one.
+* Strategies that never set the model (old saved runs, old strategies) resolve to all-ATR, so
+  nothing existing changes until a client switches a level over.
+
+### Market Chart: zoom & full screen
+
+The **Market Chart** toolbar now carries a zoom control — `−` · current factor · `+` · **Reset** —
+and a **Full screen** button. Zoom moves both axes together: the buttons scale the visible bar range
+*and* the price range, on top of the wheel / pinch zoom and drag-to-pan the chart always had.
+
+| Control | Action |
+| --- | --- |
+| `+` (or `=`) | Zoom in — fewer candles, tighter price range |
+| `−` | Zoom out |
+| **Reset** (or `0`) | Back to the automatic price fit with every candle in view (`fitContent`) |
+| Double-click the chart | Same as Reset |
+| **Full screen** | The chart fills the window — `Esc` or **Exit full** leaves it |
+
+Vertical zoom rides on the automatic price fit (an `autoscaleInfoProvider`), so the axis keeps
+following new candles while the client is zoomed in; the label next to the buttons reads `auto fit`,
+`1.54× in`, `2.00× out` and so on. Scrolling, the wheel and the keyboard shortcuts are ignored while
+typing in a field, and inside an iframe that blocks the browser Fullscreen API the button falls back
+to an in-page full-window overlay, so it still works everywhere.
+
+### FastTest V1.0 — the debug strategy with validation + profit booking
+
+`FastTest` is the debug strategy: it fires on almost every bar (RSI(14) below 50 → long, at/above 50
+→ short) so order placement, history and P&L plumbing can be exercised. **`FastTestV1` is a separate
+strategy** (`backend/app/core/fast_test_v1.py`) — the original `FastTest` is untouched and keeps
+behaving exactly as before. V1 copies the entry rule verbatim and adds only two trade-management
+layers on top of the existing stop plan:
+
+| rule | type | detail |
+|---|---|---|
+| **+0.90% profit booking** | **TOUCH** | long `high ≥ entry × 1.0090` · short `low ≤ entry × 0.9910` → book the full position at that level |
+| **2H validation** | **CLOSE** | the close of the 2nd completed 1h candle after entry must satisfy long `close ≥ entry × 1.0035` / short `close ≤ entry × 0.9965` |
+| validation PASS | — | marked `VALIDATED`; the trade continues on the existing SL / trailing SL / exits |
+| validation FAIL | — | exits **at that 2h close** (reason `VALFAIL`) |
+
+Priority inside one candle matches the spec and the engine's conservatism: the resting **stop still
+wins** if a bar pierces both the stop and the target; otherwise the +0.90% touch books before the
+trailing stop, the plan's TP and the timeout. Nothing else changed — entry conditions, position
+sizing, initial SL, trailing SL, cooldown, timeout and fees are the same values the other strategies
+use, and **no new indicator or filter** was added.
+
+Where to pick it: **Paper**, **Live**, **Chart** and **Backtest** dropdowns, plus the admin panel's
+debug button.
+
+### Configuring the Fast Test strategies (debug + V1.0)
+
+Kudos values are edited in **Backtest → Strategy Configuration**. Both debug strategies are
+configured the same way: pick **Fast Test Strategy (debug)** or **Fast Test Strategy V1.0** in
+*Strategy to test* and the panel switches to that strategy's own fields — every value the backend
+reads for it:
+
+| Group | Fields |
+| --- | --- |
+| **Risk & Exit Model** | the same editor as Kudos: ATR units (default) / price % / both per level, plus the ATR stop floor % |
+| **Exits & Timing** | timeout bars, cooldown bars |
+| **Sizing & Drawdown Guard** | leverage, margin %, lot size (BTC), reduced margin %, the three drawdown-guard levels |
+| **Entry rule** | RSI period, the long threshold (LONG below it) and the short threshold (SHORT at/above it), plus the allowed direction (both / long only / short only) |
+| **Exit rule** | on/off switches for the stop, take profit, trailing stop, breakeven and timeout |
+| **Exit conditions** | close the position on a completed candle when the entry rule points the other way, when RSI crosses back through a level, or when the MACD line flips against the trade — each switchable |
+| **V1.0 — validation & profit booking** (V1 only) | validation window (bars), validation close %, profit booking % |
+
+Defaults are the shipped values, so a strategy nobody edits behaves exactly as before (RSI 14 —
+long below 50 / short at/above 50, every protective rule on, no conditions, and the 2H / +0.35% /
++0.90% V1 rules). The panel always shows the rule it is running (`RSI(14) → long below 50, short
+at/above 50`), so an edit is visible before it is saved.
+
+**Entry rule.** One side per 1H candle, decided on that candle's RSI. Change the period or either
+threshold and the same rule runs with your numbers; a threshold band leaves the middle flat (no
+signal between the two). *Direction* reuses the strategy's existing side filter.
+
+**Exit rule.** Each protective rule can be switched off (the venue-side bracket drops the matching
+leg too, so live never rests protection the strategy itself no longer manages), and the three
+conditions are judged on a **completed candle's close** — after that candle's stop / target (a
+resting stop always keeps priority) and before the timeout. They are recorded with their own reason
+codes in the trade log, CSV / Excel export, Paper and Live History: `OPP` (opposite signal), `RSIX`
+(RSI level) and `MFLIP` (MACD flip). Nothing is computed while all three are off, so an unedited
+strategy costs exactly what it did before.
+
+Press **Save as strategy** and the saved strategy remembers which family it belongs to — it is
+labelled `· Fast Test Strategy V1.0` (or debug) in the Backtest, Paper, Live and Strategies lists,
+and starting it in **Paper** or **Live** runs that entry rule with your saved stop, target, sizing
+and timing values. Auto-resume after a restart keeps the same strategy and values.
+
+Under the hood each saved strategy stores `strategy_id` next to its parameters; the API rebuilds the
+typed config (`FastTestConfig` / `FastTestV1Config`), and one factory picks the matching signal
+service and order manager — so a saved V1.0 strategy keeps the validation / booking layer in every
+mode. The entry rule (period, thresholds, direction) lives on the signal service, the exit rule on
+the order manager (`use_*` switches) plus the close-based conditions in
+`backend/app/core/fast_test_rules.py`; Backtest, Paper and Live hand the completed candle's
+RSI / MACD values to the same evaluator. A saved strategy with no marker stays a Kudos strategy,
+exactly as before — and the **Kudos / Phantom strategy does not declare any of these fields**, so
+its form, signals and exits are untouched.
+
+**Audit fields.** Every V1 trade carries seven extra fields in the trade log, the CSV/Excel export
+(appended as the last seven columns, so existing sheets keep their positions) and the paper/live
+History detail:
+
+| field | meaning |
+|---|---|
+| `validation_status` | `VALIDATED` · `FAILED` · `TP_090_HIT` · `NOT_REACHED` |
+| `validation_close` | the close the rule judged (validating close, failing deadline close, or the last close seen) |
+| `validation_threshold` | the price level the close had to reach (`entry × 1.0035` long / `× 0.9965` short) |
+| `tp090_hit` | 1 when the +0.90% booking fired |
+| `validation_exit` | 1 when the trade was closed by the 2H rule |
+| `final_exit_reason` | the closing reason code (`TP090`, `VALFAIL`, or the existing `SL` / `TSL` / `TP` / `MH` / `REV`) |
+| `final_net_pnl` | the booked P&L in ₹ **after** entry + exit fees |
+
+Exit reasons `TP090` (profit booked) and `VALFAIL` (validation failed) only ever come from this
+strategy. In live trading the venue bracket's take-profit leg is placed at the +0.90% level so the
+exchange target matches the strategy; the stop-loss leg and trail distance are unchanged.
+
 ### Trade log: which candle, which colour, and the full export
 The trade log answers three questions for every trade — **which candle raised the signal**, **which
 candle the entry actually filled on**, and **what colour each was**. The strategy fires on candle *i*
@@ -395,9 +594,43 @@ That button is separate from the raw engine dump described above
 `True`/`False`/blank, snake_case headers — for scripting; the UI export is the human-readable sheet,
 rendering those same flags as `PASS` / `FAIL` / `N/A` and adding the candle colours and times.
 
-Paper sessions export the same per-trade fields (`entry_time, exit_time, direction, symbol, entry,
-exit, lots, margin_inr, notional_usd, sl, sl_final, tp, trail_stop, atr_at_entry, peak_price,
-bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
+Paper and Live trade **analysis** works exactly like the Backtest log. Every closed paper/live
+trade now records the same detail (`backend/app/core/trade_conditions.py` — the engine's builders,
+moved out unchanged so the backtest wording is byte-identical):
+
+* the **signal candle** (time + colour) and the **entry candle** (time + colour),
+* **every entry condition** spelled out — measured value vs the threshold applied to that side,
+  PASS / FAIL / N/A (`1. 4h trend: … -> PASS`, `4. ATR regime: … -> PASS`, …),
+* the **condition snapshot** behind it (`rsi14`, `macd_hist`, `adx`, `atr14`, `ema50_1h/4h`,
+  `trend_4h`, `setup`, the `cond_*` flags, the MACD line/signal values),
+* the **exit rule** that fired (`exit_detail`) and the colour of the **exit candle**.
+
+Where to see it: **Paper → Trade Reply / Closed Trades** and **Live → Closed trades (live)** both
+have a **Conditions** button on every row (the same expandable detail the Backtest log shows) and an
+**Export CSV** button. The export is literally the Backtest trade-log spreadsheet — one column
+layout, so a paper or live run can be diffed against a backtest in Excel. Saved paper sessions use
+the same export from the History panel. Records ride along in the paper session snapshot and the
+`/live-trade/status` payload, so stopping, reloading or resuming a worker never loses them, and
+records saved before this feature render an honest "no condition detail" note instead of
+disappearing.
+
+```text
+# paper / live closed trade — added keys (backtest-compatible)
+signal_candle_time, signal_candle_type, entry_candle_time, entry_candle_type, exit_candle_type,
+setup, trend_4h, rsi14, macd_hist, adx, atr14, ema50_1h, ema50_4h, macd_line, macd_signal,
+cond_trend_ok, cond_adx_ok, cond_macd_hist_ok, cond_atr_regime_ok, cond_rsi_ok,
+cond_macd_confirm_ok, cond_di_ok, cond_macd_line_ok, entry_conditions_detail
+```
+
+Strategies that publish no per-condition metadata (`FastTest`, `FastTestV1`) get no invented
+conditions — exactly like a backtest run of those strategies. Their rows still show the exit rule,
+the candle colours and (for V1) the seven audit fields.
+
+**Execution safety.** The analysis can never disturb trading: the snapshot is taken **after** the
+paper order / live order has been sent, it is dropped silently if a strategy's metadata cannot be
+read (no exception, no error line, no blocked or altered order), and the merge into the closed-trade
+record is wrapped so a malformed record can never stop a trade from being booked or an exit order
+from being sent.
 
 ### Running the tests
 ```bash
@@ -405,7 +638,21 @@ bars_held, reason, exit_detail, gross_pnl, fees, pnl`) from the History panel.
 cd backend
 python test_trade_log_detail.py   # 57 checks: candles, colours, conditions, export columns
 python test_atr_regime_op.py      # 32 checks: per-side ATR operator
+python test_macd_line_and_modes.py # 76 checks: MACD line/signal rules, setup + direction splits, presets
+python test_fast_test_v1.py       # 114 checks: FastTest V1.0 — entry parity, 2H validation, +0.90% booking,
+                                  # audit fields, paper/live wiring, DB migration, results API
+python test_risk_exit_model.py   # 48 checks: ATR / price / per-level mix on every protective level,
+                                  # per-side stops, trail + breakeven, live venue trail, V1 untouched
+python test_trade_conditions_shared.py  # 28 checks: the shared entry/exit-condition detail the
+                                  # backtest / paper / live logs all use, end-to-end paper entry
 python test_paper_history.py      # 63 checks: paper history persistence
+python test_fast_test_rules.py    # 74 checks: the editable entry / exit rules — the original rule is
+                                  # reproduced byte-for-byte, then period / thresholds / direction,
+                                  # the five exit switches and the three signal conditions are pinned
+                                  # on the rule objects and through real engine runs (V1 included)
+python test_fast_test_config.py   # 68 checks: the configurable Fast Test / V1.0 values — builders,
+                                  # saved-strategy family round trip, service / OMS factories, backtest,
+                                  # paper, live, resume and chart-overlay wiring
 python test_delta_and_paper.py    # 37 checks: Delta seeder + paper exit details
 python test_api_e2e.py            # 47 checks: API end to end
 python test_seed_repair.py        # 57 checks: full-history seed + corrupt-candle repair
@@ -417,11 +664,23 @@ python test_broker_connections.py # 40 checks: which saved credentials a live ca
 python test_delta_key_recovery.py # 73 checks: rejected API key — hold entries, park the deadman switch, reload credentials
 python test_multi_instance_live.py # 99 checks: 3-4 live strategies sharing one broker account
 python test_tick_feed.py          # 93 checks: live price feeds (websocket/REST) + the fast exit tick
+python test_chart_overlay_api.py   # 18 checks: /klines window + chronological candle order (venue
+                                   # fallback included), signal fields for the chart overlay
 
 # frontend (renders the real components with react-dom/server)
-cd frontend && npm test            # 380 checks: trade-log table + CSV export, trading windows, page
+cd frontend && npm test            # 601 checks (600 pass; the known PaperTrade live-tick smoke check fails on the
+                                   # untouched baseline): trade-log table + CSV export, paper/live condition
+                                   # analysis + Backtest-identical export, trading windows, page
                                    # smoke, live terminal (incl. the per-mode margin breakdown), broker
-                                   # key replacement + credential badges
+                                   # key replacement + credential badges, Kudos presets + MACD line form,
+                                   # FastTest V1.0 dropdowns / audit columns / validation chips /
+                                   # configurable debug + V1.0 fields and the editable entry / exit
+                                   # rules — including a real render of the debug panel
+                                   # (fast_test_v1_ui.jsx, 58 checks),
+                                   # paper+live condition analysis (trade_conditions_ui.jsx),
+                                   # Risk & Exit model editor + docs (risk_exit_model_ui.jsx),
+                                   # Market Chart zoom helpers + toolbar + full screen (chart_zoom_ui.jsx),
+                                   # candle ordering for the overlay charts (chart_overlay.jsx)
 ```
 The backend tests are plain scripts (no test runner needed) and require only the packages from
 `requirements.txt` plus `httpx`, which `fastapi.testclient` imports — `pip install httpx`. The

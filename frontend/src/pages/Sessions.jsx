@@ -8,6 +8,7 @@ import {
 } from 'recharts';
 import { API_URL } from '../api';
 import { useVisibilityPause } from '../hooks/useVisibilityPause';
+import { EntryConditionBlock } from '../components/TradeConditionDetail';
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -53,6 +54,13 @@ const EXIT_REASONS = {
   SL: { label: 'Stop Loss', cls: 'text-red-400 border-red-800 bg-red-900/20' },
   MH: { label: 'Max Hold', cls: 'text-yellow-400 border-yellow-800 bg-yellow-900/20' },
   REV: { label: 'Reversal', cls: 'text-blue-400 border-blue-800 bg-blue-900/20' },
+  // FastTest V1.0's own exits.
+  TP090: { label: '+0.90% Profit Book', cls: 'text-emerald-300 border-emerald-800 bg-emerald-900/20' },
+  VALFAIL: { label: '2H Validation Fail', cls: 'text-red-300 border-red-800 bg-red-900/20' },
+  // Fast Test (debug) + V1.0 configurable exit conditions.
+  OPP: { label: 'Opposite Signal', cls: 'text-sky-300 border-sky-800 bg-sky-900/20' },
+  RSIX: { label: 'RSI Exit', cls: 'text-indigo-300 border-indigo-800 bg-indigo-900/20' },
+  MFLIP: { label: 'MACD Flip', cls: 'text-teal-300 border-teal-800 bg-teal-900/20' },
 };
 const reasonMeta = (r) => EXIT_REASONS[r] || { label: r || '—', cls: 'text-gray-400 border-gray-700 bg-gray-900' };
 
@@ -167,6 +175,29 @@ const TradeRow = ({ trade, index }) => {
                 The stop moved during this trade (breakeven / trail) — it exited on {num(trade.sl_final)},
                 not the {num(trade.sl)} it started with.
               </p>
+            )}
+            {/* FastTest V1.0 audit — blank on every other strategy. */}
+            {trade.validation_status && (
+              <div className="mt-3 rounded border border-gray-700 bg-gray-900 p-2">
+                <div className="mb-1.5 text-[9px] font-bold uppercase text-gray-500">
+                  FastTest V1.0 — 2H validation &amp; +0.90% booking
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-7">
+                  <Stat label="Validation status" value={trade.validation_status} />
+                  <Stat label="Validation close" value={num(trade.validation_close)} />
+                  <Stat label="Validation threshold" value={num(trade.validation_threshold)} />
+                  <Stat label="TP 0.90% hit" value={trade.tp090_hit ? 'YES' : 'NO'} />
+                  <Stat label="Validation exit" value={trade.validation_exit ? 'YES' : 'NO'} />
+                  <Stat label="Final exit reason" value={trade.final_exit_reason || trade.reason} />
+                  <Stat label="Final net P&L" value={num(trade.final_net_pnl ?? trade.pnl)}
+                        cls={pnlClass(trade.final_net_pnl ?? trade.pnl)} />
+                </div>
+              </div>
+            )}
+            {trade.entry_conditions_detail && (
+              <div className="mt-3">
+                <EntryConditionBlock trade={trade} testId="session-trade-entry-conditions" />
+              </div>
             )}
             {trade.exit_detail && (
               <p className="mt-2 rounded border border-gray-700 bg-gray-900 p-2 text-[11px] text-gray-300">

@@ -12,6 +12,12 @@ from app.services.order_manager import OrderManager
 from app.services.broker_client import BrokerClient
 import requests
 from app.core.indicators import compute_indicators
+from app.core import trade_conditions
+# Helper for close-based strategy rules (FastTest V1's 2H validation): the
+# close of the candle the clock just moved past. Imported here so the import
+# graph stays one-way (fast_test_v1 -> order_manager only).
+from app.core.fast_test_v1 import completed_bar_close
+from app.core.fast_test_rules import fast_test_bar_state
 
 # India Standard Time is UTC+5:30. All timestamps shown in the paper-trade UI
 # (last checked, trade entry/exit, log lines) are emitted in IST so the user
@@ -224,7 +230,7 @@ class PaperTradeService:
         # (np.float64 serializes as float, but comparisons yield np.bool_ which
         # FastAPI cannot encode — keep every numeric field a real float).
         f = lambda v: None if v is None else float(v)
-        self.closed_trades.append({
+        rec = {
             "symbol": trade.symbol,
             "direction": int(trade.direction),
             "entry": f(trade.entry_price),
@@ -255,7 +261,32 @@ class PaperTradeService:
             "entry_time": _to_ist(trade.entry_time),
             "exit_time": _to_ist(trade.exit_time),
             "bars_held": int(trade.bars_held),
-        })
+        }
+        # Strategy audit fields (FastTest V1: validation status / close /
+        # threshold, +0.90% booking, final reason and net P&L). Empty — and the
+        # record untouched — for every other strategy.
+        audit = getattr(self.oms, 'strategy_audit_fields', None)
+        if callable(audit):
+            rec.update(audit(trade, pnl_inr))
+        # Trade-log detail: the same entry-condition record a backtest writes
+        # (signal candle + colour, every condition with PASS/FAIL) and the
+        # candle the exit landed in. Records from older versions simply lack
+        # these keys, so nothing already saved changes shape.
+        try:
+            # Convert the candle stamps first: safe_context keeps plain
+            # scalars and would otherwise drop a datetime it cannot classify.
+            ctx = dict(getattr(trade, 'entry_context', None) or {})
+            for key in ('signal_candle_time', 'entry_candle_time'):
+                if ctx.get(key) is not None:
+                    ctx[key] = _to_ist(ctx[key])
+            rec.update(trade_conditions.safe_context(ctx))
+            exit_color = getattr(trade, 'exit_candle_type', None)
+            if exit_color:
+                rec['exit_candle_type'] = exit_color
+        except Exception:
+            # Booking the trade must never fail on analysis detail.
+            pass
+        self.closed_trades.append(rec)
         # Same accounting rule as the live worker: trades age out of memory,
         # but their PnL must not vanish from the session totals.
         if len(self.closed_trades) > self.MAX_CLOSED_TRADES:
@@ -263,6 +294,38 @@ class PaperTradeService:
             self.dropped_trade_count += len(dropped)
             self.dropped_trade_pnl += sum(float(t.get("pnl") or 0.0) for t in dropped)
             self.closed_trades = self.closed_trades[-self.MAX_CLOSED_TRADES:]
+
+    def _entry_condition_context(self, signal_dir, df_1h_with_ind, df_4h, current_time):
+        """The entry-condition record for a trade opened on this tick.
+
+        Uses the strategy's metadata for the newest 1h bar — the very builders
+        the backtest uses — so a paper trade spells out every entry condition
+        (measured value, threshold, PASS/FAIL) exactly like a backtest row.
+        Strategies that publish no metadata (e.g. FastTest) return ``{}`` and
+        their trade log is unchanged.
+
+        Paper fills happen on the live tick inside the signal bar itself, so
+        the signal candle and the entry candle are the same bar here; the
+        backtest fills on the next candle's open and records it separately.
+        """
+        meta_fn = getattr(self.strategy, 'generate_signals_with_metadata', None)
+        if not callable(meta_fn):
+            return {}
+        try:
+            _, meta = meta_fn(df_1h_with_ind, df_4h)
+            if meta is None or len(meta) == 0:
+                return {}
+            i = len(meta) - 1
+            color = trade_conditions.candle_color(meta, i)
+            return trade_conditions.entry_context(
+                getattr(self.strategy, 'config', self.config), meta, i, signal_dir,
+                signal_candle_time=current_time, entry_candle_time=current_time,
+                entry_candle_type=color)
+        except Exception:
+            # Analysis must never disturb trading: a strategy whose metadata
+            # cannot be read simply gets no condition record. No exception and
+            # no error output — the order path is unaffected.
+            return {}
 
     def _record_equity_point(self):
         """Append one equity-curve sample (IST timestamp, equity in ₹)."""
@@ -478,6 +541,9 @@ class PaperTradeService:
 
         signals = self.strategy.generate_signals(df_1h_with_ind, df_4h)
         last_sig = signals[-1]
+        # Colour of the bar the tick is in, stamped on any trade closed this
+        # tick so the log can name the exit candle (None when unreadable).
+        candle_color = trade_conditions.frame_candle_color(df_1h_with_ind)
 
         # ---- BTC perpetual: traded price vs mark price ---------------
         # Risk maths runs on the MARK price of the perpetual; the traded price
@@ -525,14 +591,28 @@ class PaperTradeService:
         # Everything measured in candles (holding time, one entry per signal,
         # post-exit cooldown) keys off this flag instead of the tick count.
         new_bar = self._last_bar_time is None or current_time != self._last_bar_time
+        # The candle the clock just moved past is complete, so its final close
+        # is available for close-based rules (FastTest V1's 2H validation). The
+        # timestamp is captured BEFORE the clock advances.
+        completed_bar_time = self._last_bar_time
+        completed_bar = None
+        completed_state = None
         if new_bar:
             self._last_bar_time = current_time
             if self._bars_since_exit is not None:
                 self._bars_since_exit += 1
+            completed_bar = completed_bar_close(df_1h, completed_bar_time)
+            # The same candle's RSI / MACD values, for the debug strategies'
+            # configurable signal-condition exits (None unless one is on).
+            completed_state = fast_test_bar_state(df_1h_with_ind, completed_bar_time, self.config)
 
         # ---- Manage open positions ----------------------------------
         if self._manage_open_positions(decision_price, current_atr, current_time,
-                                       trade_price, mark_price, new_bar):
+                                       trade_price, mark_price, new_bar,
+                                       bar_close=completed_bar,
+                                       bar_time=(completed_bar_time if completed_bar else None),
+                                       candle_color=candle_color,
+                                       bar_state=completed_state):
             trade_event = True
 
         # A stale candle set must never OPEN anything — the signal and the
@@ -589,6 +669,8 @@ class PaperTradeService:
                             "BTCUSDT", decision_price, current_time, "REV",
                             "Close & reverse — opposite signal",
                             trade_price_usd=trade_price, mark_price_usd=mark_price)
+                        if candle_color:
+                            closed.exit_candle_type = candle_color
                         self._bars_since_exit = 0
                         self._book_close(closed)
                         trade_event = True
@@ -601,6 +683,13 @@ class PaperTradeService:
                         self._log("warn", "Signal rejected: notional below the minimum 0.001 BTC lot")
                     else:
                         trade_event = True
+                        # The condition snapshot is taken only once the order
+                        # exists, so nothing in the analysis can sit in front of
+                        # (or disturb) the execution itself. An exit hours later
+                        # still exports the conditions the entry was taken on.
+                        entry_ctx = self._entry_condition_context(last_sig, df_1h_with_ind, df_4h, current_time)
+                        if entry_ctx:
+                            new_trade.entry_context = entry_ctx
                         # This candle's signal is spent — the remaining ticks of
                         # the same 1h candle must not open another position.
                         self._acted_signal_bar = current_time
@@ -631,23 +720,41 @@ class PaperTradeService:
     # Trade management helpers
     # ------------------------------------------------------------------
     def _manage_open_positions(self, decision_price, current_atr, current_time,
-                               trade_price, mark_price, advance_bar):
+                               trade_price, mark_price, advance_bar,
+                               bar_close=None, bar_time=None, candle_color=None,
+                               bar_state=None):
         """Mark every open paper position and book any exit it triggers.
 
         Shared by the 60-second candle tick and the live-tick path so a stop
         is acted on as soon as the price arrives, not up to a minute late.
         ``advance_bar`` stays False on the fast path (holding time is candles).
         Returns True when at least one trade closed.
+
+        ``bar_close`` / ``bar_time`` are the *completed* candle's close price
+        and stamp (present only on the tick that follows a candle rollover).
+        Close-based strategy rules — FastTest V1's 2H validation — are judged on
+        them; every other strategy ignores them.
+
+        ``candle_color`` is the colour of the bar this tick is in, stamped on
+        the trade when it closes so the trade log can name the exit candle.
+
+        ``bar_state`` carries that completed candle's RSI / MACD values for the
+        debug strategies' configurable exit conditions (``None`` otherwise).
         """
         closed = False
         for symbol in list(self.oms.active_trades.keys()):
             result = self.oms.update_trade(symbol, decision_price, current_atr, current_time,
                                            trade_price_usd=trade_price,
                                            mark_price_usd=mark_price,
-                                           advance_bar=advance_bar)
+                                           advance_bar=advance_bar,
+                                           bar_close_usd=(float(bar_close[0]) if bar_close else None),
+                                           bar_time=bar_time,
+                                           strategy_bar_state=bar_state)
             if result:
                 closed = True
                 self._bars_since_exit = 0
+                if candle_color:
+                    result.exit_candle_type = candle_color
                 self._book_close(result)
         return closed
 

@@ -477,6 +477,7 @@ const PaperTab = () => {
       <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 flex items-center gap-4 flex-wrap">
         <button onClick={() => start('PhantomV2')} className="bg-green-600 hover:bg-green-500 px-6 py-3 rounded-xl font-bold">▶ Start Kudos v3 Paper</button>
         <button onClick={() => start('FastTest')} className="bg-gray-600 hover:bg-gray-500 px-6 py-3 rounded-xl font-bold">▶ Start FastTest (debug)</button>
+        <button onClick={() => start('FastTestV1')} className="bg-gray-600 hover:bg-gray-500 px-6 py-3 rounded-xl font-bold">▶ Start FastTest V1.0 (debug)</button>
         {msg && <span className="text-xs text-gray-400 font-mono">{msg}</span>}
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
