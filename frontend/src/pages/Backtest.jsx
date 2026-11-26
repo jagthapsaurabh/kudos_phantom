@@ -1352,6 +1352,9 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     contract: results.contract,
     blockedEntries: Number(results.blocked_entries || 0),
     windows: results.params?.trading_windows || null,
+    // Which candles produced this run — shown next to the summary so a
+    // zero-trade backtest can be compared with the paper session's feed.
+    dataInfo: results.data_info || null,
   } : null;
 
   const pieData = stats?.exitDist ? Object.entries(stats.exitDist).map(([name, value]) => ({ name, value })) : [];
@@ -2206,6 +2209,13 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
               <span className="rounded border border-gray-700 bg-gray-800 px-2 py-0.5 font-mono text-gray-200">
                 {stats?.contract || `${perpetualFor(results?.data_source)} perpetual`}
               </span>
+              {stats?.dataInfo?.['1h']?.rows > 0 && (
+                <span title={`${stats.dataInfo['1h'].origin === 'seeded' ? 'Seeded' : 'Venue API'} ${stats.dataInfo['1h'].symbol} candles on ${stats.dataInfo.source}`}
+                      className="rounded border border-gray-700 bg-gray-800 px-2 py-0.5 font-mono text-gray-300">
+                  {stats.dataInfo['1h'].origin === 'seeded' ? 'Seeded' : 'Venue'} candles ·{' '}
+                  {Number(stats.dataInfo['1h'].rows).toLocaleString('en-IN')} × 1h
+                </span>
+              )}
               <span className={`rounded border px-2 py-0.5 font-semibold ${
                 stats?.useMarkPrice ? 'border-amber-700/60 bg-amber-900/20 text-amber-300'
                                     : 'border-gray-700 bg-gray-800 text-gray-400'}`}>

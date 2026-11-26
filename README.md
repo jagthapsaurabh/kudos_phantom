@@ -253,6 +253,11 @@ contract value and tick size fall back to the venue's instrument endpoint and ca
 is the single resolver used by market-data seeding, the backtest engine, the paper worker and the
 live worker (`GET /market/contract` shows which one a venue resolves to).
 
+**Paper vs Backtest trades.** When a paper session shows trades but a backtest of the same
+strategy/period shows none, check the run's `data_info` badge and
+[docs/backtest_paper_parity.md](docs/backtest_paper_parity.md): both modes must resolve the venue's
+BTC symbol (`BTCUSD` on Delta, `BTCUSDT` on Binance) and read the same seeded 1h/4h candles.
+
 **Mark price.** Risk runs on the exchange **mark price**, the same price liquidations are computed
 on: stop-loss, take-profit, trailing, breakeven, drawdown and PnL are all evaluated on it. The price
 an order actually fills at (traded/last price) is recorded beside it, so a trade can always be

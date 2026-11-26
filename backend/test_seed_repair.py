@@ -563,7 +563,7 @@ check("Delta pre-listing window advanced as an empty page",
       (dsummary.get("empty_pages") or 0) >= 1, str(dsummary.get("empty_pages")))
 db = SessionLocal()
 drows = [r.event_time for r in db.query(Klines).filter_by(
-    source="Delta", symbol="BTCUSDT", interval="1d").order_by(Klines.event_time).all()]
+    source="Delta", symbol="BTCUSD", interval="1d").order_by(Klines.event_time).all()]
 db.close()
 check("Delta candles form a clean grid with no duplicates", len(drows) == expected_delta
       and len(set(drows)) == len(drows), f"rows={len(drows)}")
@@ -586,7 +586,7 @@ check("Delta mark series requested the MARK: perpetual symbol",
       str(delta_mark_symbols[:3]))
 db = SessionLocal()
 dmarked = db.query(Klines).filter(
-    Klines.source == "Delta", Klines.symbol == "BTCUSDT", Klines.interval == "1d",
+    Klines.source == "Delta", Klines.symbol == "BTCUSD", Klines.interval == "1d",
     Klines.event_time >= datetime(2020, 1, 15), Klines.event_time <= datetime(2020, 1, 24),
     Klines.mark_close.isnot(None)).count()
 db.close()
@@ -626,7 +626,7 @@ finally:
     DataSyncService._delta_fetch = classmethod(REAL_DELTA_FETCH)
 
 db = SessionLocal()
-dbg = db.query(Klines).filter_by(source="Delta", symbol="BTCUSDT", interval="1d").filter(
+dbg = db.query(Klines).filter_by(source="Delta", symbol="BTCUSD", interval="1d").filter(
     Klines.event_time >= datetime(2020, 3, 1), Klines.event_time <= datetime(2020, 3, 15)).count()
 db.close()
 check("Delta background job seeded the requested range", dbg == 15, f"candles={dbg}")

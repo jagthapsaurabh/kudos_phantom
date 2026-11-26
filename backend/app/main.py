@@ -1842,7 +1842,8 @@ def market_data_status(health: bool = False, admin=Depends(require_admin), db=De
     """Per-series inventory. `duplicate_rows` is always reported (SQL
     count/distinct). With ?health=1 the response also carries `misaligned_rows`
     — candles whose timestamp is off the interval grid, the signature of the
-    corrupted CSV imports — via an exact (capped) scan."""
+    corrupted CSV imports — and `gap_count` / `largest_gap_bars` for missing
+    candles in the recent window (both via capped scans)."""
     rows = db.query(
         Klines.source, Klines.symbol, Klines.interval,
         func.count(Klines.id).label('count'), func.count(Klines.volume).label('volume_rows'),
@@ -1865,6 +1866,8 @@ def market_data_status(health: bool = False, admin=Depends(require_admin), db=De
             item = health_by_key.get((source, symbol, interval), {})
             entry['misaligned_rows'] = item.get('misaligned_rows')
             entry['scanned_rows'] = item.get('scanned', 0)
+            entry['gap_count'] = item.get('gap_count', 0)
+            entry['largest_gap_bars'] = item.get('largest_gap_bars', 0)
         result.append(entry)
     return result
 
@@ -2417,6 +2420,7 @@ def execute_backtest_task(run_id: int, req: BacktestRequest, user_id: int):
             run.roi = float(results['roi'])
             run.equity_curve = results['equity_curve']
             run.rejected_reasons = json.dumps(results.get('rejected_reasons', {}))
+            run.data_info_json = json.dumps(results.get('data_info', {}), default=str)
             run.data_source = source
             run.fee_mode = req.fee_mode
             run.taker_fee_bps = float(fees.taker_fee_bps)
@@ -2580,6 +2584,9 @@ def get_backtest_results(run_id: int, user=Depends(get_current_user), db=Depends
             "maker_fee_bps": run.maker_fee_bps,
             "timestamp": run.timestamp,
             "rejected_reasons": json.loads(run.rejected_reasons) if run.rejected_reasons else {},
+            # The exact candles behind the run, so "paper had trades, backtest
+            # had none" can be checked against the seeded source/symbol.
+            "data_info": (json.loads(run.data_info_json) if getattr(run, 'data_info_json', None) else {}),
             # BTC perpetual pricing + the blackout schedule that shaped the run.
             "use_mark_price": int(run.use_mark_price) if run.use_mark_price is not None else 1,
             "trading_windows_enabled": int(run.trading_windows_enabled or 0),
@@ -4023,30 +4030,43 @@ def get_klines(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 500,
                source: str = "Delta", start_date: Optional[str] = None,
                end_date: Optional[str] = None, db=Depends(get_db)):
     try:
-        # A date window is required for strategy/backtest overlays: the last-N
-        # candles from "now" never contain a 2020–2024 trade marker.
-        q = db.query(Klines).filter(
-            Klines.symbol == symbol,
-            Klines.interval == interval,
-            Klines.source == normalize_source(source)
-        )
+        from .services.data_sync import DataSyncService
+        venue = normalize_source(source)
+        # Delta stores its BTC perpetual as BTCUSD, Binance as BTCUSDT. The
+        # chart request still uses BTCUSDT, so resolve both spellings here or
+        # the overlay silently renders the API fallback instead of the seed.
+        symbols = DataSyncService.stored_symbols(venue, symbol)
         windowed = bool(start_date or end_date)
-        if start_date:
-            try:
-                q = q.filter(Klines.event_time >= datetime.strptime(start_date, "%Y-%m-%d"))
-            except ValueError:
-                pass
-        if end_date:
-            try:
-                q = q.filter(Klines.event_time < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
-            except ValueError:
-                pass
         cap = max(1, min(int(limit or 500), 60000 if windowed else 5000))
-        if windowed:
-            data = q.order_by(Klines.event_time.asc()).limit(cap).all()
-        else:
-            data = q.order_by(Klines.event_time.desc()).limit(cap).all()
-            data.reverse()
+
+        data = []
+        # Exact source match first (indexed), then the case-insensitive repair
+        # pass for rows written by older scripts.
+        for source_filter in (Klines.source == venue, func.lower(Klines.source) == venue.lower()):
+            for stored_symbol in symbols:
+                q = db.query(Klines).filter(
+                    Klines.symbol == stored_symbol,
+                    Klines.interval == interval,
+                    source_filter,
+                )
+                if start_date:
+                    try:
+                        q = q.filter(Klines.event_time >= datetime.strptime(start_date, "%Y-%m-%d"))
+                    except ValueError:
+                        pass
+                if end_date:
+                    try:
+                        q = q.filter(Klines.event_time < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+                    except ValueError:
+                        pass
+                data = (q.order_by(Klines.event_time.asc()).limit(cap).all() if windowed else
+                        q.order_by(Klines.event_time.desc()).limit(cap).all())
+                if not windowed:
+                    data.reverse()
+                if data:
+                    break
+            if data:
+                break
 
         if data:
             formatted = []
