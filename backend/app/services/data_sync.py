@@ -73,6 +73,12 @@ class DataSyncService:
     # A manual admin refresh and the startup/24-hour worker must not overlap
     # and double the exchange request rate.
     DAILY_SYNC_LOCK = threading.Lock()
+    # The daily job also closes holes left by a failed window / a server that
+    # was down for a few days. Scan a bounded recent window so an offline
+    # install with years of history is not re-walked on every startup.
+    GAP_LOOKBACK_DAYS = 90
+    GAP_SCAN_ROW_LIMIT = 50_000
+    GAP_FILL_WINDOWS_PER_INTERVAL = 20
 
     @classmethod
     def normalize_source(cls, source: str | None) -> str:
@@ -97,6 +103,25 @@ class DataSyncService:
         if raw not in _PERPETUAL_ALIASES:
             return symbol
         return perpetual_symbol(cls.normalize_source(source), raw)
+
+    @classmethod
+    def series_symbol(cls, source, symbol="BTCUSDT"):
+        """The ONE symbol used on a klines row for this venue.
+
+        Every write path (manual seed, daily refresh, mark prices, repair) must
+        use this value. Historically the full-history seed wrote the incoming
+        ``BTCUSDT`` while the daily job wrote ``BTCUSD`` for Delta, producing
+        two divergent series — the daily job updated one and the backtest read
+        the other.
+        """
+        return cls.venue_symbol(source, symbol)
+
+    @classmethod
+    def stored_symbols(cls, source, symbol="BTCUSDT"):
+        """Canonical symbol first, then the alias older installs may hold."""
+        canonical = cls.series_symbol(source, symbol)
+        raw = str(symbol or "BTCUSDT").replace("/", "").replace("-", "").upper()
+        return [value for value in dict.fromkeys((canonical, raw)) if value]
 
     @staticmethod
     def _as_datetime(value):
@@ -448,6 +473,7 @@ class DataSyncService:
         from app.core.mark_price import upsert_mark_rows
 
         source = cls.normalize_source(source)
+        symbol = cls.series_symbol(source, symbol)
         kind = cls._adapter_kind(source, definition)
         intervals = list(intervals or (cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES))
         init_db()
@@ -459,14 +485,28 @@ class DataSyncService:
                 try:
                     interval_seconds = cls._interval_seconds(interval)
                     page_limit = cls._page_limit(source, limit, definition)
-                    if start_time:
+                    # With no explicit range (the daily job), resume from the
+                    # oldest candle in the recent window that still lacks a
+                    # mark. Fetching only the newest exchange page left older
+                    # backfilled candles priced on traded data forever.
+                    mark_start = start_time
+                    if not mark_start:
+                        lookback_from = datetime.utcnow() - timedelta(days=cls.GAP_LOOKBACK_DAYS)
+                        unmarked = db.query(func.min(Klines.event_time)).filter(
+                            Klines.source == source, Klines.symbol == symbol,
+                            Klines.interval == interval,
+                            Klines.event_time >= lookback_from,
+                            Klines.mark_close.is_(None),
+                        ).first()
+                        mark_start = unmarked[0] if unmarked and unmarked[0] else None
+                    if mark_start:
                         # Full-history mark backfill: page the whole range like
                         # the traded-OHLCV seed instead of fetching a single
                         # page (one page covers only the first `limit` candles
                         # of a 2020 → today range). Mark rows whose candle is
                         # not seeded yet are skipped, so this runs after the
                         # OHLCV seed of the same range.
-                        cursor = cls._as_datetime(start_time)
+                        cursor = cls._as_datetime(mark_start)
                         range_end = cls._as_datetime(end_time) if end_time else datetime.utcnow()
                         # A date-only end string (YYYY-MM-DD) is inclusive
                         # through that day — the same rule as the traded-OHLCV
@@ -474,10 +514,11 @@ class DataSyncService:
                         if isinstance(end_time, str) and len(end_time) == 10:
                             range_end += timedelta(days=1) - timedelta(microseconds=1)
                         window_span = timedelta(seconds=interval_seconds * max(0, page_limit - 1))
-                        inserted = updated = fetched = 0
+                        inserted = updated = fetched = pages = 0
                         first = last = None
                         window_attempts = 0
-                        while cursor < range_end:
+                        max_pages = max(20, cls.GAP_FILL_WINDOWS_PER_INTERVAL * 2)
+                        while cursor < range_end and pages < max_pages:
                             window_end = min(range_end, cursor + window_span)
                             try:
                                 rows = cls.fetch_mark_klines(source, symbol, interval, cursor,
@@ -490,6 +531,7 @@ class DataSyncService:
                                                    cls.RETRY_SLEEP_CAP_SECONDS))
                                     continue
                                 raise
+                            pages += 1
                             if rows:
                                 result = upsert_mark_rows(db, rows, source, symbol, interval)
                                 db.commit()
@@ -503,14 +545,14 @@ class DataSyncService:
                                 time.sleep(cls.SEED_PAGE_SLEEP_SECONDS)
                         entry.update(inserted=inserted, updated=updated,
                                      total=inserted + updated, fetched=fetched,
-                                     first=first, last=last)
+                                     pages=pages, first=first, last=last)
+                        if cursor < range_end:
+                            entry['error'] = (f'mark backfill capped at {max_pages} windows; '
+                                              'the next daily run continues from the oldest '
+                                              'candle still without a mark')
                     else:
-                        rows = cls.fetch_mark_klines(source, symbol, interval, start_time,
-                                                     end_time, limit, definition=definition)
-                        result = upsert_mark_rows(db, rows, source, symbol, interval) if rows else {
-                            "inserted": 0, "updated": 0, "total": 0}
-                        db.commit()
-                        entry.update(result, fetched=len(rows))
+                        # Nothing unmarked in the lookback — no venue request.
+                        entry.update(inserted=0, updated=0, total=0, fetched=0)
                 except MarketDataError as exc:
                     db.rollback()
                     entry.update(inserted=0, updated=0, total=0, fetched=0, error=str(exc))
@@ -661,6 +703,7 @@ class DataSyncService:
         are never touched. Re-seed afterwards to refill what was removed.
         """
         source = cls.normalize_source(source)
+        symbols = cls.stored_symbols(source, symbol)
         kind = cls._adapter_kind(source, definition)
         if intervals is None:
             intervals = cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES
@@ -675,17 +718,18 @@ class DataSyncService:
         try:
             for interval in intervals:
                 interval_seconds = cls._interval_seconds(interval)
-                # id-ascending so the last id per timestamp is the newest write
-                rows = db.query(Klines.id, Klines.event_time).filter(
-                    Klines.source == source, Klines.symbol == symbol,
+                # Repair the canonical series AND any legacy alias still in
+                # the database, so a stale duplicate cannot feed a chart.
+                rows = db.query(Klines.id, Klines.symbol, Klines.event_time).filter(
+                    Klines.source == source, Klines.symbol.in_(symbols),
                     Klines.interval == interval,
-                ).order_by(Klines.event_time.asc(), Klines.id.asc()).all()
+                ).order_by(Klines.symbol.asc(), Klines.event_time.asc(), Klines.id.asc()).all()
 
                 aligned_ids_by_time = {}
                 misaligned_ids = set()
-                for row_id, event_time in rows:
+                for row_id, row_symbol, event_time in rows:
                     if cls._aligned_to_grid(event_time, interval_seconds):
-                        aligned_ids_by_time.setdefault(event_time, []).append(row_id)
+                        aligned_ids_by_time.setdefault((row_symbol, event_time), []).append(row_id)
                     else:
                         misaligned_ids.add(row_id)
                 duplicate_ids = set()
@@ -700,7 +744,7 @@ class DataSyncService:
                         Klines.id.in_(chunk)).delete(synchronize_session=False)
                 db.commit()
                 summary.append({
-                    "source": source, "symbol": symbol, "interval": interval,
+                    "source": source, "symbol": symbols[0], "interval": interval,
                     "total": len(rows), "removed": len(remove_ids),
                     "duplicates_removed": len(duplicate_ids),
                     "misaligned_removed": len(misaligned_ids),
@@ -714,8 +758,47 @@ class DataSyncService:
         return summary
 
     @classmethod
+    def find_gaps(cls, source="Delta", symbol="BTCUSDT", interval="1h",
+                  start=None, end=None, limit=None, db=None):
+        """Missing candle ranges in one stored series, oldest first.
+
+        Returns ``[(start, end), ...]`` of inclusive missing candle timestamps.
+        Only the newest ``limit`` rows are walked; a bounded lookback keeps this
+        cheap enough for the daily job and the admin health screen.
+        """
+        source = cls.normalize_source(source)
+        symbol = cls.series_symbol(source, symbol)
+        interval_seconds = cls._interval_seconds(str(interval).lower())
+        end = cls._as_datetime(end) if end else datetime.utcnow()
+        lookback = timedelta(days=cls.GAP_LOOKBACK_DAYS)
+        start = cls._as_datetime(start) if start else max(cls.FULL_HISTORY_START, end - lookback)
+        limit = int(limit or cls.GAP_SCAN_ROW_LIMIT)
+
+        own_db = db is None
+        db = db or SessionLocal()
+        try:
+            times = [cls._as_datetime(row[0]) for row in db.query(Klines.event_time).filter(
+                Klines.source == source, Klines.symbol == symbol,
+                Klines.interval == str(interval).lower(),
+                Klines.event_time >= start, Klines.event_time <= end,
+            ).order_by(Klines.event_time.desc()).limit(limit + 1).all()]
+        finally:
+            if own_db:
+                db.close()
+        times.reverse()
+
+        gaps = []
+        for previous, current in zip(times, times[1:]):
+            expected = cls._next_grid_time(previous, interval_seconds)
+            if current > expected:
+                gaps.append((expected, current - timedelta(seconds=interval_seconds)))
+                if len(gaps) >= cls.GAP_FILL_WINDOWS_PER_INTERVAL:
+                    break
+        return gaps
+
+    @classmethod
     def data_health(cls, scan_limit=None):
-        """Per-series corruption counters: duplicate and off-grid candles.
+        """Per-series corruption counters: duplicate, off-grid and gaps.
 
         ``duplicate_rows`` is a cheap SQL count/distinct and always exact.
         ``misaligned_rows`` uses the exact grid check in Python and is capped
@@ -753,6 +836,18 @@ class DataSyncService:
                         misaligned += 1
                 entry["scanned"] = min(len(rows), scan_limit)
                 entry["misaligned_rows"] = misaligned if (misaligned or not truncated) else None
+                # Gap counting is only meaningful for the canonical series;
+                # a legacy alias is reported as-is and merged by migrate_db.
+                entry["gap_count"] = 0
+                entry["largest_gap_bars"] = 0
+                if symbol == cls.series_symbol(source, symbol):
+                    gaps = cls.find_gaps(source, symbol, interval, end=datetime.utcnow(),
+                                         limit=min(scan_limit, cls.GAP_SCAN_ROW_LIMIT), db=db)
+                    entry["gap_count"] = len(gaps)
+                    if gaps:
+                        entry["largest_gap_bars"] = max(
+                            int((finish - begin).total_seconds() // interval_seconds) + 1
+                            for begin, finish in gaps)
             return [report[key] for key in sorted(report)]
         finally:
             db.close()
@@ -920,6 +1015,10 @@ class DataSyncService:
         trying to advance from whichever end the exchange happened to return.
         """
         source = cls.normalize_source(source)
+        # One canonical symbol on every row: progress cursor, OHLC upsert and
+        # mark-price join all key off this value. A raw BTCUSDT used to write
+        # a second Delta series that the daily job never updated.
+        symbol = cls.series_symbol(source, symbol)
         kind = cls._adapter_kind(source, definition)
         if intervals is None:
             intervals = cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES
@@ -1163,11 +1262,19 @@ class DataSyncService:
     @classmethod
     def sync_market_data(cls, source="Delta", symbol=None, intervals=None,
                           definition=None, limit=1000):
-        """Incrementally refresh one configured source for the daily job."""
+        """Incrementally refresh one configured source for the daily job.
+
+        Starts at the oldest missing candle in the recent lookback (not just
+        the last stored one), pages all the way up to now, and upserts into the
+        same canonical series the backtest reads. A failed window is reported
+        and stops that interval; the next daily run starts from the hole again
+        instead of pretending the series is complete.
+        """
         source = cls.normalize_source(source)
-        symbol = symbol or cls.SYMBOL
+        symbol = cls.series_symbol(source, symbol or cls.SYMBOL)
         kind = cls._adapter_kind(source, definition)
         intervals = intervals or (cls.DELTA_HISTORY_INTERVALS if kind == "delta" else cls.TIMEFRAMES)
+        page_limit = cls._page_limit(source, limit, definition)
         init_db()
         db = SessionLocal()
         try:
@@ -1185,25 +1292,61 @@ class DataSyncService:
         for interval in intervals:
             interval_seconds = cls._interval_seconds(interval)
             latest = latest_by_interval.get(interval)
-            last_time = latest[0] if latest else None
-            start = cls._as_datetime(last_time) - timedelta(seconds=interval_seconds) if last_time else \
-                end - timedelta(seconds=interval_seconds * cls._page_limit(source, limit, definition))
-            try:
-                rows = cls.fetch_klines(
-                    source, symbol, interval, start, end, limit, definition=definition
-                )
-                result = cls.upsert_rows(rows, source, symbol, interval) if rows else {
-                    "inserted": 0, "updated": 0, "total": 0
-                }
-                item = {"source": source, "symbol": symbol, "interval": interval,
-                        "fetched": len(rows), "first": rows[0]["event_time"] if rows else None,
-                        "last": rows[-1]["event_time"] if rows else None, **result}
-                print(f"Synced {len(rows)} {source} {symbol} {interval} candles")
-            except MarketDataError as exc:
-                item = {"source": source, "symbol": symbol, "interval": interval,
-                        "fetched": 0, "inserted": 0, "updated": 0, "total": 0,
-                        "error": str(exc)}
-                print(f"Sync skipped for {source}/{interval}: {exc}")
+            last_time = cls._as_datetime(latest[0]) if latest else None
+            tail_start = (last_time - timedelta(seconds=interval_seconds)) if last_time else \
+                (end - timedelta(seconds=interval_seconds * page_limit))
+
+            # Interior holes left by a failed page or a server outage take
+            # priority over the tail: filling the tail first would move the
+            # "latest" cursor past the gap and hide it forever.
+            gaps = cls.find_gaps(source, symbol, interval, end=end)
+            cursor = gaps[0][0] if gaps else tail_start
+            fetched = inserted = updated = pages = 0
+            first = last = None
+            error = None
+            max_pages = max(20, cls.GAP_FILL_WINDOWS_PER_INTERVAL * 2)
+            while cursor <= end and pages < max_pages:
+                window_end = min(end, cursor + timedelta(seconds=interval_seconds * (page_limit - 1)))
+                try:
+                    rows = cls.fetch_klines(
+                        source, symbol, interval, cursor, window_end, page_limit,
+                        definition=definition,
+                    )
+                except MarketDataError as exc:
+                    error = str(exc)
+                    break
+                pages += 1
+                fetched += len(rows or [])
+                if rows:
+                    first = min(first, cls._as_datetime(rows[0]["event_time"])) if first else \
+                        cls._as_datetime(rows[0]["event_time"])
+                    last = max(last, cls._as_datetime(rows[-1]["event_time"])) if last else \
+                        cls._as_datetime(rows[-1]["event_time"])
+                    result = cls.upsert_rows(rows, source, symbol, interval)
+                    inserted += result["inserted"]
+                    updated += result["updated"]
+                # Advance by the requested window, not by the last row: an
+                # empty/short page must never be fetched again forever.
+                cursor = cls._next_grid_time(window_end, interval_seconds)
+
+            remaining = cls.find_gaps(source, symbol, interval, end=end)
+            item = {"source": source, "symbol": symbol, "interval": interval,
+                    "fetched": fetched, "first": first, "last": last,
+                    "inserted": inserted, "updated": updated, "total": inserted + updated,
+                    "pages": pages, "gaps_found": len(gaps),
+                    "gaps_remaining": len(remaining), "gaps": remaining[:5]}
+            if error:
+                item["error"] = error
+            if pages >= max_pages and cursor <= end:
+                item["error"] = (item.get("error") or "") + \
+                    f" daily refresh capped at {max_pages} windows; re-run to continue"
+                item["error"] = item["error"].strip()
+            status = f"Synced {fetched} {source} {symbol} {interval} candles in {pages} windows"
+            if remaining:
+                status += f" ({len(remaining)} gap(s) still open)"
+            print(status)
+            if error:
+                print(f"Sync incomplete for {source}/{interval}: {item['error']}")
             summary.append(item)
         return summary
 

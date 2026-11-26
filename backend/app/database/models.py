@@ -331,6 +331,9 @@ class BacktestRun(Base):
     roi = Column(Float)
     equity_curve = Column(JSON, nullable=True)
     rejected_reasons = Column(String, nullable=True)
+    # Which candles a run actually used (seeded vs venue fallback, symbol,
+    # row counts). Stored so an empty result can be diagnosed after the fact.
+    data_info_json = Column(String, nullable=True)
     trades = relationship('Trade', back_populates='run', cascade='all, delete-orphan')
 
 
@@ -668,6 +671,44 @@ def migrate_db():
                 ))
             except Exception as exc:
                 print(f'[migrate] kline dedupe skipped: {exc}')
+
+            # Full-history seeds used to store the caller's ticker verbatim
+            # while the daily job stored the venue ticker (Delta BTCUSDT vs
+            # BTCUSD). That left two divergent series: the backtest read one,
+            # the daily updater fed the other. Fold every legacy alias into the
+            # canonical series once, keeping whichever mark price is present,
+            # then drop the stale alias rows. Idempotent: no alias rows = no-op.
+            for source_code, alias, canonical in (
+                ('Delta', 'BTCUSDT', 'BTCUSD'),
+                ('DeltaGlobal', 'BTCUSDT', 'BTCUSD'),
+                ('Binance', 'BTCUSD', 'BTCUSDT'),
+            ):
+                try:
+                    params = {'source': source_code, 'alias': alias, 'canonical': canonical}
+                    moved = conn.execute(text(
+                        'INSERT INTO klines '
+                        '(source, symbol, interval, event_time, open, high, low, close, volume, '
+                        ' mark_open, mark_high, mark_low, mark_close) '
+                        'SELECT source, :canonical, interval, event_time, open, high, low, close, volume, '
+                        '       mark_open, mark_high, mark_low, mark_close '
+                        'FROM klines '
+                        'WHERE lower(source) = lower(:source) AND symbol = :alias '
+                        'ON CONFLICT(source, symbol, interval, event_time) DO UPDATE SET '
+                        '  open=excluded.open, high=excluded.high, low=excluded.low, '
+                        '  close=excluded.close, volume=excluded.volume, '
+                        '  mark_open=COALESCE(klines.mark_open, excluded.mark_open), '
+                        '  mark_high=COALESCE(klines.mark_high, excluded.mark_high), '
+                        '  mark_low=COALESCE(klines.mark_low, excluded.mark_low), '
+                        '  mark_close=COALESCE(klines.mark_close, excluded.mark_close)'
+                    ), params).rowcount
+                    if moved:
+                        conn.execute(text(
+                            'DELETE FROM klines WHERE lower(source) = lower(:source) AND symbol = :alias'
+                        ), params)
+                        print(f'[migrate] merged {moved} legacy {source_code} {alias} '
+                              f'candles into {canonical}')
+                except Exception as exc:
+                    print(f'[migrate] {source_code} symbol merge skipped: {exc}')
 
         # Sessions predate the paper/live split: everything already stored was
         # a paper run, so stamp it rather than leaving the discriminator NULL.

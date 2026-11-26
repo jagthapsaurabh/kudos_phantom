@@ -5,7 +5,8 @@ from . import trade_conditions
 from .strategy import ValidatorService
 from ..services.order_manager import OrderManager
 from ..database.models import SessionLocal, Klines
-from datetime import datetime
+from datetime import datetime, timedelta
+from sqlalchemy import func
 
 class BacktestEngine:
     def __init__(self, config: PhantomV2Config = PhantomV2Config(), fee_schedule=None, data_source="Delta",
@@ -20,18 +21,134 @@ class BacktestEngine:
         self.strategy_service = strategy_service or StrategyService(config)
         self.validator_service = ValidatorService()
         self.oms = oms or OrderManager(config)
+        # Set when the venue fallback fails, so a zero-trade run can say why.
+        self.last_data_error = None
+        self.data_info = {}
+
+    # ------------------------------------------------------------------
+    # Market data resolution
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _date_window(start_date, end_date):
+        """Normalise API/CLI date inputs to naive datetimes.
+
+        A date-only end (``"2026-10-26"``) is inclusive through that whole day,
+        exactly like the seeder and ``GET /klines``. The old ``event_time <=
+        '2026-10-26'`` string comparison silently dropped the final day.
+        """
+        def parse(value):
+            if value is None or value == '':
+                return None
+            if isinstance(value, datetime):
+                return value.replace(tzinfo=None) if value.tzinfo else value
+            if isinstance(value, pd.Timestamp):
+                ts = value.to_pydatetime()
+                return ts.replace(tzinfo=None) if ts.tzinfo else ts
+            if hasattr(value, 'year') and hasattr(value, 'month') and hasattr(value, 'day'):
+                return datetime(value.year, value.month, value.day)
+            try:
+                ts = pd.to_datetime(str(value), errors='raise').to_pydatetime()
+                return ts.replace(tzinfo=None) if ts.tzinfo else ts
+            except (TypeError, ValueError):
+                return None
+
+        start = parse(start_date)
+        end = parse(end_date)
+        if end is not None and isinstance(end_date, str) and len(end_date.strip()) <= 10:
+            end += timedelta(days=1) - timedelta(microseconds=1)
+        return start, end
+
+    @staticmethod
+    def _series_symbols(source, symbol):
+        """Symbols a seeded series may be stored under, venue symbol first.
+
+        Delta lists the BTC perpetual as ``BTCUSD`` while Binance uses
+        ``BTCUSDT``. The seeder stores the venue symbol; older CSV imports and
+        scripts stored ``BTCUSDT`` for both. Accept either so a backtest reads
+        the candles that were actually seeded instead of silently falling back
+        to a short live fetch (or no data at all).
+        """
+        from ..services.data_sync import DataSyncService
+        return DataSyncService.stored_symbols(source, symbol)
+
+    @staticmethod
+    def _row_time(row):
+        ts = pd.Timestamp(row.get('event_time')).to_pydatetime()
+        return ts.replace(tzinfo=None) if ts.tzinfo else ts
+
+    def _fetch_api_candles(self, fetcher, source, symbol, interval,
+                           start_dt, end_dt, page_limit):
+        """Page a venue API over the requested window (oldest first).
+
+        One exchange page is not a whole backtest: 1,000 hourly candles only
+        cover ~41 days, so a two-month run used to lose its first weeks when it
+        had to fall back to the API.
+        """
+        from ..services.data_sync import DataSyncService
+
+        def collect(batch):
+            for row in batch or []:
+                try:
+                    rows[self._row_time(row)] = dict(row)
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+        rows = {}
+        if start_dt is None and end_dt is None:
+            collect(fetcher(source, symbol, interval, None, None, 500))
+            return [rows[ts] for ts in sorted(rows)]
+
+        seconds = DataSyncService._interval_seconds(str(interval).lower())
+        cursor = start_dt or (end_dt - timedelta(seconds=seconds * page_limit))
+        final = end_dt or datetime.utcnow()
+        # A hard cap keeps a malformed date range from hammering the venue.
+        for _ in range(20):
+            if cursor > final:
+                break
+            window_end = min(final, cursor + timedelta(seconds=seconds * (page_limit - 1)))
+            batch = fetcher(source, symbol, interval, cursor, window_end, page_limit) or []
+            collect(batch)
+            newest = max((self._row_time(row) for row in batch), default=None)
+            cursor = (newest + timedelta(seconds=seconds)) if newest else \
+                (window_end + timedelta(seconds=seconds))
+        return [rows[ts] for ts in sorted(rows)]
 
     def _get_data_from_db(self, symbol, interval, start_date=None, end_date=None, source=None):
-        db = SessionLocal()
-        query = db.query(Klines).filter(Klines.symbol == symbol, Klines.interval == interval)
-        if source:
-            query = query.filter(Klines.source == source)
-        if start_date: query = query.filter(Klines.event_time >= start_date)
-        if end_date: query = query.filter(Klines.event_time <= end_date)
-        data = query.order_by(Klines.event_time.asc()).all()
-        db.close()
+        from ..services.data_sync import DataSyncService
 
-        if data:
+        source_name = DataSyncService.normalize_source(source or self.data_source or 'Delta')
+        symbols = self._series_symbols(source_name, symbol)
+        start_dt, end_dt = self._date_window(start_date, end_date)
+        db = SessionLocal()
+        available, data, winner = [], [], None
+        try:
+            def lookup(source_filter):
+                queries = {}
+                for candidate in symbols:
+                    query = db.query(Klines).filter(
+                        Klines.symbol == candidate, Klines.interval == interval, source_filter)
+                    if start_dt:
+                        query = query.filter(Klines.event_time >= start_dt)
+                    if end_dt:
+                        query = query.filter(Klines.event_time <= end_dt)
+                    queries[candidate] = query
+                # If both a legacy and a venue-symbol series exist, use the one
+                # that actually covers the requested window.
+                counts = {sym: query.count() for sym, query in queries.items()}
+                found = [(sym, count) for sym, count in counts.items() if count]
+                # Venue symbol wins ties (that is what the current seeder writes).
+                best = max(found, key=lambda item: (item[1], -symbols.index(item[0])))[0] if found else None
+                return found, (queries[best].order_by(Klines.event_time.asc()).all() if best else []), best
+
+            # Exact match first so the indexed source column stays usable;
+            # the case-insensitive pass only repairs old hand-written rows.
+            available, data, winner = lookup(Klines.source == source_name)
+            if not available:
+                available, data, winner = lookup(func.lower(Klines.source) == source_name.lower())
+        finally:
+            db.close()
+
+        if available:
             df = pd.DataFrame([
                 {'event_time': k.event_time, 'open': k.open, 'high': k.high, 'low': k.low, 'close': k.close, 'volume': k.volume,
                  'mark_open': getattr(k, 'mark_open', None), 'mark_high': getattr(k, 'mark_high', None),
@@ -39,47 +156,52 @@ class BacktestEngine:
                 for k in data
             ])
             df.set_index('event_time', inplace=True)
-            return df
+            df.attrs.update({'origin': 'seeded', 'symbol': winner, 'source': source_name,
+                             'rows': len(df),
+                             'first': df.index.min() if len(df) else None,
+                             'last': df.index.max() if len(df) else None})
+            return df.sort_index()
 
-        # Fallback: when DB is empty (e.g. sandbox or recent date not seeded yet),
-        # fetch from the venue's public API so chart signals and backtest use the
-        # same candles. This fixes "chart shows 5 signals for 28 Aug 2026 but
-        # backtest shows 0 trades" when the DB has no 2026 data but /klines does.
+        # Fallback: when no seed covers the window, fetch from the venue's
+        # public API so chart signals and backtests still see the same candles.
+        # The venue symbol resolver is shared with the seeder and paper worker.
         try:
-            from ..services.data_sync import DataSyncService
-            from datetime import datetime as _dt
-            # Parse start/end which may be strings like "2026-08-28"
-            s_dt = None
-            e_dt = None
-            if start_date:
-                try:
-                    s_dt = _dt.strptime(str(start_date)[:10], "%Y-%m-%d")
-                except Exception:
-                    s_dt = None
-            if end_date:
-                try:
-                    e_dt = _dt.strptime(str(end_date)[:10], "%Y-%m-%d") + pd.Timedelta(days=1)
-                except Exception:
-                    e_dt = None
-            # Fetch enough candles to cover the range; for a single-day window
-            # like 28 Aug 2026, 500 1h candles covers ~20 days.
-            limit = 1000 if (s_dt or e_dt) else 500
-            rows = DataSyncService.fetch_klines(source or self.data_source, symbol, interval,
-                                                start_time=s_dt, end_time=e_dt, limit=limit)
+            venue_symbol = symbols[0]
+            page_limit = DataSyncService._page_limit(source_name, 1000)
+            rows = self._fetch_api_candles(DataSyncService.fetch_klines, source_name,
+                                           venue_symbol, interval, start_dt, end_dt, page_limit)
             if not rows:
                 return pd.DataFrame()
+            if getattr(self.config, 'use_mark_price', True):
+                try:
+                    marks = self._fetch_api_candles(DataSyncService.fetch_mark_klines, source_name,
+                                                    venue_symbol, interval, start_dt, end_dt, page_limit)
+                    mark_by_time = {self._row_time(row): row for row in marks}
+                    for row in rows:
+                        mark = mark_by_time.get(self._row_time(row))
+                        if mark:
+                            for column in ('open', 'high', 'low', 'close'):
+                                row[f'mark_{column}'] = mark.get(column)
+                except Exception:
+                    # A venue without a mark-price series simply prices the
+                    # run off traded candles, same as a seed without marks.
+                    pass
             df = pd.DataFrame(rows)
-            # Ensure event_time column exists
             if 'event_time' not in df.columns:
                 return pd.DataFrame()
             df['event_time'] = pd.to_datetime(df['event_time'])
             df.set_index('event_time', inplace=True)
-            # Ensure required columns
             for col in ('open', 'high', 'low', 'close', 'volume'):
                 if col not in df.columns:
                     df[col] = 0.0
+            df.attrs.update({'origin': 'venue-api', 'symbol': venue_symbol, 'source': source_name,
+                             'rows': len(df),
+                             'first': df.index.min() if len(df) else None,
+                             'last': df.index.max() if len(df) else None})
+            self.last_data_error = None
             return df.sort_index()
-        except Exception:
+        except Exception as exc:
+            self.last_data_error = f'{exc.__class__.__name__}: {exc}'
             return pd.DataFrame()
 
     # ------------------------------------------------------------------
@@ -232,8 +354,26 @@ class BacktestEngine:
         if df_4h is None:
             df_4h = self._get_data_from_db(symbol, "4h", start_date, end_date, self.data_source)
 
+        def _data_detail(frame):
+            return {key: frame.attrs.get(key) for key in ('origin', 'symbol', 'source', 'rows', 'first', 'last')} \
+                if frame is not None and getattr(frame, 'attrs', None) else {}
+
+        self.data_info = {
+            'requested_symbol': symbol,
+            'source': self.data_source,
+            '1h': _data_detail(df_1h),
+            '4h': _data_detail(df_4h),
+        }
         if df_1h.empty or df_4h.empty:
-            raise ValueError("Insufficient data in DB for the selected date range.")
+            missing = [interval for interval, frame in (('1h', df_1h), ('4h', df_4h)) if frame is None or frame.empty]
+            venue = self._series_symbols(self.data_source, symbol)[0]
+            detail = (f"Insufficient market data ({', '.join(missing)}) for {symbol} / {venue} "
+                      f"on {self.data_source} in {start_date or 'all'} → {end_date or 'now'}. "
+                      "Seed both intervals for this source (the backtest reads the same venue "
+                      "candles as Paper Trade).")
+            if self.last_data_error:
+                detail += f" Last venue fetch error: {self.last_data_error}"
+            raise ValueError(detail)
 
         df_1h = df_1h.sort_index()
         df_4h = df_4h.sort_index()
@@ -505,6 +645,9 @@ class BacktestEngine:
             "exit_dist": dist,
             "setup_dist": setup_dist,
             "rejected_reasons": rejected_reasons,
+            # Which candles the run actually traded (seeded vs venue fallback),
+            # so a zero-trade result can be checked against the paper session.
+            "data_info": self.data_info,
             # BTC perpetual: which price the run was priced on, and how much of
             # the range actually carried a mark price.
             "mark_price_basis": self.mark_price_basis,
