@@ -27,8 +27,9 @@ every 24 hours) also had data-identity problems, now fixed:
 
 * Full-history seeds wrote Delta candles as `BTCUSDT`, the daily updater as
   `BTCUSD` — two series that never met. Every seed/mark/repair path now writes
-  one canonical venue symbol, and existing installs are merged at startup
-  (legacy rows folded into the canonical series, mark prices preserved).
+  one canonical venue symbol, and existing installs are copied at startup
+  (legacy rows are kept as a backup — nothing is deleted — and mark prices are
+  preserved).
 * The job measured "last candle" on the raw ticker, so on Delta it always
   started from a fixed recent window rather than its own last stored candle.
   It now starts from the **oldest missing candle** in a 90-day lookback and

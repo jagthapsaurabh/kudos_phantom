@@ -61,15 +61,33 @@ marked = db.query(Klines).filter(
     Klines.source == 'Delta', Klines.symbol == 'BTCUSD', Klines.interval == '1h',
     Klines.mark_close.isnot(None)).count()
 db.close()
-check('legacy full-history rows merged into the venue series', canonical == 5 and legacy == 0,
-      f'canonical={canonical} legacy={legacy}')
+check('legacy rows copied into the venue series without deleting originals',
+      canonical == 5 and legacy == 5, f'canonical={canonical} legacy={legacy}')
 check('mark prices survive the merge', marked == 1, f'marked={marked}')
 # Idempotent: a second startup must not duplicate anything.
 migrate_db()
 db = SessionLocal()
 again = db.query(Klines).filter_by(source='Delta', symbol='BTCUSD', interval='1h').count()
 db.close()
-check('migration is idempotent', again == 5, f'rows={again}')
+check('migration is idempotent and keeps both series', again == 5 and legacy == 5,
+      f'canonical={again} legacy={legacy}')
+
+# A newer canonical candle must never be reverted by the older alias copy.
+db = SessionLocal()
+row = db.query(Klines).filter_by(source='Delta', symbol='BTCUSD', interval='1h',
+                                 event_time=base).first()
+row.close = 999.0
+db.commit()
+db.close()
+migrate_db()
+db = SessionLocal()
+kept_close = db.query(Klines).filter_by(
+    source='Delta', symbol='BTCUSD', interval='1h', event_time=base).first().close
+legacy_close = db.query(Klines).filter_by(
+    source='Delta', symbol='BTCUSDT', interval='1h', event_time=base).first().close
+db.close()
+check('stale legacy rows never overwrite newer canonical candles',
+      kept_close == 999.0 and legacy_close < 999.0, f'canonical={kept_close} legacy={legacy_close}')
 
 print('\n== gap detection ==')
 db = SessionLocal()
@@ -123,8 +141,8 @@ db = SessionLocal()
 stored = db.query(Klines).filter_by(source='Delta', symbol='BTCUSD', interval='1h').count()
 alias = db.query(Klines).filter_by(source='Delta', symbol='BTCUSDT', interval='1h').count()
 db.close()
-check('backfilled rows live only on the canonical series', stored >= 9 and alias == 0,
-      f'stored={stored} alias={alias}')
+check('backfill writes canonical candles and preserves the legacy copy',
+      stored >= 9 and alias == 5, f'stored={stored} alias={alias}')
 
 print('\n== daily mark-price repair ==')
 mark_calls = []

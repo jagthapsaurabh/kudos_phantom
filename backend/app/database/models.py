@@ -675,9 +675,12 @@ def migrate_db():
             # Full-history seeds used to store the caller's ticker verbatim
             # while the daily job stored the venue ticker (Delta BTCUSDT vs
             # BTCUSD). That left two divergent series: the backtest read one,
-            # the daily updater fed the other. Fold every legacy alias into the
-            # canonical series once, keeping whichever mark price is present,
-            # then drop the stale alias rows. Idempotent: no alias rows = no-op.
+            # the daily updater fed the other. COPY every legacy alias into the
+            # canonical series, keeping whichever mark price is present.
+            # Existing canonical candles are never overwritten by the older
+            # alias copy. Legacy rows are LEFT IN PLACE as a backup — this
+            # migration must never delete stored market data. Idempotent:
+            # re-running only refreshes the copied rows from the same source.
             for source_code, alias, canonical in (
                 ('Delta', 'BTCUSDT', 'BTCUSD'),
                 ('DeltaGlobal', 'BTCUSDT', 'BTCUSD'),
@@ -685,7 +688,7 @@ def migrate_db():
             ):
                 try:
                     params = {'source': source_code, 'alias': alias, 'canonical': canonical}
-                    moved = conn.execute(text(
+                    copied = conn.execute(text(
                         'INSERT INTO klines '
                         '(source, symbol, interval, event_time, open, high, low, close, volume, '
                         ' mark_open, mark_high, mark_low, mark_close) '
@@ -693,20 +696,18 @@ def migrate_db():
                         '       mark_open, mark_high, mark_low, mark_close '
                         'FROM klines '
                         'WHERE lower(source) = lower(:source) AND symbol = :alias '
+                        # Never overwrite a canonical candle with a stale
+                        # legacy copy: only fill candles that are missing, and
+                        # only fill mark columns that are still empty.
                         'ON CONFLICT(source, symbol, interval, event_time) DO UPDATE SET '
-                        '  open=excluded.open, high=excluded.high, low=excluded.low, '
-                        '  close=excluded.close, volume=excluded.volume, '
                         '  mark_open=COALESCE(klines.mark_open, excluded.mark_open), '
                         '  mark_high=COALESCE(klines.mark_high, excluded.mark_high), '
                         '  mark_low=COALESCE(klines.mark_low, excluded.mark_low), '
                         '  mark_close=COALESCE(klines.mark_close, excluded.mark_close)'
                     ), params).rowcount
-                    if moved:
-                        conn.execute(text(
-                            'DELETE FROM klines WHERE lower(source) = lower(:source) AND symbol = :alias'
-                        ), params)
-                        print(f'[migrate] merged {moved} legacy {source_code} {alias} '
-                              f'candles into {canonical}')
+                    if copied:
+                        print(f'[migrate] copied {copied} legacy {source_code} {alias} '
+                              f'candles into {canonical} (originals kept)')
                 except Exception as exc:
                     print(f'[migrate] {source_code} symbol merge skipped: {exc}')
 
