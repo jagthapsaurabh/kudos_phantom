@@ -23,7 +23,9 @@ from .core.fast_test_v1 import (
 )
 from .core.strategy import (
     PHANTOM_PRESETS, BUILTIN_PHANTOM_ID, parse_phantom_variant, apply_phantom_variant,
-    phantom_preset_name, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
+    phantom_preset_name, KUDOS_OPTIMIZE_COMPIL_ID, KUDOS_OPTIMIZE_COMPIL_NAME,
+    COMPULSORY_CONDITIONS, COMPULSORY_CONDITION_LABELS, normalize_compulsory_conditions,
+    is_kudos_optimize_compulsory, SETUP_MODES, TRADE_DIRECTIONS, SETUP_MODE_LABELS,
     TRADE_DIRECTION_LABELS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS,
     RISK_EXIT_MODELS, RISK_EXIT_MODEL_LABELS, RISK_EXIT_LEVELS,
     FastTestConfig, FastTestStrategyService, fast_test_config,
@@ -431,7 +433,8 @@ def _is_builtin_phantom(strategy_id) -> bool:
 def _is_phantom_preset(strategy_id) -> bool:
     """A built-in id OTHER than the plain champion (``PhantomV2``)."""
     variant = parse_phantom_variant(strategy_id)
-    return bool(variant) and (variant['setup_mode'] != 'both' or variant['trade_direction'] != 'both')
+    return bool(variant) and (variant['setup_mode'] != 'both' or variant['trade_direction'] != 'both'
+                              or bool(variant.get('compulsory_conditions')))
 
 
 def _load_builtin_config(strategy_id) -> PhantomV2Config:
@@ -2189,6 +2192,8 @@ def phantom_config(strategy_id: Optional[str] = None, user=Depends(get_current_u
                 "risk_exit_models": [{"value": m, "label": RISK_EXIT_MODEL_LABELS[m]}
                                      for m in RISK_EXIT_MODELS],
                 "risk_exit_levels": list(RISK_EXIT_LEVELS),
+                "compulsory_conditions": [{"value": k, "label": COMPULSORY_CONDITION_LABELS[k]}
+                                          for k in COMPULSORY_CONDITIONS],
             }}
 
 

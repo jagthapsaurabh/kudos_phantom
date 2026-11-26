@@ -13,7 +13,8 @@ globalThis.window = { location: { protocol: 'http:', hostname: 'localhost', sear
 globalThis.fetch = () => Promise.resolve({ ok: false, json: async () => ([]) });
 
 import {
-  PHANTOM_PRESETS, PHANTOM_DEFAULT_ID, parsePhantomVariant, isPhantomBuiltin, isPhantomPreset,
+  PHANTOM_PRESETS, PHANTOM_DEFAULT_ID, KUDOS_OPTIMIZE_COMPIL_ID, KUDOS_OPTIMIZE_COMPIL_NAME,
+  COMPULSORY_CONDITIONS, parsePhantomVariant, isPhantomBuiltin, isPhantomPreset,
   builtinStrategyName, strategyDisplayName, phantomPresetId, phantomPresetName, macdLineRuleText,
   macdLineRulesActive, DEFAULT_MACD_LINE_RULES, setupModeLabel, tradeDirectionLabel,
 } from '../src/utils/phantomPresets.js';
@@ -33,9 +34,9 @@ const check = (name, cond, extra = '') => {
 };
 
 // ------------------------------------------------------------- id helpers --
-check('8 curated presets, none is the plain default',
-  PHANTOM_PRESETS.length === 8 && PHANTOM_PRESETS.every(p => p.id !== PHANTOM_DEFAULT_ID));
-check('preset ids are unique', new Set(PHANTOM_PRESETS.map(p => p.id)).size === 8);
+check('9 curated presets, none is the plain default',
+  PHANTOM_PRESETS.length === 9 && PHANTOM_PRESETS.every(p => p.id !== PHANTOM_DEFAULT_ID));
+check('preset ids are unique', new Set(PHANTOM_PRESETS.map(p => p.id)).size === 9);
 check('preset ids mirror the backend scheme',
   PHANTOM_PRESETS.some(p => p.id === 'PhantomV2:reversal')
   && PHANTOM_PRESETS.some(p => p.id === 'PhantomV2:long')
@@ -66,6 +67,24 @@ check('strategyDisplayName prefers the saved name, then built-in, then id',
   && strategyDisplayName('42', []) === '42');
 check('labels', setupModeLabel('reversal') === 'Reversal only' && tradeDirectionLabel('short') === 'Short only'
   && setupModeLabel('both') === 'Reversal + Momentum');
+
+// ------------------------------------------- compulsory MACD hist preset ---
+const optVariant = parsePhantomVariant(KUDOS_OPTIMIZE_COMPIL_ID);
+check('Kudos Optimize Compulsory parses with condition 3 compulsory',
+  optVariant && optVariant.setup_mode === 'both' && optVariant.trade_direction === 'both'
+  && JSON.stringify(optVariant.compulsory_conditions) === JSON.stringify(['macd_hist']));
+check('Kudos Optimize Compulsory name + dropdown entry',
+  builtinStrategyName(KUDOS_OPTIMIZE_COMPIL_ID) === 'Kudos Optimize Compulsory'
+  && KUDOS_OPTIMIZE_COMPIL_NAME === 'Kudos Optimize Compulsory'
+  && PHANTOM_PRESETS.some(p => p.id === KUDOS_OPTIMIZE_COMPIL_ID && p.name === KUDOS_OPTIMIZE_COMPIL_NAME
+    && JSON.stringify(p.compulsory_conditions) === JSON.stringify(['macd_hist'])));
+check('the compulsory preset is a built-in preset, the default is not',
+  isPhantomBuiltin(KUDOS_OPTIMIZE_COMPIL_ID) && isPhantomPreset(KUDOS_OPTIMIZE_COMPIL_ID)
+  && !isPhantomPreset(PHANTOM_DEFAULT_ID));
+check('strategyDisplayName resolves the compulsory preset',
+  strategyDisplayName(KUDOS_OPTIMIZE_COMPIL_ID, []) === 'Kudos Optimize Compulsory');
+check('all seven conditions are offered', COMPULSORY_CONDITIONS.length === 7
+  && COMPULSORY_CONDITIONS.some(c => c.value === 'macd_hist' && c.label.includes('3.')));
 
 // ------------------------------------------------------- MACD rule text ----
 const off = { macd_line_rules: { ...DEFAULT_MACD_LINE_RULES } };
@@ -106,6 +125,15 @@ check('summary shows the MACD line rules per side', summaryHtml.includes('MACD l
 check('summary shows the hist threshold per side', summaryHtml.includes('Long ≥ 3') && summaryHtml.includes('Short ≤ -3'));
 const plainSummary = renderToString(<StrategyConfigSummary strategyId="5" strategies={[{ id: 5, name: 'x', rules: { rsi_oversold: 40, macd_hist_min: 5 } }]} />);
 check('summary says line rules are off for an untouched strategy', plainSummary.includes('Off — only the histogram threshold'));
+const compulsorySummary = flat(renderToString(<StrategyConfigSummary strategyId="7" strategies={[
+  { id: 7, name: 'Strict', rules: { rsi_oversold: 40, compulsory_conditions: ['macd_hist'] } },
+]} />));
+check('summary shows compulsory conditions when configured',
+  compulsorySummary.includes('Compulsory conditions') && compulsorySummary.includes('MACD hist'));
+check('summary says none when the list is empty',
+  flat(renderToString(<StrategyConfigSummary strategyId="8" strategies={[
+    { id: 8, name: 'Plain', rules: { rsi_oversold: 40 } },
+  ]} />)).includes('None — original behaviour'));
 check('summary renders nothing for a Chartink rule strategy',
   renderToString(<StrategyConfigSummary strategyId="6" strategies={[{ id: 6, name: 'rules', rules: [{ a: 1 }] }]} />) === '');
 check('summary renders nothing for a built-in id before /phantom/config answers',
@@ -117,6 +145,11 @@ const bt = html(Backtest);
 check('Backtest renders', !bt.startsWith('RENDER ERROR') && bt.length > 200, bt.slice(0, 120));
 check('Backtest dropdown lists the presets next to the default',
   bt.includes('Kudos V2.5 (Default)') && bt.includes('value="PhantomV2:reversal"') && bt.includes('Kudos — Long only'));
+check('Backtest dropdown offers Kudos Optimize Compulsory',
+  bt.includes(`value="${KUDOS_OPTIMIZE_COMPIL_ID}"`) && bt.includes('Kudos Optimize Compulsory'));
+check('Backtest form has the compulsory-condition checkboxes, none checked by default',
+  bt.includes('data-testid="compulsory-conditions"') && bt.includes('data-testid="compulsory-macd_hist"')
+  && bt.includes('data-testid="compulsory-candle_color"') && !bt.includes('checked="" data-testid="compulsory-macd_hist"'));
 check('Backtest form has the Setup / Direction selectors', bt.includes('strategy-separation')
   && bt.includes('Reversal + Momentum') && bt.includes('Long + Short'));
 check('Backtest form has the MACD line / signal block, collapsed by default',

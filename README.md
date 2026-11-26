@@ -421,6 +421,17 @@ A preset is the tuned champion config with only the setup / direction narrowed (
 lists them). Presets are separate strategy ids, so a preset and the default can run side by side on
 one account, and History / Sessions show the preset's name.
 
+**Compulsory conditions (new, off by default).** The Backtest form now has a *Compulsory conditions*
+panel listing the seven documented entry conditions (4h trend, ADX, MACD hist, ATR regime, RSI
+trigger, candle colour, MACD confirmation). Ticking one adds that filter as a gate on **every** entry,
+including Setup B momentum entries that previously skipped it. No ticks = the original strategy;
+the new `compulsory_conditions` config key defaults to `[]`, so old saved strategies and runs are
+untouched. Trade logs show condition 3 as an applied PASS/FAIL instead of `N/A` when it is compulsory.
+
+The drop-down also offers a named preset, **`PhantomV2:optimize-compulsory`** — *Kudos Optimize
+Compulsory*. It is the tuned champion with condition 3 (MACD hist magnitude) compulsory on both
+setups; plain *Kudos V2.5 (Default)* keeps exactly its old behaviour.
+
 ### v3.6 addon: Risk & Exit model — ATR units, price %, or both per level
 
 Every protective level has always been measured in **ATR units**. The client can now run each level

@@ -59,7 +59,13 @@ def condition_snapshot(meta, i, signal_dir):
     # a trade "failing" a condition it was never tested against.
     if setup == 'MOMENTUM':
         # Setup B gates: trend, ADX, ATR regime, DI, MACD zero-cross, RSI.
-        hist_ok = None
+        # MACD hist is N/A unless the run made it compulsory (e.g. the
+        # "Kudos Optimize Compulsory" strategy), in which case its pass mask
+        # is reported like on Setup A.
+        if meta.get('compulsory_macd_hist'):
+            hist_ok = bool(meta['cond_mom_macd_hist_long' if is_long else 'cond_mom_macd_hist_short'][i])
+        else:
+            hist_ok = None
         rsi_ok = bool(meta['cond_mom_rsi_long' if is_long else 'cond_mom_rsi_short'][i])
         macd_ok = bool(meta['cond_mom_cross_long' if is_long else 'cond_mom_cross_short'][i])
         di_ok = bool(meta['cond_di_long' if is_long else 'cond_di_short'][i])
@@ -202,9 +208,10 @@ def entry_conditions_text(config, meta, i, signal_dir):
     lines.append(f"2. ADX: {num(adx_v, 1)} >= min {num(adx_min, 1)} -> "
                  f"{'PASS' if adx_v >= adx_min else 'FAIL'}")
 
-    # 3. MACD histogram — a Setup A gate only. Setup B enters on the
-    # zero-cross instead, so saying "FAIL" there would be wrong.
-    if setup == 'MOMENTUM':
+    # 3. MACD histogram — a Setup A gate by default. Setup B enters on the
+    # zero-cross instead, so saying "FAIL" there would be wrong unless the
+    # run explicitly made this condition compulsory on every entry.
+    if setup == 'MOMENTUM' and not cfg.is_compulsory('macd_hist'):
         lines.append("3. MACD hist magnitude: not applied — Setup B (momentum) "
                      "enters on the MACD zero-cross instead -> N/A")
     elif cfg.uses_direction_macd_hist():

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import os
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 from .indicators import compute_indicators, sma, macd as _macd
 from .trading_windows import TradingWindowConfig
@@ -258,6 +258,70 @@ class EntryConditions(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Compulsory entry conditions (optional, off by default)
+# ---------------------------------------------------------------------------
+# The seven conditions the strategy documents. By default every condition is
+# applied exactly where the engine has always applied it (some only belong to
+# Setup A). A client can list any of them in ``compulsory_conditions`` to make
+# that condition an extra gate on *every* entry, including Setup B. The list is
+# empty on the champion config, so every existing run is byte-for-byte
+# unchanged. "Kudos Optimize Compulsory" is the champion with MACD hist made
+# compulsory on both setups.
+COMPULSORY_CONDITIONS = (
+    'trend', 'adx', 'macd_hist', 'atr_regime', 'rsi_trigger', 'candle_color', 'macd_confirm',
+)
+COMPULSORY_CONDITION_LABELS = {
+    'trend': '4h trend',
+    'adx': 'ADX',
+    'macd_hist': 'MACD hist',
+    'atr_regime': 'ATR regime',
+    'rsi_trigger': 'RSI trigger',
+    'candle_color': 'Candle colour',
+    'macd_confirm': 'MACD confirmation',
+}
+_COMPULSORY_CONDITION_ALIASES = {
+    'trend': 'trend', '4h_trend': 'trend', 'trend_4h': 'trend', '4h': 'trend', '1': 'trend',
+    'adx': 'adx', 'adx_min': 'adx', '2': 'adx',
+    'macd_hist': 'macd_hist', 'macdhist': 'macd_hist', 'macd_histogram': 'macd_hist',
+    'hist': 'macd_hist', 'histogram': 'macd_hist', '3': 'macd_hist',
+    'atr_regime': 'atr_regime', 'atr': 'atr_regime', 'atr_floor': 'atr_regime', '4': 'atr_regime',
+    'rsi_trigger': 'rsi_trigger', 'rsi': 'rsi_trigger', 'rsi_reversal': 'rsi_trigger', '5': 'rsi_trigger',
+    'candle_color': 'candle_color', 'candlecolour': 'candle_color', 'candle': 'candle_color',
+    'candle_colour': 'candle_color', '6': 'candle_color',
+    'macd_confirm': 'macd_confirm', 'macd_confirmation': 'macd_confirm', 'confirm': 'macd_confirm', '7': 'macd_confirm',
+}
+
+
+def normalize_compulsory_conditions(value) -> List[str]:
+    """Normalise a list (or a comma-separated string) of condition keys.
+
+    Unknown names raise, so a typo can never silently change which filters a
+    backtest applies. Order is canonical; duplicates collapse.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [part for part in value.replace('|', ',').split(',') if part.strip()]
+    else:
+        try:
+            items = list(value)
+        except TypeError:
+            raise ValueError(f"compulsory_conditions must be a list, got {value!r}")
+    out = []
+    for item in items:
+        key = str(item).strip().lower().replace(' ', '_').replace('-', '_')
+        if key in ('all', '*'):
+            return list(COMPULSORY_CONDITIONS)
+        canonical = _COMPULSORY_CONDITION_ALIASES.get(key)
+        if canonical is None:
+            raise ValueError(
+                f"Unknown compulsory condition {item!r}; use one of {', '.join(COMPULSORY_CONDITIONS)}")
+        if canonical not in out:
+            out.append(canonical)
+    return [key for key in COMPULSORY_CONDITIONS if key in out]
+
+
+# ---------------------------------------------------------------------------
 # v3.6 — Risk & Exit model.
 #
 # Every protective level (stop loss, take profit, trailing stop, breakeven) is
@@ -437,6 +501,10 @@ class PhantomV2Config(BaseModel):
     # ------------------------------------------------------------------
     setup_mode: str = Field(default=DEFAULT_SETUP_MODE)
     trade_direction: str = Field(default=DEFAULT_TRADE_DIRECTION)
+    # Optional compulsory entry conditions. Empty = the engine applies each
+    # condition exactly where it always has; e.g. ['macd_hist'] additionally
+    # requires the histogram threshold on momentum (Setup B) entries.
+    compulsory_conditions: List[str] = Field(default_factory=list)
     # v3.5 — optional MACD line / signal line entry rules (OFF by default).
     macd_line_rules: MacdLineConditions = Field(default_factory=MacdLineConditions)
     # ------------------------------------------------------------------
@@ -474,6 +542,11 @@ class PhantomV2Config(BaseModel):
     def _validate_trade_direction(cls, value):
         """Canonical 'both' / 'long' / 'short'; unknown values raise."""
         return normalize_trade_direction(value)
+
+    @field_validator('compulsory_conditions', mode='before')
+    @classmethod
+    def _validate_compulsory_conditions(cls, value):
+        return normalize_compulsory_conditions(value)
 
     @model_validator(mode="after")
     def _validate_macd_periods(self):
@@ -764,6 +837,14 @@ class PhantomV2Config(BaseModel):
             return direction == -1
         return True
 
+    def is_compulsory(self, condition: str) -> bool:
+        """Whether a named entry condition is forced on every setup."""
+        key = _COMPULSORY_CONDITION_ALIASES.get(str(condition).strip().lower())
+        return key is not None and key in self.compulsory_conditions
+
+    def compulsory_labels(self) -> List[str]:
+        return [COMPULSORY_CONDITION_LABELS[k] for k in self.compulsory_conditions]
+
     def setup_label(self) -> str:
         if self.setup_mode == 'both' and not self.enable_momentum_entry:
             # Legacy way of running reversal-only: the momentum box unticked.
@@ -872,6 +953,16 @@ class PhantomV2Config(BaseModel):
 # its own is untouched and keeps meaning the full strategy.
 BUILTIN_PHANTOM_ID = 'PhantomV2'
 _PRESET_SEPARATORS = (':', '-', '.', '/')
+# A named built-in strategy: the tuned champion with condition 3 (MACD hist)
+# compulsory on both setups. It is a separate dropdown entry and never alters
+# plain ``PhantomV2`` or the setup / direction presets.
+KUDOS_OPTIMIZE_COMPIL_ID = 'PhantomV2:optimize-compulsory'
+KUDOS_OPTIMIZE_COMPIL_NAME = 'Kudos Optimize Compulsory'
+_KUDOS_OPTIMIZE_ALIASES = (KUDOS_OPTIMIZE_COMPIL_ID.lower(), 'kudosoptimizecompulsory')
+
+
+def is_kudos_optimize_compulsory(strategy_id) -> bool:
+    return str(strategy_id or '').strip().lower() in _KUDOS_OPTIMIZE_ALIASES
 
 
 def parse_phantom_variant(strategy_id) -> Optional[dict]:
@@ -885,6 +976,9 @@ def parse_phantom_variant(strategy_id) -> Optional[dict]:
     sid = str(strategy_id).strip()
     if not sid:
         return None
+    if is_kudos_optimize_compulsory(sid):
+        return {'setup_mode': DEFAULT_SETUP_MODE, 'trade_direction': DEFAULT_TRADE_DIRECTION,
+                'compulsory_conditions': ['macd_hist']}
     if sid == BUILTIN_PHANTOM_ID:
         return {'setup_mode': DEFAULT_SETUP_MODE, 'trade_direction': DEFAULT_TRADE_DIRECTION}
     if not sid.lower().startswith(BUILTIN_PHANTOM_ID.lower()):
@@ -930,6 +1024,8 @@ def phantom_preset_id(setup_mode: str = 'both', trade_direction: str = 'both') -
 
 def phantom_preset_name(strategy_id) -> Optional[str]:
     """Display name for a built-in id ("Kudos — Reversal · Long only"), else None."""
+    if is_kudos_optimize_compulsory(strategy_id):
+        return KUDOS_OPTIMIZE_COMPIL_NAME
     variant = parse_phantom_variant(strategy_id)
     if variant is None:
         return None
@@ -954,9 +1050,16 @@ def apply_phantom_variant(config: 'PhantomV2Config', strategy_id) -> 'PhantomV2C
     variant = parse_phantom_variant(strategy_id)
     if not variant:
         return config
-    if variant['setup_mode'] == 'both' and variant['trade_direction'] == 'both':
+    compulsory = list(variant.get('compulsory_conditions') or [])
+    if (variant['setup_mode'] == 'both' and variant['trade_direction'] == 'both'
+            and not compulsory):
         return config
-    return config.model_copy(update=dict(variant))
+    update = {'setup_mode': variant['setup_mode'], 'trade_direction': variant['trade_direction']}
+    if compulsory:
+        # The strategy ID wins: selecting the compulsory preset must not be
+        # undone by an empty list left in a saved / cached form payload.
+        update['compulsory_conditions'] = compulsory
+    return config.model_copy(update=update)
 
 
 def _build_presets():
@@ -974,6 +1077,18 @@ def _build_presets():
                 'setup_label': SETUP_MODE_LABELS[setup_mode],
                 'direction_label': TRADE_DIRECTION_LABELS[trade_direction],
             })
+    # Named compulsory-condition strategy — full champion setup / direction,
+    # but condition 3 is required on momentum entries too.
+    presets.append({
+        'id': KUDOS_OPTIMIZE_COMPIL_ID,
+        'name': KUDOS_OPTIMIZE_COMPIL_NAME,
+        'setup_mode': DEFAULT_SETUP_MODE,
+        'trade_direction': DEFAULT_TRADE_DIRECTION,
+        'setup_label': SETUP_MODE_LABELS[DEFAULT_SETUP_MODE],
+        'direction_label': TRADE_DIRECTION_LABELS[DEFAULT_TRADE_DIRECTION],
+        'compulsory_conditions': ['macd_hist'],
+        'compulsory_label': COMPULSORY_CONDITION_LABELS['macd_hist'],
+    })
     return presets
 
 
@@ -1120,6 +1235,25 @@ class StrategyService:
             long_B = long_B & macd_line_ok_l
             short_A = short_A & macd_line_ok_s
             short_B = short_B & macd_line_ok_s
+        # Optional compulsory conditions: every selected filter becomes a gate
+        # on BOTH setups. The reversal setup already includes all seven, so
+        # this only narrows momentum entries; with an empty list nothing runs.
+        if cfg.compulsory_conditions:
+            gates = {
+                'trend': ((trend_col == 1), (trend_col == -1)),
+                'adx': (adx_ok_l, adx_ok_s),
+                'macd_hist': (hist_ok_l, hist_ok_s),
+                'atr_regime': (regime_ok_l, regime_ok_s),
+                'rsi_trigger': (long_rsi_A, short_rsi_A),
+                'candle_color': (is_green, is_red),
+                'macd_confirm': (long_macd_A, short_macd_A),
+            }
+            long_gates = [gates[key][0] for key in cfg.compulsory_conditions]
+            short_gates = [gates[key][1] for key in cfg.compulsory_conditions]
+            long_A = long_A & np.logical_and.reduce(long_gates)
+            short_A = short_A & np.logical_and.reduce(short_gates)
+            long_B = long_B & np.logical_and.reduce(long_gates)
+            short_B = short_B & np.logical_and.reduce(short_gates)
         # Setup separation: momentum_enabled() is exactly the legacy
         # enable_momentum_entry switch while setup_mode is 'both'.
         if not cfg.momentum_enabled():
@@ -1167,6 +1301,11 @@ class StrategyService:
             'cond_adx_ok_long': adx_ok_l, 'cond_adx_ok_short': adx_ok_s,
             'cond_macd_hist_ok_long': hist_ok_l, 'cond_macd_hist_ok_short': hist_ok_s,
             'cond_atr_regime_ok_long': regime_ok_l, 'cond_atr_regime_ok_short': regime_ok_s,
+            # Compulsory-condition run flags + momentum hist masks, so the
+            # trade log can show condition 3 as applied (not N/A) on Setup B.
+            'compulsory_conditions': list(cfg.compulsory_conditions),
+            'compulsory_macd_hist': bool(cfg.is_compulsory('macd_hist')),
+            'cond_mom_macd_hist_long': hist_ok_l, 'cond_mom_macd_hist_short': hist_ok_s,
             # Backward-compatible shared keys (identical to the long masks when
             # the direction toggle is OFF).
             'cond_adx_ok': adx_ok_l, 'cond_macd_hist_ok': hist_ok_l,
