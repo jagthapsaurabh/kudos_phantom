@@ -12,7 +12,7 @@ import RiskExitModelEditor from '../components/RiskExitModelEditor';
 import { DEFAULT_RISK_EXIT, RISK_EXIT_META, riskExitText } from '../utils/riskExit';
 import {
   SETUP_MODES, TRADE_DIRECTIONS, MACD_LINE_RULES, MACD_LINE_RULE_KEYS, DEFAULT_MACD_LINE_RULES,
-  parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, strategyDisplayName, macdLineRuleText,
+  COMPULSORY_CONDITIONS, parsePhantomVariant, isPhantomBuiltin, builtinStrategyName, strategyDisplayName, macdLineRuleText,
   FAST_TEST_ID, FAST_TEST_NAME, FAST_TEST_V1_ID, FAST_TEST_V1_NAME, isFastTestV1,
 } from '../utils/phantomPresets';
 
@@ -632,6 +632,9 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     // v3.5 strategy separation — 'both' / 'both' is the original strategy.
     setup_mode: 'both',
     trade_direction: 'both',
+    // Empty = the original engine. Tick a condition to require it on every
+    // entry, including momentum (Setup B) trades.
+    compulsory_conditions: [],
     // v3.5 MACD line / signal line rules — OFF unless the client enables them.
     macd_line_rules: { ...DEFAULT_MACD_LINE_RULES },
     entry_conditions: {
@@ -727,9 +730,24 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
   // the selectors then mirror the preset and are locked.
   const presetVariant = parsePhantomVariant(selectedStrategyId);
   const presetLocked = !!presetVariant && (presetVariant.setup_mode !== 'both' || presetVariant.trade_direction !== 'both');
+  // A named compulsory-condition strategy fixes that list too — the same
+  // pattern as the setup / direction presets.
+  const compulsoryLocked = !!(presetVariant && presetVariant.compulsory_conditions && presetVariant.compulsory_conditions.length);
 
   const toggleSection = (key) => setSectionVisibility(prev => ({ ...prev, [key]: !prev[key] }));
   const setSharedField = (field, value) => setParams(prev => ({ ...prev, [field]: value }));
+  const toggleCompulsory = (key) => {
+    if (compulsoryLocked) return;
+    setParams(prev => {
+      const list = prev.compulsory_conditions || [];
+      return {
+        ...prev,
+        compulsory_conditions: list.includes(key)
+          ? list.filter(v => v !== key)
+          : [...list, key],
+      };
+    });
+  };
   const setMacdLineRule = (field, value) => setParams(prev => ({
     ...prev,
     macd_line_rules: { ...DEFAULT_MACD_LINE_RULES, ...(prev.macd_line_rules || {}), [field]: value },
@@ -872,6 +890,7 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     const base = DEFAULT_PARAMS[field];
     if (current === undefined || base === undefined) return false;
     if (typeof current === 'number' && typeof base === 'number') return Math.abs(current - base) > 1e-12;
+    if (Array.isArray(current) && Array.isArray(base)) return JSON.stringify(current) !== JSON.stringify(base);
     if (typeof current === 'object' || typeof base === 'object') return false;
     return current !== base;
   };
@@ -1211,6 +1230,8 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
       // v3.5 fields: runs saved before them simply keep the inert defaults.
       setup_mode: saved.setup_mode || base.setup_mode,
       trade_direction: saved.trade_direction || base.trade_direction,
+      compulsory_conditions: Array.isArray(saved.compulsory_conditions) ? [...saved.compulsory_conditions]
+        : (saved.compulsory_conditions ? [saved.compulsory_conditions] : [...base.compulsory_conditions]),
       macd_line_rules: { ...base.macd_line_rules, ...((saved.macd_line_rules && typeof saved.macd_line_rules === 'object') ? saved.macd_line_rules : {}) },
       // v3.6: runs saved before the Risk & Exit model stay all-ATR.
       risk_exit: { ...base.risk_exit, ...((saved.risk_exit && typeof saved.risk_exit === 'object') ? saved.risk_exit : {}) },
@@ -1254,9 +1275,15 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
     // so switching back never leaves a preset's restriction behind.
     const variant = parsePhantomVariant(sid);
     if (variant) {
-      setParams(prev => ({ ...prev, setup_mode: variant.setup_mode, trade_direction: variant.trade_direction }));
+      setParams(prev => ({
+        ...prev,
+        setup_mode: variant.setup_mode,
+        trade_direction: variant.trade_direction,
+        compulsory_conditions: variant.compulsory_conditions ? [...variant.compulsory_conditions] : [],
+      }));
       return;
     }
+    setParams(prev => ({ ...prev, compulsory_conditions: [] }));
     // When a saved Kudos-style strategy is chosen, load its params into the
     // form so the admin can tweak it before re-running.
     const found = strategies.find(s => String(s.id) === String(sid));
@@ -1680,6 +1707,39 @@ const Backtest = ({ initialStrategyId = 'PhantomV2', initialParams = null } = {}
             {(params.setup_mode === 'momentum' && params.enable_momentum_entry === false) && (
               <p className="text-[11px] text-amber-300 sm:col-span-2 xl:col-span-3">Momentum only overrides the unticked "Momentum entries" box — Setup B fires regardless.</p>
             )}
+          </ParamGroupCard>
+          )}
+
+          {/* Optional compulsory conditions: make any of the seven documented
+              filters apply to momentum entries too. Empty = original engine. */}
+          {!fastTestFamily && (
+          <ParamGroupCard id="config-compulsory-conditions" data-testid="compulsory-conditions"
+            title="Compulsory conditions" icon={Shield}
+            hint="Tick a condition to require it on every entry. None ticked = the original strategy."
+            changed={changedIn(['compulsory_conditions'])}
+            onReset={() => resetGroup(['compulsory_conditions'])}>
+            {compulsoryLocked && (
+              <span className="inline-flex w-fit items-center rounded-lg border border-amber-700/60 bg-amber-900/20 px-2.5 py-1 text-[11px] text-amber-300 sm:col-span-2 xl:col-span-3">
+                Fixed by the selected preset ({builtinStrategyName(selectedStrategyId)}). Pick <b className="mx-1">Kudos V2.5 (Default)</b> to change.
+              </span>
+            )}
+            <div className="grid gap-2 sm:col-span-2 xl:col-span-3 sm:grid-cols-2 xl:grid-cols-3">
+              {COMPULSORY_CONDITIONS.map(c => {
+                const checked = (params.compulsory_conditions || []).includes(c.value);
+                return (
+                  <label key={c.value} className="flex cursor-pointer items-center gap-2 rounded-lg border border-gray-700/70 bg-gray-800/40 px-3 py-2 text-xs text-gray-300">
+                    <input type="checkbox" checked={checked} disabled={compulsoryLocked}
+                      data-testid={`compulsory-${c.value}`}
+                      onChange={() => toggleCompulsory(c.value)} className="accent-blue-500" />
+                    {c.label}
+                  </label>
+                );
+              })}
+            </div>
+            <p className="text-[11px] leading-relaxed text-gray-500 sm:col-span-2 xl:col-span-3">
+              By default condition 3 (MACD hist) is a reversal-only gate; momentum trades enter on the MACD zero-cross.
+              Tick it — or select <b className="mx-1 text-gray-300">Kudos Optimize Compulsory</b> — to require the histogram threshold on both setups.
+            </p>
           </ParamGroupCard>
           )}
 

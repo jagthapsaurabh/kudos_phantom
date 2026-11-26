@@ -7,6 +7,10 @@
 
 export const PHANTOM_DEFAULT_ID = 'PhantomV2';
 export const PHANTOM_DEFAULT_NAME = 'Kudos V2.5 (Default)';
+// Named strategy: the tuned champion with condition 3 (MACD hist) required on
+// momentum entries too. Plain PhantomV2 keeps the original behaviour.
+export const KUDOS_OPTIMIZE_COMPIL_ID = 'PhantomV2:optimize-compulsory';
+export const KUDOS_OPTIMIZE_COMPIL_NAME = 'Kudos Optimize Compulsory';
 export const FAST_TEST_ID = 'FastTest';
 export const FAST_TEST_NAME = 'Fast Test Strategy';
 // FastTest V1.0 — the same debug signals, plus the 2H +0.35% validation and
@@ -46,6 +50,21 @@ export const MACD_LINE_RULE_KEYS = [
   { key: 'line_vs_zero', label: 'MACD line vs zero', left: 'MACD line', right: '0' },
   { key: 'signal_vs_zero', label: 'Signal line vs zero', left: 'signal line', right: '0' },
 ];
+
+// The seven documented entry conditions. Selecting one in Backtest makes it
+// an extra gate on every entry (Setup B included). The list is empty by
+// default, so an untouched run is exactly the original strategy.
+export const COMPULSORY_CONDITIONS = [
+  { value: 'trend', label: '1. 4h trend' },
+  { value: 'adx', label: '2. ADX' },
+  { value: 'macd_hist', label: '3. MACD hist' },
+  { value: 'atr_regime', label: '4. ATR regime' },
+  { value: 'rsi_trigger', label: '5. RSI trigger' },
+  { value: 'candle_color', label: '6. Candle colour' },
+  { value: 'macd_confirm', label: '7. MACD confirmation' },
+];
+export const COMPULSORY_CONDITION_LABELS = Object.fromEntries(
+  COMPULSORY_CONDITIONS.map(c => [c.value, c.label]));
 
 export const DEFAULT_MACD_LINE_RULES = {
   enabled: false,
@@ -87,21 +106,37 @@ export const phantomPresetName = (setup = 'both', direction = 'both') => {
   return `Kudos — ${bits.join(' · ')}`;
 };
 
-export const PHANTOM_PRESETS = PRESET_SPECS.map(([setup, direction]) => ({
-  id: phantomPresetId(setup, direction),
-  name: phantomPresetName(setup, direction),
-  setup_mode: setup,
-  trade_direction: direction,
-  setup_label: setupLabel(setup).label,
-  direction_label: directionLabel(direction).label,
-}));
+export const PHANTOM_PRESETS = [
+  ...PRESET_SPECS.map(([setup, direction]) => ({
+    id: phantomPresetId(setup, direction),
+    name: phantomPresetName(setup, direction),
+    setup_mode: setup,
+    trade_direction: direction,
+    setup_label: setupLabel(setup).label,
+    direction_label: directionLabel(direction).label,
+  })),
+  {
+    id: KUDOS_OPTIMIZE_COMPIL_ID,
+    name: KUDOS_OPTIMIZE_COMPIL_NAME,
+    setup_mode: 'both',
+    trade_direction: 'both',
+    setup_label: setupLabel('both').label,
+    direction_label: directionLabel('both').label,
+    compulsory_conditions: ['macd_hist'],
+    compulsory_label: COMPULSORY_CONDITION_LABELS.macd_hist,
+  },
+];
 
 // `PhantomV2:reversal:long` -> { setup_mode, trade_direction } | null.
 // Mirrors backend parse_phantom_variant (separators : - . /, 1–2 tokens).
 export const parsePhantomVariant = (strategyId) => {
   if (strategyId === null || strategyId === undefined) return null;
   const text = String(strategyId).trim();
-  if (!text.toLowerCase().startsWith(PHANTOM_DEFAULT_ID.toLowerCase())) return null;
+  const lower = text.toLowerCase();
+  if (lower === KUDOS_OPTIMIZE_COMPIL_ID.toLowerCase() || lower === 'kudosoptimizecompulsory') {
+    return { setup_mode: 'both', trade_direction: 'both', compulsory_conditions: ['macd_hist'] };
+  }
+  if (!lower.startsWith(PHANTOM_DEFAULT_ID.toLowerCase())) return null;
   const rest = text.slice(PHANTOM_DEFAULT_ID.length);
   if (!rest) return { setup_mode: 'both', trade_direction: 'both' };
   if (!/^[:\-./]/.test(rest)) return null;
@@ -128,7 +163,8 @@ export const isPhantomBuiltin = (strategyId) => parsePhantomVariant(strategyId) 
 // True only for the narrowed presets (never for plain `PhantomV2`).
 export const isPhantomPreset = (strategyId) => {
   const v = parsePhantomVariant(strategyId);
-  return !!v && (v.setup_mode !== 'both' || v.trade_direction !== 'both');
+  return !!v && (v.setup_mode !== 'both' || v.trade_direction !== 'both'
+    || (v.compulsory_conditions && v.compulsory_conditions.length > 0));
 };
 
 // True for the FastTestV1 debug strategy (and nothing else). Mirrors the
@@ -141,6 +177,10 @@ export const isFastTestV1 = (strategyId) =>
 export const builtinStrategyName = (strategyId) => {
   if (String(strategyId) === FAST_TEST_ID) return FAST_TEST_NAME;
   if (isFastTestV1(strategyId)) return FAST_TEST_V1_NAME;
+  const text = String(strategyId ?? '').trim().toLowerCase();
+  if (text === KUDOS_OPTIMIZE_COMPIL_ID.toLowerCase() || text === 'kudosoptimizecompulsory') {
+    return KUDOS_OPTIMIZE_COMPIL_NAME;
+  }
   const v = parsePhantomVariant(strategyId);
   return v ? phantomPresetName(v.setup_mode, v.trade_direction) : null;
 };

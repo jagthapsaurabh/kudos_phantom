@@ -265,7 +265,7 @@ def main():
     check("direction-only id", parse_phantom_variant('PhantomV2:short') == {'setup_mode': 'both', 'trade_direction': 'short'})
     check("preset id builder round-trips",
           phantom_preset_id('momentum', 'long') == 'PhantomV2:momentum:long' and phantom_preset_id('both', 'both') == 'PhantomV2')
-    check("8 curated presets", len(PHANTOM_PRESETS) == 8 and all(p['id'] != BUILTIN_PHANTOM_ID for p in PHANTOM_PRESETS))
+    check("9 curated presets", len(PHANTOM_PRESETS) == 9 and all(p['id'] != BUILTIN_PHANTOM_ID for p in PHANTOM_PRESETS))
     check("preset names", phantom_preset_name('PhantomV2:reversal') == 'Kudos — Reversal only'
           and phantom_preset_name('PhantomV2:momentum:short') == 'Kudos — Momentum · Short only'
           and phantom_preset_name('PhantomV2') == 'Kudos V2.5 (Default)'

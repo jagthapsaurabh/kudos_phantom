@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Activity, Crosshair, Info, Shield } from 'lucide-react';
 import { API_URL } from '../api';
 import {
-  isPhantomBuiltin, macdLineRuleText, setupModeLabel, tradeDirectionLabel,
+  isPhantomBuiltin, macdLineRuleText, setupModeLabel, tradeDirectionLabel, COMPULSORY_CONDITION_LABELS,
 } from '../utils/phantomPresets';
 import { riskExitModelFor, riskExitModelLabel, riskExitText } from '../utils/riskExit';
 
@@ -76,6 +76,10 @@ const StrategyConfigSummary = ({ strategyId, strategies = [], className = '' }) 
   const lineLong = macdLineRuleText(params, 1);
   const lineShort = macdLineRuleText(params, -1);
   const lineActive = lineLong !== 'off' || lineShort !== 'off';
+  const compulsory = Array.isArray(params.compulsory_conditions) ? params.compulsory_conditions : [];
+  const compulsoryText = compulsory.length
+    ? compulsory.map(k => COMPULSORY_CONDITION_LABELS[k] || k).join(', ')
+    : 'None — original behaviour';
 
   return (
     <div className={`overflow-hidden rounded-2xl border border-gray-700 bg-gray-800/70 text-[11px] text-gray-300 ${className}`}
@@ -102,6 +106,7 @@ const StrategyConfigSummary = ({ strategyId, strategies = [], className = '' }) 
               {perSidePeriods ? <>L {periods('long')} · S {periods('short')}</> : periods('long')}
             </SummaryTile>
             <SummaryTile label="MACD hist threshold" mono>Long ≥ {histLong} · Short ≤ {histShort}</SummaryTile>
+            <SummaryTile label="Compulsory conditions">{compulsoryText}</SummaryTile>
           </div>
         </section>
 
